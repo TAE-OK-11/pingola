@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
+
+const MAX_RATE_BUCKETS: usize = 262_144;
 
 #[derive(Clone, Eq)]
 struct ClientKey {
@@ -34,15 +35,21 @@ struct Bucket {
 /// Per-client token buckets. The map is sharded so unrelated clients do not
 /// contend on a global lock.
 pub struct RateLimiter {
-    buckets: DashMap<ClientKey, Mutex<Bucket>>,
+    buckets: DashMap<ClientKey, Bucket>,
     observations: AtomicU64,
+    max_buckets: usize,
 }
 
 impl RateLimiter {
     pub fn new() -> Self {
+        Self::with_max_buckets(MAX_RATE_BUCKETS)
+    }
+
+    fn with_max_buckets(max_buckets: usize) -> Self {
         Self {
             buckets: DashMap::new(),
             observations: AtomicU64::new(0),
+            max_buckets,
         }
     }
 
@@ -57,13 +64,16 @@ impl RateLimiter {
         let now = Instant::now();
         let capacity = f64::from(burst) + 1.0;
         let key = ClientKey { zone, ip };
-        let entry = self.buckets.entry(key).or_insert_with(|| {
-            Mutex::new(Bucket {
-                tokens: capacity,
-                updated_at: now,
-            })
+        // Bound memory even during a sustained unique-source flood. Existing
+        // clients continue to use their buckets; unseen clients fail closed
+        // until the periodic idle cleanup frees capacity.
+        if self.buckets.len() >= self.max_buckets && !self.buckets.contains_key(&key) {
+            return false;
+        }
+        let mut bucket = self.buckets.entry(key).or_insert_with(|| Bucket {
+            tokens: capacity,
+            updated_at: now,
         });
-        let mut bucket = entry.lock();
         let elapsed = now.duration_since(bucket.updated_at).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * requests_per_second).min(capacity);
         bucket.updated_at = now;
@@ -73,13 +83,12 @@ impl RateLimiter {
             bucket.tokens -= 1.0;
         }
         drop(bucket);
-        drop(entry);
 
         // Bound memory during long-running scans. Cleanup is deliberately rare
         // and only removes buckets that have been idle for ten minutes.
         if self.observations.fetch_add(1, Ordering::Relaxed) & 0x3fff == 0x3fff {
             self.buckets
-                .retain(|_, bucket| now.duration_since(bucket.lock().updated_at).as_secs() < 600);
+                .retain(|_, bucket| now.duration_since(bucket.updated_at).as_secs() < 600);
         }
 
         allowed
@@ -164,6 +173,13 @@ mod tests {
         assert!(limiter.acquire("host", ip, 1).is_none());
         drop(permit);
         assert!(limiter.acquire("host", ip, 1).is_some());
+    }
+
+    #[test]
+    fn rate_bucket_capacity_is_bounded_and_fails_closed_for_new_clients() {
+        let limiter = RateLimiter::with_max_buckets(1);
+        assert!(limiter.allow("api", "192.0.2.10".parse().unwrap(), 1.0, 0));
+        assert!(!limiter.allow("api", "192.0.2.11".parse().unwrap(), 1.0, 0));
     }
 
     #[test]

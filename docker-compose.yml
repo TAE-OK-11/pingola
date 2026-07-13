@@ -8,7 +8,13 @@ services:
         RUST_TARGET_CPU: x86-64-v2
     network_mode: host
     restart: unless-stopped
+    stop_grace_period: 65s
+    pids_limit: 256
     read_only: true
+    ulimits:
+      nofile:
+        soft: 32768
+        hard: 32768
     cap_drop:
       - ALL
     cap_add:

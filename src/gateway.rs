@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
+use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
@@ -36,6 +37,7 @@ const COVER_PREFIXES: &[&str] = &["/rest/getCoverArt", "/api/artwork", "/coverar
 static LEGACY_HEALTH_WARNING: Once = Once::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
 enum RouteClass {
     NavidromeStream,
     NavidromeCover,
@@ -49,6 +51,22 @@ enum RouteClass {
 }
 
 impl RouteClass {
+    const ALL: [Self; 9] = [
+        Self::NavidromeStream,
+        Self::NavidromeCover,
+        Self::NavidromeApi,
+        Self::VaultwardenAuth,
+        Self::VaultwardenHub,
+        Self::Vaultwarden,
+        Self::Couchdb,
+        Self::Doh,
+        Self::AdguardUi,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::NavidromeStream => "navidrome_stream",
@@ -99,11 +117,24 @@ impl RouteClass {
     }
 }
 
+#[derive(Clone, Debug)]
+struct PreparedUpstream {
+    peer: HttpPeer,
+    read_timeout_seconds: Option<u64>,
+    write_timeout_seconds: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct RoutePolicy {
+    rate_limit: Option<(f64, u32)>,
+    active_request_override: Option<usize>,
+}
+
 #[derive(Clone)]
 struct RequestPlan {
-    domain: String,
+    domain: Arc<str>,
     handler: HandlerKind,
-    upstream_name: String,
+    upstream: Arc<PreparedUpstream>,
     route: RouteClass,
     max_body_bytes: usize,
     tls: bool,
@@ -136,6 +167,8 @@ impl Default for RequestContext {
 pub struct Gateway {
     runtime: Arc<RuntimeConfig>,
     static_files: StaticFiles,
+    upstreams: HashMap<String, Arc<PreparedUpstream>>,
+    route_policies: [RoutePolicy; RouteClass::ALL.len()],
     rates: RateLimiter,
     active_requests: ActiveRequestLimiter,
 }
@@ -153,9 +186,27 @@ impl Gateway {
             })
             .collect::<HashMap<_, _>>();
         let static_files = StaticFiles::new(roots, runtime.config.server.static_cache_bytes)?;
+        let upstreams = runtime
+            .config
+            .upstreams
+            .iter()
+            .map(|(name, upstream)| {
+                prepare_upstream(name, upstream).map(|prepared| (name.clone(), Arc::new(prepared)))
+            })
+            .collect::<anyhow::Result<HashMap<_, _>>>()?;
+        let route_policies = RouteClass::ALL.map(|route| RoutePolicy {
+            rate_limit: effective_rate_limit(&runtime, route),
+            active_request_override: runtime
+                .config
+                .route_limits
+                .get(route.name())
+                .and_then(|limit| limit.active_requests),
+        });
         Ok(Self {
             runtime,
             static_files,
+            upstreams,
+            route_policies,
             rates: RateLimiter::new(),
             active_requests: ActiveRequestLimiter::new(),
         })
@@ -163,7 +214,7 @@ impl Gateway {
 
     fn request_plan(
         &self,
-        domain: &str,
+        domain: &Arc<str>,
         host: &HostConfig,
         path: &str,
         tls: bool,
@@ -181,7 +232,7 @@ impl Gateway {
                 } else {
                     RouteClass::NavidromeApi
                 };
-                (route, host.upstream.clone()?)
+                (route, host.upstream.as_deref()?)
             }
             HandlerKind::Vaultwarden => {
                 let route = if vaultwarden_auth_path(path) {
@@ -191,9 +242,9 @@ impl Gateway {
                 } else {
                     RouteClass::Vaultwarden
                 };
-                (route, host.upstream.clone()?)
+                (route, host.upstream.as_deref()?)
             }
-            HandlerKind::Couchdb => (RouteClass::Couchdb, host.upstream.clone()?),
+            HandlerKind::Couchdb => (RouteClass::Couchdb, host.upstream.as_deref()?),
             HandlerKind::AdguardDns | HandlerKind::AdguardKorea => {
                 if path.starts_with("/dns-query") {
                     let upstream = match host.handler {
@@ -201,17 +252,17 @@ impl Gateway {
                         HandlerKind::AdguardKorea => "adguard_korea_doh",
                         _ => unreachable!(),
                     };
-                    (RouteClass::Doh, upstream.to_string())
+                    (RouteClass::Doh, upstream)
                 } else {
-                    (RouteClass::AdguardUi, host.upstream.clone()?)
+                    (RouteClass::AdguardUi, host.upstream.as_deref()?)
                 }
             }
         };
 
         Some(RequestPlan {
-            domain: domain.to_owned(),
+            domain: domain.clone(),
             handler: host.handler,
-            upstream_name,
+            upstream: self.upstreams.get(upstream_name)?.clone(),
             route,
             max_body_bytes: host.max_body_bytes,
             tls,
@@ -277,7 +328,7 @@ impl ProxyHttp for Gateway {
                 .uri
                 .path_and_query()
                 .map_or("/", |value| value.as_str());
-            let location = format!("https://{domain}{path_and_query}");
+            let location = format!("https://{}{path_and_query}", domain.as_ref());
             return send_empty(
                 session,
                 308,
@@ -293,7 +344,7 @@ impl ProxyHttp for Gateway {
         }
 
         if host.handler == HandlerKind::NavidromeMain && path == "/" {
-            let location = format!("https://{domain}/app/");
+            let location = format!("https://{}/app/", domain.as_ref());
             return send_empty(
                 session,
                 308,
@@ -323,7 +374,8 @@ impl ProxyHttp for Gateway {
             return send_empty(session, 413, Some(plan.handler), tls, &[]).await;
         }
 
-        if let Some((rate, burst)) = effective_rate_limit(&self.runtime, plan.route) {
+        let policy = self.route_policies[plan.route.index()];
+        if let Some((rate, burst)) = policy.rate_limit {
             if !self.rates.allow(plan.route.name(), client_ip, rate, burst) {
                 return send_empty(
                     session,
@@ -354,8 +406,10 @@ impl ProxyHttp for Gateway {
             ctx._global_request_permit = Some(permit);
         }
 
-        if let Some(active_limit) = effective_active_limit(&self.runtime, plan.handler, plan.route)
-        {
+        let active_limit = policy
+            .active_request_override
+            .unwrap_or_else(|| default_active_limit(plan.handler, plan.route));
+        if active_limit > 0 {
             let Some(permit) =
                 self.active_requests
                     .acquire(plan.route.name(), client_ip, active_limit)
@@ -391,31 +445,11 @@ impl ProxyHttp for Gateway {
             .plan
             .as_ref()
             .ok_or_else(|| Error::explain(HTTPStatus(500), "request plan is missing"))?;
-        let upstream = self
-            .runtime
-            .upstream(&plan.upstream_name)
-            .ok_or_else(|| Error::explain(HTTPStatus(502), "upstream is missing"))?;
-        let sni = upstream.sni.clone().unwrap_or_default();
-        let mut peer = HttpPeer::new(upstream.address.as_str(), upstream.tls, sni);
+        let mut peer = plan.upstream.peer.clone();
         peer.group_key = plan.route.upstream_pool_group();
-        peer.options.connection_timeout =
-            Some(Duration::from_secs(upstream.connect_timeout_seconds));
-        peer.options.total_connection_timeout =
-            Some(Duration::from_secs(upstream.connect_timeout_seconds));
-        let (read_timeout, write_timeout) = upstream_timeouts(plan.route, upstream);
+        let (read_timeout, write_timeout) = upstream_timeouts(plan.route, &plan.upstream);
         peer.options.read_timeout = Some(read_timeout);
         peer.options.write_timeout = Some(write_timeout);
-        peer.options.idle_timeout = Some(Duration::from_secs(upstream.idle_timeout_seconds));
-        peer.options.verify_cert = upstream.verify_certificate;
-        peer.options.verify_hostname = upstream.verify_certificate;
-        peer.options.alpn = ALPN::H1;
-        peer.options.tcp_keepalive = Some(TcpKeepalive {
-            idle: Duration::from_secs(60),
-            interval: Duration::from_secs(10),
-            count: 3,
-            #[cfg(target_os = "linux")]
-            user_timeout: Duration::from_secs(90),
-        });
         Ok(Box::new(peer))
     }
 
@@ -429,19 +463,33 @@ impl ProxyHttp for Gateway {
             .plan
             .as_ref()
             .ok_or_else(|| Error::explain(HTTPStatus(500), "request plan is missing"))?;
-        let client_ip = ctx.client_ip.to_string();
+        let client_ip =
+            http::HeaderValue::from_str(&ctx.client_ip.to_string()).map_err(|error| {
+                Error::because(
+                    HTTPStatus(400),
+                    "resolved client IP could not be encoded as a header",
+                    error,
+                )
+            })?;
+        let domain = http::HeaderValue::from_str(plan.domain.as_ref()).map_err(|error| {
+            Error::because(
+                HTTPStatus(400),
+                "host could not be encoded as a header",
+                error,
+            )
+        })?;
         let upstream_host = if plan.route == RouteClass::Doh {
-            "direct.tae00217.cloud"
+            http::HeaderValue::from_static("direct.tae00217.cloud")
         } else {
-            plan.domain.as_str()
+            domain.clone()
         };
 
         upstream_request.remove_header(&FORWARDED);
         upstream_request.remove_header("x-forwarded-for");
         upstream_request.insert_header(HOST, upstream_host)?;
-        upstream_request.insert_header("x-real-ip", client_ip.as_str())?;
-        upstream_request.insert_header("x-forwarded-for", client_ip.as_str())?;
-        upstream_request.insert_header("x-forwarded-host", plan.domain.as_str())?;
+        upstream_request.insert_header("x-real-ip", client_ip.clone())?;
+        upstream_request.insert_header("x-forwarded-for", client_ip)?;
+        upstream_request.insert_header("x-forwarded-host", domain)?;
         upstream_request.insert_header("x-forwarded-port", if plan.tls { "443" } else { "80" })?;
         upstream_request
             .insert_header("x-forwarded-proto", if plan.tls { "https" } else { "http" })?;
@@ -672,20 +720,6 @@ fn default_active_limit(handler: HandlerKind, route: RouteClass) -> usize {
     }
 }
 
-fn effective_active_limit(
-    runtime: &RuntimeConfig,
-    handler: HandlerKind,
-    route: RouteClass,
-) -> Option<usize> {
-    let configured = runtime
-        .config
-        .route_limits
-        .get(route.name())
-        .and_then(|limit| limit.active_requests);
-    let limit = configured.unwrap_or_else(|| default_active_limit(handler, route));
-    (limit > 0).then_some(limit)
-}
-
 fn effective_rate_limit(runtime: &RuntimeConfig, route: RouteClass) -> Option<(f64, u32)> {
     let defaults = route.default_rate_limit();
     let configured = runtime.config.route_limits.get(route.name());
@@ -702,10 +736,7 @@ fn effective_rate_limit(runtime: &RuntimeConfig, route: RouteClass) -> Option<(f
     Some((rate, burst))
 }
 
-fn upstream_timeouts(
-    route: RouteClass,
-    upstream: &crate::config::UpstreamConfig,
-) -> (Duration, Duration) {
+fn upstream_timeouts(route: RouteClass, upstream: &PreparedUpstream) -> (Duration, Duration) {
     let route_default = Duration::from_secs(route.timeout_seconds());
     (
         upstream
@@ -719,6 +750,52 @@ fn upstream_timeouts(
     )
 }
 
+fn prepare_upstream(
+    name: &str,
+    upstream: &crate::config::UpstreamConfig,
+) -> anyhow::Result<PreparedUpstream> {
+    let address = upstream
+        .address
+        .to_socket_addrs()
+        .with_context(|| {
+            format!(
+                "upstream address resolution failed: name={name} address={}",
+                upstream.address
+            )
+        })?
+        .next()
+        .ok_or_else(|| {
+            anyhow!(
+                "upstream address resolution returned no addresses: name={name} address={}",
+                upstream.address
+            )
+        })?;
+    let mut peer = HttpPeer::new(
+        address,
+        upstream.tls,
+        upstream.sni.clone().unwrap_or_default(),
+    );
+    peer.options.connection_timeout = Some(Duration::from_secs(upstream.connect_timeout_seconds));
+    peer.options.total_connection_timeout =
+        Some(Duration::from_secs(upstream.connect_timeout_seconds));
+    peer.options.idle_timeout = Some(Duration::from_secs(upstream.idle_timeout_seconds));
+    peer.options.verify_cert = upstream.verify_certificate;
+    peer.options.verify_hostname = upstream.verify_certificate;
+    peer.options.alpn = ALPN::H1;
+    peer.options.tcp_keepalive = Some(TcpKeepalive {
+        idle: Duration::from_secs(60),
+        interval: Duration::from_secs(10),
+        count: 3,
+        #[cfg(target_os = "linux")]
+        user_timeout: Duration::from_secs(90),
+    });
+    Ok(PreparedUpstream {
+        peer,
+        read_timeout_seconds: upstream.read_timeout_seconds,
+        write_timeout_seconds: upstream.write_timeout_seconds,
+    })
+}
+
 pub fn resolve_client_ip(
     runtime: &RuntimeConfig,
     peer_ip: IpAddr,
@@ -730,20 +807,15 @@ pub fn resolve_client_ip(
     let Some(forwarded_for) = forwarded_for.filter(|value| value.len() <= 4096) else {
         return peer_ip;
     };
-    let parsed = forwarded_for
-        .split(',')
-        .map(str::trim)
-        .map(str::parse::<IpAddr>)
-        .collect::<std::result::Result<Vec<_>, _>>();
-    let Ok(chain) = parsed else {
-        return peer_ip;
-    };
-    if chain.len() > 32 {
+    if forwarded_for.split(',').nth(32).is_some() {
         return peer_ip;
     }
 
     let mut selected = peer_ip;
-    for candidate in chain.into_iter().rev() {
+    for candidate in forwarded_for.rsplit(',') {
+        let Ok(candidate) = candidate.trim().parse::<IpAddr>() else {
+            return peer_ip;
+        };
         selected = candidate;
         if !runtime.is_trusted_proxy(candidate) {
             break;
@@ -948,6 +1020,7 @@ write_timeout_seconds: 9
 "#,
         )
         .unwrap();
+        let upstream = prepare_upstream("test", &upstream).unwrap();
         assert_eq!(
             upstream_timeouts(RouteClass::NavidromeStream, &upstream),
             (Duration::from_secs(7), Duration::from_secs(9))
@@ -962,6 +1035,7 @@ write_timeout_seconds: 9
     fn omitted_upstream_timeout_uses_each_route_default() {
         let upstream: crate::config::UpstreamConfig =
             serde_yaml::from_str("address: 127.0.0.1:9000").unwrap();
+        let upstream = prepare_upstream("test", &upstream).unwrap();
         assert_eq!(
             upstream_timeouts(RouteClass::NavidromeStream, &upstream),
             (Duration::from_secs(3600), Duration::from_secs(3600))
@@ -973,6 +1047,30 @@ write_timeout_seconds: 9
         assert_eq!(
             upstream_timeouts(RouteClass::Doh, &upstream),
             (Duration::from_secs(30), Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn invalid_upstream_address_is_rejected_before_serving_requests() {
+        let upstream: crate::config::UpstreamConfig =
+            serde_yaml::from_str("address: '127.0.0.1:not-a-port'").unwrap();
+        let error = prepare_upstream("broken", &upstream).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("name=broken"));
+        assert!(message.contains("127.0.0.1:not-a-port"));
+    }
+
+    #[test]
+    fn forwarded_for_chain_limit_does_not_allocate_or_accept_oversized_chains() {
+        let runtime = runtime();
+        let peer = "127.0.0.1".parse().unwrap();
+        let chain = std::iter::repeat_n("10.0.0.1", 33)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(resolve_client_ip(&runtime, peer, Some(&chain)), peer);
+        assert_eq!(
+            resolve_client_ip(&runtime, peer, Some("invalid, 10.0.0.1")),
+            peer
         );
     }
 }

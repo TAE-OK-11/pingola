@@ -78,6 +78,25 @@ expect_failure broken_symlink \
   'private key open.*symlink=true.*final_target=.*/archive/privkey7.pem.*target_exists=false' \
   "${BIN}" --config "${RUNTIME}/broken.yaml" --check
 
+cat >"${RUNTIME}/invalid-upstream.yaml" <<EOF
+server:
+  http_listen: ["127.0.0.1:18516"]
+  https_listen: []
+  health_socket: ${RUNTIME}/health-18516.sock
+trusted_proxies: ["127.0.0.0/8"]
+upstreams:
+  broken:
+    address: "127.0.0.1:not-a-port"
+hosts:
+  app:
+    domains: ["app.test"]
+    handler: vaultwarden
+    upstream: broken
+EOF
+expect_failure invalid_upstream \
+  'upstream address broken.*configured=127.0.0.1:not-a-port.*resolution failed' \
+  "${BIN}" --config "${RUNTIME}/invalid-upstream.yaml" --check
+
 cp "${RUNTIME}/a.key" "${RUNTIME}/root-only.key"
 chown 0:0 "${RUNTIME}/root-only.key"
 chmod 0600 "${RUNTIME}/root-only.key"

@@ -104,10 +104,14 @@ where
 /// Attempt to load the native cas into the given root-certificate store
 pub fn load_platform_certs_incl_env_into_store(ca_certs: &mut RootCertStore) -> Result<()> {
     // this includes handling of ENV vars SSL_CERT_FILE & SSL_CERT_DIR
-    for cert in load_native_certs()
-        .or_err(ErrorType::InvalidCert, "Failed to load native certificates")?
-        .into_iter()
-    {
+    let native = load_native_certs();
+    if !native.errors.is_empty() {
+        return Error::e_explain(
+            ErrorType::InvalidCert,
+            format!("Failed to load native certificates: {:?}", native.errors),
+        );
+    }
+    for cert in native.certs {
         ca_certs.add(cert).or_err(
             ErrorType::InvalidCert,
             "Failed to load native certificate into root store",
@@ -187,4 +191,3 @@ pub fn hash_certificate(cert: &CertificateDer) -> Vec<u8> {
     let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, cert.as_ref());
     hash.as_ref().to_vec()
 }
-

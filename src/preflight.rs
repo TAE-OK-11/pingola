@@ -1,6 +1,6 @@
 use std::fs::{self, File, Metadata};
 use std::io::{BufReader, Read};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -91,6 +91,28 @@ pub fn check_runtime(runtime: &RuntimeConfig, check_bind: bool) -> CheckReport {
             Err(error) => report.error(
                 format!("static_root {name}"),
                 format!("cannot read directory: {error}; {}", describe_file(root)),
+            ),
+        }
+    }
+
+    for (name, upstream) in &runtime.config.upstreams {
+        match upstream.address.to_socket_addrs() {
+            Ok(mut addresses) => match addresses.next() {
+                Some(address) => report.ok(
+                    format!("upstream address {name}"),
+                    format!("configured={} resolved={address}", upstream.address),
+                ),
+                None => report.error(
+                    format!("upstream address {name}"),
+                    format!(
+                        "configured={} resolved to no socket addresses",
+                        upstream.address
+                    ),
+                ),
+            },
+            Err(error) => report.error(
+                format!("upstream address {name}"),
+                format!("configured={} resolution failed: {error}", upstream.address),
             ),
         }
     }
@@ -412,6 +434,7 @@ impl MetadataSymlink for Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Config, RuntimeConfig};
     use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
@@ -432,5 +455,40 @@ mod tests {
         let port = ipv4.local_addr().unwrap().as_socket().unwrap().port();
         let ipv6 = bind_listener(&format!("[::]:{port}")).unwrap();
         assert!(ipv6.local_addr().unwrap().as_socket().unwrap().is_ipv6());
+    }
+
+    #[test]
+    fn runtime_check_reports_invalid_upstream_address_without_panicking() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+server:
+  http_listen: ["127.0.0.1:0"]
+  https_listen: []
+  health_socket: /tmp/pingora-test-health.sock
+trusted_proxies: ["127.0.0.0/8"]
+upstreams:
+  broken:
+    address: "127.0.0.1:not-a-port"
+hosts:
+  app:
+    domains: ["app.example.com"]
+    handler: navidrome-main
+    upstream: broken
+"#,
+        )
+        .unwrap();
+        let runtime = RuntimeConfig::new(config).unwrap();
+        let report = check_runtime(&runtime, false);
+        let item = report
+            .items
+            .iter()
+            .find(|item| item.name == "upstream address broken")
+            .unwrap();
+        assert!(item.result.is_err());
+        assert!(item
+            .result
+            .as_ref()
+            .unwrap_err()
+            .contains("127.0.0.1:not-a-port"));
     }
 }

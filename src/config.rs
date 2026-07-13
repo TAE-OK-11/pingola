@@ -171,7 +171,7 @@ pub struct RouteLimitConfig {
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub config: Arc<Config>,
-    hosts_by_domain: HashMap<String, String>,
+    hosts_by_domain: HashMap<Arc<str>, String>,
 }
 
 impl RuntimeConfig {
@@ -189,7 +189,7 @@ impl RuntimeConfig {
         let mut hosts_by_domain = HashMap::new();
         for (name, host) in &config.hosts {
             for domain in &host.domains {
-                hosts_by_domain.insert(domain.to_ascii_lowercase(), name.clone());
+                hosts_by_domain.insert(Arc::from(domain.to_ascii_lowercase()), name.clone());
             }
         }
 
@@ -199,18 +199,15 @@ impl RuntimeConfig {
         })
     }
 
-    pub fn host(&self, authority: &str) -> Option<(&str, &str, &HostConfig)> {
+    pub fn host(&self, authority: &str) -> Option<(&Arc<str>, &str, &HostConfig)> {
         let domain = normalized_host(authority);
-        let (canonical_domain, name) = self.hosts_by_domain.get_key_value(domain.as_ref())?;
+        let (canonical_domain, name) =
+            self.hosts_by_domain.get_key_value::<str>(domain.as_ref())?;
         Some((
-            canonical_domain.as_str(),
+            canonical_domain,
             name.as_str(),
             self.config.hosts.get(name)?,
         ))
-    }
-
-    pub fn upstream(&self, name: &str) -> Option<&UpstreamConfig> {
-        self.config.upstreams.get(name)
     }
 
     pub fn is_trusted_proxy(&self, ip: std::net::IpAddr) -> bool {
@@ -417,7 +414,7 @@ hosts:
     fn resolves_host_case_insensitively() {
         let runtime = RuntimeConfig::new(sample_config()).unwrap();
         let (domain, name, _) = runtime.host("APP.EXAMPLE.COM:443").unwrap();
-        assert_eq!(domain, "app.example.com");
+        assert_eq!(domain.as_ref(), "app.example.com");
         assert_eq!(name, "app");
     }
 

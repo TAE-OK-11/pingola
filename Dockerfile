@@ -1,27 +1,26 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.25
 
-ARG RUST_VERSION=1.96.0
+ARG RUST_VERSION=1.97.0
+ARG RUST_TARGET_CPU=x86-64-v2
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         build-essential \
-        autoconf \
         ca-certificates \
         cmake \
         ninja-build \
         perl \
-        pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY vendor ./vendor
-COPY src ./src
+COPY --link Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY --link vendor ./vendor
+COPY --link src ./src
 
-ARG RUST_TARGET_CPU=x86-64-v2
+ARG RUST_TARGET_CPU
 ARG ALLOCATOR=tcmalloc
 ENV CARGO_INCREMENTAL=0 \
     CMAKE_GENERATOR=Ninja \
@@ -44,6 +43,8 @@ FROM debian:bookworm-slim AS runtime
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=unknown
 ARG ALLOCATOR=tcmalloc
+ARG RUST_VERSION
+ARG RUST_TARGET_CPU
 
 LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.description="High-performance AWS-LC JBS Pingora reverse proxy" \
@@ -51,6 +52,8 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.version="${BUILD_VERSION}" \
       org.opencontainers.image.revision="${BUILD_REVISION}" \
       org.opencontainers.image.allocator="${ALLOCATOR}" \
+      org.opencontainers.image.rust.version="${RUST_VERSION}" \
+      org.opencontainers.image.rust.target-cpu="${RUST_TARGET_CPU}" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update \
@@ -60,8 +63,8 @@ RUN apt-get update \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin pingora \
     && install -d -o 10001 -g 10001 /etc/pingora /var/www/pikky /tmp/pingora
 
-COPY --from=builder /out/pingora /usr/local/bin/pingora
-COPY --chown=10001:10001 config/pingora.yaml /etc/pingora/pingora.yaml
+COPY --link --from=builder /out/pingora /usr/local/bin/pingora
+COPY --link --chown=10001:10001 config/pingora.yaml /etc/pingora/pingora.yaml
 
 RUN setcap cap_net_bind_service=+ep /usr/local/bin/pingora
 

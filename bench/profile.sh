@@ -8,8 +8,18 @@ BACKEND_PORT=${PROFILE_BACKEND_PORT:-18800}
 HTTP_PORT=${PROFILE_HTTP_PORT:-18880}
 HTTPS_PORT=${PROFILE_HTTPS_PORT:-18843}
 DURATION=${PROFILE_DURATION_SECONDS:-5}
+CPUS=${PROFILE_CPUS:-}
+MEMORY=${PROFILE_MEMORY:-}
 NAME=pingora-profile-$$
 BACKEND_PID=
+DOCKER_RESOURCE_ARGS=()
+
+if [[ -n "${CPUS}" ]]; then
+  DOCKER_RESOURCE_ARGS+=(--cpus "${CPUS}")
+fi
+if [[ -n "${MEMORY}" ]]; then
+  DOCKER_RESOURCE_ARGS+=(--memory "${MEMORY}")
+fi
 
 cleanup() {
   docker logs "${NAME}" >"${OUTPUT}/container.log" 2>&1 || true
@@ -68,6 +78,7 @@ for _ in {1..100}; do
 done
 
 docker run --detach --name "${NAME}" --network host --read-only \
+  "${DOCKER_RESOURCE_ARGS[@]}" \
   --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
   --tmpfs /tmp/pingora:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700 \
   --env PINGORA_ALLOCATOR_STATS=1 --volume "${OUTPUT}:/work:ro" \
@@ -86,6 +97,8 @@ timestamp=$(date -u +%FT%TZ)
 image=${IMAGE}
 container_pid=${PID}
 duration_seconds=${DURATION}
+container_cpus=${CPUS:-unlimited}
+container_memory=${MEMORY:-unlimited}
 perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo unknown)
 EOF
 lscpu >>"${OUTPUT}/environment.txt" 2>&1

@@ -65,13 +65,14 @@ pub fn summary(include_stats: bool) -> Result<String> {
 
     let stats = read_tcmalloc_stats()?;
     Ok(format!(
-        "{base} allocated={} heap={} physical={} virtual={} peak={} realized_fragmentation_percent={}",
+        "{base} allocated={} heap={} physical={} virtual={} peak={} realized_fragmentation_percent={} per_cpu_caches_active={}",
         stats.current_allocated_bytes,
         stats.heap_size,
         stats.physical_memory_used,
         stats.virtual_memory_used,
         stats.peak_memory_usage,
         stats.realized_fragmentation_percent,
+        stats.per_cpu_caches_active,
     ))
 }
 

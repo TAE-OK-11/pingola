@@ -84,6 +84,8 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{json .HostConfig.CapAdd}}' "${name}") == '["CAP_NET_BIND_SERVICE"]' ]]
   docker exec "${name}" /usr/local/bin/pingora --allocator-info \
     | grep -q "^allocator=${EXPECTED_ALLOCATOR} "
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.allocator"}}' "${name}") == "${EXPECTED_ALLOCATOR}" ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.target-cpu"}}' "${name}") == x86-64-v2 ]]
 }
 
 write_config "${RUNTIME}/http.yaml" '["127.0.0.1:18570"]' '[]'

@@ -82,7 +82,10 @@ docker compose ps
 ```
 
 기본 Compose는 기존 `10.77.0.1` 및 localhost upstream 접근을 위해 host network를
-사용합니다. 같은 호스트의 80/tcp와 443/tcp가 비어 있어야 합니다.
+사용합니다. 같은 호스트의 80/tcp와 443/tcp가 비어 있어야 합니다. Compose의
+`stop_grace_period: 65s`는 기본 60초 graceful drain보다 길게 잡혀 Docker가 재생 중인
+stream을 10초 기본 timeout으로 강제 종료하지 않게 하며, file descriptor limit은
+32,768, process/thread 수는 256으로 명시해 자원 증가를 bounded 상태로 유지합니다.
 
 Let's Encrypt의 `live/<domain>/*.pem`은 실제 파일이 아니라
 `archive/<domain>/*N.pem`을 가리키는 symlink입니다. `live` directory나 PEM
@@ -151,6 +154,11 @@ symlink 여부, 최종 target과 존재 여부가 포함됩니다. 개인키 내
 1. YAML/schema 및 host/upstream 참조 검증
 2. certificate/key 실제 open, PEM, key match, symlink target, static root 검증
 
+각 upstream 주소도 이 단계에서 socket address로 해석합니다. 해석 실패는 upstream
+이름과 설정 주소를 함께 출력하며 요청이 들어온 뒤 peer 생성에서 panic하지 않습니다.
+해석 결과는 process 시작 때 준비되므로 DNS 이름의 주소가 바뀌면 Pingora를 재시작해야
+합니다. 기본 운영 config처럼 고정 IP upstream을 권장합니다.
+
 실제 port bind는 운영 listener를 순간 점유할 수 있으므로 `--check-bind`에서만
 추가합니다. 정상 startup은 race를 줄이기 위해 bind 검사를 포함한 전체 preflight를
 항상 먼저 실행합니다.
@@ -210,6 +218,9 @@ route_limits:
 connection이 아니라 활성 HTTP request이며 HTTP/2에서는 stream입니다. 서비스별
 zone은 서로 격리되고, 전체 IP limit이 필요하면 `server.global_active_requests`를
 별도로 설정합니다. 설정 reload는 아직 지원하지 않으므로 변경 후 재시작해야 합니다.
+Rate limiter의 client bucket은 최대 262,144개로 제한하며, 한도에 도달하면 기존
+client는 계속 처리하고 새로운 client는 idle bucket 정리 전까지 fail-closed로 429를
+받습니다. 따라서 고유 source IP flood에서도 limiter memory가 무제한 증가하지 않습니다.
 모든 limiter를 끈 [`config/benchmark.yaml`](config/benchmark.yaml)은 localhost
 benchmark 전용이며 운영에 사용하면 안 됩니다.
 
@@ -256,6 +267,12 @@ ALLOCATOR_BENCH_CPUS=0.5 ALLOCATOR_BENCH_MEMORY=1g \
 
 ## 빌드와 검증
 
+Rust toolchain은 1.97.0이며 Cargo lockfile은 직접 의존성의 최신 호환 버전을
+고정합니다. GitHub Actions는 RustSec audit를 image 게시 전 실행하고, Dependabot이
+Cargo, Docker base image, Actions를 매주 확인합니다. Cloudflare Pingora 0.8.1이
+직접 고정한 일부 transitive crate와 deprecated `serde_yaml`은 upstream 제약 때문에
+별도로 남아 있으며 `cargo update --dry-run --verbose`로 추적합니다.
+
 ```bash
 cargo fmt --check
 cargo test --all-targets --locked
@@ -299,7 +316,8 @@ sudo BENCH_PROFILE=full BENCH_ROUNDS=5 \
   bench/compare.sh
 
 # perf stat/record, flamegraph 입력, strace -c, allocator 전후 counter
-sudo PROFILE_DURATION_SECONDS=30 bench/profile.sh
+sudo PROFILE_CPUS=0.5 PROFILE_MEMORY=1g PROFILE_DURATION_SECONDS=30 \
+  bench/profile.sh
 
 # max concurrent streams 32/64/128/256 교차 측정
 sudo bench/h2_tuning.sh
