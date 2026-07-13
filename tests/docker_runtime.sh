@@ -97,8 +97,17 @@ write_config "${RUNTIME}/ipv6.yaml" '[]' '["[::1]:18571"]' true
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj '/CN=health.test' -addext 'subjectAltName=DNS:health.test' \
   -keyout "${RUNTIME}/cert/key.pem" -out "${RUNTIME}/cert/cert.pem" >/dev/null 2>&1
-chown 0:10001 "${RUNTIME}/cert/key.pem" "${RUNTIME}/cert/cert.pem"
 chmod 0640 "${RUNTIME}/cert/key.pem" "${RUNTIME}/cert/cert.pem"
+if [[ ${EUID} -eq 0 ]]; then
+  chown 0:10001 "${RUNTIME}/cert/key.pem" "${RUNTIME}/cert/cert.pem"
+elif command -v sudo >/dev/null 2>&1; then
+  # GitHub-hosted runners are unprivileged. Elevate only the fixture ownership
+  # change; Docker and every runtime assertion remain under the runner user.
+  sudo chown 0:10001 "${RUNTIME}/cert/key.pem" "${RUNTIME}/cert/cert.pem"
+else
+  echo "root or passwordless sudo is required to create the root:10001 TLS fixture" >&2
+  exit 1
+fi
 start_container pingora-test-https-ipv6 "${RUNTIME}/ipv6.yaml" \
   --volume "${RUNTIME}/cert:/etc/pingora/cert:ro"
 assert_container_hardening pingora-test-https-ipv6
