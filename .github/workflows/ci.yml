@@ -33,7 +33,9 @@ jobs:
         run: cargo check --all-targets --locked --no-default-features --features system-allocator
       - name: Protocol and security integration checks
         run: |
-          tests/runtime_preflight.sh
+          # This test intentionally creates a root-owned mode-0600 private key
+          # and then checks it as UID/GID 10001. Limit elevation to that test.
+          sudo tests/runtime_preflight.sh
           tests/listeners_health.sh
           tests/retries.sh
           tests/limit_isolation.sh
