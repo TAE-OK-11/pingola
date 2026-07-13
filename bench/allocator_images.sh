@@ -4,9 +4,12 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 JEMALLOC_IMAGE=${JEMALLOC_IMAGE:-ghcr.io/tae-ok-11/pingora@sha256:78ccd4006270d6ccc98be36a6d912a7bd0a16108e87f6aa4af56a57c7da8cff5}
 TCMALLOC_IMAGE=${TCMALLOC_IMAGE:-ghcr.io/tae-ok-11/pingora@sha256:46244afee72d96cc2aa465416358febdfbbeadd086a875a1cb032ce163c35b44}
+JEMALLOC_EXPECTED_ALLOCATOR=${ALLOCATOR_BENCH_JEMALLOC_EXPECTED:-jemalloc}
+TCMALLOC_EXPECTED_ALLOCATOR=${ALLOCATOR_BENCH_TCMALLOC_EXPECTED:-tcmalloc}
 BACKEND_IMAGE=${ALLOCATOR_BACKEND_IMAGE:-tae00217/jbs-nginx:ultra-4.0}
 CPU_LIMIT=${ALLOCATOR_BENCH_CPUS:-0.5}
 MEMORY_LIMIT=${ALLOCATOR_BENCH_MEMORY:-1g}
+MIN_FREE_BYTES=${ALLOCATOR_BENCH_MIN_FREE_BYTES:-1073741824}
 ROUNDS=${ALLOCATOR_BENCH_ROUNDS:-5}
 DURATION=${ALLOCATOR_BENCH_DURATION:-3s}
 WARMUP=${ALLOCATOR_BENCH_WARMUP:-1s}
@@ -15,6 +18,9 @@ BACKEND_PORT=${ALLOCATOR_BACKEND_PORT:-18900}
 HTTP_PORT=${ALLOCATOR_HTTP_PORT:-18980}
 HTTPS_PORT=${ALLOCATOR_HTTPS_PORT:-18943}
 OUTPUT=${ALLOCATOR_BENCH_OUTPUT:-${ROOT}/bench/results/allocator-images-$(date -u +%Y%m%dT%H%M%SZ)}
+if [[ "${OUTPUT}" != /* ]]; then
+  OUTPUT=${ROOT}/${OUTPUT}
+fi
 NAME=pingora-allocator-bench-$$
 BACKEND_NAME=${NAME}-backend
 case "${PROFILE}" in
@@ -44,7 +50,13 @@ cleanup() {
   docker logs "${BACKEND_NAME}" >"${OUTPUT}/raw/${BACKEND_NAME}.final.log" 2>&1 || true
   docker rm -f "${BACKEND_NAME}" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT INT TERM
+handle_signal() {
+  trap - EXIT INT TERM
+  cleanup
+  exit 130
+}
+trap cleanup EXIT
+trap handle_signal INT TERM
 
 for command in docker curl wrk h2load openssl python3 sha256sum jq numfmt dd; do
   if ! command -v "${command}" >/dev/null; then
@@ -55,6 +67,11 @@ done
 
 mkdir -p "${OUTPUT}/raw"
 chmod 0755 "${OUTPUT}" "${OUTPUT}/raw"
+AVAILABLE_BYTES=$(df --output=avail -B1 "${OUTPUT}" | tail -1 | tr -d ' ')
+if ((AVAILABLE_BYTES < MIN_FREE_BYTES)); then
+  echo "insufficient benchmark disk space: available=${AVAILABLE_BYTES} required=${MIN_FREE_BYTES} path=${OUTPUT}" >&2
+  exit 2
+fi
 
 CPU_NANO=$(python3 - "${CPU_LIMIT}" <<'PY'
 import sys
@@ -67,10 +84,14 @@ cat >"${OUTPUT}/environment.txt" <<EOF
 timestamp=$(date -u +%FT%TZ)
 jemalloc_image=${JEMALLOC_IMAGE}
 tcmalloc_image=${TCMALLOC_IMAGE}
+jemalloc_expected_allocator=${JEMALLOC_EXPECTED_ALLOCATOR}
+tcmalloc_expected_allocator=${TCMALLOC_EXPECTED_ALLOCATOR}
 cpu_limit=${CPU_LIMIT}
 cpu_nano=${CPU_NANO}
 memory_limit=${MEMORY_LIMIT}
 memory_bytes=${MEMORY_BYTES}
+minimum_free_bytes=${MIN_FREE_BYTES}
+available_bytes_at_start=${AVAILABLE_BYTES}
 rounds=${ROUNDS}
 profile=${PROFILE}
 duration=${DURATION}
@@ -84,13 +105,15 @@ docker version >>"${OUTPUT}/environment.txt" 2>&1
 for allocator in jemalloc tcmalloc; do
   if [[ "${allocator}" == jemalloc ]]; then
     image=${JEMALLOC_IMAGE}
+    expected_allocator=${JEMALLOC_EXPECTED_ALLOCATOR}
   else
     image=${TCMALLOC_IMAGE}
+    expected_allocator=${TCMALLOC_EXPECTED_ALLOCATOR}
   fi
   docker image inspect "${image}" >"${OUTPUT}/${allocator}-inspect.json"
   docker run --rm --entrypoint /usr/local/bin/pingora "${image}" --allocator-info \
     >"${OUTPUT}/${allocator}-allocator.txt"
-  grep -q "^allocator=${allocator} " "${OUTPUT}/${allocator}-allocator.txt"
+  grep -q "^allocator=${expected_allocator} " "${OUTPUT}/${allocator}-allocator.txt"
 done
 docker image inspect "${BACKEND_IMAGE}" >"${OUTPUT}/backend-inspect.json"
 
@@ -164,15 +187,26 @@ http {
 }
 EOF
 chmod 0644 "${OUTPUT}/backend-nginx.conf"
-docker run --detach --name "${BACKEND_NAME}" --network host \
+if ! docker run --detach --name "${BACKEND_NAME}" --network host \
+  --ulimit nofile=32768:32768 \
   --volume "${OUTPUT}:/work:ro" --entrypoint /usr/sbin/nginx "${BACKEND_IMAGE}" \
-  -c /work/backend-nginx.conf -g 'daemon off;' >/dev/null
+  -c /work/backend-nginx.conf -g 'daemon off;' >/dev/null; then
+  echo "benchmark backend failed to start" >&2
+  exit 1
+fi
+backend_ready=false
 for _ in {1..100}; do
   if curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}/bytes/64" -o /dev/null; then
+    backend_ready=true
     break
   fi
   sleep 0.05
 done
+if [[ "${backend_ready}" != true ]]; then
+  echo "benchmark backend did not become ready at 127.0.0.1:${BACKEND_PORT}" >&2
+  docker logs "${BACKEND_NAME}" >&2 || true
+  exit 1
+fi
 
 printf 'allocator\tprotocol\tpayload_bytes\tconcurrency\tround\tstatus\trps\tp50_us\tp90_us\tp95_us\tp99_us\tp999_us\tmax_us\tcpu_avg_pct\tcpu_peak_pct\trss_avg_kib\trss_peak_kib\terrors\tstatus_distribution\traw\n' \
   >"${OUTPUT}/results.tsv"
@@ -196,6 +230,7 @@ start_proxy() {
   PROXY_NAME=${NAME}-${allocator}-r${round}
   docker run --detach --name "${PROXY_NAME}" --network host --read-only \
     --cpus "${CPU_LIMIT}" --memory "${MEMORY_LIMIT}" --memory-swap "${MEMORY_LIMIT}" \
+    --ulimit nofile=32768:32768 \
     --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
     --tmpfs /tmp/pingora:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700 \
     --volume "${OUTPUT}:/work:ro" --entrypoint /usr/local/bin/pingora \
@@ -234,7 +269,7 @@ sample_resources() {
     usage=$(awk '$1 == "usage_usec" {print $2}' "${cg}/cpu.stat" 2>/dev/null || echo 0)
     while read -r member; do
       [[ -r "/proc/${member}/status" ]] || continue
-      value=$(awk '$1 == "VmRSS:" {print $2}' "/proc/${member}/status")
+      value=$(awk '$1 == "VmRSS:" {print $2}' "/proc/${member}/status" 2>/dev/null || true)
       rss=$((rss + ${value:-0}))
     done <"${cg}/cgroup.procs"
     printf '%s %s %s\n' "${timestamp}" "${usage}" "${rss}" >>"${output}"

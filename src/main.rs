@@ -261,7 +261,9 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
 
     let gateway = Gateway::new(runtime.clone()).context("service bootstrap failed")?;
     let mut http_options = HttpServerOptions::default();
-    http_options.keepalive_request_limit = Some(500);
+    // Pingora 0.8.1 interprets this value as the number of HTTP/1.1 reuses
+    // after the first request. Use 499 to match NGINX keepalive_requests 500.
+    http_options.keepalive_request_limit = Some(499);
     let mut service = ProxyServiceBuilder::new(&server.configuration, gateway)
         .name("pingora-gateway")
         .server_options(http_options)

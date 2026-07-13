@@ -305,7 +305,12 @@ body SHA-256과 raw curl/nghttp/h2load log를 `/tmp/pingora-h2-matrix`에 남깁
 고유 container 이름만 사용합니다. 종료와 Ctrl+C 때 자신이 만든 container와
 backend만 정리합니다. 한 case가 실패해도 다음 case를 계속하고 실패를 0 RPS로
 바꾸지 않습니다. raw curl/wrk/h2load, container log, CPU/RSS sample, image inspect,
-`nginx -V`, `ldd`, 실제 `nginx -T`를 결과 directory에 보존합니다.
+`nginx -V`, `ldd`, 실제 `nginx -T`를 결과 directory에 보존합니다. 두 프록시에는
+동일한 forwarded/security header, downstream HTTP/1.1 500-request keepalive,
+upstream pool, timeout, nofile 32768을 적용합니다. 기본 0.5 CPU/1 GiB 제한은 시작
+후 Docker inspect로 재확인하며, raw log 때문에 디스크가 가득 차지 않도록 시작 시
+최소 1 GiB 여유 공간을 요구합니다. `summary.txt`와 `summary.tsv`에는 5라운드
+paired 중앙값과 RPS/CPU 효율 기하평균이 생성됩니다.
 
 ```bash
 # 빠른 도구/무결성 확인
@@ -313,6 +318,7 @@ BENCH_PROFILE=smoke BENCH_ROUNDS=1 bench/compare.sh
 
 # Oracle 운영 호스트에서 실행하는 공식 5-round 전체 비교
 sudo BENCH_PROFILE=full BENCH_ROUNDS=5 \
+  BENCH_CPUS=0.5 BENCH_MEMORY=1g \
   PINGORA_IMAGE=ghcr.io/tae-ok-11/pingora:latest \
   NGINX_IMAGE=tae00217/jbs-nginx:ultra-4.0 \
   BENCH_OUTPUT=/var/tmp/pingora-bench-$(date -u +%Y%m%dT%H%M%SZ) \

@@ -94,6 +94,61 @@ jq -e '.headers["x-forwarded-for"] == "198.51.100.50"' \
 jq -e '.headers["x-forwarded-proto"] == "https"' \
   <<<"${proxy_response}" >/dev/null
 
+# The server-level 500 request keepalive limit must count down across reused
+# HTTP/1.1 sessions. Resetting it in request_filter makes the connection
+# effectively unlimited and retains per-connection allocations indefinitely.
+python3 - <<'PY'
+import socket
+import ssl
+
+context = ssl.create_default_context()
+context.check_hostname = False
+context.verify_mode = ssl.CERT_NONE
+context.set_alpn_protocols(["http/1.1"])
+raw = socket.create_connection(("127.0.0.1", 18443), timeout=5)
+connection = context.wrap_socket(raw, server_hostname="vault.test")
+connection.settimeout(5)
+buffer = b""
+completed = 0
+
+for _ in range(501):
+    try:
+        connection.sendall(
+            b"GET /hello HTTP/1.1\r\nHost: vault.test\r\nConnection: keep-alive\r\n\r\n"
+        )
+    except (BrokenPipeError, ssl.SSLError):
+        break
+
+    while b"\r\n\r\n" not in buffer:
+        chunk = connection.recv(65536)
+        if not chunk:
+            break
+        buffer += chunk
+    if b"\r\n\r\n" not in buffer:
+        break
+
+    header, buffer = buffer.split(b"\r\n\r\n", 1)
+    lines = header.split(b"\r\n")
+    if b" 200 " not in lines[0]:
+        raise SystemExit(f"unexpected keepalive response: {lines[0]!r}")
+    headers = {}
+    for line in lines[1:]:
+        name, value = line.split(b":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers[b"content-length"])
+    while len(buffer) < length:
+        chunk = connection.recv(65536)
+        if not chunk:
+            raise SystemExit("connection closed before response body completed")
+        buffer += chunk
+    buffer = buffer[length:]
+    completed += 1
+
+connection.close()
+if completed != 500:
+    raise SystemExit(f"downstream keepalive limit mismatch: completed={completed}, expected=500")
+PY
+
 status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \
   --resolve app.test:18443:127.0.0.1 \
   --data 'this-body-is-over-sixteen-bytes' https://app.test:18443/upload)

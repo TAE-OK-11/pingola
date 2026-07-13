@@ -5,12 +5,19 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PROFILE=${BENCH_PROFILE:-smoke}
 PINGORA_IMAGE=${PINGORA_IMAGE:-ghcr.io/tae-ok-11/pingora:local}
 NGINX_IMAGE=${NGINX_IMAGE:-tae00217/jbs-nginx:ultra-4.0}
+CPU_LIMIT=${BENCH_CPUS:-0.5}
+MEMORY_LIMIT=${BENCH_MEMORY:-1g}
+MIN_FREE_BYTES=${BENCH_MIN_FREE_BYTES:-1073741824}
 BACKEND_PORT=${BACKEND_PORT:-18700}
 HTTP_PORT=${HTTP_PORT:-18780}
 HTTPS_PORT=${HTTPS_PORT:-18743}
 DURATION=${BENCH_DURATION:-3s}
 WARMUP=${BENCH_WARMUP:-1s}
+STABILITY_REQUESTS=${BENCH_STABILITY_REQUESTS:-480}
 OUTPUT=${BENCH_OUTPUT:-${ROOT}/bench/results/$(date -u +%Y%m%dT%H%M%SZ)}
+if [[ "${OUTPUT}" != /* ]]; then
+  OUTPUT=${ROOT}/${OUTPUT}
+fi
 NAME=pingora-compare-$$
 BACKEND_PID=
 PROXY_NAME=
@@ -45,19 +52,37 @@ cleanup() {
     wait "${BACKEND_PID}" >/dev/null 2>&1 || true
   fi
 }
-trap cleanup EXIT INT TERM
+handle_signal() {
+  trap - EXIT INT TERM
+  cleanup
+  exit 130
+}
+trap cleanup EXIT
+trap handle_signal INT TERM
 
 mkdir -p "${OUTPUT}/raw"
 chmod 0755 "${OUTPUT}" "${OUTPUT}/raw"
+AVAILABLE_BYTES=$(df --output=avail -B1 "${OUTPUT}" | tail -1 | tr -d ' ')
+if ((AVAILABLE_BYTES < MIN_FREE_BYTES)); then
+  echo "insufficient benchmark disk space: available=${AVAILABLE_BYTES} required=${MIN_FREE_BYTES} path=${OUTPUT}" >&2
+  exit 2
+fi
 chmod +x "${ROOT}/bench/backend.py" "${ROOT}/bench/summarize_h2load.py" \
-  "${ROOT}/bench/summarize_resources.py"
+  "${ROOT}/bench/summarize_resources.py" "${ROOT}/bench/summarize_compare.py"
 
-for command in docker curl wrk h2load openssl python3 sha256sum jq; do
+for command in docker curl wrk h2load openssl python3 sha256sum jq numfmt; do
   if ! command -v "${command}" >/dev/null; then
     echo "missing required command: ${command}" >&2
     exit 2
   fi
 done
+
+CPU_NANO=$(python3 - "${CPU_LIMIT}" <<'PY'
+import sys
+print(int(float(sys.argv[1]) * 1_000_000_000))
+PY
+)
+MEMORY_BYTES=$(numfmt --from=iec "${MEMORY_LIMIT^^}")
 
 cat >"${OUTPUT}/environment.txt" <<EOF
 timestamp=$(date -u +%FT%TZ)
@@ -65,7 +90,14 @@ profile=${PROFILE}
 host=$(uname -a)
 pingora_image=${PINGORA_IMAGE}
 nginx_image=${NGINX_IMAGE}
-note=load generator, proxy, and backend share this host and can compete for CPU
+cpu_limit=${CPU_LIMIT}
+cpu_nano=${CPU_NANO}
+memory_limit=${MEMORY_LIMIT}
+memory_bytes=${MEMORY_BYTES}
+minimum_free_bytes=${MIN_FREE_BYTES}
+available_bytes_at_start=${AVAILABLE_BYTES}
+stability_requests=${STABILITY_REQUESTS}
+note=load generator and backend share this host; each proxy container has identical CPU and memory limits
 EOF
 lscpu >>"${OUTPUT}/environment.txt" 2>&1
 docker image inspect "${PINGORA_IMAGE}" >"${OUTPUT}/pingora-inspect.json"
@@ -135,6 +167,14 @@ http {
   gzip off;
   brotli off;
   zstd off;
+  map \$https \$forwarded_ssl {
+    default off;
+    on on;
+  }
+  map \$https \$hsts {
+    default "";
+    on "max-age=63072000; includeSubDomains; preload";
+  }
   proxy_http_version 1.1;
   proxy_buffering off;
   proxy_request_buffering off;
@@ -142,8 +182,22 @@ http {
   proxy_read_timeout 3600s;
   proxy_send_timeout 3600s;
   proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$remote_addr;
+  proxy_set_header X-Forwarded-Host \$host;
+  proxy_set_header X-Forwarded-Port \$server_port;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header X-Forwarded-Ssl \$forwarded_ssl;
+  proxy_set_header Accept-Encoding "";
+  proxy_set_header Upgrade "";
   proxy_set_header Connection "";
   proxy_hide_header Server;
+  proxy_hide_header X-Powered-By;
+  proxy_hide_header Alt-Svc;
+  proxy_hide_header Strict-Transport-Security;
+  proxy_hide_header X-Content-Type-Options;
+  proxy_hide_header X-Frame-Options;
+  proxy_hide_header Referrer-Policy;
   upstream benchmark_backend {
     server 127.0.0.1:${BACKEND_PORT};
     keepalive 128;
@@ -159,6 +213,9 @@ http {
     ssl_certificate_key /work/key.pem;
     ssl_protocols TLSv1.3;
     add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+    add_header Strict-Transport-Security \$hsts always;
     location / { proxy_pass http://benchmark_backend; }
   }
 }
@@ -168,10 +225,18 @@ chmod 0644 "${OUTPUT}/pingora.yaml" "${OUTPUT}/nginx.conf"
 python3 "${ROOT}/bench/backend.py" --port "${BACKEND_PORT}" \
   >"${OUTPUT}/backend.stdout" 2>"${OUTPUT}/backend.stderr" &
 BACKEND_PID=$!
+backend_ready=false
 for _ in {1..100}; do
-  curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}/bytes/64" -o /dev/null && break
+  if curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}/bytes/64" -o /dev/null 2>/dev/null; then
+    backend_ready=true
+    break
+  fi
   sleep 0.05
 done
+if [[ "${backend_ready}" != true ]]; then
+  echo "benchmark backend did not become ready at 127.0.0.1:${BACKEND_PORT}" >&2
+  exit 1
+fi
 
 printf 'proxy\tprotocol\tpayload_bytes\tconcurrency\tround\tstatus\trps\tp50_us\tp90_us\tp95_us\tp99_us\tp999_us\tmax_us\tcpu_avg_pct\tcpu_peak_pct\trss_avg_kib\trss_peak_kib\terrors\tstatus_distribution\traw\n' \
   >"${OUTPUT}/results.tsv"
@@ -191,15 +256,27 @@ start_proxy() {
   PROXY_NAME=${NAME}-${proxy}
   if [[ "${proxy}" == pingora ]]; then
     docker run --detach --name "${PROXY_NAME}" --network host --read-only \
+      --cpus "${CPU_LIMIT}" --memory "${MEMORY_LIMIT}" --memory-swap "${MEMORY_LIMIT}" \
+      --ulimit nofile=32768:32768 \
       --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
       --tmpfs /tmp/pingora:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700 \
       --volume "${OUTPUT}:/work:ro" --entrypoint /usr/local/bin/pingora \
       "${PINGORA_IMAGE}" --config /work/pingora.yaml >/dev/null
   else
     docker run --detach --name "${PROXY_NAME}" --network host \
+      --cpus "${CPU_LIMIT}" --memory "${MEMORY_LIMIT}" --memory-swap "${MEMORY_LIMIT}" \
+      --ulimit nofile=32768:32768 \
       --volume "${OUTPUT}:/work:ro" --volume "${OUTPUT}/nginx.conf:/etc/nginx/nginx.conf:ro" \
       "${NGINX_IMAGE}" >/dev/null
   fi
+
+  local limits
+  limits=$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}' "${PROXY_NAME}")
+  if [[ "${limits}" != "${CPU_NANO} ${MEMORY_BYTES} ${MEMORY_BYTES}" ]]; then
+    echo "resource limit mismatch for ${proxy}: got=${limits} expected=${CPU_NANO} ${MEMORY_BYTES} ${MEMORY_BYTES}" >&2
+    return 1
+  fi
+
   for _ in {1..100}; do
     if curl --noproxy '*' -fsS -H 'host: bench.test' \
       "http://127.0.0.1:${HTTP_PORT}/bytes/64" -o /dev/null 2>/dev/null; then
@@ -227,7 +304,7 @@ sample_resources() {
     usage=$(awk '$1 == "usage_usec" {print $2}' "${cg}/cpu.stat" 2>/dev/null || echo 0)
     while read -r member; do
       [[ -r "/proc/${member}/status" ]] || continue
-      value=$(awk '$1 == "VmRSS:" {print $2}' "/proc/${member}/status")
+      value=$(awk '$1 == "VmRSS:" {print $2}' "/proc/${member}/status" 2>/dev/null || true)
       rss=$((rss + ${value:-0}))
     done <"${cg}/cgroup.procs"
     printf '%s %s %s\n' "${timestamp}" "${usage}" "${rss}" >>"${output}"
@@ -387,19 +464,19 @@ for ((round = 1; round <= ROUNDS; round++)); do
     curl --noproxy '*' -fsS -H 'host: bench.test' \
       "http://127.0.0.1:${HTTP_PORT}/bytes/64" -o /dev/null || true
     sleep 0.5
-    stability_raw=${OUTPUT}/raw/${proxy}-r${round}-h2-single-connection-640.txt
-    h2load -n 640 -c 1 -m 32 --sni bench.test -H 'host: bench.test' \
+    stability_raw=${OUTPUT}/raw/${proxy}-r${round}-h2-single-connection-${STABILITY_REQUESTS}.txt
+    h2load -n "${STABILITY_REQUESTS}" -c 1 -m 32 --sni bench.test -H 'host: bench.test' \
       "https://127.0.0.1:${HTTPS_PORT}/bytes/64" >"${stability_raw}" 2>&1
     stability_rc=$?
     stability_errors=$(sed -nE 's/requests: [0-9]+ total, [0-9]+ started, [0-9]+ done, [0-9]+ succeeded, ([0-9]+) failed.*/\1/p' \
       "${stability_raw}" | tail -1)
-    stability_errors=${stability_errors:-640}
+    stability_errors=${stability_errors:-${STABILITY_REQUESTS}}
     stability_status=PASS
     if ((stability_rc != 0 || stability_errors != 0)); then
       stability_status=FAIL
     fi
-    printf '%s\t%s\th2-single-connection-640\t%s\t%s\t%s\n' \
-      "${proxy}" "${round}" "${stability_status}" "${stability_errors}" "${stability_raw}" \
+    printf '%s\t%s\th2-single-connection-%s\t%s\t%s\t%s\n' \
+      "${proxy}" "${round}" "${STABILITY_REQUESTS}" "${stability_status}" "${stability_errors}" "${stability_raw}" \
       >>"${OUTPUT}/stability.tsv"
     for protocol in "${PROTOCOLS[@]}"; do
       for size in "${PAYLOADS[@]}"; do
@@ -413,5 +490,8 @@ for ((round = 1; round <= ROUNDS; round++)); do
   done
 done
 
+python3 "${ROOT}/bench/summarize_compare.py" \
+  "${OUTPUT}/results.tsv" "${OUTPUT}/summary.tsv" >"${OUTPUT}/summary.txt"
+cat "${OUTPUT}/summary.txt"
 echo "results=${OUTPUT}/results.tsv failures=${FAILURES}"
 exit $((FAILURES > 0))

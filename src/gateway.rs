@@ -430,7 +430,6 @@ impl ProxyHttp for Gateway {
         session.set_read_timeout(Some(timeout));
         session.set_write_timeout(Some(timeout));
         session.set_keepalive(Some(30));
-        session.set_keepalive_reuses_remaining(Some(500));
         ctx.plan = Some(plan);
 
         Ok(false)
