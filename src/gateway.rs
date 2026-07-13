@@ -83,6 +83,20 @@ impl RouteClass {
             _ => 60,
         }
     }
+
+    fn upstream_pool_group(self) -> u64 {
+        match self {
+            Self::NavidromeStream => 1,
+            Self::NavidromeCover => 2,
+            Self::NavidromeApi => 3,
+            Self::VaultwardenAuth => 4,
+            Self::VaultwardenHub => 5,
+            Self::Vaultwarden => 6,
+            Self::Couchdb => 7,
+            Self::Doh => 8,
+            Self::AdguardUi => 9,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -386,6 +400,7 @@ impl ProxyHttp for Gateway {
             .ok_or_else(|| Error::explain(HTTPStatus(502), "upstream is missing"))?;
         let sni = upstream.sni.clone().unwrap_or_default();
         let mut peer = HttpPeer::new(upstream.address.as_str(), upstream.tls, sni);
+        peer.group_key = plan.route.upstream_pool_group();
         peer.options.connection_timeout =
             Some(Duration::from_secs(upstream.connect_timeout_seconds));
         peer.options.total_connection_timeout =
@@ -435,11 +450,11 @@ impl ProxyHttp for Gateway {
             .insert_header("x-forwarded-proto", if plan.tls { "https" } else { "http" })?;
         upstream_request.insert_header("x-forwarded-ssl", if plan.tls { "on" } else { "off" })?;
 
-        let navidrome = matches!(
-            plan.handler,
-            HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn
+        let navidrome_compressible = matches!(
+            plan.route,
+            RouteClass::NavidromeApi | RouteClass::NavidromeCover
         );
-        if navidrome {
+        if navidrome_compressible {
             if let Some(value) = session.req_header().headers.get(ACCEPT_ENCODING) {
                 upstream_request.insert_header(ACCEPT_ENCODING, value.clone())?;
             } else {

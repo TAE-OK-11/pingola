@@ -33,6 +33,7 @@ jobs:
           tests/listeners_health.sh
           tests/retries.sh
           tests/limit_isolation.sh
+          tests/service_matrix.sh
           tests/integration.sh
       - name: HTTP/2 correctness matrix
         run: tests/http2_matrix.sh
