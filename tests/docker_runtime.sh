@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGE=${PINGORA_TEST_IMAGE:-ghcr.io/tae-ok-11/pingora:local}
 EXPECTED_ALLOCATOR=${PINGORA_EXPECTED_ALLOCATOR:-tcmalloc}
+EXPECTED_TARGET_CPU=${PINGORA_EXPECTED_TARGET_CPU:-x86-64-v2}
 RUNTIME=${PINGORA_DOCKER_TEST_RUNTIME:-/tmp/pingora-docker-runtime}
 CONTAINERS=()
 
@@ -85,7 +86,7 @@ assert_container_hardening() {
   docker exec "${name}" /usr/local/bin/pingora --allocator-info \
     | grep -q "^allocator=${EXPECTED_ALLOCATOR} "
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.allocator"}}' "${name}") == "${EXPECTED_ALLOCATOR}" ]]
-  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.target-cpu"}}' "${name}") == x86-64-v2 ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.target-cpu"}}' "${name}") == "${EXPECTED_TARGET_CPU}" ]]
 }
 
 write_config "${RUNTIME}/http.yaml" '["127.0.0.1:18570"]' '[]'

@@ -88,6 +88,7 @@ jobs:
       - name: Non-root and read-only runtime checks
         env:
           PINGORA_TEST_IMAGE: pingora:ci-${{ matrix.target_cpu }}
+          PINGORA_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
         run: tests/docker_runtime.sh
 
   image:
