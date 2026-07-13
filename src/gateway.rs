@@ -258,6 +258,8 @@ impl ProxyHttp for Gateway {
         let Some(plan) = self.request_plan(domain, &host, &path, tls) else {
             return send_empty(session, 500, Some(host.handler), tls, &[]).await;
         };
+        ctx.client_ip = client_ip;
+        ctx.plan = Some(plan.clone());
 
         if content_length(session.req_header()).is_some_and(|length| length > plan.max_body_bytes) {
             return send_empty(session, 413, Some(plan.handler), tls, &[]).await;
@@ -297,8 +299,6 @@ impl ProxyHttp for Gateway {
         session.set_keepalive(Some(30));
         session.set_keepalive_reuses_remaining(Some(500));
 
-        ctx.client_ip = client_ip;
-        ctx.plan = Some(plan);
         ctx._connection_permit = Some(permit);
         Ok(false)
     }

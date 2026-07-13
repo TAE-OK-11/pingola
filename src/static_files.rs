@@ -182,7 +182,7 @@ impl StaticFiles {
                 Ok(value) => value,
                 Err(_) => return send_empty(session, 500, &[], tls).await,
             };
-            let etag = format!("\"{:x}-{:x}\"", metadata.len(), modified_nanos);
+            let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), modified_nanos);
             let asset = Arc::new(CachedAsset {
                 body,
                 content_type,
