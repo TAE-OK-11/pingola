@@ -10,6 +10,11 @@ repository = "https://github.com/TAE-OK-11/pingora"
 name = "pingora"
 path = "src/main.rs"
 
+[features]
+default = ["jemalloc"]
+jemalloc = []
+system-allocator = []
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"

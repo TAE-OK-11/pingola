@@ -22,6 +22,8 @@ COPY vendor ./vendor
 COPY src ./src
 
 ARG RUST_TARGET_CPU=x86-64-v2
+ARG CARGO_FEATURE_ARGS=
+ARG EXPECTED_ALLOCATOR=jemalloc
 ENV CARGO_INCREMENTAL=0 \
     CMAKE_GENERATOR=Ninja \
     RUSTFLAGS="-C target-cpu=${RUST_TARGET_CPU} -C link-arg=-Wl,--gc-sections"
@@ -29,8 +31,8 @@ ENV CARGO_INCREMENTAL=0 \
 RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=pingora-target,target=/src/target,sharing=locked \
-    cargo build --locked --release \
-    && target/release/pingora --allocator-info | grep -q '^allocator=jemalloc ' \
+    cargo build --locked --release ${CARGO_FEATURE_ARGS} \
+    && target/release/pingora --allocator-info | grep -q "^allocator=${EXPECTED_ALLOCATOR}" \
     && install -Dm755 target/release/pingora /out/pingora
 
 FROM debian:bookworm-slim AS runtime

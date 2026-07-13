@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::net::SocketAddr;
@@ -198,10 +199,14 @@ impl RuntimeConfig {
         })
     }
 
-    pub fn host(&self, authority: &str) -> Option<(&str, &HostConfig)> {
-        let domain = normalize_host(authority);
-        let name = self.hosts_by_domain.get(&domain)?;
-        Some((name.as_str(), self.config.hosts.get(name)?))
+    pub fn host(&self, authority: &str) -> Option<(&str, &str, &HostConfig)> {
+        let domain = normalized_host(authority);
+        let (canonical_domain, name) = self.hosts_by_domain.get_key_value(domain.as_ref())?;
+        Some((
+            canonical_domain.as_str(),
+            name.as_str(),
+            self.config.hosts.get(name)?,
+        ))
     }
 
     pub fn upstream(&self, name: &str) -> Option<&UpstreamConfig> {
@@ -217,16 +222,23 @@ impl RuntimeConfig {
 }
 
 pub fn normalize_host(authority: &str) -> String {
-    let authority = authority.trim().trim_end_matches('.').to_ascii_lowercase();
-    if let Some(stripped) = authority.strip_prefix('[') {
-        return stripped
-            .split_once(']')
-            .map_or_else(|| authority.clone(), |(host, _)| host.to_string());
-    }
+    normalized_host(authority).into_owned()
+}
 
-    match authority.rsplit_once(':') {
-        Some((host, port)) if port.parse::<u16>().is_ok() => host.to_string(),
-        _ => authority,
+fn normalized_host(authority: &str) -> Cow<'_, str> {
+    let authority = authority.trim().trim_end_matches('.');
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        stripped.split_once(']').map_or(authority, |(host, _)| host)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if port.parse::<u16>().is_ok() => host,
+            _ => authority,
+        }
+    };
+    if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(host)
     }
 }
 
@@ -404,7 +416,8 @@ hosts:
     #[test]
     fn resolves_host_case_insensitively() {
         let runtime = RuntimeConfig::new(sample_config()).unwrap();
-        let (name, _) = runtime.host("APP.EXAMPLE.COM:443").unwrap();
+        let (domain, name, _) = runtime.host("APP.EXAMPLE.COM:443").unwrap();
+        assert_eq!(domain, "app.example.com");
         assert_eq!(name, "app");
     }
 

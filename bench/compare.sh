@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PROFILE=${BENCH_PROFILE:-smoke}
+PINGORA_IMAGE=${PINGORA_IMAGE:-ghcr.io/tae-ok-11/pingora:local}
+NGINX_IMAGE=${NGINX_IMAGE:-tae00217/jbs-nginx:ultra-4.0}
+BACKEND_PORT=${BACKEND_PORT:-18700}
+HTTP_PORT=${HTTP_PORT:-18780}
+HTTPS_PORT=${HTTPS_PORT:-18743}
+DURATION=${BENCH_DURATION:-3s}
+WARMUP=${BENCH_WARMUP:-1s}
+OUTPUT=${BENCH_OUTPUT:-${ROOT}/bench/results/$(date -u +%Y%m%dT%H%M%SZ)}
+NAME=pingora-compare-$$
+BACKEND_PID=
+PROXY_NAME=
+FAILURES=0
+
+case "${PROFILE}" in
+  smoke)
+    ROUNDS=${BENCH_ROUNDS:-1}
+    PROTOCOLS=(h1-keepalive h2-single h2-multi)
+    PAYLOADS=(64 4096)
+    CONCURRENCIES=(1 8 32)
+    ;;
+  full)
+    ROUNDS=${BENCH_ROUNDS:-5}
+    PROTOCOLS=(h1-keepalive h1-new h1-new-tls h2-single h2-multi)
+    PAYLOADS=(0 64 1024 4096 65536 1048576 10485760 104857600)
+    CONCURRENCIES=(1 4 8 16 32 64 128)
+    ;;
+  *)
+    echo "BENCH_PROFILE must be smoke or full" >&2
+    exit 2
+    ;;
+esac
+
+cleanup() {
+  if [[ -n "${PROXY_NAME}" ]]; then
+    docker logs "${PROXY_NAME}" >"${OUTPUT}/${PROXY_NAME}.final.log" 2>&1 || true
+    docker rm -f "${PROXY_NAME}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${BACKEND_PID}" ]]; then
+    kill "${BACKEND_PID}" >/dev/null 2>&1 || true
+    wait "${BACKEND_PID}" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+mkdir -p "${OUTPUT}/raw"
+chmod 0755 "${OUTPUT}" "${OUTPUT}/raw"
+chmod +x "${ROOT}/bench/backend.py" "${ROOT}/bench/summarize_h2load.py" \
+  "${ROOT}/bench/summarize_resources.py"
+
+for command in docker curl wrk h2load openssl python3 sha256sum jq; do
+  if ! command -v "${command}" >/dev/null; then
+    echo "missing required command: ${command}" >&2
+    exit 2
+  fi
+done
+
+cat >"${OUTPUT}/environment.txt" <<EOF
+timestamp=$(date -u +%FT%TZ)
+profile=${PROFILE}
+host=$(uname -a)
+pingora_image=${PINGORA_IMAGE}
+nginx_image=${NGINX_IMAGE}
+note=load generator, proxy, and backend share this host and can compete for CPU
+EOF
+lscpu >>"${OUTPUT}/environment.txt" 2>&1
+docker image inspect "${PINGORA_IMAGE}" >"${OUTPUT}/pingora-inspect.json"
+docker image inspect "${NGINX_IMAGE}" >"${OUTPUT}/nginx-inspect.json"
+docker history --no-trunc "${NGINX_IMAGE}" >"${OUTPUT}/nginx-history.txt"
+docker run --rm "${NGINX_IMAGE}" nginx -V >"${OUTPUT}/nginx-V.txt" 2>&1
+docker run --rm --entrypoint sh "${NGINX_IMAGE}" -c \
+  'ldd /usr/sbin/nginx 2>/dev/null || ldd /usr/local/nginx/sbin/nginx; nginx -T' \
+  >"${OUTPUT}/nginx-runtime.txt" 2>&1 || true
+docker run --rm --entrypoint /usr/local/bin/pingora "${PINGORA_IMAGE}" --allocator-info \
+  >"${OUTPUT}/pingora-allocator.txt"
+
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -subj '/CN=bench.test' -addext 'subjectAltName=DNS:bench.test' \
+  -keyout "${OUTPUT}/key.pem" -out "${OUTPUT}/cert.pem" >/dev/null 2>&1
+chown 0:10001 "${OUTPUT}/key.pem" "${OUTPUT}/cert.pem"
+chmod 0640 "${OUTPUT}/key.pem" "${OUTPUT}/cert.pem"
+
+cat >"${OUTPUT}/pingora.yaml" <<EOF
+server:
+  http_listen: ["127.0.0.1:${HTTP_PORT}"]
+  https_listen: ["127.0.0.1:${HTTPS_PORT}"]
+  certificate: /work/cert.pem
+  private_key: /work/key.pem
+  health_socket: /tmp/pingora/health.sock
+  threads: 1
+  upstream_keepalive_pool_size: 128
+  max_retries: 0
+  access_log: false
+  health_details: false
+  http2_max_concurrent_streams: 128
+  graceful_shutdown_timeout_seconds: 2
+trusted_proxies: ["127.0.0.0/8"]
+upstreams:
+  backend:
+    address: "127.0.0.1:${BACKEND_PORT}"
+    connect_timeout_seconds: 2
+    read_timeout_seconds: 3600
+    write_timeout_seconds: 3600
+    idle_timeout_seconds: 30
+hosts:
+  bench:
+    domains: ["bench.test"]
+    handler: vaultwarden
+    upstream: backend
+    max_body_bytes: 536870912
+route_limits:
+  vaultwarden:
+    rate_per_second: 0
+    active_requests: 0
+EOF
+
+cat >"${OUTPUT}/nginx.conf" <<EOF
+user nginx;
+worker_processes 1;
+error_log /dev/stderr warn;
+pid /tmp/nginx.pid;
+events { worker_connections 8192; }
+http {
+  access_log off;
+  server_tokens off;
+  sendfile on;
+  tcp_nopush on;
+  tcp_nodelay on;
+  keepalive_timeout 30s;
+  keepalive_requests 500;
+  gzip off;
+  brotli off;
+  zstd off;
+  proxy_http_version 1.1;
+  proxy_buffering off;
+  proxy_request_buffering off;
+  proxy_connect_timeout 2s;
+  proxy_read_timeout 3600s;
+  proxy_send_timeout 3600s;
+  proxy_set_header Host \$host;
+  proxy_set_header Connection "";
+  proxy_hide_header Server;
+  upstream benchmark_backend {
+    server 127.0.0.1:${BACKEND_PORT};
+    keepalive 128;
+    keepalive_requests 2000;
+    keepalive_timeout 30s;
+  }
+  server {
+    listen 127.0.0.1:${HTTP_PORT};
+    listen 127.0.0.1:${HTTPS_PORT} ssl;
+    http2 on;
+    server_name bench.test;
+    ssl_certificate /work/cert.pem;
+    ssl_certificate_key /work/key.pem;
+    ssl_protocols TLSv1.3;
+    add_header X-Content-Type-Options nosniff always;
+    location / { proxy_pass http://benchmark_backend; }
+  }
+}
+EOF
+chmod 0644 "${OUTPUT}/pingora.yaml" "${OUTPUT}/nginx.conf"
+
+python3 "${ROOT}/bench/backend.py" --port "${BACKEND_PORT}" \
+  >"${OUTPUT}/backend.stdout" 2>"${OUTPUT}/backend.stderr" &
+BACKEND_PID=$!
+for _ in {1..100}; do
+  curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}/bytes/64" -o /dev/null && break
+  sleep 0.05
+done
+
+printf 'proxy\tprotocol\tpayload_bytes\tconcurrency\tround\tstatus\trps\tp50_us\tp90_us\tp95_us\tp99_us\tp999_us\tmax_us\tcpu_avg_pct\tcpu_peak_pct\trss_avg_kib\trss_peak_kib\terrors\tstatus_distribution\traw\n' \
+  >"${OUTPUT}/results.tsv"
+printf 'proxy\tround\tprobe\tstatus\terrors\traw\n' >"${OUTPUT}/stability.tsv"
+
+stop_proxy() {
+  if [[ -n "${PROXY_NAME}" ]]; then
+    docker logs "${PROXY_NAME}" >"${OUTPUT}/raw/${PROXY_NAME}.log" 2>&1 || true
+    docker rm -f "${PROXY_NAME}" >/dev/null 2>&1 || true
+    PROXY_NAME=
+  fi
+}
+
+start_proxy() {
+  local proxy=$1
+  stop_proxy
+  PROXY_NAME=${NAME}-${proxy}
+  if [[ "${proxy}" == pingora ]]; then
+    docker run --detach --name "${PROXY_NAME}" --network host --read-only \
+      --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
+      --tmpfs /tmp/pingora:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700 \
+      --volume "${OUTPUT}:/work:ro" --entrypoint /usr/local/bin/pingora \
+      "${PINGORA_IMAGE}" --config /work/pingora.yaml >/dev/null
+  else
+    docker run --detach --name "${PROXY_NAME}" --network host \
+      --volume "${OUTPUT}:/work:ro" --volume "${OUTPUT}/nginx.conf:/etc/nginx/nginx.conf:ro" \
+      "${NGINX_IMAGE}" >/dev/null
+  fi
+  for _ in {1..100}; do
+    if curl --noproxy '*' -fsS -H 'host: bench.test' \
+      "http://127.0.0.1:${HTTP_PORT}/bytes/64" -o /dev/null 2>/dev/null; then
+      return 0
+    fi
+    if ! docker inspect --format '{{.State.Running}}' "${PROXY_NAME}" 2>/dev/null | grep -q true; then
+      docker logs "${PROXY_NAME}" >&2
+      return 1
+    fi
+    sleep 0.05
+  done
+  docker logs "${PROXY_NAME}" >&2
+  return 1
+}
+
+sample_resources() {
+  local pid=$1
+  local output=$2
+  local cg
+  cg=/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' "/proc/${pid}/cgroup")
+  while kill -0 "${pid}" 2>/dev/null; do
+    local timestamp usage rss=0 member value
+    timestamp=$(date +%s%N)
+    timestamp=${timestamp::-3}
+    usage=$(awk '$1 == "usage_usec" {print $2}' "${cg}/cpu.stat" 2>/dev/null || echo 0)
+    while read -r member; do
+      [[ -r "/proc/${member}/status" ]] || continue
+      value=$(awk '$1 == "VmRSS:" {print $2}' "/proc/${member}/status")
+      rss=$((rss + ${value:-0}))
+    done <"${cg}/cgroup.procs"
+    printf '%s %s %s\n' "${timestamp}" "${usage}" "${rss}" >>"${output}"
+    sleep 0.1
+  done
+}
+
+field() {
+  local line=$1 key=$2
+  sed -nE "s/.*${key}=([^ ]+).*/\\1/p" <<<"${line}"
+}
+
+run_case() {
+  local proxy=$1 protocol=$2 size=$3 concurrency=$4 round=$5
+  local case_id=${proxy}-r${round}-${protocol}-b${size}-c${concurrency}
+  local raw=${OUTPUT}/raw/${case_id}.txt
+  local warmup_raw=${OUTPUT}/raw/${case_id}.warmup.txt
+  local request_log=${OUTPUT}/raw/${case_id}.requests.tsv
+  local resources=${OUTPUT}/raw/${case_id}.resources
+  local path expected actual curl_args=() url
+  if ((size == 0)); then
+    path=/status/204
+  elif ((size >= 10485760)); then
+    path=/stream/${size}
+  else
+    path=/bytes/${size}
+  fi
+  if [[ "${protocol}" == h2-* || "${protocol}" == h1-new-tls ]]; then
+    url="https://127.0.0.1:${HTTPS_PORT}${path}"
+    curl_args=(-k --resolve "bench.test:${HTTPS_PORT}:127.0.0.1")
+  else
+    url="http://127.0.0.1:${HTTP_PORT}${path}"
+  fi
+  expected=$(curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}${path}" | sha256sum | cut -d' ' -f1)
+  if [[ "${protocol}" == h2-* ]]; then
+    actual=$(curl --noproxy '*' -ksS --http2 --resolve "bench.test:${HTTPS_PORT}:127.0.0.1" \
+      "https://bench.test:${HTTPS_PORT}${path}" | sha256sum | cut -d' ' -f1)
+  else
+    actual=$(curl --noproxy '*' -fsS "${curl_args[@]}" -H 'host: bench.test' "${url}" \
+      | sha256sum | cut -d' ' -f1)
+  fi
+  if [[ "${actual}" != "${expected}" ]]; then
+    printf '%s\t%s\t%s\t%s\t%s\tFAIL_HASH\t0\tNA\tNA\tNA\tNA\tNA\tNA\t0\t0\t0\t0\t1\tNA\t%s\n' \
+      "${proxy}" "${protocol}" "${size}" "${concurrency}" "${round}" "${raw}" \
+      >>"${OUTPUT}/results.tsv"
+    echo "SHA-256 mismatch expected=${expected} actual=${actual}" >"${raw}"
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
+
+  case "${protocol}" in
+    h1-keepalive)
+      wrk -t1 -c "${concurrency}" -d "${WARMUP}" \
+        -s "${ROOT}/bench/wrk-keepalive.lua" -H 'Host: bench.test' "${url}" \
+        >"${warmup_raw}" 2>&1 || true
+      ;;
+    h1-new|h1-new-tls)
+      wrk -t1 -c "${concurrency}" -d "${WARMUP}" \
+        -s "${ROOT}/bench/wrk-close.lua" -H 'Host: bench.test' "${url}" \
+        >"${warmup_raw}" 2>&1 || true
+      ;;
+    h2-single)
+      h2load -n "${concurrency}" -c 1 -m "${concurrency}" --sni bench.test \
+        -H 'host: bench.test' "${url}" >"${warmup_raw}" 2>&1 || true
+      ;;
+    h2-multi)
+      local warm_clients=$((concurrency < 4 ? concurrency : 4))
+      local warm_streams=$(((concurrency + warm_clients - 1) / warm_clients))
+      h2load -n "${concurrency}" -c "${warm_clients}" -m "${warm_streams}" \
+        --sni bench.test -H 'host: bench.test' "${url}" >"${warmup_raw}" 2>&1 || true
+      ;;
+  esac
+
+  local container_pid sampler_pid rc
+  container_pid=$(docker inspect --format '{{.State.Pid}}' "${PROXY_NAME}")
+  : >"${resources}"
+  sample_resources "${container_pid}" "${resources}" &
+  sampler_pid=$!
+  sleep 0.05
+  case "${protocol}" in
+    h1-keepalive)
+      wrk --latency -t1 -c "${concurrency}" -d "${DURATION}" \
+        -s "${ROOT}/bench/wrk-keepalive.lua" -H 'Host: bench.test' "${url}" >"${raw}" 2>&1
+      rc=$?
+      ;;
+    h1-new|h1-new-tls)
+      wrk --latency -t1 -c "${concurrency}" -d "${DURATION}" \
+        -s "${ROOT}/bench/wrk-close.lua" -H 'Host: bench.test' "${url}" >"${raw}" 2>&1
+      rc=$?
+      ;;
+    h2-single)
+      local requests=500
+      ((size >= 10485760)) && requests=$((concurrency * 2))
+      ((size >= 104857600)) && requests=${concurrency}
+      h2load -n "${requests}" -c 1 -m "${concurrency}" \
+        --sni bench.test -H 'host: bench.test' --log-file "${request_log}" "${url}" >"${raw}" 2>&1
+      rc=$?
+      ;;
+    h2-multi)
+      local clients=$((concurrency < 4 ? concurrency : 4))
+      local streams=$(((concurrency + clients - 1) / clients))
+      local requests=500
+      ((size >= 10485760)) && requests=$((concurrency * 2))
+      ((size >= 104857600)) && requests=${concurrency}
+      h2load -n "${requests}" -c "${clients}" -m "${streams}" \
+        --sni bench.test -H 'host: bench.test' --log-file "${request_log}" "${url}" >"${raw}" 2>&1
+      rc=$?
+      ;;
+  esac
+  sleep 0.05
+  kill "${sampler_pid}" >/dev/null 2>&1 || true
+  wait "${sampler_pid}" >/dev/null 2>&1 || true
+
+  local latency_line resource_line rps errors status distribution
+  if [[ "${protocol}" == h2-* ]]; then
+    latency_line=$(python3 "${ROOT}/bench/summarize_h2load.py" "${request_log}" 2>/dev/null || true)
+    rps=$(sed -nE 's/.*finished in [^,]+, ([0-9.]+) req\/s.*/\1/p' "${raw}" | tail -1)
+    errors=$(sed -nE 's/requests: [0-9]+ total, [0-9]+ started, [0-9]+ done, [0-9]+ succeeded, ([0-9]+) failed.*/\1/p' "${raw}" | tail -1)
+    distribution=$(field "${latency_line}" statuses)
+  else
+    latency_line=$(grep 'LATENCY_US ' "${raw}" | tail -1)
+    rps=$(awk '/Requests\/sec:/ {print $2}' "${raw}" | tail -1)
+    errors=$(awk '/Socket errors:/ {gsub(/[^0-9 ]/, ""); print $1+$2+$3+$4}' "${raw}" | tail -1)
+    distribution=not-collected
+  fi
+  resource_line=$(python3 "${ROOT}/bench/summarize_resources.py" "${resources}")
+  rps=${rps:-0}
+  errors=${errors:-0}
+  status=PASS
+  if ((rc != 0 || errors != 0)) || [[ "${rps}" == 0 || "${rps}" == 0.00 ]]; then
+    status=FAIL
+    FAILURES=$((FAILURES + 1))
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${proxy}" "${protocol}" "${size}" "${concurrency}" "${round}" "${status}" "${rps}" \
+    "$(field "${latency_line}" p50)" "$(field "${latency_line}" p90)" \
+    "$(field "${latency_line}" p95)" "$(field "${latency_line}" p99)" \
+    "$(field "${latency_line}" p999)" "$(field "${latency_line}" max)" \
+    "$(field "${resource_line}" cpu_avg)" "$(field "${resource_line}" cpu_peak)" \
+    "$(field "${resource_line}" rss_avg_kib)" "$(field "${resource_line}" rss_peak_kib)" \
+    "${errors}" "${distribution:-NA}" "${raw}" >>"${OUTPUT}/results.tsv"
+}
+
+for ((round = 1; round <= ROUNDS; round++)); do
+  if ((round % 2 == 1)); then
+    ORDER=(nginx pingora)
+  else
+    ORDER=(pingora nginx)
+  fi
+  for proxy in "${ORDER[@]}"; do
+    if ! start_proxy "${proxy}"; then
+      echo "${proxy} failed to start in round ${round}" >&2
+      FAILURES=$((FAILURES + 1))
+      stop_proxy
+      continue
+    fi
+    curl --noproxy '*' -fsS -H 'host: bench.test' \
+      "http://127.0.0.1:${HTTP_PORT}/bytes/64" -o /dev/null || true
+    sleep 0.5
+    stability_raw=${OUTPUT}/raw/${proxy}-r${round}-h2-single-connection-640.txt
+    h2load -n 640 -c 1 -m 32 --sni bench.test -H 'host: bench.test' \
+      "https://127.0.0.1:${HTTPS_PORT}/bytes/64" >"${stability_raw}" 2>&1
+    stability_rc=$?
+    stability_errors=$(sed -nE 's/requests: [0-9]+ total, [0-9]+ started, [0-9]+ done, [0-9]+ succeeded, ([0-9]+) failed.*/\1/p' \
+      "${stability_raw}" | tail -1)
+    stability_errors=${stability_errors:-640}
+    stability_status=PASS
+    if ((stability_rc != 0 || stability_errors != 0)); then
+      stability_status=FAIL
+    fi
+    printf '%s\t%s\th2-single-connection-640\t%s\t%s\t%s\n' \
+      "${proxy}" "${round}" "${stability_status}" "${stability_errors}" "${stability_raw}" \
+      >>"${OUTPUT}/stability.tsv"
+    for protocol in "${PROTOCOLS[@]}"; do
+      for size in "${PAYLOADS[@]}"; do
+        for concurrency in "${CONCURRENCIES[@]}"; do
+          run_case "${proxy}" "${protocol}" "${size}" "${concurrency}" "${round}"
+        done
+      done
+    done
+    stop_proxy
+    sleep 0.5
+  done
+done
+
+echo "results=${OUTPUT}/results.tsv failures=${FAILURES}"
+exit $((FAILURES > 0))

@@ -278,20 +278,22 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         service.add_tcp_with_settings(address, listener_options(address)?);
     }
     for address in &server_config.https_listen {
-        let certificate = server_config
-            .certificate
-            .as_deref()
-            .expect("schema validation requires certificate for HTTPS");
-        let private_key = server_config
-            .private_key
-            .as_deref()
-            .expect("schema validation requires private_key for HTTPS");
+        let certificate = server_config.certificate.as_deref().ok_or_else(|| {
+            anyhow!(
+                "TLS settings creation failed for listener {address}: certificate path is missing"
+            )
+        })?;
+        let private_key = server_config.private_key.as_deref().ok_or_else(|| {
+            anyhow!(
+                "TLS settings creation failed for listener {address}: private key path is missing"
+            )
+        })?;
         let certificate = certificate.to_string_lossy();
         let private_key = private_key.to_string_lossy();
         let mut tls = TlsSettings::intermediate(&certificate, &private_key).with_context(|| {
             format!(
-                "TLS settings creation failed for certificate={} private_key={}",
-                certificate, private_key
+                "TLS settings creation failed for listener={address} certificate={} private_key={}",
+                certificate, private_key,
             )
         })?;
         tls.enable_h2();

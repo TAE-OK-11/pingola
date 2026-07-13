@@ -21,7 +21,7 @@ use http::Method;
 use log::{info, warn};
 use serde_json::json;
 
-use crate::config::{normalize_host, HandlerKind, HostConfig, RuntimeConfig};
+use crate::config::{HandlerKind, HostConfig, RuntimeConfig};
 use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, RateLimiter};
 use crate::static_files::StaticFiles;
 
@@ -163,7 +163,7 @@ impl Gateway {
 
     fn request_plan(
         &self,
-        domain: String,
+        domain: &str,
         host: &HostConfig,
         path: &str,
         tls: bool,
@@ -209,7 +209,7 @@ impl Gateway {
         };
 
         Some(RequestPlan {
-            domain,
+            domain: domain.to_owned(),
             handler: host.handler,
             upstream_name,
             route,
@@ -229,7 +229,7 @@ impl ProxyHttp for Gateway {
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let tls = is_tls(session);
-        let path = session.req_header().uri.path().to_string();
+        let path = session.req_header().uri.path();
 
         if path == "/pingora-health" || path == "/pingora-live" || path == "/pingora-ready" {
             return send_empty(session, 204, None, tls, &[("x-proxy-product", "Pingora")]).await;
@@ -266,13 +266,10 @@ impl ProxyHttp for Gateway {
         let Some(authority) = request_authority(session.req_header()) else {
             return send_empty(session, 400, None, tls, &[]).await;
         };
-        let domain = normalize_host(&authority);
-        let Some((host_name, host)) = self.runtime.host(&authority) else {
+        let Some((domain, host_name, host)) = self.runtime.host(authority) else {
             session.set_keepalive(None);
             return send_empty(session, 421, None, tls, &[]).await;
         };
-        let host_name = host_name.to_string();
-        let host = host.clone();
 
         if !tls && host.redirect_http {
             let path_and_query = session
@@ -292,7 +289,7 @@ impl ProxyHttp for Gateway {
         }
 
         if host.handler == HandlerKind::Static {
-            return self.static_files.serve(&host_name, session, tls).await;
+            return self.static_files.serve(host_name, session, tls).await;
         }
 
         if host.handler == HandlerKind::NavidromeMain && path == "/" {
@@ -317,11 +314,10 @@ impl ProxyHttp for Gateway {
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok());
         let client_ip = resolve_client_ip(&self.runtime, peer_ip, forwarded_for);
-        let Some(plan) = self.request_plan(domain, &host, &path, tls) else {
+        let Some(plan) = self.request_plan(domain, host, path, tls) else {
             return send_empty(session, 500, Some(host.handler), tls, &[]).await;
         };
         ctx.client_ip = client_ip;
-        ctx.plan = Some(plan.clone());
 
         if content_length(session.req_header()).is_some_and(|length| length > plan.max_body_bytes) {
             return send_empty(session, 413, Some(plan.handler), tls, &[]).await;
@@ -381,6 +377,7 @@ impl ProxyHttp for Gateway {
         session.set_write_timeout(Some(timeout));
         session.set_keepalive(Some(30));
         session.set_keepalive_reuses_remaining(Some(500));
+        ctx.plan = Some(plan);
 
         Ok(false)
     }
@@ -611,7 +608,7 @@ impl ProxyHttp for Gateway {
     }
 }
 
-fn request_authority(request: &RequestHeader) -> Option<String> {
+fn request_authority(request: &RequestHeader) -> Option<&str> {
     if request.headers.get_all(HOST).iter().count() > 1 {
         return None;
     }
@@ -619,13 +616,7 @@ fn request_authority(request: &RequestHeader) -> Option<String> {
         .headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-        .or_else(|| {
-            request
-                .uri
-                .authority()
-                .map(|value| value.as_str().to_string())
-        })
+        .or_else(|| request.uri.authority().map(|value| value.as_str()))
 }
 
 fn content_length(request: &RequestHeader) -> Option<usize> {
@@ -819,11 +810,21 @@ async fn send_empty(
 }
 
 async fn send_health_details(session: &mut Session, runtime: &RuntimeConfig) -> Result<bool> {
-    let check_upstreams = session
-        .req_header()
-        .uri
-        .query()
-        .is_some_and(|query| query.split('&').any(|value| value == "upstreams=1"));
+    let query = session.req_header().uri.query().unwrap_or_default();
+    let check_upstreams = query.split('&').any(|value| value == "upstreams=1");
+    let allocator = if query.split('&').any(|value| value == "allocator=1")
+        && crate::allocator::environment_requests_stats()
+    {
+        Some(crate::allocator::detailed_stats().map_err(|error| {
+            Error::because(
+                HTTPStatus(500),
+                "jemalloc diagnostic collection failed",
+                error,
+            )
+        })?)
+    } else {
+        None
+    };
     let mut upstreams = std::collections::BTreeMap::new();
     let mut ready = true;
     if check_upstreams {
@@ -849,6 +850,7 @@ async fn send_health_details(session: &mut Session, runtime: &RuntimeConfig) -> 
         "certificate_loaded": !runtime.config.server.https_listen.is_empty(),
         "upstreams_checked": check_upstreams,
         "upstreams": upstreams,
+        "allocator": allocator,
     }))
     .map_err(|error| Error::because(HTTPStatus(500), "health JSON serialization failed", error))?;
     let mut response = ResponseHeader::build(if ready { 200 } else { 503 }, Some(8)).unwrap();

@@ -25,8 +25,12 @@ jobs:
         run: cargo fmt --check
       - name: Unit tests
         run: cargo test --all-targets --locked
+      - name: Build integration-test binary
+        run: cargo build --locked
       - name: Lints
         run: cargo clippy --all-targets --locked -- -D warnings
+      - name: System allocator baseline still builds
+        run: cargo check --all-targets --locked --no-default-features --features system-allocator
       - name: Protocol and security integration checks
         run: |
           tests/runtime_preflight.sh
@@ -38,9 +42,32 @@ jobs:
       - name: HTTP/2 correctness matrix
         run: tests/http2_matrix.sh
 
+  image-test:
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build runnable image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: pingora:ci
+          build-args: |
+            RUST_TARGET_CPU=x86-64-v2
+            BUILD_VERSION=ci
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Non-root and read-only runtime checks
+        env:
+          PINGORA_TEST_IMAGE: pingora:ci
+        run: tests/docker_runtime.sh
+
   image:
     if: github.event_name != 'pull_request'
-    needs: verify
+    needs: image-test
     runs-on: ubuntu-24.04
     permissions:
       contents: read
