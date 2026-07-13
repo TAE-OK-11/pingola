@@ -17,7 +17,7 @@ server:
   legacy_pingola_health: true
   health_details: false
   global_active_requests: 0
-  http2_max_concurrent_streams: 128
+  http2_max_concurrent_streams: 32
 
 trusted_proxies:
   - "127.0.0.0/8"

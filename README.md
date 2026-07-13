@@ -12,7 +12,7 @@ upstream dependency는 Rust 코드에서 `cloudflare_pingora` alias로 가져옵
 ## 주요 기능과 한계
 
 - AWS-LC를 사용하는 rustls와 다운스트림 TLS 1.3 전용 정책
-- HTTP/1.1 및 HTTP/2, 기본 최대 128개 동시 H2 stream
+- HTTP/1.1 및 HTTP/2, 기본 최대 32개 동시 H2 stream(설정으로 1~1024 override)
 - IPv4/IPv6 listener와 IPv6 socket의 명시적 `IPV6_V6ONLY=true`
 - Host allowlist, trusted proxy 기반 `X-Forwarded-For`, body 크기 제한
 - 서비스·route별 rate limit 및 active request/H2 stream limit
@@ -292,6 +292,10 @@ sudo PROFILE_DURATION_SECONDS=30 bench/profile.sh
 # max concurrent streams 32/64/128/256 교차 측정
 sudo bench/h2_tuning.sh
 ```
+
+기본값 32는 개발 호스트 교차 측정에서 128보다 평균 RPS는 낮았지만 p99와 peak
+memory가 유의미하게 낮아 p99 우선 정책으로 선택했습니다. 운영 Oracle 서버에서는
+위 스크립트로 다시 측정한 뒤 `server.http2_max_concurrent_streams`를 override하십시오.
 
 전체 profile은 0B~100MiB, concurrency/H2 stream 1~128을 실행하므로 충분한 시간을
 확보해야 합니다. Oracle 1 vCPU에서는 load generator·proxy·synthetic backend가

@@ -22,7 +22,7 @@ fn default_max_retries() -> usize {
 }
 
 fn default_http2_max_concurrent_streams() -> u32 {
-    128
+    32
 }
 
 fn default_health_socket() -> PathBuf {
