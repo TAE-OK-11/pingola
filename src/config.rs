@@ -27,6 +27,10 @@ fn default_body_limit() -> usize {
     100 * 1024 * 1024
 }
 
+fn default_static_cache() -> usize {
+    32 * 1024 * 1024
+}
+
 fn default_true() -> bool {
     true
 }
@@ -67,6 +71,8 @@ pub struct ServerConfig {
     pub max_retries: usize,
     #[serde(default = "default_graceful_shutdown")]
     pub graceful_shutdown_timeout_seconds: u64,
+    #[serde(default = "default_static_cache")]
+    pub static_cache_bytes: usize,
     #[serde(default)]
     pub access_log: bool,
 }
@@ -193,6 +199,9 @@ fn validate(config: &Config) -> Result<()> {
     }
     if config.server.threads == 0 {
         bail!("server.threads must be greater than zero");
+    }
+    if config.server.static_cache_bytes == 0 {
+        bail!("server.static_cache_bytes must be greater than zero");
     }
     if !config.server.https_listen.is_empty()
         && (config.server.certificate.as_os_str().is_empty()

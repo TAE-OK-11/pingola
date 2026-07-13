@@ -9,6 +9,7 @@ server:
   upstream_keepalive_pool_size: 128
   max_retries: 2
   graceful_shutdown_timeout_seconds: 60
+  static_cache_bytes: 33554432
   access_log: false
 
 trusted_proxies:
@@ -123,4 +124,3 @@ hosts:
     upstream: adguard_korea
     redirect_http: true
     max_body_bytes: 65536
-

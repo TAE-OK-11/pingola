@@ -1452,6 +1452,7 @@ dependencies = [
  "httpdate",
  "ipnet",
  "log",
+ "lru",
  "mime_guess",
  "parking_lot",
  "percent-encoding",
