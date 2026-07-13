@@ -1,16 +1,23 @@
 server:
   http_listen:
     - "0.0.0.0:80"
+    - "[::]:80"
   https_listen:
     - "0.0.0.0:443"
-  certificate: /etc/pingola/cert/live/tae00217.cloud/fullchain.pem
-  private_key: /etc/pingola/cert/live/tae00217.cloud/privkey.pem
+    - "[::]:443"
+  certificate: /etc/pingora/cert/live/tae00217.cloud/fullchain.pem
+  private_key: /etc/pingora/cert/live/tae00217.cloud/privkey.pem
   threads: 1
   upstream_keepalive_pool_size: 128
   max_retries: 2
   graceful_shutdown_timeout_seconds: 60
   static_cache_bytes: 33554432
   access_log: false
+  health_socket: /tmp/pingora/health.sock
+  legacy_pingola_health: true
+  health_details: false
+  global_active_requests: 0
+  http2_max_concurrent_streams: 128
 
 trusted_proxies:
   - "127.0.0.0/8"

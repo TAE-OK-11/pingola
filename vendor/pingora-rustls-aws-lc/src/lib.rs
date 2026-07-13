@@ -1,5 +1,5 @@
 // Copyright 2026 Cloudflare, Inc.
-// Modified for AWS-LC-only crypto by the Pingola project.
+// Modified for AWS-LC-only crypto by the JBS Pingora project.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -187,5 +187,4 @@ pub fn hash_certificate(cert: &CertificateDer) -> Vec<u8> {
     let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, cert.as_ref());
     hash.as_ref().to_vec()
 }
-
 

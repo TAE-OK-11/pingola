@@ -19,7 +19,7 @@ jobs:
       - name: Install build and test tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cmake ninja-build jq
+          sudo apt-get install --yes cmake ninja-build jq nghttp2-client
           rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
       - name: Format
         run: cargo fmt --check
@@ -28,7 +28,14 @@ jobs:
       - name: Lints
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Protocol and security integration checks
-        run: tests/integration.sh
+        run: |
+          tests/runtime_preflight.sh
+          tests/listeners_health.sh
+          tests/retries.sh
+          tests/limit_isolation.sh
+          tests/integration.sh
+      - name: HTTP/2 correctness matrix
+        run: tests/http2_matrix.sh
 
   image:
     if: github.event_name != 'pull_request'
@@ -52,7 +59,11 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/tae-ok-11/pingola
+          # Publish the deprecated name from the same build for one migration
+          # release so both tags resolve to identical manifests.
+          images: |
+            ghcr.io/tae-ok-11/pingora
+            ghcr.io/tae-ok-11/pingola
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-
@@ -74,4 +85,3 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
-

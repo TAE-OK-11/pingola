@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
+use cloudflare_pingora::http::ResponseHeader;
+use cloudflare_pingora::proxy::Session;
+use cloudflare_pingora::Result;
 use http::header::{
     ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
     IF_NONE_MATCH, LAST_MODIFIED, VARY,
@@ -15,9 +18,6 @@ use http::Method;
 use lru::LruCache;
 use parking_lot::Mutex;
 use percent_encoding::percent_decode_str;
-use pingora::http::ResponseHeader;
-use pingora::proxy::Session;
-use pingora::Result;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 
@@ -367,8 +367,8 @@ async fn serve_streaming_file(
         None
     } else {
         Some(tokio::fs::File::open(path).await.map_err(|error| {
-            pingora::Error::because(
-                pingora::ErrorType::FileReadError,
+            cloudflare_pingora::Error::because(
+                cloudflare_pingora::ErrorType::FileReadError,
                 "failed to open asset",
                 error,
             )
@@ -394,8 +394,8 @@ async fn serve_streaming_file(
                 .read(&mut buffer[..chunk_length])
                 .await
                 .map_err(|error| {
-                    pingora::Error::because(
-                        pingora::ErrorType::FileReadError,
+                    cloudflare_pingora::Error::because(
+                        cloudflare_pingora::ErrorType::FileReadError,
                         "failed to read asset",
                         error,
                     )
@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn compressors_round_trip_nonempty_data() {
-        let data = b"pingola ".repeat(1024);
+        let data = b"pingora ".repeat(1024);
         assert!(!compress(data.clone(), Encoding::Gzip).unwrap().is_empty());
         assert!(!compress(data.clone(), Encoding::Brotli).unwrap().is_empty());
         assert!(!compress(data, Encoding::Zstd).unwrap().is_empty());

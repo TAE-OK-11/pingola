@@ -1,25 +1,28 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
+use cloudflare_pingora::prelude::HttpPeer;
+use cloudflare_pingora::protocols::{TcpKeepalive, ALPN};
+use cloudflare_pingora::proxy::{ProxyHttp, Session};
+use cloudflare_pingora::Error;
+use cloudflare_pingora::ErrorType;
+use cloudflare_pingora::ErrorType::HTTPStatus;
+use cloudflare_pingora::Result;
 use http::header::{
     ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, EXPIRES, FORWARDED, HOST,
-    LAST_MODIFIED, PRAGMA, UPGRADE,
+    LAST_MODIFIED, PRAGMA, TRANSFER_ENCODING, UPGRADE,
 };
+use http::Method;
 use log::{info, warn};
-use pingora::http::{RequestHeader, ResponseHeader};
-use pingora::prelude::HttpPeer;
-use pingora::protocols::{TcpKeepalive, ALPN};
-use pingora::proxy::{ProxyHttp, Session};
-use pingora::Error;
-use pingora::ErrorType::HTTPStatus;
-use pingora::Result;
+use serde_json::json;
 
 use crate::config::{normalize_host, HandlerKind, HostConfig, RuntimeConfig};
-use crate::limits::{ConnectionLimiter, ConnectionPermit, RateLimiter};
+use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, RateLimiter};
 use crate::static_files::StaticFiles;
 
 const STREAM_PREFIXES: &[&str] = &[
@@ -30,6 +33,7 @@ const STREAM_PREFIXES: &[&str] = &[
     "/ext/stream",
 ];
 const COVER_PREFIXES: &[&str] = &["/rest/getCoverArt", "/api/artwork", "/coverart", "/artwork"];
+static LEGACY_HEALTH_WARNING: Once = Once::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RouteClass {
@@ -45,13 +49,27 @@ enum RouteClass {
 }
 
 impl RouteClass {
-    fn rate_limit(self) -> Option<(&'static str, f64, u32)> {
+    fn name(self) -> &'static str {
         match self {
-            Self::NavidromeStream => Some(("navidrome_stream", 40.0, 15)),
-            Self::NavidromeCover => Some(("navidrome_api", 20.0, 20)),
-            Self::NavidromeApi => Some(("navidrome_api", 20.0, 30)),
-            Self::VaultwardenAuth => Some(("auth", 5.0 / 60.0, 3)),
-            Self::Doh => Some(("doh", 100.0, 200)),
+            Self::NavidromeStream => "navidrome_stream",
+            Self::NavidromeCover => "navidrome_cover",
+            Self::NavidromeApi => "navidrome_api",
+            Self::VaultwardenAuth => "vaultwarden_auth",
+            Self::VaultwardenHub => "vaultwarden_hub",
+            Self::Vaultwarden => "vaultwarden",
+            Self::Couchdb => "couchdb",
+            Self::Doh => "doh",
+            Self::AdguardUi => "adguard_ui",
+        }
+    }
+
+    fn default_rate_limit(self) -> Option<(f64, u32)> {
+        match self {
+            Self::NavidromeStream => Some((40.0, 15)),
+            Self::NavidromeCover => Some((20.0, 20)),
+            Self::NavidromeApi => Some((20.0, 30)),
+            Self::VaultwardenAuth => Some((5.0 / 60.0, 3)),
+            Self::Doh => Some((100.0, 200)),
             _ => None,
         }
     }
@@ -83,7 +101,8 @@ pub struct RequestContext {
     body_bytes: usize,
     retries: usize,
     started_at: Instant,
-    _connection_permit: Option<ConnectionPermit>,
+    _active_request_permit: Option<ActiveRequestPermit>,
+    _global_request_permit: Option<ActiveRequestPermit>,
 }
 
 impl Default for RequestContext {
@@ -94,7 +113,8 @@ impl Default for RequestContext {
             body_bytes: 0,
             retries: 0,
             started_at: Instant::now(),
-            _connection_permit: None,
+            _active_request_permit: None,
+            _global_request_permit: None,
         }
     }
 }
@@ -103,7 +123,7 @@ pub struct Gateway {
     runtime: Arc<RuntimeConfig>,
     static_files: StaticFiles,
     rates: RateLimiter,
-    connections: ConnectionLimiter,
+    active_requests: ActiveRequestLimiter,
 }
 
 impl Gateway {
@@ -123,7 +143,7 @@ impl Gateway {
             runtime,
             static_files,
             rates: RateLimiter::new(),
-            connections: ConnectionLimiter::new(),
+            active_requests: ActiveRequestLimiter::new(),
         })
     }
 
@@ -197,8 +217,36 @@ impl ProxyHttp for Gateway {
         let tls = is_tls(session);
         let path = session.req_header().uri.path().to_string();
 
-        if path == "/nginx-health" || path == "/pingola-health" {
-            return send_empty(session, 204, None, tls, &[]).await;
+        if path == "/pingora-health" || path == "/pingora-live" || path == "/pingora-ready" {
+            return send_empty(session, 204, None, tls, &[("x-proxy-product", "Pingora")]).await;
+        }
+        if path == "/pingola-health" {
+            if self.runtime.config.server.legacy_pingola_health {
+                LEGACY_HEALTH_WARNING.call_once(|| {
+                    warn!(
+                        "/pingola-health is deprecated; migrate to /pingora-health (legacy support will be removed after one release)"
+                    );
+                });
+                return send_empty(
+                    session,
+                    204,
+                    None,
+                    tls,
+                    &[("x-proxy-product", "Pingora"), ("deprecation", "true")],
+                )
+                .await;
+            }
+            return send_empty(session, 404, None, tls, &[("x-proxy-product", "Pingora")]).await;
+        }
+        if path == "/nginx-health" {
+            return send_empty(session, 404, None, tls, &[("x-proxy-product", "Pingora")]).await;
+        }
+        if path == "/pingora-health/details" {
+            if !self.runtime.config.server.health_details {
+                return send_empty(session, 404, None, tls, &[("x-proxy-product", "Pingora")])
+                    .await;
+            }
+            return send_health_details(session, &self.runtime).await;
         }
 
         let Some(authority) = request_authority(session.req_header()) else {
@@ -265,8 +313,8 @@ impl ProxyHttp for Gateway {
             return send_empty(session, 413, Some(plan.handler), tls, &[]).await;
         }
 
-        if let Some((zone, rate, burst)) = plan.route.rate_limit() {
-            if !self.rates.allow(zone, client_ip, rate, burst) {
+        if let Some((rate, burst)) = effective_rate_limit(&self.runtime, plan.route) {
+            if !self.rates.allow(plan.route.name(), client_ip, rate, burst) {
                 return send_empty(
                     session,
                     429,
@@ -278,20 +326,41 @@ impl ProxyHttp for Gateway {
             }
         }
 
-        let connection_limit = connection_limit(plan.handler, plan.route);
-        let Some(permit) = self
-            .connections
-            .acquire("conn_per_ip", client_ip, connection_limit)
-        else {
-            return send_empty(
-                session,
-                429,
-                Some(plan.handler),
-                tls,
-                &[("retry-after", "1")],
-            )
-            .await;
-        };
+        if self.runtime.config.server.global_active_requests > 0 {
+            let Some(permit) = self.active_requests.acquire(
+                "global",
+                client_ip,
+                self.runtime.config.server.global_active_requests,
+            ) else {
+                return send_empty(
+                    session,
+                    429,
+                    Some(plan.handler),
+                    tls,
+                    &[("retry-after", "1")],
+                )
+                .await;
+            };
+            ctx._global_request_permit = Some(permit);
+        }
+
+        if let Some(active_limit) = effective_active_limit(&self.runtime, plan.handler, plan.route)
+        {
+            let Some(permit) =
+                self.active_requests
+                    .acquire(plan.route.name(), client_ip, active_limit)
+            else {
+                return send_empty(
+                    session,
+                    429,
+                    Some(plan.handler),
+                    tls,
+                    &[("retry-after", "1")],
+                )
+                .await;
+            };
+            ctx._active_request_permit = Some(permit);
+        }
 
         let timeout = Duration::from_secs(plan.route.timeout_seconds());
         session.set_read_timeout(Some(timeout));
@@ -299,7 +368,6 @@ impl ProxyHttp for Gateway {
         session.set_keepalive(Some(30));
         session.set_keepalive_reuses_remaining(Some(500));
 
-        ctx._connection_permit = Some(permit);
         Ok(false)
     }
 
@@ -322,11 +390,9 @@ impl ProxyHttp for Gateway {
             Some(Duration::from_secs(upstream.connect_timeout_seconds));
         peer.options.total_connection_timeout =
             Some(Duration::from_secs(upstream.connect_timeout_seconds));
-        let route_timeout = Duration::from_secs(plan.route.timeout_seconds());
-        peer.options.read_timeout =
-            Some(route_timeout.max(Duration::from_secs(upstream.read_timeout_seconds)));
-        peer.options.write_timeout =
-            Some(route_timeout.max(Duration::from_secs(upstream.write_timeout_seconds)));
+        let (read_timeout, write_timeout) = upstream_timeouts(plan.route, upstream);
+        peer.options.read_timeout = Some(read_timeout);
+        peer.options.write_timeout = Some(write_timeout);
         peer.options.idle_timeout = Some(Duration::from_secs(upstream.idle_timeout_seconds));
         peer.options.verify_cert = upstream.verify_certificate;
         peer.options.verify_hostname = upstream.verify_certificate;
@@ -440,14 +506,65 @@ impl ProxyHttp for Gateway {
 
     fn fail_to_connect(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         _peer: &HttpPeer,
         ctx: &mut Self::CTX,
         mut error: Box<Error>,
     ) -> Box<Error> {
-        if ctx.retries < 1 {
+        let retryable_error = matches!(
+            error.etype(),
+            ErrorType::ConnectTimedout
+                | ErrorType::ConnectRefused
+                | ErrorType::ConnectNoRoute
+                | ErrorType::ConnectError
+                | ErrorType::TLSHandshakeTimedout
+        );
+        let should_retry = retryable_error
+            && request_is_replay_safe(session)
+            && ctx.retries < self.runtime.config.server.max_retries;
+        warn!(
+            "upstream connect failure category={} attempt={} configured_retries={} retry={} method={}",
+            error.etype().as_str(),
+            ctx.retries + 1,
+            self.runtime.config.server.max_retries,
+            should_retry,
+            session.req_header().method
+        );
+        if should_retry {
             ctx.retries += 1;
             error.set_retry(true);
+        } else {
+            error.set_retry(false);
+        }
+        error
+    }
+
+    fn error_while_proxy(
+        &self,
+        peer: &HttpPeer,
+        session: &mut Session,
+        mut error: Box<Error>,
+        ctx: &mut Self::CTX,
+        client_reused: bool,
+    ) -> Box<Error> {
+        let can_retry = client_reused
+            && request_is_replay_safe(session)
+            && session.response_written().is_none()
+            && !session.as_ref().retry_buffer_truncated()
+            && ctx.retries < self.runtime.config.server.max_retries;
+        error.retry.decide_reuse(can_retry);
+        let should_retry = can_retry && error.retry.retry();
+        error.set_retry(should_retry);
+        if should_retry {
+            ctx.retries += 1;
+            warn!(
+                "upstream reused-connection retry category={} retry={}/{} method={} peer={}",
+                error.etype().as_str(),
+                ctx.retries,
+                self.runtime.config.server.max_retries,
+                session.req_header().method,
+                peer
+            );
         }
         error
     }
@@ -459,9 +576,10 @@ impl ProxyHttp for Gateway {
             .map_or(0, |response| response.status.as_u16());
         if let Some(error) = error {
             warn!(
-                "proxy error client={} status={} elapsed_ms={} error={}",
+                "proxy error client={} status={} retries={} elapsed_ms={} error={}",
                 ctx.client_ip,
                 status,
+                ctx.retries,
                 elapsed.as_millis(),
                 error
             );
@@ -503,6 +621,16 @@ fn content_length(request: &RequestHeader) -> Option<usize> {
         .and_then(|value| value.parse().ok())
 }
 
+fn request_is_replay_safe(session: &Session) -> bool {
+    request_header_is_replay_safe(session.req_header())
+}
+
+fn request_header_is_replay_safe(request: &RequestHeader) -> bool {
+    matches!(request.method, Method::GET | Method::HEAD)
+        && content_length(request).is_none_or(|length| length == 0)
+        && !request.headers.contains_key(TRANSFER_ENCODING)
+}
+
 fn is_tls(session: &Session) -> bool {
     session
         .digest()
@@ -525,7 +653,7 @@ fn vaultwarden_auth_path(path: &str) -> bool {
     })
 }
 
-fn connection_limit(handler: HandlerKind, route: RouteClass) -> usize {
+fn default_active_limit(handler: HandlerKind, route: RouteClass) -> usize {
     match handler {
         HandlerKind::NavidromeCdn if route == RouteClass::NavidromeStream => 12,
         HandlerKind::NavidromeCdn => 48,
@@ -536,6 +664,53 @@ fn connection_limit(handler: HandlerKind, route: RouteClass) -> usize {
         HandlerKind::AdguardDns | HandlerKind::AdguardKorea => 96,
         HandlerKind::Static => 1,
     }
+}
+
+fn effective_active_limit(
+    runtime: &RuntimeConfig,
+    handler: HandlerKind,
+    route: RouteClass,
+) -> Option<usize> {
+    let configured = runtime
+        .config
+        .route_limits
+        .get(route.name())
+        .and_then(|limit| limit.active_requests);
+    let limit = configured.unwrap_or_else(|| default_active_limit(handler, route));
+    (limit > 0).then_some(limit)
+}
+
+fn effective_rate_limit(runtime: &RuntimeConfig, route: RouteClass) -> Option<(f64, u32)> {
+    let defaults = route.default_rate_limit();
+    let configured = runtime.config.route_limits.get(route.name());
+    let rate = configured
+        .and_then(|limit| limit.rate_per_second)
+        .or_else(|| defaults.map(|(rate, _)| rate))?;
+    if rate == 0.0 {
+        return None;
+    }
+    let burst = configured
+        .and_then(|limit| limit.burst)
+        .or_else(|| defaults.map(|(_, burst)| burst))
+        .unwrap_or(0);
+    Some((rate, burst))
+}
+
+fn upstream_timeouts(
+    route: RouteClass,
+    upstream: &crate::config::UpstreamConfig,
+) -> (Duration, Duration) {
+    let route_default = Duration::from_secs(route.timeout_seconds());
+    (
+        upstream
+            .read_timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or(route_default),
+        upstream
+            .write_timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or(route_default),
+    )
 }
 
 pub fn resolve_client_ip(
@@ -628,6 +803,55 @@ async fn send_empty(
     Ok(true)
 }
 
+async fn send_health_details(session: &mut Session, runtime: &RuntimeConfig) -> Result<bool> {
+    let check_upstreams = session
+        .req_header()
+        .uri
+        .query()
+        .is_some_and(|query| query.split('&').any(|value| value == "upstreams=1"));
+    let mut upstreams = std::collections::BTreeMap::new();
+    let mut ready = true;
+    if check_upstreams {
+        for (name, upstream) in &runtime.config.upstreams {
+            let connected = tokio::time::timeout(
+                Duration::from_millis(500),
+                tokio::net::TcpStream::connect(upstream.address.as_str()),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok());
+            ready &= connected;
+            upstreams.insert(name.as_str(), connected);
+        }
+    }
+    let body = serde_json::to_vec(&json!({
+        "product": "Pingora",
+        "liveness": true,
+        "readiness": ready,
+        "listeners": {
+            "http": runtime.config.server.http_listen,
+            "https": runtime.config.server.https_listen,
+        },
+        "certificate_loaded": !runtime.config.server.https_listen.is_empty(),
+        "upstreams_checked": check_upstreams,
+        "upstreams": upstreams,
+    }))
+    .map_err(|error| Error::because(HTTPStatus(500), "health JSON serialization failed", error))?;
+    let mut response = ResponseHeader::build(if ready { 200 } else { 503 }, Some(8)).unwrap();
+    response.insert_header("content-type", "application/json")?;
+    response.insert_header(CONTENT_LENGTH, body.len().to_string())?;
+    response.insert_header("cache-control", "no-store")?;
+    response.insert_header("x-proxy-product", "Pingora")?;
+    session
+        .write_response_header(Box::new(response), body.is_empty())
+        .await?;
+    if !body.is_empty() {
+        session
+            .write_response_body(Some(Bytes::from(body)), true)
+            .await?;
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,5 +904,58 @@ hosts:
         assert!(vaultwarden_auth_path("/api/accounts/login"));
         assert!(vaultwarden_auth_path("/identity/connect/token/extra"));
         assert!(!vaultwarden_auth_path("/api/accounts/login-evil"));
+    }
+
+    #[test]
+    fn retries_only_bodyless_get_and_head_requests() {
+        let get = RequestHeader::build(Method::GET, b"/", None).unwrap();
+        assert!(request_header_is_replay_safe(&get));
+
+        let mut get_with_body = RequestHeader::build(Method::GET, b"/", None).unwrap();
+        get_with_body.insert_header(CONTENT_LENGTH, "1").unwrap();
+        assert!(!request_header_is_replay_safe(&get_with_body));
+
+        let post = RequestHeader::build(Method::POST, b"/", None).unwrap();
+        assert!(!request_header_is_replay_safe(&post));
+        let put = RequestHeader::build(Method::PUT, b"/", None).unwrap();
+        assert!(!request_header_is_replay_safe(&put));
+    }
+
+    #[test]
+    fn explicit_upstream_timeout_overrides_long_route_default() {
+        let upstream: crate::config::UpstreamConfig = serde_yaml::from_str(
+            r#"
+address: "127.0.0.1:9000"
+read_timeout_seconds: 7
+write_timeout_seconds: 9
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            upstream_timeouts(RouteClass::NavidromeStream, &upstream),
+            (Duration::from_secs(7), Duration::from_secs(9))
+        );
+        assert_eq!(
+            upstream_timeouts(RouteClass::VaultwardenHub, &upstream),
+            (Duration::from_secs(7), Duration::from_secs(9))
+        );
+    }
+
+    #[test]
+    fn omitted_upstream_timeout_uses_each_route_default() {
+        let upstream: crate::config::UpstreamConfig =
+            serde_yaml::from_str("address: 127.0.0.1:9000").unwrap();
+        assert_eq!(
+            upstream_timeouts(RouteClass::NavidromeStream, &upstream),
+            (Duration::from_secs(3600), Duration::from_secs(3600))
+        );
+        assert_eq!(
+            upstream_timeouts(RouteClass::VaultwardenHub, &upstream),
+            (Duration::from_secs(86_400), Duration::from_secs(86_400))
+        );
+        assert_eq!(
+            upstream_timeouts(RouteClass::Doh, &upstream),
+            (Duration::from_secs(30), Duration::from_secs(30))
+        );
     }
 }

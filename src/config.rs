@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,6 +18,18 @@ fn default_keepalive_pool() -> usize {
 
 fn default_max_retries() -> usize {
     2
+}
+
+fn default_http2_max_concurrent_streams() -> u32 {
+    128
+}
+
+fn default_health_socket() -> PathBuf {
+    PathBuf::from("/tmp/pingora/health.sock")
+}
+
+fn default_legacy_health_endpoint() -> bool {
+    true
 }
 
 fn default_graceful_shutdown() -> u64 {
@@ -39,10 +52,6 @@ fn default_connect_timeout() -> u64 {
     5
 }
 
-fn default_read_timeout() -> u64 {
-    60
-}
-
 fn default_idle_timeout() -> u64 {
     15
 }
@@ -54,6 +63,8 @@ pub struct Config {
     pub trusted_proxies: Vec<IpNet>,
     pub upstreams: BTreeMap<String, UpstreamConfig>,
     pub hosts: BTreeMap<String, HostConfig>,
+    #[serde(default)]
+    pub route_limits: BTreeMap<String, RouteLimitConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,8 +72,10 @@ pub struct Config {
 pub struct ServerConfig {
     pub http_listen: Vec<String>,
     pub https_listen: Vec<String>,
-    pub certificate: PathBuf,
-    pub private_key: PathBuf,
+    #[serde(default)]
+    pub certificate: Option<PathBuf>,
+    #[serde(default)]
+    pub private_key: Option<PathBuf>,
     #[serde(default = "default_threads")]
     pub threads: usize,
     #[serde(default = "default_keepalive_pool")]
@@ -75,6 +88,16 @@ pub struct ServerConfig {
     pub static_cache_bytes: usize,
     #[serde(default)]
     pub access_log: bool,
+    #[serde(default = "default_health_socket")]
+    pub health_socket: PathBuf,
+    #[serde(default = "default_legacy_health_endpoint")]
+    pub legacy_pingola_health: bool,
+    #[serde(default)]
+    pub health_details: bool,
+    #[serde(default)]
+    pub global_active_requests: usize,
+    #[serde(default = "default_http2_max_concurrent_streams")]
+    pub http2_max_concurrent_streams: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,10 +112,10 @@ pub struct UpstreamConfig {
     pub verify_certificate: bool,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_seconds: u64,
-    #[serde(default = "default_read_timeout")]
-    pub read_timeout_seconds: u64,
-    #[serde(default = "default_read_timeout")]
-    pub write_timeout_seconds: u64,
+    #[serde(default)]
+    pub read_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub write_timeout_seconds: Option<u64>,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_seconds: u64,
 }
@@ -128,6 +151,20 @@ pub struct HostConfig {
     pub redirect_http: bool,
     #[serde(default = "default_body_limit")]
     pub max_body_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteLimitConfig {
+    /// Requests per second. Zero disables the rate limiter for this route.
+    #[serde(default)]
+    pub rate_per_second: Option<f64>,
+    /// Extra token-bucket capacity. Zero means no burst beyond the base rate.
+    #[serde(default)]
+    pub burst: Option<u32>,
+    /// Concurrent active requests/H2 streams. Zero disables this route limit.
+    #[serde(default)]
+    pub active_requests: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -200,12 +237,44 @@ fn validate(config: &Config) -> Result<()> {
     if config.server.threads == 0 {
         bail!("server.threads must be greater than zero");
     }
+    if config.server.threads > 64 {
+        bail!("server.threads must not exceed 64");
+    }
+    if config.server.max_retries > 10 {
+        bail!("server.max_retries must not exceed 10");
+    }
+    if !(1..=1024).contains(&config.server.http2_max_concurrent_streams) {
+        bail!("server.http2_max_concurrent_streams must be between 1 and 1024");
+    }
     if config.server.static_cache_bytes == 0 {
         bail!("server.static_cache_bytes must be greater than zero");
     }
+    if config.server.health_socket.as_os_str().is_empty()
+        || !config.server.health_socket.is_absolute()
+    {
+        bail!("server.health_socket must be an absolute path");
+    }
+    for (kind, addresses) in [
+        ("HTTP", &config.server.http_listen),
+        ("HTTPS", &config.server.https_listen),
+    ] {
+        for address in addresses {
+            address.parse::<SocketAddr>().with_context(|| {
+                format!("server {kind} listener has invalid socket address {address}")
+            })?;
+        }
+    }
     if !config.server.https_listen.is_empty()
-        && (config.server.certificate.as_os_str().is_empty()
-            || config.server.private_key.as_os_str().is_empty())
+        && (config
+            .server
+            .certificate
+            .as_ref()
+            .is_none_or(|path| path.as_os_str().is_empty())
+            || config
+                .server
+                .private_key
+                .as_ref()
+                .is_none_or(|path| path.as_os_str().is_empty()))
     {
         bail!("certificate and private_key are required for HTTPS listeners");
     }
@@ -257,6 +326,45 @@ fn validate(config: &Config) -> Result<()> {
         if upstream.tls && upstream.sni.as_deref().unwrap_or_default().is_empty() {
             bail!("TLS upstream {name} requires sni");
         }
+        if upstream.connect_timeout_seconds == 0 || upstream.idle_timeout_seconds == 0 {
+            bail!("upstream {name} timeout values must be greater than zero");
+        }
+        if upstream.read_timeout_seconds == Some(0) || upstream.write_timeout_seconds == Some(0) {
+            bail!("upstream {name} explicit read/write timeouts must be greater than zero");
+        }
+    }
+
+    const ROUTES: &[&str] = &[
+        "navidrome_stream",
+        "navidrome_cover",
+        "navidrome_api",
+        "vaultwarden_auth",
+        "vaultwarden_hub",
+        "vaultwarden",
+        "couchdb",
+        "doh",
+        "adguard_ui",
+    ];
+    for (name, limit) in &config.route_limits {
+        if !ROUTES.contains(&name.as_str()) {
+            bail!("route_limits contains unknown route {name}");
+        }
+        if let Some(rate) = limit.rate_per_second {
+            if !rate.is_finite() || !(0.0..=1_000_000.0).contains(&rate) {
+                bail!(
+                    "route_limits.{name}.rate_per_second must be finite and between 0 and 1000000"
+                );
+            }
+        }
+        if limit.burst.is_some_and(|burst| burst > 1_000_000) {
+            bail!("route_limits.{name}.burst must not exceed 1000000");
+        }
+        if limit
+            .active_requests
+            .is_some_and(|active| active > 1_000_000)
+        {
+            bail!("route_limits.{name}.active_requests must not exceed 1000000");
+        }
     }
 
     Ok(())
@@ -272,8 +380,6 @@ mod tests {
 server:
   http_listen: ["127.0.0.1:8080"]
   https_listen: []
-  certificate: /tmp/cert.pem
-  private_key: /tmp/key.pem
 trusted_proxies: ["127.0.0.0/8"]
 upstreams:
   app:
@@ -306,6 +412,31 @@ hosts:
     fn rejects_unknown_upstream() {
         let mut config = sample_config();
         config.hosts.get_mut("app").unwrap().upstream = Some("missing".into());
+        assert!(RuntimeConfig::new(config).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_listener_address() {
+        let mut config = sample_config();
+        config.server.http_listen = vec!["localhost:not-a-port".into()];
+        assert!(RuntimeConfig::new(config).is_err());
+    }
+
+    #[test]
+    fn accepts_http_only_without_tls_files() {
+        assert!(RuntimeConfig::new(sample_config()).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_finite_route_rate() {
+        let mut config = sample_config();
+        config.route_limits.insert(
+            "doh".into(),
+            RouteLimitConfig {
+                rate_per_second: Some(f64::INFINITY),
+                ..RouteLimitConfig::default()
+            },
+        );
         assert!(RuntimeConfig::new(config).is_err());
     }
 }

@@ -3,14 +3,15 @@ server:
     - "127.0.0.1:18080"
   https_listen:
     - "127.0.0.1:18443"
-  certificate: /tmp/pingola-integration/cert.pem
-  private_key: /tmp/pingola-integration/key.pem
+  certificate: /tmp/pingora-integration/cert.pem
+  private_key: /tmp/pingora-integration/key.pem
   threads: 1
   upstream_keepalive_pool_size: 16
   max_retries: 1
   graceful_shutdown_timeout_seconds: 2
   static_cache_bytes: 4194304
   access_log: true
+  health_socket: /tmp/pingora-integration/health.sock
 
 trusted_proxies:
   - "127.0.0.0/8"
@@ -25,7 +26,7 @@ hosts:
     domains:
       - static.test
     handler: static
-    static_root: /tmp/pingola-integration/www
+    static_root: /tmp/pingora-integration/www
   app:
     domains:
       - app.test
@@ -39,4 +40,3 @@ hosts:
     handler: vaultwarden
     upstream: backend
     redirect_http: true
-

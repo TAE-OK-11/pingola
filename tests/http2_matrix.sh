@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Preserve every raw response under /tmp/pingola-h2-matrix and continue after
+# Preserve every raw response under /tmp/pingora-h2-matrix and continue after
 # individual failures so one protocol cannot hide results from the others.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-RUNTIME=${PINGOLA_H2_RUNTIME:-/tmp/pingola-h2-matrix}
+RUNTIME=${PINGORA_H2_RUNTIME:-/tmp/pingora-h2-matrix}
 RESULTS=${RUNTIME}/results.tsv
 GATEWAY_PID=
 BACKEND_PID=
@@ -75,7 +75,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj "/CN=matrix.test" -addext "subjectAltName=DNS:matrix.test" \
   -keyout "${RUNTIME}/key.pem" -out "${RUNTIME}/cert.pem" >/dev/null 2>&1
 
-cat >"${RUNTIME}/pingola.yaml" <<EOF
+cat >"${RUNTIME}/pingora.yaml" <<EOF
 server:
   http_listen: ["127.0.0.1:18081"]
   https_listen: ["127.0.0.1:18444"]
@@ -86,6 +86,7 @@ server:
   max_retries: 1
   graceful_shutdown_timeout_seconds: 2
   static_cache_bytes: 1048576
+  health_socket: ${RUNTIME}/health.sock
 trusted_proxies: ["127.0.0.0/8"]
 upstreams:
   matrix:
@@ -103,17 +104,17 @@ python3 "${ROOT}/tests/h2_matrix_backend.py" >"${RUNTIME}/backend.stdout" \
   2>"${RUNTIME}/backend.stderr" &
 BACKEND_PID=$!
 
-if [[ ! -x "${ROOT}/target/debug/pingola" ]]; then
+if [[ ! -x "${ROOT}/target/debug/pingora" ]]; then
   cargo build --manifest-path "${ROOT}/Cargo.toml" || exit 1
 fi
-RUST_LOG=debug "${ROOT}/target/debug/pingola" --config "${RUNTIME}/pingola.yaml" \
+RUST_LOG=debug "${ROOT}/target/debug/pingora" --config "${RUNTIME}/pingora.yaml" \
   >"${RUNTIME}/gateway.stdout" 2>"${RUNTIME}/gateway.stderr" &
 GATEWAY_PID=$!
 
 ready=0
 for _ in {1..100}; do
   if curl --noproxy '*' -fsS -H 'host: matrix.test' \
-    http://127.0.0.1:18081/pingola-health -o /dev/null 2>/dev/null; then
+    http://127.0.0.1:18081/pingora-health -o /dev/null 2>/dev/null; then
     ready=1
     break
   fi

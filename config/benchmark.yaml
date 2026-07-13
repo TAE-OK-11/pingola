@@ -1,0 +1,39 @@
+# Pure localhost proxy benchmark configuration. Generate the referenced
+# certificate under /tmp/pingora-bench before use. Every application limiter is
+# disabled so 429 responses cannot be mistaken for benchmark throughput.
+server:
+  http_listen: ["127.0.0.1:18090"]
+  https_listen: ["127.0.0.1:18490"]
+  certificate: /tmp/pingora-bench/cert.pem
+  private_key: /tmp/pingora-bench/key.pem
+  health_socket: /tmp/pingora-bench/health.sock
+  threads: 1
+  upstream_keepalive_pool_size: 128
+  max_retries: 0
+  graceful_shutdown_timeout_seconds: 2
+  static_cache_bytes: 1048576
+  access_log: false
+  legacy_pingola_health: false
+  http2_max_concurrent_streams: 128
+trusted_proxies: ["127.0.0.0/8", "::1/128"]
+upstreams:
+  benchmark:
+    address: "127.0.0.1:19095"
+    connect_timeout_seconds: 2
+    read_timeout_seconds: 3600
+    write_timeout_seconds: 3600
+hosts:
+  benchmark:
+    domains: ["bench.test"]
+    handler: adguard-dns
+    upstream: benchmark
+route_limits:
+  navidrome_stream: { rate_per_second: 0, active_requests: 0 }
+  navidrome_cover: { rate_per_second: 0, active_requests: 0 }
+  navidrome_api: { rate_per_second: 0, active_requests: 0 }
+  vaultwarden_auth: { rate_per_second: 0, active_requests: 0 }
+  vaultwarden_hub: { rate_per_second: 0, active_requests: 0 }
+  vaultwarden: { rate_per_second: 0, active_requests: 0 }
+  couchdb: { rate_per_second: 0, active_requests: 0 }
+  doh: { rate_per_second: 0, active_requests: 0 }
+  adguard_ui: { rate_per_second: 0, active_requests: 0 }

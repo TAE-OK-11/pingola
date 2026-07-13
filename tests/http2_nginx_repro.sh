@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Reproduce the reported path with the exact custom NGINX image:
-# client -> Pingola TLS/H2 -> tae00217/jbs-nginx:ultra-4.0 HTTP/1.1.
+# client -> Pingora TLS/H2 -> tae00217/jbs-nginx:ultra-4.0 HTTP/1.1.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-RUNTIME=${PINGOLA_NGINX_REPRO_RUNTIME:-/tmp/pingola-h2-nginx-repro}
+RUNTIME=${PINGORA_NGINX_REPRO_RUNTIME:-/tmp/pingora-h2-nginx-repro}
 IMAGE=${JBS_NGINX_IMAGE:-tae00217/jbs-nginx:ultra-4.0}
-CONTAINER=pingola-h2-nginx-repro-$$
+CONTAINER=pingora-h2-nginx-repro-$$
 GATEWAY_PID=
 FAILURES=0
 
@@ -69,7 +69,7 @@ fi
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj "/CN=matrix.test" -addext "subjectAltName=DNS:matrix.test" \
   -keyout "${RUNTIME}/key.pem" -out "${RUNTIME}/cert.pem" >/dev/null 2>&1
-cat >"${RUNTIME}/pingola.yaml" <<EOF
+cat >"${RUNTIME}/pingora.yaml" <<EOF
 server:
   http_listen: ["127.0.0.1:18082"]
   https_listen: ["127.0.0.1:18445"]
@@ -80,6 +80,7 @@ server:
   max_retries: 1
   graceful_shutdown_timeout_seconds: 2
   static_cache_bytes: 1048576
+  health_socket: ${RUNTIME}/health.sock
 trusted_proxies: ["127.0.0.0/8"]
 upstreams:
   nginx:
@@ -91,18 +92,18 @@ hosts:
     upstream: nginx
 EOF
 
-RUST_LOG=debug "${ROOT}/target/debug/pingola" --config "${RUNTIME}/pingola.yaml" \
+RUST_LOG=debug "${ROOT}/target/debug/pingora" --config "${RUNTIME}/pingora.yaml" \
   >"${RUNTIME}/gateway.stdout" 2>"${RUNTIME}/gateway.stderr" &
 GATEWAY_PID=$!
 for _ in {1..100}; do
   if curl --noproxy '*' -fsS -H 'host: matrix.test' \
-    http://127.0.0.1:18082/pingola-health -o /dev/null 2>/dev/null; then
+    http://127.0.0.1:18082/pingora-health -o /dev/null 2>/dev/null; then
     break
   fi
   sleep 0.1
 done
 kill -0 "${GATEWAY_PID}" 2>/dev/null || {
-  echo "Pingola failed to start; see ${RUNTIME}/gateway.stderr" >&2
+  echo "Pingora failed to start; see ${RUNTIME}/gateway.stderr" >&2
   exit 1
 }
 

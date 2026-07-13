@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-RUNTIME=/tmp/pingola-integration
+RUNTIME=/tmp/pingora-integration
 GATEWAY_LOG=${RUNTIME}/gateway.log
 BACKEND_LOG=${RUNTIME}/backend.log
 GATEWAY_PID=
@@ -32,19 +32,19 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 cargo build --manifest-path "${ROOT}/Cargo.toml"
 python3 "${ROOT}/tests/backend.py" >"${BACKEND_LOG}" 2>&1 &
 BACKEND_PID=$!
-RUST_LOG=info "${ROOT}/target/debug/pingola" \
+RUST_LOG=info "${ROOT}/target/debug/pingora" \
   --config "${ROOT}/tests/fixtures/integration.yaml" >"${GATEWAY_LOG}" 2>&1 &
 GATEWAY_PID=$!
 
 for _ in {1..50}; do
   if curl --noproxy '*' -fsS -H 'host: health.invalid' \
-    http://127.0.0.1:18080/pingola-health -o /dev/null 2>/dev/null; then
+    http://127.0.0.1:18080/pingora-health -o /dev/null 2>/dev/null; then
     break
   fi
   sleep 0.1
 done
 kill -0 "${GATEWAY_PID}"
-"${ROOT}/target/debug/pingola" --healthcheck 127.0.0.1:18080
+"${ROOT}/target/debug/pingora" --config "${ROOT}/tests/fixtures/integration.yaml" --healthcheck
 
 status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
   -H 'host: unknown.test' http://127.0.0.1:18080/)
@@ -57,7 +57,7 @@ location=$(curl --noproxy '*' -sSI -H 'host: app.test' \
 
 static_body=$(curl --noproxy '*' --compressed -fsS -H 'host: static.test' \
   -H 'accept-encoding: gzip' http://127.0.0.1:18080/)
-grep -q 'pingola-static-response' <<<"${static_body}"
+grep -q 'pingora-static-response' <<<"${static_body}"
 
 curl --noproxy '*' -sSI -H 'host: static.test' -H 'accept-encoding: zstd' \
   http://127.0.0.1:18080/ | grep -qi '^content-encoding: zstd'
@@ -116,4 +116,8 @@ if curl --noproxy '*' -ksSI --http2 --resolve app.test:18443:127.0.0.1 \
   exit 1
 fi
 
-echo 'Pingola integration checks passed'
+status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+  -H 'host: health.invalid' http://127.0.0.1:18080/nginx-health)
+[[ "${status}" == "404" ]]
+
+echo 'Pingora integration checks passed'

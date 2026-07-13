@@ -1,114 +1,263 @@
-# Pingola
+# Pingora
 
-Cloudflare의 [Pingora](https://github.com/cloudflare/pingora)로 만든 저오버헤드
-리버스 프록시입니다. 이 저장소의 기본 설정은 기존 Nginx 게이트웨이가 담당하던
-PiKKY, Navidrome, Vaultwarden, CouchDB, AdGuard Home/DoH 라우팅을 1 vCPU / 1 GB
-환경에서 대체하도록 구성되어 있습니다.
+Cloudflare [Pingora](https://github.com/cloudflare/pingora)를 기반으로 AWS-LC,
+HTTP/1.1, HTTP/2를 지원하는 JBS 리버스 프록시입니다. 기본 설정은 PiKKY 정적
+사이트, Navidrome, Vaultwarden, CouchDB, AdGuard Home/DoH를 1 vCPU / 1 GB Linux
+호스트에서 운영하도록 bounded cache·buffer·limiter를 사용합니다.
 
-## 구현 범위
+이 프로젝트의 이전 이름은 Pingola였습니다. Cargo package는 upstream `pingora`
+crate와 충돌하지 않도록 `jbs-pingora`, 실행 binary와 제품명은 `pingora`입니다.
+upstream dependency는 Rust 코드에서 `cloudflare_pingora` alias로 가져옵니다.
 
-- AWS-LC 전용 rustls 암호화 백엔드와 TLS 1.3 전용 다운스트림
-- HTTP/1.1 및 HTTP/2, 최대 동시 HTTP/2 스트림 32개
-- Host allowlist와 신뢰 프록시 기반 재귀적 `X-Forwarded-For` 검증
-- Navidrome 스트림/커버/API, Vaultwarden 인증/WebSocket, CouchDB 스트리밍,
-  AdGuard UI/DoH별 라우팅과 타임아웃
-- IP별 token-bucket 요청 제한과 활성 요청/스트림 제한
-- 본문 크기 제한, upstream 응답 헤더 제거, HSTS/nosniff/frame/referrer 보안 헤더
-- PiKKY 정적 파일의 SPA fallback, 경로 이탈 및 symlink 탈출 차단
-- 32 MiB 제한 LRU와 gzip 레벨 3, Brotli 레벨 3, Zstd 레벨 1 압축
-- 동적 압축 동시 실행 1개, 8 MiB 초과 정적 파일의 64 KiB 청크 스트리밍
-- 사전 압축된 `.gz`, `.br`, `.zst` 파일 우선 사용과 ETag/Last-Modified 처리
-- 단일 worker, 제한된 keepalive pool, release LTO/strip로 낮춘 CPU·메모리 오버헤드
-- UID 10001 비루트 컨테이너, 읽기 전용 root filesystem, 최소 Linux capability
+## 주요 기능과 한계
 
-Pingora 0.8.1의 rustls 어댑터는 기본적으로 Ring을 고정해서 가져옵니다. 이
-저장소는 해당 어댑터를 같은 API의 AWS-LC 버전으로 패치하므로 이미지에 Ring과
-AWS-LC가 중복 포함되지 않습니다.
+- AWS-LC를 사용하는 rustls와 다운스트림 TLS 1.3 전용 정책
+- HTTP/1.1 및 HTTP/2, 기본 최대 128개 동시 H2 stream
+- IPv4/IPv6 listener와 IPv6 socket의 명시적 `IPV6_V6ONLY=true`
+- Host allowlist, trusted proxy 기반 `X-Forwarded-For`, body 크기 제한
+- 서비스·route별 rate limit 및 active request/H2 stream limit
+- Navidrome audio 무압축 streaming, Vaultwarden hub, CouchDB replication, DoH 정책
+- PiKKY 정적 파일 gzip/Brotli/Zstd 동적·사전 압축, bounded LRU cache
+- AWS-LC TLS 파일 사전 검사와 UID/GID/mode/symlink 대상 진단
+- Rust global allocator로 정적 링크된 jemalloc 5.3.1
+- UID/GID `10001:10001`, read-only root filesystem, 최소 capability
 
-## 이미지 사용
+Pingora 0.8.1은 다운스트림 HTTP/3/QUIC server를 제공하지 않으므로 HTTP/3와
+`Alt-Svc`는 지원하지 않습니다. gzip/Brotli/Zstd는 PiKKY 정적 파일에만 적용하며
+proxy 응답과 audio stream에는 동적 압축을 하지 않습니다.
 
-`main` 브랜치 검증을 통과하면 GitHub Actions가 다음 이미지를 빌드하고 SBOM 및
-provenance와 함께 GHCR에 게시합니다.
+## 새 이름과 한 릴리스 호환성
+
+| 항목 | 새 기본값 | 임시 호환값 |
+|---|---|---|
+| binary | `pingora` | 없음 |
+| image | `ghcr.io/tae-ok-11/pingora` | `ghcr.io/tae-ok-11/pingola` 동일 manifest |
+| Compose service/container | `pingora` | 없음 |
+| config env | `PINGORA_CONFIG` | `PINGOLA_CONFIG` 경고 후 fallback |
+| config | `/etc/pingora/pingora.yaml` | `/etc/pingola/pingola.yaml` 경고 후 fallback |
+| working directory | `/tmp/pingora` | 없음 |
+| health | `/pingora-health` | `/pingola-health` 경고 후 alias |
+
+구 config/env/health alias는 한 릴리스 뒤 제거할 예정입니다. 새 이름을 먼저
+검색하고 구 이름을 실제로 사용할 때 프로세스당 한 번만 deprecated 경고를 냅니다.
+`/nginx-health`에는 항상 `404`를 반환합니다.
+
+저장소 이름은 코드와 CI에서 `TAE-OK-11/pingora`를 목표로 준비되어 있습니다.
+저장소 소유자가 마지막에 다음 명령을 실행해야 합니다.
 
 ```bash
-docker pull ghcr.io/tae-ok-11/pingola:latest
+gh repo rename pingora --repo TAE-OK-11/pingola --yes
+git remote set-url origin https://github.com/TAE-OK-11/pingora.git
+```
+
+## IPv4와 IPv6
+
+기본 [`config/pingora.yaml`](config/pingora.yaml)은 다음 네 listener를 동시에
+사용합니다.
+
+```yaml
+server:
+  http_listen: ["0.0.0.0:80", "[::]:80"]
+  https_listen: ["0.0.0.0:443", "[::]:443"]
+```
+
+AAAA record가 있는데 IPv6 listener가 없으면 IPv4에서는 정상이어도 AAAA를 먼저
+선택하는 휴대폰에서 접속이 실패할 수 있습니다. IPv6 listener는 커널의
+`net.ipv6.bindv6only` 기본값에 기대지 않고 `IPV6_V6ONLY=true`를 설정하므로 같은
+port의 IPv4 wildcard와 중복 bind하지 않습니다. 다음 명령은 모든 주소를 동시에
+실제 bind하여 충돌 주소를 표시합니다.
+
+```bash
+pingora --config config/pingora.yaml --check-bind
+```
+
+## Docker 배포와 인증서 mount
+
+`main` 검증을 통과한 image는 SBOM/provenance와 함께 GHCR에 게시됩니다.
+
+```bash
+docker pull ghcr.io/tae-ok-11/pingora:latest
+docker compose up -d
+docker compose ps
+```
+
+기본 Compose는 기존 `10.77.0.1` 및 localhost upstream 접근을 위해 host network를
+사용합니다. 같은 호스트의 80/tcp와 443/tcp가 비어 있어야 합니다.
+
+Let's Encrypt의 `live/<domain>/*.pem`은 실제 파일이 아니라
+`archive/<domain>/*N.pem`을 가리키는 symlink입니다. `live` directory나 PEM
+symlink만 mount하면 container 안에 archive 대상이 없어 broken symlink가 됩니다.
+따라서 기본 Compose는 전체 tree를 mount합니다.
+
+```yaml
+volumes:
+  - /etc/letsencrypt:/etc/pingora/cert:ro
+```
+
+다른 저장소를 사용하면 host root를 바꾸고 `config/pingora.yaml`의 내부 경로도
+그 mount 구조에 맞춥니다.
+
+```bash
+PINGORA_CERT_ROOT=/srv/my-certificate-store \
+PINGORA_CONFIG_FILE=./config/pingora.yaml \
 docker compose up -d
 ```
 
-기본 [`docker-compose.yml`](docker-compose.yml)은 Linux host network를 사용합니다.
-이는 기존 설정의 `10.77.0.1` upstream과 `127.0.0.1` Korea POP을 컨테이너에서도
-같은 주소로 접근하기 위해 필요합니다. 따라서 동일 호스트의 80/tcp와 443/tcp가
-비어 있어야 합니다. HTTP/3를 광고하지 않으므로 443/udp는 사용하지 않습니다.
+## 개인키 ACL과 Certbot 갱신
 
-운영 전 다음 마운트를 환경에 맞게 확인하십시오.
-
-- `./config/pingola.yaml` → `/etc/pingola/pingola.yaml`
-- `/etc/nginx/cert` → `/etc/pingola/cert`
-- `/var/www/pikky` → `/var/www/pikky`
-
-컨테이너가 UID/GID `10001:10001`로 실행되므로 인증서 체인과 개인 키는 해당
-사용자가 읽을 수 있어야 합니다. 키를 world-readable로 만들지 말고 전용 그룹이나
-ACL로 읽기 권한만 부여하십시오. 인증서와 키는 이미지에 포함되지 않습니다.
-
-로컬에서 직접 빌드하려면 다음 명령을 사용합니다. 기본 CPU 타깃 `x86-64-v2`는
-AMD EPYC Zen 계열을 포함합니다. 더 오래된 x86-64 CPU는 build arg를 `x86-64`로
-바꾸십시오.
+개인키를 world-readable로 변경하지 마십시오. Container UID 10001에만 directory
+traverse와 파일 read ACL을 줍니다. 아래 예시는 한 lineage에만 적용합니다.
 
 ```bash
-docker build --build-arg RUST_TARGET_CPU=x86-64-v2 -t pingola:local .
+DOMAIN=tae00217.cloud
+sudo apt-get install -y acl
+sudo setfacl -m u:10001:--x /etc/letsencrypt /etc/letsencrypt/live \
+  "/etc/letsencrypt/live/$DOMAIN" /etc/letsencrypt/archive \
+  "/etc/letsencrypt/archive/$DOMAIN"
+sudo setfacl -R -m u:10001:r-X "/etc/letsencrypt/archive/$DOMAIN"
+sudo setfacl -m d:u:10001:r-X "/etc/letsencrypt/archive/$DOMAIN"
+sudo getfacl "/etc/letsencrypt/archive/$DOMAIN"
 ```
 
-## 설정과 점검
-
-기본 운영 설정은 [`config/pingola.yaml`](config/pingola.yaml)에 있습니다. 실행하지
-않고 스키마와 라우팅 참조를 검사할 수 있습니다.
+특정 `privkey6.pem`에만 ACL을 주면 갱신 때 생성되는 `privkey7.pem`에는 권한이
+없습니다. archive lineage의 default ACL이나 Certbot deploy hook이 필요합니다.
+저장소의 hook은 새 archive target 권한을 적용하고 container UID로 인증서 open,
+PEM parse, certificate/key 일치를 검사한 뒤에만 Pingora를 재시작합니다.
 
 ```bash
-cargo run -- --config config/pingola.yaml --check
-docker run --rm \
-  -v "$PWD/config:/etc/pingola:ro" \
-  ghcr.io/tae-ok-11/pingola:latest --check
+sudo install -m 0755 scripts/certbot-deploy-hook.sh \
+  /etc/letsencrypt/renewal-hooks/deploy/pingora
+sudo PINGORA_COMPOSE_FILE=/opt/pingora/docker-compose.yml \
+  certbot renew --dry-run --run-deploy-hooks
 ```
 
-컨테이너 healthcheck는 외부 도구 없이 바이너리 자체로 plaintext listener의
-`/pingola-health`를 검사합니다.
+수동 갱신 검증은 다음과 같습니다.
 
 ```bash
-pingola --healthcheck 127.0.0.1:80
+readlink -f /etc/letsencrypt/live/tae00217.cloud/privkey.pem
+PINGORA_COMPOSE_FILE=/opt/pingora/docker-compose.yml \
+  scripts/validate-certificates.sh
+docker compose restart pingora
+docker compose exec pingora pingora --healthcheck
 ```
 
-설정 변경은 현재 무중단 reload 대신 컨테이너 재시작으로 반영합니다. 종료 신호를
-받으면 최대 60초 동안 진행 중 요청을 정리합니다. 평상시 access log는 꺼져 있고
-오류는 stderr에 기록됩니다. 문제 분석이 필요할 때만 `server.access_log: true`로
-켜는 것이 저사양 환경에 유리합니다.
+`--check` 오류에는 입력 경로, 현재 process UID/GID, 대상 owner UID/GID, mode,
+symlink 여부, 최종 target과 존재 여부가 포함됩니다. 개인키 내용은 출력하지 않습니다.
 
-## 검증
+## 두 단계 사전 검사
+
+`--check`는 첫 오류에서 중단하지 않고 가능한 오류를 모두 수집합니다.
+
+1. YAML/schema 및 host/upstream 참조 검증
+2. certificate/key 실제 open, PEM, key match, symlink target, static root 검증
+
+실제 port bind는 운영 listener를 순간 점유할 수 있으므로 `--check-bind`에서만
+추가합니다. 정상 startup은 race를 줄이기 위해 bind 검사를 포함한 전체 preflight를
+항상 먼저 실행합니다.
+
+```bash
+pingora --config config/pingora.yaml --check
+pingora --config config/pingora.yaml --check-bind
+docker compose run --rm --no-deps pingora --check
+```
+
+## Healthcheck
+
+Docker HEALTHCHECK는 `127.0.0.1:80`에 의존하지 않습니다. 설정의 local Unix socket
+(`/tmp/pingora/health.sock`)을 binary 자체가 검사하므로 HTTP listener가 없거나,
+HTTPS-only 또는 IPv6-only여도 동작합니다.
+
+- `/pingora-health`: 저오버헤드 204 및 `X-Proxy-Product: Pingora`
+- `/pingora-live`: process/listener liveness 204
+- `/pingora-ready`: startup preflight와 listener가 완료된 readiness 204
+- `/pingora-health/details`: `server.health_details: true`일 때 JSON
+- `/pingora-health/details?upstreams=1`: 각 upstream TCP connect 결과, 실패 시 503
+
+```bash
+pingora --config config/pingora.yaml --healthcheck
+PINGORA_HEALTH_TARGET='unix:/tmp/pingora/health.sock' pingora --healthcheck
+pingora --healthcheck tcp:'[::1]:8080'
+```
+
+실패 메시지는 실제 검사한 `unix:` 또는 `tcp:` target을 출력합니다.
+
+## Timeout, retry, limiter 설정
+
+Upstream `read_timeout_seconds`와 `write_timeout_seconds`를 생략하면 route 기본값을
+사용합니다. 명시하면 route 기본값보다 크거나 작아도 정확한 override입니다.
+Navidrome stream/CouchDB 3600초, Vaultwarden hub 86400초, Vaultwarden UI 300초,
+DoH 30초가 생략 시 기본값입니다.
+
+`server.max_retries`는 최초 시도 뒤의 추가 retry 횟수입니다. `0`, `1`, `2`는 각각
+총 1, 2, 3번 connect 시도입니다. Retry는 response가 client로 전송되기 전의 body
+없는 GET/HEAD와 transient connect 오류에만 허용합니다. POST/PUT/stream body,
+certificate 오류, upstream HTTP 502/503 response는 자동 재전송하지 않습니다.
+
+`route_limits`에서 기존 기본값을 선택적으로 override할 수 있습니다.
+
+```yaml
+route_limits:
+  navidrome_stream:
+    rate_per_second: 40
+    burst: 15
+    active_requests: 12
+  doh:
+    rate_per_second: 0   # rate limiter disabled
+    active_requests: 0   # active request/H2 stream limiter disabled
+```
+
+음수, NaN, infinity 및 1,000,000 초과 값은 거부합니다. Limit 이름의 단위는 TCP
+connection이 아니라 활성 HTTP request이며 HTTP/2에서는 stream입니다. 서비스별
+zone은 서로 격리되고, 전체 IP limit이 필요하면 `server.global_active_requests`를
+별도로 설정합니다. 설정 reload는 아직 지원하지 않으므로 변경 후 재시작해야 합니다.
+모든 limiter를 끈 [`config/benchmark.yaml`](config/benchmark.yaml)은 localhost
+benchmark 전용이며 운영에 사용하면 안 됩니다.
+
+## jemalloc 진단
+
+jemalloc은 `tikv-jemallocator` 0.7을 global allocator로 명시하여 정적 링크합니다.
+`LD_PRELOAD`나 system allocator 전환에 의존하지 않습니다. 평상시 stats 수집은
+하지 않습니다.
+
+```bash
+pingora --allocator-info
+PINGORA_JEMALLOC_STATS=1 pingora --config config/pingora.yaml
+```
+
+`MALLOC_CONF`는 측정 없이 image에 고정하지 않습니다.
+
+## 빌드와 검증
 
 ```bash
 cargo fmt --check
 cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
+tests/runtime_preflight.sh
+tests/listeners_health.sh
+tests/retries.sh
+tests/limit_isolation.sh
 tests/integration.sh
+tests/http2_matrix.sh
+tests/http2_nginx_repro.sh
+docker build --build-arg RUST_TARGET_CPU=x86-64-v2 -t pingora:local .
 ```
 
-통합 검사는 실제 TLS listener와 테스트 backend를 띄워 HTTP/2 ALPN, TLS 1.3 성공,
-TLS 1.2 거부, gzip/Zstd, HSTS, Host 차단, 308 redirect, 신뢰 IP 재작성, 413 본문
-제한, 429 속도 제한, upstream `Server` 헤더 제거를 확인합니다.
+`tests/http2_matrix.sh`는 HTTP/1.1/H2 fixed length, chunked, trailer, 204, HEAD,
+upstream close/keepalive/early EOF, TLS 1.3 ALPN, H2 concurrency 1/8/32를 검사하고
+body SHA-256과 raw curl/nghttp/h2load log를 `/tmp/pingora-h2-matrix`에 남깁니다.
+`tests/http2_nginx_repro.sh`는 upstream으로 반드시
+`tae00217/jbs-nginx:ultra-4.0` image를 사용합니다.
 
-## Nginx 대비 의도적인 차이
+## NGINX 대비 동작 차이
 
-- Pingora 0.8.1은 다운스트림 HTTP/3/QUIC 서버를 제공하지 않으므로 HTTP/3와
-  `Alt-Svc`는 지원하지 않습니다. HTTP/2는 완전히 지원합니다.
-- 알 수 없는 HTTP Host는 Nginx의 비표준 `444` 대신 표준 `421 Misdirected Request`로
-  거부합니다. rustls listener에서는 알 수 없는 SNI를 handshake 단계가 아니라
-  HTTP Host 단계에서 거부합니다.
-- 프록시 응답 압축은 기존 정책과 동일하게 하지 않습니다. Navidrome에만 클라이언트의
-  `Accept-Encoding`을 전달하고, gzip/Brotli/Zstd는 PiKKY 정적 파일에만 적용합니다.
-- 기존 DoH 설정과 동작을 맞추기 위해 `direct.tae00217.cloud` upstream 인증서 검증이
-  꺼져 있습니다. 내부 CA를 배포할 수 있다면 `verify_certificate: true`로 변경하는
-  것을 권장합니다.
+- 알 수 없는 Host는 비표준 444 대신 `421 Misdirected Request`로 거부합니다.
+- HTTP/3는 지원하지 않습니다.
+- Navidrome audio는 전체 buffering하거나 동적 압축하지 않습니다.
+- DoH upstream의 기존 운영 동작을 맞추기 위해 기본 config의
+  `verify_certificate: false`가 유지됩니다. 내부 CA를 배포할 수 있으면 반드시
+  `true`로 전환하십시오.
 
 ## 라이선스
 
-Apache-2.0. Vendored Pingora rustls 어댑터는 원본 Cloudflare 저작권과 라이선스를
-그 디렉터리에 함께 보존합니다.
+Apache-2.0. Vendored Pingora rustls adapter는 원본 Cloudflare 저작권과 라이선스를
+보존합니다.

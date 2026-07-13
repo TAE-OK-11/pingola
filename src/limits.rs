@@ -86,13 +86,13 @@ impl RateLimiter {
     }
 }
 
-/// Counts active requests per IP. For HTTP/1.1 this tracks connections closely;
-/// for HTTP/2 it intentionally counts streams, which is the safer bound.
-pub struct ConnectionLimiter {
+/// Counts active requests per IP. HTTP/2 requests are streams, not TCP
+/// connections, so the type intentionally describes what is actually bounded.
+pub struct ActiveRequestLimiter {
     counters: Arc<DashMap<ClientKey, Arc<AtomicUsize>>>,
 }
 
-impl ConnectionLimiter {
+impl ActiveRequestLimiter {
     pub fn new() -> Self {
         Self {
             counters: Arc::new(DashMap::new()),
@@ -104,7 +104,7 @@ impl ConnectionLimiter {
         zone: &'static str,
         ip: IpAddr,
         limit: usize,
-    ) -> Option<ConnectionPermit> {
+    ) -> Option<ActiveRequestPermit> {
         let key = ClientKey { zone, ip };
         let counter = self
             .counters
@@ -118,7 +118,7 @@ impl ConnectionLimiter {
             })
             .ok()?;
 
-        Some(ConnectionPermit {
+        Some(ActiveRequestPermit {
             counters: self.counters.clone(),
             key,
             counter,
@@ -126,13 +126,13 @@ impl ConnectionLimiter {
     }
 }
 
-pub struct ConnectionPermit {
+pub struct ActiveRequestPermit {
     counters: Arc<DashMap<ClientKey, Arc<AtomicUsize>>>,
     key: ClientKey,
     counter: Arc<AtomicUsize>,
 }
 
-impl Drop for ConnectionPermit {
+impl Drop for ActiveRequestPermit {
     fn drop(&mut self) {
         if self.counter.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.counters.remove_if(&self.key, |_, current| {
@@ -157,12 +157,22 @@ mod tests {
     }
 
     #[test]
-    fn connection_permit_releases_capacity() {
-        let limiter = ConnectionLimiter::new();
+    fn active_request_permit_releases_capacity() {
+        let limiter = ActiveRequestLimiter::new();
         let ip = "192.0.2.2".parse().unwrap();
         let permit = limiter.acquire("host", ip, 1).unwrap();
         assert!(limiter.acquire("host", ip, 1).is_none());
         drop(permit);
         assert!(limiter.acquire("host", ip, 1).is_some());
+    }
+
+    #[test]
+    fn zones_are_isolated_for_the_same_client() {
+        let limiter = ActiveRequestLimiter::new();
+        let ip = "192.0.2.3".parse().unwrap();
+        let _stream = limiter.acquire("navidrome_stream", ip, 1).unwrap();
+        assert!(limiter.acquire("navidrome_stream", ip, 1).is_none());
+        assert!(limiter.acquire("vaultwarden", ip, 1).is_some());
+        assert!(limiter.acquire("doh", ip, 1).is_some());
     }
 }

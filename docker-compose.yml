@@ -1,6 +1,7 @@
 services:
-  pingola:
-    image: ghcr.io/tae-ok-11/pingola:latest
+  pingora:
+    container_name: pingora
+    image: ghcr.io/tae-ok-11/pingora:latest
     build:
       context: .
       args:
@@ -13,9 +14,10 @@ services:
     cap_add:
       - NET_BIND_SERVICE
     tmpfs:
-      - /tmp:size=16m,mode=1770,uid=10001,gid=10001
+      - /tmp/pingora:size=16m,mode=0700,uid=10001,gid=10001
+    environment:
+      PINGORA_CONFIG: /etc/pingora/pingora.yaml
     volumes:
-      - ./config/pingola.yaml:/etc/pingola/pingola.yaml:ro
-      - /etc/nginx/cert:/etc/pingola/cert:ro
+      - ${PINGORA_CONFIG_FILE:-./config/pingora.yaml}:/etc/pingora/pingora.yaml:ro
+      - ${PINGORA_CERT_ROOT:-/etc/letsencrypt}:/etc/pingora/cert:ro
       - /var/www/pikky:/var/www/pikky:ro
-
