@@ -1,0 +1,6 @@
+/target
+*.pem
+*.key
+*.crt
+.env
+
