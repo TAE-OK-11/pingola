@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGE=${PINGORA_TEST_IMAGE:-ghcr.io/tae-ok-11/pingora:local}
+EXPECTED_ALLOCATOR=${PINGORA_EXPECTED_ALLOCATOR:-tcmalloc}
 RUNTIME=${PINGORA_DOCKER_TEST_RUNTIME:-/tmp/pingora-docker-runtime}
 CONTAINERS=()
 
@@ -81,7 +82,8 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "${name}") == true ]]
   [[ $(docker inspect --format '{{json .HostConfig.CapDrop}}' "${name}") == '["ALL"]' ]]
   [[ $(docker inspect --format '{{json .HostConfig.CapAdd}}' "${name}") == '["CAP_NET_BIND_SERVICE"]' ]]
-  docker exec "${name}" /usr/local/bin/pingora --allocator-info | grep -q '^allocator=jemalloc '
+  docker exec "${name}" /usr/local/bin/pingora --allocator-info \
+    | grep -q "^allocator=${EXPECTED_ALLOCATOR} "
 }
 
 write_config "${RUNTIME}/http.yaml" '["127.0.0.1:18570"]' '[]'
@@ -117,4 +119,4 @@ curl --noproxy '*' -gkfsS --http2 --resolve health.test:18571:[::1] \
 docker exec pingora-test-https-ipv6 /usr/local/bin/pingora \
   --config /etc/pingora/pingora.yaml --check >/dev/null
 
-echo "Docker UID 10001, read-only filesystem, HTTP-only, HTTPS-only, IPv6-only, healthcheck, and jemalloc tests passed"
+echo "Docker UID 10001, read-only filesystem, HTTP-only, HTTPS-only, IPv6-only, healthcheck, and ${EXPECTED_ALLOCATOR} tests passed"

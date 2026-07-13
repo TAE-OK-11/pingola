@@ -19,7 +19,7 @@ upstream dependency는 Rust 코드에서 `cloudflare_pingora` alias로 가져옵
 - Navidrome audio 무압축 streaming, Vaultwarden hub, CouchDB replication, DoH 정책
 - PiKKY 정적 파일 gzip/Brotli/Zstd 동적·사전 압축, bounded LRU cache
 - AWS-LC TLS 파일 사전 검사와 UID/GID/mode/symlink 대상 진단
-- Rust global allocator로 정적 링크된 jemalloc 5.3.1
+- Rust global allocator로 정적 링크된 Google TCMalloc(8 KiB logical page)
 - UID/GID `10001:10001`, read-only root filesystem, 최소 capability
 
 Pingora 0.8.1은 다운스트림 HTTP/3/QUIC server를 제공하지 않으므로 HTTP/3와
@@ -213,33 +213,41 @@ zone은 서로 격리되고, 전체 IP limit이 필요하면 `server.global_acti
 모든 limiter를 끈 [`config/benchmark.yaml`](config/benchmark.yaml)은 localhost
 benchmark 전용이며 운영에 사용하면 안 됩니다.
 
-## jemalloc 진단
+## TCMalloc 선택과 진단
 
-jemalloc은 `tikv-jemallocator` 0.7을 global allocator로 명시하여 정적 링크합니다.
-`LD_PRELOAD`나 system allocator 전환에 의존하지 않습니다. 평상시 stats 수집은
-하지 않습니다.
+배포 binary는 `tcmalloc-better` 0.1.19가 포함한 Google TCMalloc/Abseil 소스를
+8 KiB logical page 설정으로 빌드하고 Rust global allocator로 명시적으로
+등록합니다. 빌드 중 별도 Git 저장소나 tarball을 받지 않으며 `LD_PRELOAD`에도
+의존하지 않습니다. 1 vCPU 환경에서 확인되지 않은 background thread, huge-page,
+arena 튜닝은 image에 강제하지 않습니다.
 
 ```bash
 pingora --allocator-info
-PINGORA_JEMALLOC_STATS=1 pingora --config config/pingora.yaml
+PINGORA_ALLOCATOR_STATS=1 pingora --config config/pingora.yaml
 ```
 
-`MALLOC_CONF`는 측정 없이 image에 고정하지 않습니다.
+출력이 `allocator=tcmalloc implementation=google-tcmalloc`인지 CI와 Docker runtime
+test에서 검사합니다. `PINGORA_JEMALLOC_STATS`는 이전 배포와의 환경변수 호환을
+위한 deprecated fallback이며 새 배포에서는 사용하지 마십시오. TCMalloc의
+huge-page 관련 환경값은 운영 서버 측정 없이 고정하지 않습니다.
 
 `server.health_details: true`와 진단 환경변수를 모두 명시한 경우에만 실행 중인
 process의 allocator counter를 조회할 수 있습니다. 평상시 hot path에서는 수집하지
-않습니다.
+않습니다. 진단값에는 current allocated bytes, heap size, physical/virtual memory,
+peak memory, realized fragmentation, per-CPU cache 활성 여부가 포함됩니다.
 
 ```bash
-PINGORA_JEMALLOC_STATS=1 pingora --config config/pingora.yaml
+PINGORA_ALLOCATOR_STATS=1 pingora --config config/pingora.yaml
 curl -H 'Host: health.invalid' \
   'http://127.0.0.1/pingora-health/details?allocator=1'
 ```
 
-동일 소스의 system allocator baseline은 배포용이 아니라 비교용입니다.
+system allocator와 기존 jemalloc은 배포 기본값이 아니라 회귀 비교와 즉시 rollback
+용 feature로만 유지합니다.
 
 ```bash
 cargo build --release --no-default-features --features system-allocator
+cargo build --release --no-default-features --features jemalloc
 ALLOCATOR_BENCH_ROUNDS=3 bench/allocator_compare.sh
 ```
 
@@ -258,7 +266,8 @@ tests/http2_matrix.sh
 tests/http2_nginx_repro.sh
 tests/service_matrix.sh
 PINGORA_TEST_IMAGE=ghcr.io/tae-ok-11/pingora:local tests/docker_runtime.sh
-docker build --build-arg RUST_TARGET_CPU=x86-64-v2 -t pingora:local .
+docker build --build-arg ALLOCATOR=tcmalloc \
+  --build-arg RUST_TARGET_CPU=x86-64-v2 -t pingora:local .
 ```
 
 `tests/http2_matrix.sh`는 HTTP/1.1/H2 fixed length, chunked, trailer, 204, HEAD,

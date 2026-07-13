@@ -31,6 +31,8 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: System allocator baseline still builds
         run: cargo check --all-targets --locked --no-default-features --features system-allocator
+      - name: Jemalloc rollback build still compiles
+        run: cargo check --all-targets --locked --no-default-features --features jemalloc
       - name: Protocol and security integration checks
         run: |
           # This test intentionally creates a root-owned mode-0600 private key
@@ -57,6 +59,7 @@ jobs:
           load: true
           tags: pingora:ci
           build-args: |
+            ALLOCATOR=tcmalloc
             RUST_TARGET_CPU=x86-64-v2
             BUILD_VERSION=ci
             BUILD_REVISION=${{ github.sha }}
@@ -107,6 +110,7 @@ jobs:
             org.opencontainers.image.description=High-performance AWS-LC JBS Pingora reverse proxy
             org.opencontainers.image.source=https://github.com/TAE-OK-11/pingora
             org.opencontainers.image.url=https://github.com/TAE-OK-11/pingora
+            org.opencontainers.image.allocator=tcmalloc
       - name: Build and publish
         uses: docker/build-push-action@v6
         with:
@@ -116,6 +120,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
+            ALLOCATOR=tcmalloc
             RUST_TARGET_CPU=x86-64-v2
             BUILD_VERSION=${{ steps.meta.outputs.version }}
             BUILD_REVISION=${{ github.sha }}

@@ -70,7 +70,7 @@ done
 docker run --detach --name "${NAME}" --network host --read-only \
   --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
   --tmpfs /tmp/pingora:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700 \
-  --env PINGORA_JEMALLOC_STATS=1 --volume "${OUTPUT}:/work:ro" \
+  --env PINGORA_ALLOCATOR_STATS=1 --volume "${OUTPUT}:/work:ro" \
   --entrypoint /usr/local/bin/pingora "${IMAGE}" --config /work/pingora.yaml >/dev/null
 for _ in {1..100}; do
   if curl --noproxy '*' -fsS -H 'host: profile.test' \

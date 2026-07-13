@@ -818,7 +818,7 @@ async fn send_health_details(session: &mut Session, runtime: &RuntimeConfig) -> 
         Some(crate::allocator::detailed_stats().map_err(|error| {
             Error::because(
                 HTTPStatus(500),
-                "jemalloc diagnostic collection failed",
+                "allocator diagnostic collection failed",
                 error,
             )
         })?)

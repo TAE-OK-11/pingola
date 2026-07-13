@@ -22,8 +22,7 @@ COPY vendor ./vendor
 COPY src ./src
 
 ARG RUST_TARGET_CPU=x86-64-v2
-ARG CARGO_FEATURE_ARGS=
-ARG EXPECTED_ALLOCATOR=jemalloc
+ARG ALLOCATOR=tcmalloc
 ENV CARGO_INCREMENTAL=0 \
     CMAKE_GENERATOR=Ninja \
     RUSTFLAGS="-C target-cpu=${RUST_TARGET_CPU} -C link-arg=-Wl,--gc-sections"
@@ -31,24 +30,31 @@ ENV CARGO_INCREMENTAL=0 \
 RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=pingora-target,target=/src/target,sharing=locked \
-    cargo build --locked --release ${CARGO_FEATURE_ARGS} \
-    && target/release/pingora --allocator-info | grep -q "^allocator=${EXPECTED_ALLOCATOR}" \
+    case "${ALLOCATOR}" in \
+      jemalloc|tcmalloc|system-allocator) ;; \
+      *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; \
+    esac \
+    && cargo build --locked --release --no-default-features --features "${ALLOCATOR}" \
+    && expected="${ALLOCATOR%-allocator}" \
+    && target/release/pingora --allocator-info | grep -q "^allocator=${expected}" \
     && install -Dm755 target/release/pingora /out/pingora
 
 FROM debian:bookworm-slim AS runtime
 
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=unknown
+ARG ALLOCATOR=tcmalloc
 
 LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.description="High-performance AWS-LC JBS Pingora reverse proxy" \
       org.opencontainers.image.source="https://github.com/TAE-OK-11/pingora" \
       org.opencontainers.image.version="${BUILD_VERSION}" \
       org.opencontainers.image.revision="${BUILD_REVISION}" \
+      org.opencontainers.image.allocator="${ALLOCATOR}" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates libcap2-bin \
+    && apt-get install --yes --no-install-recommends ca-certificates libcap2-bin libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 pingora \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin pingora \
