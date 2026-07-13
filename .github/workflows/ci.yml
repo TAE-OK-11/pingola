@@ -99,6 +99,14 @@ jobs:
             type=sha,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+          # metadata-action derives these from the current repository name by
+          # default. Pin the post-migration identity before the GitHub repo is
+          # renamed so it cannot overwrite the Dockerfile's Pingora labels.
+          labels: |
+            org.opencontainers.image.title=Pingora
+            org.opencontainers.image.description=High-performance AWS-LC JBS Pingora reverse proxy
+            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingora
+            org.opencontainers.image.url=https://github.com/TAE-OK-11/pingora
       - name: Build and publish
         uses: docker/build-push-action@v6
         with:
