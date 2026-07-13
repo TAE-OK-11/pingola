@@ -39,7 +39,10 @@ run_curl_case() {
   [[ "${protocol}" == "h2" ]] && http_version=--http2
 
   local rc=0
-  local method_args=("--request=${method}")
+  # Older curl releases bundled by some hosted runners do not accept an
+  # equals sign for options that take a value. Keep this portable across the
+  # runner curl and the newer curl used by the production benchmark host.
+  local method_args=(--request "${method}")
   if [[ "${method}" == "HEAD" ]]; then
     method_args=(--head)
   fi
