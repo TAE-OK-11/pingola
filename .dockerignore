@@ -1,0 +1,12 @@
+.git
+.github
+target
+tests
+Dockerfile*
+docker-compose*.yml
+README.md
+*.log
+*.pem
+*.key
+cert
+

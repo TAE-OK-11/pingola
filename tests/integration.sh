@@ -43,6 +43,7 @@ for _ in {1..50}; do
   sleep 0.1
 done
 kill -0 "${GATEWAY_PID}"
+"${ROOT}/target/debug/pingola" --healthcheck 127.0.0.1:18080
 
 status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
   -H 'host: unknown.test' http://127.0.0.1:18080/)

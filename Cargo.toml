@@ -34,6 +34,11 @@ zstd = "0.13"
 [dev-dependencies]
 tempfile = "3.23"
 
+# Pingora 0.8.1's rustls adapter hardcodes Ring. Keep the upstream API while
+# selecting AWS-LC for both Pingora and this binary, avoiding two crypto stacks.
+[patch.crates-io]
+pingora-rustls = { path = "vendor/pingora-rustls-aws-lc" }
+
 [profile.release]
 codegen-units = 1
 lto = "thin"

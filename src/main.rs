@@ -3,11 +3,13 @@ mod gateway;
 mod limits;
 mod static_files;
 
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use log::info;
 use pingora::apps::HttpServerOptions;
@@ -37,13 +39,20 @@ struct Cli {
     /// Validate configuration and exit without binding listeners.
     #[arg(long)]
     check: bool,
+
+    /// Probe the local plaintext health endpoint and exit.
+    #[arg(long, value_name = "ADDRESS")]
+    healthcheck: Option<String>,
 }
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    install_aws_lc_tls13_provider()?;
-
     let cli = Cli::parse();
+    if let Some(address) = cli.healthcheck.as_deref() {
+        return run_healthcheck(address);
+    }
+
+    install_aws_lc_tls13_provider()?;
     let runtime = Arc::new(RuntimeConfig::load(&cli.config)?);
     if cli.check {
         println!("configuration is valid: {}", cli.config.display());
@@ -51,6 +60,31 @@ fn main() -> Result<()> {
     }
 
     run(runtime)
+}
+
+fn run_healthcheck(address: &str) -> Result<()> {
+    let socket = address
+        .to_socket_addrs()
+        .with_context(|| format!("invalid healthcheck address {address}"))?
+        .next()
+        .ok_or_else(|| anyhow!("healthcheck address did not resolve: {address}"))?;
+    let timeout = Duration::from_secs(2);
+    let mut stream = TcpStream::connect_timeout(&socket, timeout)
+        .with_context(|| format!("failed to connect to health endpoint {address}"))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(
+        b"GET /pingola-health HTTP/1.1\r\nHost: health.invalid\r\nConnection: close\r\n\r\n",
+    )?;
+
+    let mut response = [0_u8; 64];
+    let bytes = stream.read(&mut response)?;
+    let status = String::from_utf8_lossy(&response[..bytes]);
+    if status.starts_with("HTTP/1.1 204 ") || status.starts_with("HTTP/1.0 204 ") {
+        Ok(())
+    } else {
+        Err(anyhow!("health endpoint returned an unexpected response"))
+    }
 }
 
 fn install_aws_lc_tls13_provider() -> Result<()> {

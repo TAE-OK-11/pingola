@@ -1,0 +1,21 @@
+services:
+  pingola:
+    image: ghcr.io/tae-ok-11/pingola:latest
+    build:
+      context: .
+      args:
+        RUST_TARGET_CPU: x86-64-v2
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    tmpfs:
+      - /tmp:size=16m,mode=1770,uid=10001,gid=10001
+    volumes:
+      - ./config/pingola.yaml:/etc/pingola/pingola.yaml:ro
+      - /etc/nginx/cert:/etc/pingola/cert:ro
+      - /var/www/pikky:/var/www/pikky:ro
+
