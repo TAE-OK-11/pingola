@@ -18,6 +18,11 @@ use percent_encoding::percent_decode_str;
 use pingora::http::ResponseHeader;
 use pingora::proxy::Session;
 use pingora::Result;
+use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
+
+const MAX_BUFFERED_ASSET_BYTES: u64 = 8 * 1024 * 1024;
+const FILE_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Encoding {
@@ -109,6 +114,7 @@ impl AssetCache {
 pub struct StaticFiles {
     roots: HashMap<String, PathBuf>,
     cache: AssetCache,
+    compression_slot: Semaphore,
 }
 
 impl StaticFiles {
@@ -126,6 +132,8 @@ impl StaticFiles {
         Ok(Self {
             roots: canonical_roots,
             cache: AssetCache::new(cache_bytes),
+            // One compressor keeps cold-cache bursts bounded on a 1 vCPU host.
+            compression_slot: Semaphore::new(1),
         })
     }
 
@@ -156,6 +164,18 @@ impl StaticFiles {
             .first_or_octet_stream()
             .essence_str()
             .to_string();
+        if metadata.len() > MAX_BUFFERED_ASSET_BYTES {
+            return serve_streaming_file(
+                session,
+                &path,
+                &metadata,
+                &content_type,
+                &method,
+                spa_fallback,
+                tls,
+            )
+            .await;
+        }
         let requested_encoding = if metadata.len() >= 1024 && compressible(&content_type) {
             negotiate_encoding(
                 session
@@ -177,7 +197,7 @@ impl StaticFiles {
         let asset = if let Some(asset) = self.cache.get(&key) {
             asset
         } else {
-            let body = read_representation(&path, requested_encoding).await;
+            let body = self.read_representation(&path, requested_encoding).await;
             let (body, actual_encoding) = match body {
                 Ok(value) => value,
                 Err(_) => return send_empty(session, 500, &[], tls).await,
@@ -238,6 +258,38 @@ impl StaticFiles {
         }
         Ok(true)
     }
+
+    async fn read_representation(
+        &self,
+        path: &Path,
+        encoding: Encoding,
+    ) -> std::io::Result<(Bytes, Encoding)> {
+        if let Some(extension) = encoding.extension() {
+            let mut sidecar: OsString = path.as_os_str().to_owned();
+            sidecar.push(".");
+            sidecar.push(extension);
+            if let Ok(data) = tokio::fs::read(PathBuf::from(sidecar)).await {
+                return Ok((Bytes::from(data), encoding));
+            }
+        }
+
+        if encoding == Encoding::Identity {
+            return tokio::fs::read(path)
+                .await
+                .map(|data| (Bytes::from(data), Encoding::Identity));
+        }
+
+        let _permit = self
+            .compression_slot
+            .acquire()
+            .await
+            .map_err(|_| std::io::Error::other("compression scheduler closed"))?;
+        let data = tokio::fs::read(path).await?;
+        let compressed = tokio::task::spawn_blocking(move || compress(data, encoding))
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok((Bytes::from(compressed), encoding))
+    }
 }
 
 async fn resolve_path(root: &Path, uri_path: &str) -> Option<(PathBuf, bool)> {
@@ -277,28 +329,91 @@ async fn resolve_path(root: &Path, uri_path: &str) -> Option<(PathBuf, bool)> {
     (index.starts_with(root) && index.is_file()).then_some((index, true))
 }
 
-async fn read_representation(
+async fn serve_streaming_file(
+    session: &mut Session,
     path: &Path,
-    encoding: Encoding,
-) -> std::io::Result<(Bytes, Encoding)> {
-    if let Some(extension) = encoding.extension() {
-        let mut sidecar: OsString = path.as_os_str().to_owned();
-        sidecar.push(".");
-        sidecar.push(extension);
-        if let Ok(data) = tokio::fs::read(PathBuf::from(sidecar)).await {
-            return Ok((Bytes::from(data), encoding));
+    metadata: &std::fs::Metadata,
+    content_type: &str,
+    method: &Method,
+    spa_fallback: bool,
+    tls: bool,
+) -> Result<bool> {
+    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+    let modified_nanos = modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), modified_nanos);
+
+    if session
+        .req_header()
+        .headers
+        .get(IF_NONE_MATCH)
+        .is_some_and(|value| value.as_bytes() == etag.as_bytes())
+    {
+        let mut response = ResponseHeader::build(304, Some(8)).unwrap();
+        response.insert_header(ETAG, etag)?;
+        response.insert_header(LAST_MODIFIED, httpdate::fmt_http_date(modified))?;
+        insert_cache_header(&mut response, path, spa_fallback)?;
+        insert_security_headers(&mut response, tls)?;
+        session
+            .write_response_header(Box::new(response), true)
+            .await?;
+        return Ok(true);
+    }
+
+    let head = *method == Method::HEAD;
+    let mut file = if head {
+        None
+    } else {
+        Some(tokio::fs::File::open(path).await.map_err(|error| {
+            pingora::Error::because(
+                pingora::ErrorType::FileReadError,
+                "failed to open asset",
+                error,
+            )
+        })?)
+    };
+    let mut response = ResponseHeader::build(200, Some(10)).unwrap();
+    response.insert_header(CONTENT_TYPE, content_type)?;
+    response.insert_header(CONTENT_LENGTH, metadata.len().to_string())?;
+    response.insert_header(ETAG, etag)?;
+    response.insert_header(LAST_MODIFIED, httpdate::fmt_http_date(modified))?;
+    insert_cache_header(&mut response, path, spa_fallback)?;
+    insert_security_headers(&mut response, tls)?;
+    session
+        .write_response_header(Box::new(response), head || metadata.len() == 0)
+        .await?;
+
+    if let Some(file) = file.as_mut() {
+        let mut remaining = metadata.len();
+        let mut buffer = vec![0_u8; FILE_CHUNK_BYTES];
+        while remaining > 0 {
+            let chunk_length = usize::try_from(remaining.min(FILE_CHUNK_BYTES as u64)).unwrap();
+            let bytes = file
+                .read(&mut buffer[..chunk_length])
+                .await
+                .map_err(|error| {
+                    pingora::Error::because(
+                        pingora::ErrorType::FileReadError,
+                        "failed to read asset",
+                        error,
+                    )
+                })?;
+            if bytes == 0 {
+                session.write_response_body(None, true).await?;
+                break;
+            }
+            remaining -= bytes as u64;
+            session
+                .write_response_body(
+                    Some(Bytes::copy_from_slice(&buffer[..bytes])),
+                    remaining == 0,
+                )
+                .await?;
         }
     }
-
-    let data = tokio::fs::read(path).await?;
-    if encoding == Encoding::Identity {
-        return Ok((Bytes::from(data), Encoding::Identity));
-    }
-
-    let compressed = tokio::task::spawn_blocking(move || compress(data, encoding))
-        .await
-        .map_err(std::io::Error::other)??;
-    Ok((Bytes::from(compressed), encoding))
+    Ok(true)
 }
 
 fn compress(data: Vec<u8>, encoding: Encoding) -> std::io::Result<Vec<u8>> {

@@ -23,6 +23,7 @@ trap cleanup EXIT
 rm -rf "${RUNTIME}"
 mkdir -p "${RUNTIME}/www"
 cp "${ROOT}/tests/fixtures/www/index.html" "${RUNTIME}/www/index.html"
+truncate -s 8388609 "${RUNTIME}/www/large.bin"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj "/CN=static.test" \
   -addext "subjectAltName=DNS:static.test,DNS:app.test,DNS:vault.test" \
@@ -60,6 +61,10 @@ grep -q 'pingola-static-response' <<<"${static_body}"
 
 curl --noproxy '*' -sSI -H 'host: static.test' -H 'accept-encoding: zstd' \
   http://127.0.0.1:18080/ | grep -qi '^content-encoding: zstd'
+
+curl --noproxy '*' -fsS -H 'host: static.test' \
+  http://127.0.0.1:18080/large.bin -o "${RUNTIME}/large-response.bin"
+[[ "$(stat -c '%s' "${RUNTIME}/large-response.bin")" == "8388609" ]]
 
 http_version=$(curl --noproxy '*' -ksS --http2 \
   --resolve static.test:18443:127.0.0.1 -o /dev/null -w '%{http_version}' \

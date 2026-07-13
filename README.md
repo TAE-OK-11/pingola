@@ -16,6 +16,7 @@ PiKKY, Navidrome, Vaultwarden, CouchDB, AdGuard Home/DoH 라우팅을 1 vCPU / 1
 - 본문 크기 제한, upstream 응답 헤더 제거, HSTS/nosniff/frame/referrer 보안 헤더
 - PiKKY 정적 파일의 SPA fallback, 경로 이탈 및 symlink 탈출 차단
 - 32 MiB 제한 LRU와 gzip 레벨 3, Brotli 레벨 3, Zstd 레벨 1 압축
+- 동적 압축 동시 실행 1개, 8 MiB 초과 정적 파일의 64 KiB 청크 스트리밍
 - 사전 압축된 `.gz`, `.br`, `.zst` 파일 우선 사용과 ETag/Last-Modified 처리
 - 단일 worker, 제한된 keepalive pool, release LTO/strip로 낮춘 CPU·메모리 오버헤드
 - UID 10001 비루트 컨테이너, 읽기 전용 root filesystem, 최소 Linux capability
