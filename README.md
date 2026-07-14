@@ -372,9 +372,14 @@ source symbol이 제한될 수 있어 `perf.data`와 `perf script` 입력을 모
 공식 generic image는 `x86-64-v2`입니다. Oracle 전용 image를 만들 때는 서버에서
 `lscpu`와 `rustc --print target-cpus`를 먼저 확인하고 실제 CPU와 일치하는 값만
 `RUST_TARGET_CPU`로 전달하십시오. GitHub Actions는 generic `latest`와 함께 AMD
-Zen 1 이상 전용 `ghcr.io/tae-ok-11/pingora:oracle-znver1`도 빌드·실행 검증 후
-게시합니다. 이 tag는 `lscpu`에서 AMD Zen 계열과 AVX2/BMI2 지원을 확인한 호스트에서만
-사용하고, 호환 여부가 불명확하면 반드시 `latest`를 사용하십시오.
+Zen 1 이상 전용 `ghcr.io/tae-ok-11/pingora:oracle-znver1`도 게시합니다. generic
+image는 GitHub 호스티드 러너에서 전체 Docker runtime test를 수행합니다. 호스티드
+러너의 CPU 모델은 고정되어 있지 않으므로 `znver1` image는 CI에서 build, label,
+allocator smoke test까지만 수행하고 전체 listener runtime test는 배포 대상과 동일한
+Zen 호스트에서 `PINGORA_TEST_IMAGE=ghcr.io/tae-ok-11/pingora:oracle-znver1
+PINGORA_EXPECTED_TARGET_CPU=znver1 tests/docker_runtime.sh`로 수행해야 합니다. 이 tag는
+`lscpu`에서 AMD Zen 계열과 AVX2/BMI2 지원을 확인한 호스트에서만 사용하고, 호환 여부가
+불명확하면 반드시 `latest`를 사용하십시오.
 
 ## 배포와 rollback
 

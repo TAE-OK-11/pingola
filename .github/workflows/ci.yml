@@ -72,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
-      - name: Build runnable image
+      - name: Build image
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -86,10 +86,25 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Non-root and read-only runtime checks
+        if: matrix.target_cpu == 'x86-64-v2'
         env:
           PINGORA_TEST_IMAGE: pingora:ci-${{ matrix.target_cpu }}
           PINGORA_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
         run: tests/docker_runtime.sh
+      - name: Specialized image metadata and allocator smoke check
+        if: matrix.target_cpu == 'znver1'
+        env:
+          IMAGE: pingora:ci-${{ matrix.target_cpu }}
+        run: |
+          # GitHub-hosted runner CPU models are not stable. Running the full
+          # znver1 listener on an incompatible host can correctly SIGILL even
+          # though the image was built for a compatible Oracle/AMD Zen host.
+          test "$(docker image inspect --format '{{.Config.User}}' "${IMAGE}")" = "10001:10001"
+          target_cpu=$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.target-cpu"]')
+          allocator=$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator"]')
+          test "${target_cpu}" = "znver1"
+          test "${allocator}" = "tcmalloc"
+          docker run --rm "${IMAGE}" --allocator-info | grep -q '^allocator=tcmalloc '
 
   image:
     if: github.event_name != 'pull_request'
