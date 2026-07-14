@@ -9,6 +9,7 @@ server:
   private_key: /etc/pingora/cert/live/tae00217.cloud/privkey.pem
   threads: 1
   upstream_keepalive_pool_size: 128
+  downstream_keepalive_requests: 500
   max_retries: 2
   graceful_shutdown_timeout_seconds: 60
   static_cache_bytes: 33554432

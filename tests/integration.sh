@@ -106,9 +106,9 @@ jq -e '.headers["x-private"] == null' <<<"${hop_response}" >/dev/null
 jq -e '.headers["proxy-authorization"] == null' <<<"${hop_response}" >/dev/null
 jq -e '.headers.connection == null' <<<"${hop_response}" >/dev/null
 
-# The server-level 500 request keepalive limit must count down across reused
-# HTTP/1.1 sessions. Resetting it in request_filter makes the connection
-# effectively unlimited and retains per-connection allocations indefinitely.
+# The configured request keepalive limit must count down across reused HTTP/1.1
+# sessions. Resetting it in request_filter makes the connection effectively
+# unlimited and retains per-connection allocations indefinitely.
 python3 - <<'PY'
 import socket
 import ssl
@@ -123,7 +123,8 @@ connection.settimeout(5)
 buffer = b""
 completed = 0
 
-for _ in range(501):
+expected = 37
+for _ in range(expected + 1):
     try:
         connection.sendall(
             b"GET /hello HTTP/1.1\r\nHost: vault.test\r\nConnection: keep-alive\r\n\r\n"
@@ -157,8 +158,10 @@ for _ in range(501):
     completed += 1
 
 connection.close()
-if completed != 500:
-    raise SystemExit(f"downstream keepalive limit mismatch: completed={completed}, expected=500")
+if completed != expected:
+    raise SystemExit(
+        f"downstream keepalive limit mismatch: completed={completed}, expected={expected}"
+    )
 PY
 
 status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \

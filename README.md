@@ -245,6 +245,12 @@ upstreams:
 Navidrome/Vaultwarden/CouchDB/AdGuard UI 기본 upstream은 명시적으로 `http1`을
 유지합니다. 설정 변경은 재시작 후 적용됩니다.
 
+`server.downstream_keepalive_requests`는 downstream HTTP/1.1 connection을 주기적으로
+닫아 connection별 allocation을 회수하는 상한입니다. NGINX와 같은 방식으로 첫 요청을
+포함해 세며 기본값은 500, 허용 범위는 1~1,000,000입니다. 일반 운영에서는 기본값을
+유지하십시오. 짧은 duration benchmark만 내부 warm-up이 측정 시작 시점에 connection을
+닫지 않도록 두 프록시에 동일하게 1,000,000을 사용합니다.
+
 ## Timeout, retry, limiter 설정
 
 Upstream `read_timeout_seconds`와 `write_timeout_seconds`를 생략하면 route 기본값을
@@ -379,8 +385,10 @@ body SHA-256과 raw curl/nghttp/h2load log를 `/tmp/pingora-h2-matrix`에 남깁
 backend만 정리합니다. 한 case가 실패해도 다음 case를 계속하고 실패를 0 RPS로
 바꾸지 않습니다. raw curl/wrk/h2load, container log, CPU/RSS sample, image inspect,
 `nginx -V`, `ldd`, 실제 `nginx -T`를 결과 directory에 보존합니다. 두 프록시에는
-동일한 forwarded/security header, downstream HTTP/1.1 500-request keepalive,
-upstream pool, timeout, nofile 32768을 적용합니다. 기본 0.5 CPU/1 GiB 제한은 시작
+동일한 forwarded/security header, downstream request keepalive 상한,
+upstream pool, timeout, nofile 32768을 적용합니다. Duration형 H2 측정에서는 h2load의
+내부 warm-up이 기본 500회 상한을 소진해 측정 구간을 0건으로 만들 수 있으므로, 생성된
+benchmark 설정에만 양쪽 모두 1,000,000의 bounded 상한을 적용합니다. 기본 0.5 CPU/1 GiB 제한은 시작
 후 Docker inspect로 재확인하며, raw log 때문에 디스크가 가득 차지 않도록 시작 시
 최소 1 GiB 여유 공간을 요구합니다. `summary.txt`와 `summary.tsv`에는 5라운드
 paired 중앙값과 RPS/CPU 효율 기하평균이 생성됩니다.

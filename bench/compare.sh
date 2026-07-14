@@ -127,6 +127,7 @@ server:
   health_socket: /tmp/pingora/health.sock
   threads: 1
   upstream_keepalive_pool_size: 128
+  downstream_keepalive_requests: 1000000
   max_retries: 0
   access_log: false
   health_details: false
@@ -165,7 +166,7 @@ http {
   tcp_nopush on;
   tcp_nodelay on;
   keepalive_timeout 30s;
-  keepalive_requests 500;
+  keepalive_requests 1000000;
   gzip off;
   brotli off;
   zstd off;

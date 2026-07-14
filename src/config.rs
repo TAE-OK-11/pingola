@@ -17,6 +17,10 @@ fn default_keepalive_pool() -> usize {
     128
 }
 
+fn default_downstream_keepalive_requests() -> u32 {
+    500
+}
+
 fn default_max_retries() -> usize {
     2
 }
@@ -85,6 +89,8 @@ pub struct ServerConfig {
     pub threads: usize,
     #[serde(default = "default_keepalive_pool")]
     pub upstream_keepalive_pool_size: usize,
+    #[serde(default = "default_downstream_keepalive_requests")]
+    pub downstream_keepalive_requests: u32,
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
     #[serde(default = "default_graceful_shutdown")]
@@ -253,6 +259,9 @@ fn validate(config: &Config) -> Result<()> {
     }
     if config.server.max_retries > 10 {
         bail!("server.max_retries must not exceed 10");
+    }
+    if !(1..=1_000_000).contains(&config.server.downstream_keepalive_requests) {
+        bail!("server.downstream_keepalive_requests must be between 1 and 1000000");
     }
     if !(1..=1024).contains(&config.server.http2_max_concurrent_streams) {
         bail!("server.http2_max_concurrent_streams must be between 1 and 1024");
@@ -441,7 +450,18 @@ hosts:
 
     #[test]
     fn accepts_unique_normalized_domains() {
-        assert!(RuntimeConfig::new(sample_config()).is_ok());
+        let config = sample_config();
+        assert_eq!(config.server.downstream_keepalive_requests, 500);
+        assert!(RuntimeConfig::new(config).is_ok());
+    }
+
+    #[test]
+    fn rejects_unbounded_downstream_keepalive_requests() {
+        for invalid in [0, 1_000_001] {
+            let mut config = sample_config();
+            config.server.downstream_keepalive_requests = invalid;
+            assert!(RuntimeConfig::new(config).is_err());
+        }
     }
 
     #[test]
