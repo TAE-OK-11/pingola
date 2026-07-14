@@ -306,8 +306,9 @@ Cargo, Docker base image, Actions를 매주 확인합니다. Cloudflare Pingora 
 Builder와 runtime은 Debian 13 `trixie-slim`을 사용하고 Actions build마다 base
 manifest를 다시 확인합니다. Rust link는 GNU ld 대신 LLVM `lld`를 사용합니다.
 기본 release profile은 `codegen-units=1`, `opt-level=3`, `panic=abort`, symbol strip과
-Thin LTO이며, Fat LTO가 실제 proxy workload에서 더 빠른지는 후보 image를 동일한
-0.5 CPU/1 GiB 조건으로 측정한 뒤에만 변경합니다. `libcap2-bin`은 build 중 file
+Fat LTO입니다. 동일한 0.5 CPU/1 GiB 5라운드 비교에서 Fat은 Thin보다 RPS 6.20%,
+CPU 효율 6.92%가 높고 p99 중앙값 3.62%, peak RSS 중앙값 3.44%가 낮아 기본값으로
+선택했습니다. `RUST_LTO=thin`은 회귀 rollback용으로 계속 지원합니다. `libcap2-bin`은 build 중 file
 capability를 설정할 때만 mount layer 안에 설치했다가 제거하므로 runtime image에는
 남지 않습니다. `RUST_LTO`, `RUST_CODEGEN_UNITS`, `RUST_TARGET_CPU`는 label로 기록되어
 실행 image의 build policy를 inspect할 수 있습니다.
@@ -327,7 +328,7 @@ tests/service_matrix.sh
 PINGORA_TEST_IMAGE=ghcr.io/tae-ok-11/pingora:local tests/docker_runtime.sh
 docker build --build-arg ALLOCATOR=tcmalloc \
   --build-arg RUST_TARGET_CPU=x86-64-v2 \
-  --build-arg RUST_LTO=thin \
+  --build-arg RUST_LTO=fat \
   --build-arg RUST_CODEGEN_UNITS=1 \
   -t pingora:local .
 ```

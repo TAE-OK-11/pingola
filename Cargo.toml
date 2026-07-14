@@ -61,7 +61,7 @@ pingora-rustls = { path = "vendor/pingora-rustls-aws-lc" }
 
 [profile.release]
 codegen-units = 1
-lto = "thin"
+lto = "fat"
 opt-level = 3
 panic = "abort"
 strip = "symbols"
