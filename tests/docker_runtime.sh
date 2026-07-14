@@ -6,6 +6,7 @@ IMAGE=${PINGORA_TEST_IMAGE:-ghcr.io/tae-ok-11/pingora:local}
 EXPECTED_ALLOCATOR=${PINGORA_EXPECTED_ALLOCATOR:-tcmalloc}
 EXPECTED_TARGET_CPU=${PINGORA_EXPECTED_TARGET_CPU:-x86-64-v2}
 EXPECTED_LTO=${PINGORA_EXPECTED_LTO:-fat}
+EXPECTED_BOLT=${PINGORA_EXPECTED_BOLT:-true}
 RUNTIME=${PINGORA_DOCKER_TEST_RUNTIME:-/tmp/pingora-docker-runtime}
 CONTAINERS=()
 
@@ -90,6 +91,7 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.target-cpu"}}' "${name}") == "${EXPECTED_TARGET_CPU}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.lto"}}' "${name}") == "${EXPECTED_LTO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.linker"}}' "${name}") == lld ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.bolt"}}' "${name}") == "${EXPECTED_BOLT}" ]]
   if docker exec "${name}" sh -c 'command -v setcap >/dev/null || dpkg-query -W libcap2-bin >/dev/null 2>&1'; then
     echo "runtime image unexpectedly contains libcap2-bin" >&2
     return 1
