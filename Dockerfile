@@ -72,8 +72,13 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
     && if [ "${BOLT_ENABLED}" = true ]; then \
          readelf -S target/release/pingora | grep -q '\.rela\.text'; \
          readelf -s target/release/pingora | grep -q 'FUNC'; \
+         nm --defined-only --format=posix target/release/pingora \
+           | awk '$1 ~ /(TCMalloc|tcmalloc)/ { print $1 }' \
+           | sort -u > /tmp/pingora-bolt-skip-functions; \
+         test -s /tmp/pingora-bolt-skip-functions; \
          llvm-bolt-19 target/release/pingora \
            --instrument \
+           --skip-funcs-file=/tmp/pingora-bolt-skip-functions \
            --runtime-instrumentation-lib=llvm-19/lib/libbolt_rt_instr.a \
            --instrumentation-file=/tmp/pingora-bolt.fdata \
            --instrumentation-sleep-time=1 \
@@ -83,6 +88,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
          test -s /tmp/pingora-bolt.fdata || exit 1; \
          llvm-bolt-19 target/release/pingora \
            --data=/tmp/pingora-bolt.fdata \
+           --skip-funcs-file=/tmp/pingora-bolt-skip-functions \
            --reorder-blocks=ext-tsp \
            --reorder-functions=cdsort \
            --split-functions \
