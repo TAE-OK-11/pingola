@@ -74,13 +74,13 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
          readelf -s target/release/pingora | grep -q 'FUNC'; \
          llvm-bolt-19 target/release/pingora \
            --instrument \
-           --runtime-instrumentation-lib=/usr/lib/llvm-19/lib/libbolt_rt_instr.a \
+           --runtime-instrumentation-lib=llvm-19/lib/libbolt_rt_instr.a \
            --instrumentation-file=/tmp/pingora-bolt.fdata \
            --instrumentation-sleep-time=1 \
            --instrumentation-no-counters-clear \
-           -o /tmp/pingora-instrumented; \
-         tools/bolt-train.sh /tmp/pingora-instrumented /tmp/pingora-bolt.fdata; \
-         test -s /tmp/pingora-bolt.fdata; \
+           -o /tmp/pingora-instrumented || exit $?; \
+         tools/bolt-train.sh /tmp/pingora-instrumented /tmp/pingora-bolt.fdata || exit $?; \
+         test -s /tmp/pingora-bolt.fdata || exit 1; \
          llvm-bolt-19 target/release/pingora \
            --data=/tmp/pingora-bolt.fdata \
            --reorder-blocks=ext-tsp \
@@ -89,7 +89,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
            --split-all-cold \
            --split-eh \
            --dyno-stats \
-           -o /out/pingora; \
+           -o /out/pingora || exit $?; \
        else \
          install -Dm755 target/release/pingora /out/pingora; \
        fi \
