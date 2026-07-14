@@ -85,6 +85,8 @@ trusted_proxies: ["127.0.0.0/8"]
 upstreams:
   nginx:
     address: "127.0.0.1:19092"
+  adguard_dns_doh:
+    address: "127.0.0.1:19092"
 hosts:
   matrix:
     domains: ["matrix.test"]

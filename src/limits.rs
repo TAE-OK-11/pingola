@@ -2,12 +2,15 @@ use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use parking_lot::Mutex;
 
 const MAX_RATE_BUCKETS: usize = 262_144;
+const RATE_BUCKET_IDLE: Duration = Duration::from_secs(600);
+const RATE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Eq)]
 struct ClientKey {
@@ -40,6 +43,7 @@ pub struct RateLimiter {
     bucket_count: AtomicUsize,
     observations: AtomicU64,
     max_buckets: usize,
+    last_cleanup: Mutex<Instant>,
 }
 
 impl RateLimiter {
@@ -48,12 +52,33 @@ impl RateLimiter {
     }
 
     fn with_max_buckets(max_buckets: usize) -> Self {
+        let now = Instant::now();
         Self {
             buckets: DashMap::new(),
             bucket_count: AtomicUsize::new(0),
             observations: AtomicU64::new(0),
             max_buckets,
+            last_cleanup: Mutex::new(now.checked_sub(RATE_CLEANUP_INTERVAL).unwrap_or(now)),
         }
+    }
+
+    fn cleanup_idle(&self, now: Instant) -> bool {
+        let Some(mut last_cleanup) = self.last_cleanup.try_lock() else {
+            return false;
+        };
+        if now.saturating_duration_since(*last_cleanup) < RATE_CLEANUP_INTERVAL {
+            return false;
+        }
+        *last_cleanup = now;
+
+        let mut removed = 0;
+        self.buckets.retain(|_, bucket| {
+            let keep = now.saturating_duration_since(bucket.updated_at) < RATE_BUCKET_IDLE;
+            removed += usize::from(!keep);
+            keep
+        });
+        self.bucket_count.fetch_sub(removed, Ordering::AcqRel);
+        true
     }
 
     pub fn allow(
@@ -66,25 +91,37 @@ impl RateLimiter {
         debug_assert!(requests_per_second > 0.0);
         let now = Instant::now();
         let capacity = f64::from(burst) + 1.0;
-        let key = ClientKey { zone, ip };
+        if self.observations.fetch_add(1, Ordering::Relaxed) & 0x3fff == 0x3fff {
+            self.cleanup_idle(now);
+        }
+
         // Use a single sharded-map lookup. New clients atomically reserve one
         // bounded slot; existing clients do not pay for len()+contains_key().
-        let mut bucket = match self.buckets.entry(key) {
-            Entry::Occupied(entry) => entry.into_ref(),
-            Entry::Vacant(entry) => {
-                if self
-                    .bucket_count
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                        (count < self.max_buckets).then_some(count + 1)
-                    })
-                    .is_err()
-                {
-                    return false;
+        // When the map is full, release the vacant-entry shard guard before a
+        // rate-limited idle scan so DashMap cannot deadlock on re-entry.
+        let mut retried_after_cleanup = false;
+        let mut bucket = loop {
+            match self.buckets.entry(ClientKey { zone, ip }) {
+                Entry::Occupied(entry) => break entry.into_ref(),
+                Entry::Vacant(entry) => {
+                    if self
+                        .bucket_count
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            (count < self.max_buckets).then_some(count + 1)
+                        })
+                        .is_ok()
+                    {
+                        break entry.insert(Bucket {
+                            tokens: capacity,
+                            updated_at: now,
+                        });
+                    }
+                    drop(entry);
+                    if retried_after_cleanup || !self.cleanup_idle(now) {
+                        return false;
+                    }
+                    retried_after_cleanup = true;
                 }
-                entry.insert(Bucket {
-                    tokens: capacity,
-                    updated_at: now,
-                })
             }
         };
         let elapsed = now.duration_since(bucket.updated_at).as_secs_f64();
@@ -96,18 +133,6 @@ impl RateLimiter {
             bucket.tokens -= 1.0;
         }
         drop(bucket);
-
-        // Bound memory during long-running scans. Cleanup is deliberately rare
-        // and only removes buckets that have been idle for ten minutes.
-        if self.observations.fetch_add(1, Ordering::Relaxed) & 0x3fff == 0x3fff {
-            let mut removed = 0;
-            self.buckets.retain(|_, bucket| {
-                let keep = now.duration_since(bucket.updated_at).as_secs() < 600;
-                removed += usize::from(!keep);
-                keep
-            });
-            self.bucket_count.fetch_sub(removed, Ordering::AcqRel);
-        }
 
         allowed
     }
@@ -136,14 +161,14 @@ impl ActiveRequestLimiter {
         let counter = self
             .counters
             .entry(key.clone())
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .clone();
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
 
         counter
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < limit).then_some(current + 1)
             })
             .ok()?;
+        let counter = counter.clone();
 
         Some(ActiveRequestPermit {
             counters: self.counters.clone(),
@@ -172,6 +197,10 @@ impl Drop for ActiveRequestPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Barrier;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn token_bucket_honors_burst() {
@@ -201,6 +230,24 @@ mod tests {
     }
 
     #[test]
+    fn idle_rate_bucket_is_reclaimed_when_capacity_is_full() {
+        let limiter = RateLimiter::with_max_buckets(1);
+        let old_ip = "192.0.2.20".parse().unwrap();
+        assert!(limiter.allow("api", old_ip, 1.0, 0));
+        limiter
+            .buckets
+            .get_mut(&ClientKey {
+                zone: "api",
+                ip: old_ip,
+            })
+            .unwrap()
+            .updated_at = Instant::now() - Duration::from_secs(601);
+
+        assert!(limiter.allow("api", "192.0.2.21".parse().unwrap(), 1.0, 0));
+        assert_eq!(limiter.bucket_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn zones_are_isolated_for_the_same_client() {
         let limiter = ActiveRequestLimiter::new();
         let ip = "192.0.2.3".parse().unwrap();
@@ -208,5 +255,45 @@ mod tests {
         assert!(limiter.acquire("navidrome_stream", ip, 1).is_none());
         assert!(limiter.acquire("vaultwarden", ip, 1).is_some());
         assert!(limiter.acquire("doh", ip, 1).is_some());
+    }
+
+    #[test]
+    fn concurrent_release_and_acquire_never_split_one_limit_counter() {
+        const THREADS: usize = 8;
+        const ITERATIONS: usize = 100_000;
+
+        let limiter = Arc::new(ActiveRequestLimiter::new());
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let granted = Arc::new(AtomicUsize::new(0));
+        let violated = Arc::new(AtomicBool::new(false));
+        let ip = "192.0.2.30".parse().unwrap();
+        let mut workers = Vec::new();
+
+        for _ in 0..THREADS {
+            let limiter = limiter.clone();
+            let barrier = barrier.clone();
+            let granted = granted.clone();
+            let violated = violated.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ITERATIONS {
+                    if let Some(permit) = limiter.acquire("api", ip, 1) {
+                        if granted.fetch_add(1, Ordering::AcqRel) != 0 {
+                            violated.store(true, Ordering::Release);
+                        }
+                        thread::yield_now();
+                        granted.fetch_sub(1, Ordering::AcqRel);
+                        drop(permit);
+                    } else {
+                        thread::yield_now();
+                    }
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        assert!(!violated.load(Ordering::Acquire));
     }
 }

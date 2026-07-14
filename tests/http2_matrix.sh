@@ -94,6 +94,10 @@ trusted_proxies: ["127.0.0.0/8"]
 upstreams:
   matrix:
     address: "127.0.0.1:19091"
+  # The AdGuard handler can route /dns-query independently of its UI
+  # upstream, so validation requires this route-specific target as well.
+  adguard_dns_doh:
+    address: "127.0.0.1:19091"
 hosts:
   matrix:
     domains: ["matrix.test"]

@@ -22,6 +22,8 @@ NAME=pingora-compare-$$
 BACKEND_PID=
 PROXY_NAME=
 FAILURES=0
+declare -A PREFLIGHT_RESULT
+declare -A PREFLIGHT_DETAIL
 
 case "${PROFILE}" in
   smoke)
@@ -251,9 +253,9 @@ stop_proxy() {
 }
 
 start_proxy() {
-  local proxy=$1
+  local proxy=$1 round=$2
   stop_proxy
-  PROXY_NAME=${NAME}-${proxy}
+  PROXY_NAME=${NAME}-${proxy}-r${round}
   if [[ "${proxy}" == pingora ]]; then
     docker run --detach --name "${PROXY_NAME}" --network host --read-only \
       --cpus "${CPU_LIMIT}" --memory "${MEMORY_LIMIT}" --memory-swap "${MEMORY_LIMIT}" \
@@ -324,13 +326,16 @@ run_case() {
   local warmup_raw=${OUTPUT}/raw/${case_id}.warmup.txt
   local request_log=${OUTPUT}/raw/${case_id}.requests.tsv
   local resources=${OUTPUT}/raw/${case_id}.resources
-  local path expected actual curl_args=() url
+  local path expected actual curl_args=() url expected_status
   if ((size == 0)); then
     path=/status/204
+    expected_status=204
   elif ((size >= 10485760)); then
     path=/stream/${size}
+    expected_status=200
   else
     path=/bytes/${size}
+    expected_status=200
   fi
   if [[ "${protocol}" == h2-* || "${protocol}" == h1-new-tls ]]; then
     url="https://127.0.0.1:${HTTPS_PORT}${path}"
@@ -338,19 +343,65 @@ run_case() {
   else
     url="http://127.0.0.1:${HTTP_PORT}${path}"
   fi
-  expected=$(curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}${path}" | sha256sum | cut -d' ' -f1)
-  if [[ "${protocol}" == h2-* ]]; then
-    actual=$(curl --noproxy '*' -ksS --http2 --resolve "bench.test:${HTTPS_PORT}:127.0.0.1" \
-      "https://bench.test:${HTTPS_PORT}${path}" | sha256sum | cut -d' ' -f1)
-  else
-    actual=$(curl --noproxy '*' -fsS "${curl_args[@]}" -H 'host: bench.test' "${url}" \
-      | sha256sum | cut -d' ' -f1)
+  local preflight_key=${proxy}-r${round}-${protocol}-b${size}
+  if [[ -z "${PREFLIGHT_RESULT[${preflight_key}]+present}" ]]; then
+    local expected_prefix=${OUTPUT}/raw/backend-b${size}
+    local actual_prefix=${OUTPUT}/raw/${preflight_key}.curl
+    local expected_meta actual_meta expected_rc actual_rc actual_version
+    if [[ ! -s "${expected_prefix}.sha256" ]]; then
+      expected_meta=$(curl --noproxy '*' -sS -H 'accept-encoding: identity' \
+        -D "${expected_prefix}.headers" -o "${expected_prefix}.body" \
+        -w '%{http_code} %{http_version}' \
+        "http://127.0.0.1:${BACKEND_PORT}${path}")
+      expected_rc=$?
+      printf '%s\n' "${expected_meta}" >"${expected_prefix}.meta"
+      if ((expected_rc != 0)) || [[ "${expected_meta%% *}" != "${expected_status}" ]]; then
+        PREFLIGHT_RESULT[${preflight_key}]=FAIL
+        PREFLIGHT_DETAIL[${preflight_key}]="backend curl failed rc=${expected_rc} meta=${expected_meta} expected_status=${expected_status}"
+      else
+        sha256sum "${expected_prefix}.body" | cut -d' ' -f1 >"${expected_prefix}.sha256"
+      fi
+    fi
+
+    if [[ "${PREFLIGHT_RESULT[${preflight_key}]:-PASS}" == PASS ]]; then
+      if [[ "${protocol}" == h2-* ]]; then
+        actual_meta=$(curl --noproxy '*' -ksS --http2 \
+          --resolve "bench.test:${HTTPS_PORT}:127.0.0.1" \
+          -H 'accept-encoding: identity' -D "${actual_prefix}.headers" \
+          -o "${actual_prefix}.body" -w '%{http_code} %{http_version}' \
+          "https://bench.test:${HTTPS_PORT}${path}")
+      else
+        actual_meta=$(curl --noproxy '*' -sS "${curl_args[@]}" \
+          -H 'host: bench.test' -H 'accept-encoding: identity' \
+          -D "${actual_prefix}.headers" -o "${actual_prefix}.body" \
+          -w '%{http_code} %{http_version}' "${url}")
+      fi
+      actual_rc=$?
+      printf '%s\n' "${actual_meta}" >"${actual_prefix}.meta"
+      actual_version=${actual_meta#* }
+      expected=$(<"${expected_prefix}.sha256")
+      actual=$(sha256sum "${actual_prefix}.body" | cut -d' ' -f1)
+      printf '%s\n' "${actual}" >"${actual_prefix}.sha256"
+      if ((actual_rc != 0)) \
+        || [[ "${actual_meta%% *}" != "${expected_status}" ]] \
+        || { [[ "${protocol}" == h2-* ]] && [[ "${actual_version}" != 2 ]]; } \
+        || [[ "${actual}" != "${expected}" ]]; then
+        PREFLIGHT_RESULT[${preflight_key}]=FAIL
+        PREFLIGHT_DETAIL[${preflight_key}]="proxy curl failed rc=${actual_rc} meta=${actual_meta} expected_status=${expected_status} expected_sha=${expected} actual_sha=${actual}"
+      else
+        PREFLIGHT_RESULT[${preflight_key}]=PASS
+        PREFLIGHT_DETAIL[${preflight_key}]="status=${expected_status} http_version=${actual_version} sha256=${actual}"
+      fi
+      if ((size > 1048576)); then
+        rm -f "${expected_prefix}.body" "${actual_prefix}.body"
+      fi
+    fi
   fi
-  if [[ "${actual}" != "${expected}" ]]; then
-    printf '%s\t%s\t%s\t%s\t%s\tFAIL_HASH\t0\tNA\tNA\tNA\tNA\tNA\tNA\t0\t0\t0\t0\t1\tNA\t%s\n' \
+  if [[ "${PREFLIGHT_RESULT[${preflight_key}]}" != PASS ]]; then
+    printf '%s\t%s\t%s\t%s\t%s\tFAIL_PREFLIGHT\t0\tNA\tNA\tNA\tNA\tNA\tNA\t0\t0\t0\t0\t1\tNA\t%s\n' \
       "${proxy}" "${protocol}" "${size}" "${concurrency}" "${round}" "${raw}" \
       >>"${OUTPUT}/results.tsv"
-    echo "SHA-256 mismatch expected=${expected} actual=${actual}" >"${raw}"
+    printf '%s\n' "${PREFLIGHT_DETAIL[${preflight_key}]}" >"${raw}"
     FAILURES=$((FAILURES + 1))
     return
   fi
@@ -358,23 +409,27 @@ run_case() {
   case "${protocol}" in
     h1-keepalive)
       wrk -t1 -c "${concurrency}" -d "${WARMUP}" \
-        -s "${ROOT}/bench/wrk-keepalive.lua" -H 'Host: bench.test' "${url}" \
+        -s "${ROOT}/bench/wrk-keepalive.lua" -H 'Host: bench.test' \
+        -H 'Accept-Encoding: identity' "${url}" \
         >"${warmup_raw}" 2>&1 || true
       ;;
     h1-new|h1-new-tls)
       wrk -t1 -c "${concurrency}" -d "${WARMUP}" \
-        -s "${ROOT}/bench/wrk-close.lua" -H 'Host: bench.test' "${url}" \
+        -s "${ROOT}/bench/wrk-close.lua" -H 'Host: bench.test' \
+        -H 'Accept-Encoding: identity' "${url}" \
         >"${warmup_raw}" 2>&1 || true
       ;;
     h2-single)
       h2load -n "${concurrency}" -c 1 -m "${concurrency}" --sni bench.test \
-        -H 'host: bench.test' "${url}" >"${warmup_raw}" 2>&1 || true
+        -H 'host: bench.test' -H 'accept-encoding: identity' \
+        "${url}" >"${warmup_raw}" 2>&1 || true
       ;;
     h2-multi)
       local warm_clients=$((concurrency < 4 ? concurrency : 4))
       local warm_streams=$(((concurrency + warm_clients - 1) / warm_clients))
       h2load -n "${concurrency}" -c "${warm_clients}" -m "${warm_streams}" \
-        --sni bench.test -H 'host: bench.test' "${url}" >"${warmup_raw}" 2>&1 || true
+        --sni bench.test -H 'host: bench.test' -H 'accept-encoding: identity' \
+        "${url}" >"${warmup_raw}" 2>&1 || true
       ;;
   esac
 
@@ -387,30 +442,45 @@ run_case() {
   case "${protocol}" in
     h1-keepalive)
       wrk --latency -t1 -c "${concurrency}" -d "${DURATION}" \
-        -s "${ROOT}/bench/wrk-keepalive.lua" -H 'Host: bench.test' "${url}" >"${raw}" 2>&1
+        -s "${ROOT}/bench/wrk-keepalive.lua" -H 'Host: bench.test' \
+        -H 'Accept-Encoding: identity' "${url}" >"${raw}" 2>&1
       rc=$?
       ;;
     h1-new|h1-new-tls)
       wrk --latency -t1 -c "${concurrency}" -d "${DURATION}" \
-        -s "${ROOT}/bench/wrk-close.lua" -H 'Host: bench.test' "${url}" >"${raw}" 2>&1
+        -s "${ROOT}/bench/wrk-close.lua" -H 'Host: bench.test' \
+        -H 'Accept-Encoding: identity' "${url}" >"${raw}" 2>&1
       rc=$?
       ;;
     h2-single)
-      local requests=500
-      ((size >= 10485760)) && requests=$((concurrency * 2))
-      ((size >= 104857600)) && requests=${concurrency}
-      h2load -n "${requests}" -c 1 -m "${concurrency}" \
-        --sni bench.test -H 'host: bench.test' --log-file "${request_log}" "${url}" >"${raw}" 2>&1
+      if ((size < 10485760)); then
+        h2load -D "${DURATION}" --warm-up-time="${WARMUP}" -c 1 -m "${concurrency}" \
+          --sni bench.test -H 'host: bench.test' -H 'accept-encoding: identity' \
+          --log-file "${request_log}" "${url}" >"${raw}" 2>&1
+      else
+        local requests=$((concurrency * 2))
+        ((size >= 104857600)) && requests=${concurrency}
+        h2load -n "${requests}" -c 1 -m "${concurrency}" \
+          --sni bench.test -H 'host: bench.test' -H 'accept-encoding: identity' \
+          --log-file "${request_log}" "${url}" >"${raw}" 2>&1
+      fi
       rc=$?
       ;;
     h2-multi)
       local clients=$((concurrency < 4 ? concurrency : 4))
       local streams=$(((concurrency + clients - 1) / clients))
-      local requests=500
-      ((size >= 10485760)) && requests=$((concurrency * 2))
-      ((size >= 104857600)) && requests=${concurrency}
-      h2load -n "${requests}" -c "${clients}" -m "${streams}" \
-        --sni bench.test -H 'host: bench.test' --log-file "${request_log}" "${url}" >"${raw}" 2>&1
+      if ((size < 10485760)); then
+        h2load -D "${DURATION}" --warm-up-time="${WARMUP}" \
+          -c "${clients}" -m "${streams}" --sni bench.test \
+          -H 'host: bench.test' -H 'accept-encoding: identity' \
+          --log-file "${request_log}" "${url}" >"${raw}" 2>&1
+      else
+        local requests=$((concurrency * 2))
+        ((size >= 104857600)) && requests=${concurrency}
+        h2load -n "${requests}" -c "${clients}" -m "${streams}" \
+          --sni bench.test -H 'host: bench.test' -H 'accept-encoding: identity' \
+          --log-file "${request_log}" "${url}" >"${raw}" 2>&1
+      fi
       rc=$?
       ;;
   esac
@@ -418,17 +488,23 @@ run_case() {
   kill "${sampler_pid}" >/dev/null 2>&1 || true
   wait "${sampler_pid}" >/dev/null 2>&1 || true
 
-  local latency_line resource_line rps errors status distribution
+  local latency_line resource_line rps errors status distribution http_errors transport_errors
   if [[ "${protocol}" == h2-* ]]; then
     latency_line=$(python3 "${ROOT}/bench/summarize_h2load.py" "${request_log}" 2>/dev/null || true)
     rps=$(sed -nE 's/.*finished in [^,]+, ([0-9.]+) req\/s.*/\1/p' "${raw}" | tail -1)
-    errors=$(sed -nE 's/requests: [0-9]+ total, [0-9]+ started, [0-9]+ done, [0-9]+ succeeded, ([0-9]+) failed.*/\1/p' "${raw}" | tail -1)
+    transport_errors=$(sed -nE 's/requests: [0-9]+ total, [0-9]+ started, [0-9]+ done, [0-9]+ succeeded, ([0-9]+) failed.*/\1/p' "${raw}" | tail -1)
+    http_errors=$(awk -F '\t' -v expected="${expected_status}" \
+      '$2 >= 100 && $2 <= 599 && $2 != expected {count++} END {print count + 0}' \
+      "${request_log}" 2>/dev/null)
+    errors=$((${transport_errors:-0} + ${http_errors:-0}))
     distribution=$(field "${latency_line}" statuses)
   else
     latency_line=$(grep 'LATENCY_US ' "${raw}" | tail -1)
     rps=$(awk '/Requests\/sec:/ {print $2}' "${raw}" | tail -1)
-    errors=$(awk '/Socket errors:/ {gsub(/[^0-9 ]/, ""); print $1+$2+$3+$4}' "${raw}" | tail -1)
-    distribution=not-collected
+    transport_errors=$(awk '/Socket errors:/ {gsub(/[^0-9 ]/, ""); print $1+$2+$3+$4}' "${raw}" | tail -1)
+    http_errors=$(awk '/Non-2xx or 3xx responses:/ {print $5}' "${raw}" | tail -1)
+    errors=$((${transport_errors:-0} + ${http_errors:-0}))
+    distribution=non_2xx_3xx:${http_errors:-0}
   fi
   resource_line=$(python3 "${ROOT}/bench/summarize_resources.py" "${resources}")
   rps=${rps:-0}
@@ -455,7 +531,7 @@ for ((round = 1; round <= ROUNDS; round++)); do
     ORDER=(pingora nginx)
   fi
   for proxy in "${ORDER[@]}"; do
-    if ! start_proxy "${proxy}"; then
+    if ! start_proxy "${proxy}" "${round}"; then
       echo "${proxy} failed to start in round ${round}" >&2
       FAILURES=$((FAILURES + 1))
       stop_proxy
@@ -465,15 +541,22 @@ for ((round = 1; round <= ROUNDS; round++)); do
       "http://127.0.0.1:${HTTP_PORT}/bytes/64" -o /dev/null || true
     sleep 0.5
     stability_raw=${OUTPUT}/raw/${proxy}-r${round}-h2-single-connection-${STABILITY_REQUESTS}.txt
-    h2load -n "${STABILITY_REQUESTS}" -c 1 -m 32 --sni bench.test -H 'host: bench.test' \
+    stability_log=${OUTPUT}/raw/${proxy}-r${round}-h2-single-connection-${STABILITY_REQUESTS}.requests.tsv
+    h2load -n "${STABILITY_REQUESTS}" -c 1 -m 32 --sni bench.test \
+      -H 'host: bench.test' -H 'accept-encoding: identity' --log-file "${stability_log}" \
       "https://127.0.0.1:${HTTPS_PORT}/bytes/64" >"${stability_raw}" 2>&1
     stability_rc=$?
     stability_errors=$(sed -nE 's/requests: [0-9]+ total, [0-9]+ started, [0-9]+ done, [0-9]+ succeeded, ([0-9]+) failed.*/\1/p' \
       "${stability_raw}" | tail -1)
     stability_errors=${stability_errors:-${STABILITY_REQUESTS}}
+    stability_http_errors=$(awk -F '\t' \
+      '$2 >= 100 && $2 <= 599 && $2 != 200 {count++} END {print count + 0}' \
+      "${stability_log}" 2>/dev/null)
+    stability_errors=$((stability_errors + ${stability_http_errors:-0}))
     stability_status=PASS
     if ((stability_rc != 0 || stability_errors != 0)); then
       stability_status=FAIL
+      FAILURES=$((FAILURES + 1))
     fi
     printf '%s\t%s\th2-single-connection-%s\t%s\t%s\t%s\n' \
       "${proxy}" "${round}" "${STABILITY_REQUESTS}" "${stability_status}" "${stability_errors}" "${stability_raw}" \

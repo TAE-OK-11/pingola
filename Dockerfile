@@ -36,6 +36,9 @@ ENV CARGO_INCREMENTAL=0 \
     CMAKE_GENERATOR=Ninja \
     RUSTFLAGS="-C target-cpu=${RUST_TARGET_CPU} -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections"
 
+# Do not execute a target-cpu-tuned binary in the builder: a generic CI host
+# may legitimately lack znver1 instructions. The x86-64-v2 image is executed
+# by tests/docker_runtime.sh; specialized images are verified on their target.
 RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=pingora-target-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR},target=/src/target,sharing=locked \
@@ -52,8 +55,6 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       *) echo "unsupported Rust codegen unit count: ${RUST_CODEGEN_UNITS}" >&2; exit 2 ;; \
     esac \
     && cargo build --locked --release --no-default-features --features "${ALLOCATOR}" \
-    && expected="${ALLOCATOR%-allocator}" \
-    && target/release/pingora --allocator-info | grep -q "^allocator=${expected}" \
     && install -Dm755 target/release/pingora /out/pingora
 
 FROM debian:${DEBIAN_SUITE}-slim AS runtime

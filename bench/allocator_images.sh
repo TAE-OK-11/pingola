@@ -289,30 +289,48 @@ run_case() {
   local warmup_raw=${OUTPUT}/raw/${case_id}.warmup.txt
   local request_log=${OUTPUT}/raw/${case_id}.requests.tsv
   local resources=${OUTPUT}/raw/${case_id}.resources
-  local path=/bytes/${size} expected actual url
+  local path=/bytes/${size} expected actual url expected_meta actual_meta expected_rc actual_rc
+  local expected_prefix=${OUTPUT}/raw/backend-b${size}
+  local actual_prefix=${OUTPUT}/raw/${case_id}.curl
 
-  expected=$(curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}${path}" | sha256sum | cut -d' ' -f1)
+  expected_meta=$(curl --noproxy '*' -sS -H 'accept-encoding: identity' \
+    -D "${expected_prefix}.headers" -o "${expected_prefix}.body" \
+    -w '%{http_code} %{http_version}' "http://127.0.0.1:${BACKEND_PORT}${path}")
+  expected_rc=$?
   if [[ "${protocol}" == h2-* ]]; then
     url="https://127.0.0.1:${HTTPS_PORT}${path}"
-    actual=$(curl --noproxy '*' -ksS --http2 --resolve "bench.test:${HTTPS_PORT}:127.0.0.1" \
-      "https://bench.test:${HTTPS_PORT}${path}" | sha256sum | cut -d' ' -f1)
+    actual_meta=$(curl --noproxy '*' -ksS --http2 \
+      --resolve "bench.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'accept-encoding: identity' -D "${actual_prefix}.headers" \
+      -o "${actual_prefix}.body" -w '%{http_code} %{http_version}' \
+      "https://bench.test:${HTTPS_PORT}${path}")
   else
     url="http://127.0.0.1:${HTTP_PORT}${path}"
-    actual=$(curl --noproxy '*' -fsS -H 'host: bench.test' "${url}" \
-      | sha256sum | cut -d' ' -f1)
+    actual_meta=$(curl --noproxy '*' -sS -H 'host: bench.test' \
+      -H 'accept-encoding: identity' -D "${actual_prefix}.headers" \
+      -o "${actual_prefix}.body" -w '%{http_code} %{http_version}' "${url}")
   fi
-  if [[ "${actual}" != "${expected}" ]]; then
-    printf '%s\t%s\t%s\t%s\t%s\tFAIL_HASH\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t1\tNA\t%s\n' \
+  actual_rc=$?
+  printf '%s\n' "${expected_meta}" >"${expected_prefix}.meta"
+  printf '%s\n' "${actual_meta}" >"${actual_prefix}.meta"
+  expected=$(sha256sum "${expected_prefix}.body" | cut -d' ' -f1)
+  actual=$(sha256sum "${actual_prefix}.body" | cut -d' ' -f1)
+  if ((expected_rc != 0 || actual_rc != 0)) \
+    || [[ "${expected_meta%% *}" != 200 || "${actual_meta%% *}" != 200 ]] \
+    || { [[ "${protocol}" == h2-* ]] && [[ "${actual_meta#* }" != 2 ]]; } \
+    || [[ "${actual}" != "${expected}" ]]; then
+    printf '%s\t%s\t%s\t%s\t%s\tFAIL_PREFLIGHT\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t1\tNA\t%s\n' \
       "${allocator}" "${protocol}" "${size}" "${concurrency}" "${round}" "${raw}" \
       >>"${OUTPUT}/results.tsv"
-    echo "SHA-256 mismatch expected=${expected} actual=${actual}" >"${raw}"
+    echo "preflight expected_meta=${expected_meta} actual_meta=${actual_meta} expected_sha=${expected} actual_sha=${actual}" >"${raw}"
     FAILURES=$((FAILURES + 1))
     return
   fi
 
   if [[ "${protocol}" == h1-keepalive ]]; then
     wrk -t1 -c "${concurrency}" -d "${WARMUP}" -s "${ROOT}/bench/wrk-keepalive.lua" \
-      -H 'Host: bench.test' "${url}" >"${warmup_raw}" 2>&1 || true
+      -H 'Host: bench.test' -H 'Accept-Encoding: identity' \
+      "${url}" >"${warmup_raw}" 2>&1 || true
   fi
 
   local container_pid sampler_pid rc clients streams
@@ -324,19 +342,22 @@ run_case() {
   case "${protocol}" in
     h1-keepalive)
       wrk --latency -t1 -c "${concurrency}" -d "${DURATION}" \
-        -s "${ROOT}/bench/wrk-keepalive.lua" -H 'Host: bench.test' "${url}" >"${raw}" 2>&1
+        -s "${ROOT}/bench/wrk-keepalive.lua" -H 'Host: bench.test' \
+        -H 'Accept-Encoding: identity' "${url}" >"${raw}" 2>&1
       rc=$?
       ;;
     h2-single)
       h2load -D "${DURATION}" --warm-up-time="${WARMUP}" -c 1 -m "${concurrency}" \
-        --sni bench.test -H 'host: bench.test' --log-file "${request_log}" "${url}" >"${raw}" 2>&1
+        --sni bench.test -H 'host: bench.test' -H 'accept-encoding: identity' \
+        --log-file "${request_log}" "${url}" >"${raw}" 2>&1
       rc=$?
       ;;
     h2-multi)
       clients=$((concurrency < 4 ? concurrency : 4))
       streams=$(((concurrency + clients - 1) / clients))
       h2load -D "${DURATION}" --warm-up-time="${WARMUP}" -c "${clients}" -m "${streams}" \
-        --sni bench.test -H 'host: bench.test' --log-file "${request_log}" "${url}" >"${raw}" 2>&1
+        --sni bench.test -H 'host: bench.test' -H 'accept-encoding: identity' \
+        --log-file "${request_log}" "${url}" >"${raw}" 2>&1
       rc=$?
       ;;
   esac
@@ -344,19 +365,24 @@ run_case() {
   kill "${sampler_pid}" >/dev/null 2>&1 || true
   wait "${sampler_pid}" >/dev/null 2>&1 || true
 
-  local latency_line resource_line rps errors status distribution incomplete
+  local latency_line resource_line rps errors status distribution incomplete http_errors transport_errors
   if [[ "${protocol}" == h2-* ]]; then
     latency_line=$(python3 "${ROOT}/bench/summarize_h2load.py" "${request_log}" 2>/dev/null || true)
     rps=$(sed -nE 's/.*finished in [^,]+, ([0-9.]+) req\/s.*/\1/p' "${raw}" | tail -1)
-    errors=$(sed -nE 's/requests: [0-9]+ total, [0-9]+ started, [0-9]+ done, [0-9]+ succeeded, ([0-9]+) failed.*/\1/p' "${raw}" | tail -1)
+    transport_errors=$(sed -nE 's/requests: [0-9]+ total, [0-9]+ started, [0-9]+ done, [0-9]+ succeeded, ([0-9]+) failed.*/\1/p' "${raw}" | tail -1)
+    http_errors=$(awk -F '\t' '$2 >= 100 && $2 <= 599 && $2 != 200 {count++} END {print count + 0}' \
+      "${request_log}" 2>/dev/null)
+    errors=$((${transport_errors:-0} + ${http_errors:-0}))
     distribution=$(field "${latency_line}" statuses)
     incomplete=$(field "${latency_line}" incomplete)
     distribution="${distribution},timing_cutoff:${incomplete:-0}"
   else
     latency_line=$(grep 'LATENCY_US ' "${raw}" | tail -1)
     rps=$(awk '/Requests\/sec:/ {print $2}' "${raw}" | tail -1)
-    errors=$(awk '/Socket errors:/ {gsub(/[^0-9 ]/, ""); print $1+$2+$3+$4}' "${raw}" | tail -1)
-    distribution=not-collected
+    transport_errors=$(awk '/Socket errors:/ {gsub(/[^0-9 ]/, ""); print $1+$2+$3+$4}' "${raw}" | tail -1)
+    http_errors=$(awk '/Non-2xx or 3xx responses:/ {print $5}' "${raw}" | tail -1)
+    errors=$((${transport_errors:-0} + ${http_errors:-0}))
+    distribution=non_2xx_3xx:${http_errors:-0}
   fi
   resource_line=$(python3 "${ROOT}/bench/summarize_resources.py" "${resources}")
   rps=${rps:-0}

@@ -23,6 +23,14 @@ upstreams:
     connect_timeout_seconds: 2
     read_timeout_seconds: 3600
     write_timeout_seconds: 3600
+  # The benchmark never calls /dns-query, but the AdGuard handler's route
+  # table must remain complete so --check reflects actual runtime viability.
+  adguard_dns_doh:
+    address: "127.0.0.1:19095"
+    protocol: http1
+    connect_timeout_seconds: 2
+    read_timeout_seconds: 3600
+    write_timeout_seconds: 3600
 hosts:
   benchmark:
     domains: ["bench.test"]

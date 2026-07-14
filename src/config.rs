@@ -319,6 +319,20 @@ fn validate(config: &Config) -> Result<()> {
             }
         }
 
+        let required_doh_upstream = match host.handler {
+            HandlerKind::AdguardDns => Some("adguard_dns_doh"),
+            HandlerKind::AdguardKorea => Some("adguard_korea_doh"),
+            _ => None,
+        };
+        if let Some(required) = required_doh_upstream {
+            if !config.upstreams.contains_key(required) {
+                bail!(
+                    "host {name} handler {:?} requires DoH upstream {required}",
+                    host.handler
+                );
+            }
+        }
+
         for domain in &host.domains {
             let normalized = normalize_host(domain);
             if normalized.is_empty() || normalized != domain.to_ascii_lowercase() {
@@ -485,5 +499,17 @@ hosts:
             .unwrap()
             .http2_max_concurrent_streams = 0;
         assert!(RuntimeConfig::new(config).is_err());
+    }
+
+    #[test]
+    fn adguard_handler_requires_its_internal_doh_upstream_during_validation() {
+        let mut config = sample_config();
+        config.hosts.get_mut("app").unwrap().handler = HandlerKind::AdguardDns;
+        let error = RuntimeConfig::new(config.clone()).unwrap_err();
+        assert!(format!("{error:#}").contains("adguard_dns_doh"));
+
+        let upstream = config.upstreams.get("app").unwrap().clone();
+        config.upstreams.insert("adguard_dns_doh".into(), upstream);
+        assert!(RuntimeConfig::new(config).is_ok());
     }
 }

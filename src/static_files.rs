@@ -21,6 +21,8 @@ use percent_encoding::percent_decode_str;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 
+use crate::content_encoding::{negotiate, ContentCoding};
+
 const MAX_BUFFERED_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -98,7 +100,7 @@ impl AssetCache {
         }
 
         let mut state = self.state.lock();
-        if let Some(previous) = state.assets.put(key, asset.clone()) {
+        if let Some((_, previous)) = state.assets.push(key, asset.clone()) {
             state.bytes = state.bytes.saturating_sub(previous.body.len());
         }
         state.bytes += asset.body.len();
@@ -160,8 +162,11 @@ impl StaticFiles {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path_is_compressible = compressible_path(&path);
+        let negotiation = negotiate(session.req_header().headers.get_all(ACCEPT_ENCODING).iter());
         if metadata.len() > MAX_BUFFERED_ASSET_BYTES {
+            if !negotiation.identity_acceptable {
+                return send_empty(session, 406, &[], tls).await;
+            }
             let content_type = content_type(&path);
             return serve_streaming_file(
                 session,
@@ -174,16 +179,20 @@ impl StaticFiles {
             )
             .await;
         }
-        let requested_encoding = if metadata.len() >= 1024 && path_is_compressible {
-            negotiate_encoding(
-                session
-                    .req_header()
-                    .headers
-                    .get(ACCEPT_ENCODING)
-                    .and_then(|value| value.to_str().ok()),
-            )
-        } else {
+        let requested_encoding = if metadata.len() >= 1024 && compressible_path(&path) {
+            match negotiation.preferred {
+                ContentCoding::Identity => Encoding::Identity,
+                ContentCoding::Gzip => Encoding::Gzip,
+                ContentCoding::Brotli => Encoding::Brotli,
+                ContentCoding::Zstd => Encoding::Zstd,
+                ContentCoding::NotAcceptable => {
+                    return send_empty(session, 406, &[], tls).await;
+                }
+            }
+        } else if negotiation.identity_acceptable {
             Encoding::Identity
+        } else {
+            return send_empty(session, 406, &[], tls).await;
         };
         let key = CacheKey {
             path: path.clone(),
@@ -192,27 +201,46 @@ impl StaticFiles {
             encoding: requested_encoding,
         };
 
-        let asset = if let Some(asset) = self.cache.get(&key) {
-            asset
-        } else {
-            let body = self.read_representation(&path, requested_encoding).await;
-            let (body, actual_encoding) = match body {
-                Ok(value) => value,
-                Err(_) => return send_empty(session, 500, &[], tls).await,
-            };
-            let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), modified_nanos);
-            let asset = Arc::new(CachedAsset {
-                body,
-                content_type: content_type(&path),
-                etag,
-                last_modified: httpdate::fmt_http_date(modified),
-            });
-            let actual_key = CacheKey {
-                encoding: actual_encoding,
-                ..key
-            };
-            self.cache.insert(actual_key, asset.clone());
-            asset
+        let asset = match self.cache.get(&key) {
+            Some(asset) => asset,
+            None => {
+                let _compression_permit = if requested_encoding == Encoding::Identity {
+                    None
+                } else {
+                    Some(self.compression_slot.acquire().await.map_err(|error| {
+                        cloudflare_pingora::Error::because(
+                            cloudflare_pingora::ErrorType::InternalError,
+                            "compression scheduler closed",
+                            error,
+                        )
+                    })?)
+                };
+
+                // Another cold request can populate the representation while
+                // this request waits for the bounded compressor.
+                if let Some(asset) = self.cache.get(&key) {
+                    asset
+                } else {
+                    let body = self.read_representation(&path, requested_encoding).await;
+                    let (body, actual_encoding) = match body {
+                        Ok(value) => value,
+                        Err(_) => return send_empty(session, 500, &[], tls).await,
+                    };
+                    let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), modified_nanos);
+                    let asset = Arc::new(CachedAsset {
+                        body,
+                        content_type: content_type(&path),
+                        etag,
+                        last_modified: httpdate::fmt_http_date(modified),
+                    });
+                    let actual_key = CacheKey {
+                        encoding: actual_encoding,
+                        ..key
+                    };
+                    self.cache.insert(actual_key, asset.clone());
+                    asset
+                }
+            }
         };
 
         if session
@@ -266,8 +294,8 @@ impl StaticFiles {
             let mut sidecar: OsString = path.as_os_str().to_owned();
             sidecar.push(".");
             sidecar.push(extension);
-            if let Ok(data) = tokio::fs::read(PathBuf::from(sidecar)).await {
-                return Ok((Bytes::from(data), encoding));
+            if let Some(data) = read_bounded_sidecar(&PathBuf::from(sidecar)).await? {
+                return Ok((data, encoding));
             }
         }
 
@@ -277,17 +305,32 @@ impl StaticFiles {
                 .map(|data| (Bytes::from(data), Encoding::Identity));
         }
 
-        let _permit = self
-            .compression_slot
-            .acquire()
-            .await
-            .map_err(|_| std::io::Error::other("compression scheduler closed"))?;
         let data = tokio::fs::read(path).await?;
         let compressed = tokio::task::spawn_blocking(move || compress(data, encoding))
             .await
             .map_err(std::io::Error::other)??;
         Ok((Bytes::from(compressed), encoding))
     }
+}
+
+async fn read_bounded_sidecar(path: &Path) -> std::io::Result<Option<Bytes>> {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(None),
+    };
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() || metadata.len() > MAX_BUFFERED_ASSET_BYTES {
+        return Ok(None);
+    }
+    let mut data = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(MAX_BUFFERED_ASSET_BYTES + 1)
+        .read_to_end(&mut data)
+        .await?;
+    if data.len() as u64 > MAX_BUFFERED_ASSET_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(Bytes::from(data)))
 }
 
 async fn resolve_path(root: &Path, uri_path: &str) -> Option<(PathBuf, bool)> {
@@ -309,13 +352,21 @@ async fn resolve_path(root: &Path, uri_path: &str) -> Option<(PathBuf, bool)> {
     }
 
     if let Ok(candidate) = tokio::fs::canonicalize(root.join(&relative)).await {
-        if candidate.starts_with(root) && candidate.is_file() {
-            return Some((candidate, false));
-        }
-        if candidate.starts_with(root) && candidate.is_dir() {
-            if let Ok(index) = tokio::fs::canonicalize(candidate.join("index.html")).await {
-                if index.starts_with(root) && index.is_file() {
-                    return Some((index, false));
+        if candidate.starts_with(root) {
+            if let Ok(metadata) = tokio::fs::metadata(&candidate).await {
+                if metadata.is_file() {
+                    return Some((candidate, false));
+                }
+                if metadata.is_dir() {
+                    if let Ok(index) = tokio::fs::canonicalize(candidate.join("index.html")).await {
+                        if index.starts_with(root)
+                            && tokio::fs::metadata(&index)
+                                .await
+                                .is_ok_and(|metadata| metadata.is_file())
+                        {
+                            return Some((index, false));
+                        }
+                    }
                 }
             }
         }
@@ -324,7 +375,10 @@ async fn resolve_path(root: &Path, uri_path: &str) -> Option<(PathBuf, bool)> {
     let index = tokio::fs::canonicalize(root.join("index.html"))
         .await
         .ok()?;
-    (index.starts_with(root) && index.is_file()).then_some((index, true))
+    let is_file = tokio::fs::metadata(&index)
+        .await
+        .is_ok_and(|metadata| metadata.is_file());
+    (index.starts_with(root) && is_file).then_some((index, true))
 }
 
 async fn serve_streaming_file(
@@ -435,53 +489,6 @@ fn compress(data: Vec<u8>, encoding: Encoding) -> std::io::Result<Vec<u8>> {
     }
 }
 
-fn negotiate_encoding(header: Option<&str>) -> Encoding {
-    let Some(header) = header else {
-        return Encoding::Identity;
-    };
-    let mut zstd = None;
-    let mut brotli = None;
-    let mut gzip = None;
-    let mut wildcard = 0.0;
-    for item in header.split(',') {
-        let mut parts = item.trim().split(';');
-        let name = parts.next().unwrap_or_default().trim();
-        let mut q = 1.0;
-        for parameter in parts {
-            if let Some((key, value)) = parameter.trim().split_once('=') {
-                if key.trim().eq_ignore_ascii_case("q") {
-                    q = value.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1.0);
-                }
-            }
-        }
-        if name.eq_ignore_ascii_case("zstd") {
-            zstd = Some(q);
-        } else if name.eq_ignore_ascii_case("br") {
-            brotli = Some(q);
-        } else if name.eq_ignore_ascii_case("gzip") {
-            gzip = Some(q);
-        } else if name == "*" {
-            wildcard = q;
-        }
-    }
-
-    let candidates = [
-        (Encoding::Zstd, zstd),
-        (Encoding::Brotli, brotli),
-        (Encoding::Gzip, gzip),
-    ];
-    let mut selected = Encoding::Identity;
-    let mut selected_quality = 0.0;
-    for (encoding, quality) in candidates {
-        let candidate_quality = quality.unwrap_or(wildcard);
-        if candidate_quality > selected_quality {
-            selected = encoding;
-            selected_quality = candidate_quality;
-        }
-    }
-    selected
-}
-
 fn content_type(path: &Path) -> String {
     mime_guess::from_path(path)
         .first_or_octet_stream()
@@ -521,7 +528,10 @@ fn compressible_path(path: &Path) -> bool {
                 .iter()
                 .any(|candidate| extension.eq_ignore_ascii_case(candidate))
         });
-    known_compressible || compressible_content_type(&content_type(path))
+    known_compressible
+        || mime_guess::from_path(path)
+            .first()
+            .is_some_and(|mime| compressible_content_type(mime.essence_str()))
 }
 
 fn compressible_content_type(content_type: &str) -> bool {
@@ -593,18 +603,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encoding_negotiation_respects_quality() {
-        assert_eq!(
-            negotiate_encoding(Some("gzip;q=1, br;q=0.5, zstd;q=0")),
-            Encoding::Gzip
-        );
-        assert_eq!(negotiate_encoding(Some("br, gzip")), Encoding::Brotli);
-        assert_eq!(negotiate_encoding(Some("GZIP; Q=0.7")), Encoding::Gzip);
-        assert_eq!(negotiate_encoding(Some("*;q=0.5, br;q=0")), Encoding::Zstd);
-        assert_eq!(negotiate_encoding(None), Encoding::Identity);
-    }
-
-    #[test]
     fn compressible_extensions_are_detected_without_mime_allocation() {
         assert!(compressible_path(Path::new("asset.JSON")));
         assert!(compressible_path(Path::new("index.html")));
@@ -636,5 +634,60 @@ mod tests {
         assert_eq!(decoded, data);
         assert!(!compress(data.clone(), Encoding::Brotli).unwrap().is_empty());
         assert!(!compress(data, Encoding::Zstd).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cache_byte_accounting_tracks_capacity_evictions() {
+        let cache = AssetCache::new(usize::MAX);
+        for index in 0..513_u128 {
+            cache.insert(
+                CacheKey {
+                    path: PathBuf::from(format!("asset-{index}")),
+                    modified_nanos: index,
+                    length: 1,
+                    encoding: Encoding::Identity,
+                },
+                Arc::new(CachedAsset {
+                    body: Bytes::from_static(b"x"),
+                    content_type: "text/plain".to_string(),
+                    etag: format!("etag-{index}"),
+                    last_modified: "Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+                }),
+            );
+        }
+
+        let state = cache.state.lock();
+        let actual_bytes = state
+            .assets
+            .iter()
+            .map(|(_, asset)| asset.body.len())
+            .sum::<usize>();
+        assert_eq!(state.assets.len(), 512);
+        assert_eq!(state.bytes, actual_bytes);
+    }
+
+    #[tokio::test]
+    async fn oversized_precompressed_sidecar_is_ignored_without_unbounded_read() {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("asset.txt");
+        let source = b"bounded sidecar fallback".repeat(128);
+        std::fs::write(&path, &source).unwrap();
+        let sidecar = directory.path().join("asset.txt.gz");
+        let file = std::fs::File::create(&sidecar).unwrap();
+        file.set_len(MAX_BUFFERED_ASSET_BYTES + 1).unwrap();
+
+        let files = StaticFiles::new(HashMap::new(), 1024 * 1024).unwrap();
+        let (compressed, encoding) = files
+            .read_representation(&path, Encoding::Gzip)
+            .await
+            .unwrap();
+        assert_eq!(encoding, Encoding::Gzip);
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_ref())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, source);
     }
 }

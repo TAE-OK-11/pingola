@@ -95,7 +95,7 @@ class Handler(BaseHTTPRequestHandler):
             with open(DISCONNECT_MARKER, "w", encoding="ascii") as output:
                 output.write("upstream-cancelled\n")
 
-    def _json_headers(self) -> None:
+    def _json_headers(self, no_transform: bool = False) -> None:
         payload = json.dumps(
             {
                 "method": self.command,
@@ -103,12 +103,15 @@ class Handler(BaseHTTPRequestHandler):
                 "range": self.headers.get("range"),
                 "upgrade": self.headers.get("upgrade"),
                 "connection": self.headers.get("connection"),
+                "padding": "x" * 2048,
             },
             separators=(",", ":"),
         ).encode("ascii")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        if no_transform:
+            self.send_header("Cache-Control", "private, no-transform")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -116,6 +119,18 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path in ("/api", "/lyrics", "/cover", "/headers", "/stream/headers"):
             self._json_headers()
+            return
+        if path == "/headers-no-transform":
+            self._json_headers(no_transform=True)
+            return
+        if path == "/empty/204":
+            self.send_response(204)
+            self.end_headers()
+            return
+        if path == "/not-modified/304":
+            self.send_response(304)
+            self.send_header("ETag", '"empty"')
+            self.end_headers()
             return
         if path == "/dns-query":
             payload = b"\x00\x01synthetic-dns-response"

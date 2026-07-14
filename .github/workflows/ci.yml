@@ -57,6 +57,7 @@ jobs:
           tests/listeners_health.sh
           tests/retries.sh
           tests/limit_isolation.sh
+          tests/static_global_limit.sh
           tests/service_matrix.sh
           tests/integration.sh
       - name: HTTP/2 correctness matrix
@@ -100,7 +101,7 @@ jobs:
           PINGORA_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
           PINGORA_EXPECTED_LTO: ${{ matrix.lto }}
         run: tests/docker_runtime.sh
-      - name: Specialized image metadata and allocator smoke check
+      - name: Specialized image metadata check
         if: ${{ !matrix.runtime }}
         env:
           IMAGE: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}
@@ -114,7 +115,6 @@ jobs:
           test "${target_cpu}" = "znver1"
           test "${allocator}" = "tcmalloc"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.lto"]')" = "fat"
-          docker run --rm "${IMAGE}" --allocator-info | grep -q '^allocator=tcmalloc '
 
   image:
     if: github.event_name != 'pull_request'
@@ -158,6 +158,7 @@ jobs:
             org.opencontainers.image.url=https://github.com/TAE-OK-11/pingora
             org.opencontainers.image.allocator=tcmalloc
       - name: Build and publish
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -176,6 +177,12 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
+      - name: Verify the exact published generic image
+        env:
+          PINGORA_TEST_IMAGE: ghcr.io/tae-ok-11/pingora@${{ steps.build.outputs.digest }}
+          PINGORA_EXPECTED_TARGET_CPU: x86-64-v2
+          PINGORA_EXPECTED_LTO: fat
+        run: tests/docker_runtime.sh
 
   image-znver1:
     if: github.event_name == 'push'

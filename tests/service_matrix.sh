@@ -122,6 +122,63 @@ jq -e '.accept_encoding == null' <<<"${couch_headers}" >/dev/null
 grep -qi '^content-encoding: gzip' "${RUNTIME}/vault-compression.headers"
 grep -qi '^content-encoding: gzip' "${RUNTIME}/couch-compression.headers"
 
+curl --noproxy '*' -ksS --http2 --resolve vault.test:18550:127.0.0.1 \
+  -H 'accept-encoding: gzip;q=0' -D "${RUNTIME}/vault-q0.headers" \
+  https://vault.test:18550/headers -o "${RUNTIME}/vault-q0.body"
+! grep -qi '^content-encoding:' "${RUNTIME}/vault-q0.headers"
+jq -e '.padding | length == 2048' "${RUNTIME}/vault-q0.body" >/dev/null
+status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \
+  --resolve vault.test:18550:127.0.0.1 \
+  -H 'accept-encoding: identity;q=0, *;q=0' \
+  https://vault.test:18550/headers)
+[[ "${status}" == 406 ]]
+
+curl --noproxy '*' -ksS --http2 --resolve couch.test:18550:127.0.0.1 \
+  -H 'accept-encoding: gzip' -D "${RUNTIME}/couch-no-transform.headers" \
+  https://couch.test:18550/headers-no-transform \
+  -o "${RUNTIME}/couch-no-transform.body"
+! grep -qi '^content-encoding:' "${RUNTIME}/couch-no-transform.headers"
+jq -e '.padding | length == 2048' "${RUNTIME}/couch-no-transform.body" >/dev/null
+
+curl --noproxy '*' -ksS --http2 --resolve vault.test:18550:127.0.0.1 \
+  -H 'accept-encoding: gzip' -D "${RUNTIME}/vault-binary.headers" \
+  https://vault.test:18550/attachment/1048576 \
+  -o "${RUNTIME}/vault-binary.body"
+! grep -qi '^content-encoding:' "${RUNTIME}/vault-binary.headers"
+[[ $(sha256sum "${RUNTIME}/vault-binary.body" | awk '{print $1}') == \
+  $(direct_sha /attachment/1048576) ]]
+
+# If identity is explicitly forbidden, a response that cannot legally or
+# safely be transformed must be rejected instead of silently sending identity.
+expect_identity_rejected() {
+  local host=$1
+  local path=$2
+  shift 2
+  local status
+  status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \
+    --resolve "${host}:18550:127.0.0.1" \
+    -H 'accept-encoding: gzip, identity;q=0' "$@" \
+    "https://${host}:18550${path}")
+  [[ "${status}" == 406 ]]
+}
+expect_identity_rejected vault.test /attachment/100
+expect_identity_rejected couch.test /headers-no-transform
+expect_identity_rejected couch.test /replication/4096 -H 'range: bytes=0-2047'
+
+for endpoint in empty/204 not-modified/304; do
+  expected=${endpoint##*/}
+  status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \
+    --resolve "vault.test:18550:127.0.0.1" \
+    -H 'accept-encoding: gzip, identity;q=0' \
+    "https://vault.test:18550/${endpoint}")
+  [[ "${status}" == "${expected}" ]]
+done
+status=$(curl --noproxy '*' -ksS --http2 --head -o /dev/null -w '%{http_code}' \
+  --resolve "vault.test:18550:127.0.0.1" \
+  -H 'accept-encoding: gzip, identity;q=0' \
+  https://vault.test:18550/stream/100)
+[[ "${status}" == 406 ]]
+
 for size in 1048576 10485760 104857600; do
   expected=$(direct_sha "/stream/${size}")
   actual=$(proxy_sha nav.test "/stream/${size}")

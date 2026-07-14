@@ -19,14 +19,16 @@ use cloudflare_pingora::ErrorType;
 use cloudflare_pingora::ErrorType::HTTPStatus;
 use cloudflare_pingora::Result;
 use http::header::{
-    HeaderName, HeaderValue, ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, EXPIRES,
-    FORWARDED, HOST, LAST_MODIFIED, PRAGMA, TRANSFER_ENCODING, UPGRADE,
+    HeaderName, HeaderValue, ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING,
+    CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, EXPIRES, FORWARDED, HOST, LAST_MODIFIED, PRAGMA,
+    TRANSFER_ENCODING, UPGRADE,
 };
-use http::Method;
+use http::{Method, Version};
 use log::{info, warn};
 use serde_json::json;
 
 use crate::config::{normalized_host, HandlerKind, RuntimeConfig, UpstreamProtocol};
+use crate::content_encoding::{negotiate, ContentCoding, EncodingNegotiation};
 use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, RateLimiter};
 use crate::static_files::StaticFiles;
 
@@ -45,6 +47,12 @@ const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host")
 const X_FORWARDED_PORT: HeaderName = HeaderName::from_static("x-forwarded-port");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const X_FORWARDED_SSL: HeaderName = HeaderName::from_static("x-forwarded-ssl");
+const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
+const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
+const PROXY_AUTHENTICATE: HeaderName = HeaderName::from_static("proxy-authenticate");
+const PROXY_AUTHORIZATION: HeaderName = HeaderName::from_static("proxy-authorization");
+const TE: HeaderName = HeaderName::from_static("te");
+const TRAILER: HeaderName = HeaderName::from_static("trailer");
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 const STRICT_TRANSPORT_SECURITY: HeaderName = HeaderName::from_static("strict-transport-security");
 const X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
@@ -230,6 +238,7 @@ pub struct RequestContext {
     tls: bool,
     body_bytes: usize,
     retries: usize,
+    identity_acceptable: bool,
     started_at: Option<Instant>,
     _active_request_permit: Option<ActiveRequestPermit>,
     _global_request_permit: Option<ActiveRequestPermit>,
@@ -243,6 +252,7 @@ impl Default for RequestContext {
             tls: false,
             body_bytes: 0,
             retries: 0,
+            identity_acceptable: true,
             started_at: None,
             _active_request_permit: None,
             _global_request_permit: None,
@@ -342,6 +352,18 @@ impl Gateway {
         let domain = normalized_host(authority);
         self.hosts.get::<str>(domain.as_ref())
     }
+
+    fn acquire_global_request(&self, ctx: &mut RequestContext) -> bool {
+        let limit = self.runtime.config.server.global_active_requests;
+        if limit == 0 {
+            return true;
+        }
+        let Some(permit) = self.active_requests.acquire("global", ctx.client_ip, limit) else {
+            return false;
+        };
+        ctx._global_request_permit = Some(permit);
+        true
+    }
 }
 
 #[async_trait]
@@ -416,7 +438,29 @@ impl ProxyHttp for Gateway {
             .await;
         }
 
+        let peer_ip = session
+            .client_addr()
+            .and_then(|address| address.as_inet())
+            .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |address| address.ip());
+        let forwarded_for = session
+            .req_header()
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok());
+        let client_ip = resolve_client_ip(&self.runtime, peer_ip, forwarded_for);
+        ctx.client_ip = client_ip;
+
         if host.handler == HandlerKind::Static {
+            if !self.acquire_global_request(ctx) {
+                return send_empty(
+                    session,
+                    429,
+                    Some(host.handler),
+                    tls,
+                    &[("retry-after", "1")],
+                )
+                .await;
+            }
             return self.static_files.serve(&host.name, session, tls).await;
         }
 
@@ -432,21 +476,14 @@ impl ProxyHttp for Gateway {
             .await;
         }
 
-        let peer_ip = session
-            .client_addr()
-            .and_then(|address| address.as_inet())
-            .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |address| address.ip());
-        let forwarded_for = session
-            .req_header()
-            .headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok());
-        let client_ip = resolve_client_ip(&self.runtime, peer_ip, forwarded_for);
         let Some(plan) = host.plan(path) else {
             return send_empty(session, 500, Some(host.handler), tls, &[]).await;
         };
-        configure_downstream_compression(session, plan.route);
-        ctx.client_ip = client_ip;
+        let encoding = configure_downstream_compression(session, plan.route)?;
+        if encoding.preferred == ContentCoding::NotAcceptable {
+            return send_empty(session, 406, Some(plan.handler), tls, &[]).await;
+        }
+        ctx.identity_acceptable = encoding.identity_acceptable;
         ctx.tls = tls;
 
         if content_length(session.req_header()).is_some_and(|length| length > plan.max_body_bytes) {
@@ -467,22 +504,15 @@ impl ProxyHttp for Gateway {
             }
         }
 
-        if self.runtime.config.server.global_active_requests > 0 {
-            let Some(permit) = self.active_requests.acquire(
-                "global",
-                client_ip,
-                self.runtime.config.server.global_active_requests,
-            ) else {
-                return send_empty(
-                    session,
-                    429,
-                    Some(plan.handler),
-                    tls,
-                    &[("retry-after", "1")],
-                )
-                .await;
-            };
-            ctx._global_request_permit = Some(permit);
+        if !self.acquire_global_request(ctx) {
+            return send_empty(
+                session,
+                429,
+                Some(plan.handler),
+                tls,
+                &[("retry-after", "1")],
+            )
+            .await;
         }
 
         let active_limit = policy
@@ -536,6 +566,7 @@ impl ProxyHttp for Gateway {
             .plan
             .as_ref()
             .ok_or_else(|| Error::explain(HTTPStatus(500), "request plan is missing"))?;
+        strip_request_hop_headers(session.req_header(), upstream_request)?;
         let mut client_ip_text = ArrayString::<64>::new();
         write!(&mut client_ip_text, "{}", ctx.client_ip).map_err(|error| {
             Error::because(
@@ -563,8 +594,14 @@ impl ProxyHttp for Gateway {
         upstream_request.insert_header(X_REAL_IP, client_ip.clone())?;
         upstream_request.insert_header(X_FORWARDED_FOR, client_ip)?;
         upstream_request.insert_header(X_FORWARDED_HOST, plan.domain.clone())?;
-        upstream_request
-            .insert_header(X_FORWARDED_PORT, if ctx.tls { PORT_443 } else { PORT_80 })?;
+        let listener_port = session
+            .server_addr()
+            .and_then(|address| address.as_inet())
+            .map(|address| address.port());
+        upstream_request.insert_header(
+            X_FORWARDED_PORT,
+            forwarded_port_value(listener_port, ctx.tls)?,
+        )?;
         upstream_request.insert_header(X_FORWARDED_PROTO, if ctx.tls { HTTPS } else { HTTP })?;
         upstream_request.insert_header(X_FORWARDED_SSL, if ctx.tls { ON } else { OFF })?;
 
@@ -578,10 +615,16 @@ impl ProxyHttp for Gateway {
             upstream_request.remove_header(&ACCEPT_ENCODING);
         }
 
-        if plan.route == RouteClass::Doh {
-            upstream_request.remove_header(&UPGRADE);
-            upstream_request.remove_header(&CONNECTION);
-        } else if let Some(upgrade) = session.req_header().headers.get(UPGRADE) {
+        let forwards_upgrade = plan.route != RouteClass::Doh
+            && upstream_request.version == Version::HTTP_11
+            && session.is_upgrade_req();
+        if forwards_upgrade {
+            let upgrade = session.req_header().headers.get(UPGRADE).ok_or_else(|| {
+                Error::explain(
+                    HTTPStatus(400),
+                    "upgrade request is missing its Upgrade header",
+                )
+            })?;
             upstream_request.insert_header(UPGRADE, upgrade.clone())?;
             upstream_request.insert_header(CONNECTION, UPGRADE_VALUE)?;
         } else {
@@ -613,15 +656,46 @@ impl ProxyHttp for Gateway {
 
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         let Some(plan) = ctx.plan.as_ref() else {
             return Ok(());
         };
+        let forwards_upgrade = response.status.as_u16() == 101
+            && session.req_header().version == Version::HTTP_11
+            && session.is_upgrade_req();
+        strip_response_hop_headers(response, forwards_upgrade)?;
         strip_upstream_headers(response);
         insert_security_headers(response, plan.handler, ctx.tls)?;
+        if uses_downstream_compression(plan.route)
+            && response_status_is_interim(response.status.as_u16())
+        {
+            // 100/103 are interim headers. Do not permanently disable the
+            // compressor before the final response arrives.
+            return Ok(());
+        }
+        // Status-defined no-content responses carry no selected representation.
+        // HEAD still describes the corresponding GET representation, so it
+        // must follow the same content-coding acceptability decision as GET.
+        let bodyless = response_status_has_no_body(response.status.as_u16());
+        if uses_downstream_compression(plan.route)
+            && (bodyless || !response_allows_compression(response))
+        {
+            if let Some(compression) = session
+                .downstream_modules_ctx
+                .get_mut::<ResponseCompression>()
+            {
+                compression.adjust_level(0);
+            }
+            if !bodyless && !ctx.identity_acceptable {
+                return Err(Error::explain(
+                    HTTPStatus(406),
+                    "upstream response cannot use an acceptable content coding",
+                ));
+            }
+        }
         if plan.route == RouteClass::Doh {
             response.remove_header(&CACHE_CONTROL);
             response.remove_header(&EXPIRES);
@@ -747,14 +821,30 @@ fn uses_downstream_compression(route: RouteClass) -> bool {
     matches!(route, RouteClass::Vaultwarden | RouteClass::Couchdb)
 }
 
-fn configure_downstream_compression(session: &mut Session, route: RouteClass) {
+fn configure_downstream_compression(
+    session: &mut Session,
+    route: RouteClass,
+) -> Result<EncodingNegotiation> {
     if !uses_downstream_compression(route) {
-        return;
+        return Ok(EncodingNegotiation {
+            preferred: ContentCoding::Identity,
+            identity_acceptable: true,
+        });
     }
 
+    let negotiation = negotiate(session.req_header().headers.get_all(ACCEPT_ENCODING).iter());
+    let Some(encoding) = negotiation.preferred.as_str() else {
+        return Ok(negotiation);
+    };
+
     // The default Pingora module starts disabled, so it skipped its earlier
-    // request-header hook. Enable the inexpensive level-1 encoder only for
-    // these text routes and feed it the request once to parse Accept-Encoding.
+    // request-header hook. Normalize all q-values and duplicate fields to one
+    // accepted coding before feeding Pingora's parser, which currently ignores
+    // q-values itself.
+    session
+        .downstream_session
+        .req_header_mut()
+        .insert_header(ACCEPT_ENCODING, encoding)?;
     let request = session.downstream_session.req_header();
     if let Some(compression) = session
         .downstream_modules_ctx
@@ -763,6 +853,168 @@ fn configure_downstream_compression(session: &mut Session, route: RouteClass) {
         compression.adjust_level(1);
         compression.request_filter(request);
     }
+    Ok(negotiation)
+}
+
+fn response_allows_compression(response: &ResponseHeader) -> bool {
+    if response_status_has_no_body(response.status.as_u16())
+        || response.status.as_u16() == 206
+        || response.headers.contains_key(CONTENT_RANGE)
+        || response.headers.contains_key(CONTENT_ENCODING)
+    {
+        return false;
+    }
+    if response.headers.get_all(CACHE_CONTROL).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value.split(',').any(|directive| {
+                directive
+                    .trim()
+                    .split_once('=')
+                    .map_or(directive.trim(), |(name, _)| name.trim())
+                    .eq_ignore_ascii_case("no-transform")
+            })
+        })
+    }) {
+        return false;
+    }
+    if let Some(length) = response.headers.get(CONTENT_LENGTH) {
+        if length
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_none_or(|length| length < 1024)
+        {
+            return false;
+        }
+    }
+
+    response
+        .headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(compressible_proxy_content_type)
+}
+
+fn response_status_has_no_body(status: u16) -> bool {
+    (100..200).contains(&status) || status == 204 || status == 205 || status == 304
+}
+
+fn response_status_is_interim(status: u16) -> bool {
+    (100..200).contains(&status) && status != 101
+}
+
+fn compressible_proxy_content_type(value: &str) -> bool {
+    let essence = value.split(';').next().unwrap_or_default().trim();
+    if essence
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/"))
+    {
+        return true;
+    }
+    if [
+        "application/javascript",
+        "application/json",
+        "application/ld+json",
+        "application/manifest+json",
+        "application/xhtml+xml",
+        "application/xml",
+        "application/rss+xml",
+        "image/svg+xml",
+    ]
+    .iter()
+    .any(|candidate| essence.eq_ignore_ascii_case(candidate))
+    {
+        return true;
+    }
+    essence.rsplit_once('+').is_some_and(|(_, suffix)| {
+        suffix.eq_ignore_ascii_case("json") || suffix.eq_ignore_ascii_case("xml")
+    })
+}
+
+fn connection_option_names(
+    headers: &http::HeaderMap,
+    invalid_status: u16,
+) -> Result<Vec<HeaderName>> {
+    let mut names = Vec::new();
+    for field in [&CONNECTION, &PROXY_CONNECTION] {
+        for value in headers.get_all(field).iter() {
+            for token in value.as_bytes().split(|byte| *byte == b',') {
+                let token = token.trim_ascii();
+                if token.is_empty() {
+                    continue;
+                }
+                let name = HeaderName::from_bytes(token).map_err(|error| {
+                    Error::because(
+                        HTTPStatus(invalid_status),
+                        "invalid Connection header option",
+                        error,
+                    )
+                })?;
+                if name == CONTENT_LENGTH || name == TRANSFER_ENCODING || name == HOST {
+                    return Err(Error::explain(
+                        HTTPStatus(invalid_status),
+                        format!("Connection header names critical framing field {name}"),
+                    ));
+                }
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn strip_request_hop_headers(
+    downstream: &RequestHeader,
+    upstream: &mut RequestHeader,
+) -> Result<()> {
+    for name in connection_option_names(&downstream.headers, 400)? {
+        upstream.remove_header(&name);
+    }
+    for name in [
+        &CONNECTION,
+        &KEEP_ALIVE,
+        &PROXY_CONNECTION,
+        &PROXY_AUTHENTICATE,
+        &PROXY_AUTHORIZATION,
+        &TE,
+        &TRAILER,
+        &UPGRADE,
+    ] {
+        upstream.remove_header(name);
+    }
+    Ok(())
+}
+
+fn strip_response_hop_headers(response: &mut ResponseHeader, forwards_upgrade: bool) -> Result<()> {
+    let upgrade = forwards_upgrade
+        .then(|| response.headers.get(UPGRADE).cloned())
+        .flatten();
+    for name in connection_option_names(&response.headers, 502)? {
+        response.remove_header(&name);
+    }
+    for name in [
+        &CONNECTION,
+        &KEEP_ALIVE,
+        &PROXY_CONNECTION,
+        &PROXY_AUTHENTICATE,
+        &PROXY_AUTHORIZATION,
+        &TE,
+        &TRAILER,
+        &UPGRADE,
+    ] {
+        response.remove_header(name);
+    }
+    if forwards_upgrade {
+        let upgrade = upgrade.ok_or_else(|| {
+            Error::explain(
+                HTTPStatus(502),
+                "upstream 101 response is missing its Upgrade header",
+            )
+        })?;
+        response.insert_header(UPGRADE, upgrade)?;
+        response.insert_header(CONNECTION, UPGRADE_VALUE)?;
+    }
+    Ok(())
 }
 
 fn request_authority(request: &RequestHeader) -> Option<&str> {
@@ -784,8 +1036,8 @@ fn content_length(request: &RequestHeader) -> Option<usize> {
         .and_then(|value| value.parse().ok())
 }
 
-fn request_is_replay_safe(session: &Session) -> bool {
-    request_header_is_replay_safe(session.req_header())
+fn request_is_replay_safe(session: &mut Session) -> bool {
+    request_header_is_replay_safe(session.req_header()) && session.as_mut().is_body_empty()
 }
 
 fn request_header_is_replay_safe(request: &RequestHeader) -> bool {
@@ -799,6 +1051,32 @@ fn is_tls(session: &Session) -> bool {
         .digest()
         .and_then(|digest| digest.ssl_digest.as_ref())
         .is_some()
+}
+
+fn forwarded_port_value(port: Option<u16>, tls: bool) -> Result<HeaderValue> {
+    match port {
+        Some(80) => Ok(PORT_80),
+        Some(443) => Ok(PORT_443),
+        Some(port) => {
+            let mut value = ArrayString::<5>::new();
+            write!(&mut value, "{port}").map_err(|error| {
+                Error::because(
+                    HTTPStatus(500),
+                    "listener port could not be formatted as a header",
+                    error,
+                )
+            })?;
+            HeaderValue::from_str(&value).map_err(|error| {
+                Error::because(
+                    HTTPStatus(500),
+                    "listener port could not be encoded as a header",
+                    error,
+                )
+            })
+        }
+        None if tls => Ok(PORT_443),
+        None => Ok(PORT_80),
+    }
 }
 
 fn vaultwarden_auth_path(path: &str) -> bool {
@@ -825,7 +1103,7 @@ fn default_active_limit(handler: HandlerKind, route: RouteClass) -> usize {
         HandlerKind::Vaultwarden => 12,
         HandlerKind::Couchdb => 24,
         HandlerKind::AdguardDns | HandlerKind::AdguardKorea => 96,
-        HandlerKind::Static => 1,
+        HandlerKind::Static => 0,
     }
 }
 
@@ -886,6 +1164,12 @@ fn upstream_name_for_route(
 fn prepare_route_peer(upstream: &PreparedUpstream, route: RouteClass) -> HttpPeer {
     let mut peer = upstream.peer.clone();
     peer.group_key = route.upstream_pool_group();
+    // WebSocket Upgrade is an HTTP/1.1 hop-by-hop mechanism. Pingora does not
+    // implement RFC 8441 extended CONNECT for this route.
+    if route == RouteClass::VaultwardenHub {
+        peer.options.alpn = ALPN::H1;
+        peer.options.max_h2_streams = 1;
+    }
     let (read_timeout, write_timeout) = upstream_timeouts(route, upstream);
     peer.options.read_timeout = Some(read_timeout);
     peer.options.write_timeout = Some(write_timeout);
@@ -1174,6 +1458,114 @@ hosts:
     }
 
     #[test]
+    fn compression_gate_rejects_small_binary_partial_and_no_transform_responses() {
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        response
+            .insert_header(CONTENT_TYPE, "application/json")
+            .unwrap();
+        response.insert_header(CONTENT_LENGTH, "2048").unwrap();
+        assert!(response_allows_compression(&response));
+
+        response
+            .insert_header(CACHE_CONTROL, "private, no-transform")
+            .unwrap();
+        assert!(!response_allows_compression(&response));
+        response.remove_header(&CACHE_CONTROL);
+        response.insert_header(CONTENT_LENGTH, "100").unwrap();
+        assert!(!response_allows_compression(&response));
+        response.insert_header(CONTENT_LENGTH, "2048").unwrap();
+        response
+            .insert_header(CONTENT_TYPE, "application/octet-stream")
+            .unwrap();
+        assert!(!response_allows_compression(&response));
+        response.status = http::StatusCode::PARTIAL_CONTENT;
+        assert!(!response_allows_compression(&response));
+        response.status = http::StatusCode::OK;
+        response.remove_header(&CONTENT_RANGE);
+        response
+            .insert_header(CONTENT_ENCODING, "already-encoded")
+            .unwrap();
+        assert!(!response_allows_compression(&response));
+        response.remove_header(&CONTENT_ENCODING);
+        response.status = http::StatusCode::NO_CONTENT;
+        assert!(!response_allows_compression(&response));
+        response.status = http::StatusCode::NOT_MODIFIED;
+        assert!(!response_allows_compression(&response));
+        response.status = http::StatusCode::RESET_CONTENT;
+        assert!(!response_allows_compression(&response));
+        assert!(response_status_is_interim(100));
+        assert!(response_status_is_interim(103));
+        assert!(!response_status_is_interim(101));
+        assert!(!response_status_is_interim(200));
+    }
+
+    #[test]
+    fn connection_nominated_and_fixed_hop_headers_are_removed() {
+        let mut downstream = RequestHeader::build(Method::GET, b"/", None).unwrap();
+        downstream
+            .insert_header(CONNECTION, "keep-alive, x-private")
+            .unwrap();
+        downstream.insert_header("x-private", "secret").unwrap();
+        downstream.insert_header(KEEP_ALIVE, "timeout=5").unwrap();
+        downstream
+            .insert_header(PROXY_AUTHORIZATION, "Basic secret")
+            .unwrap();
+        let mut upstream = downstream.clone();
+
+        strip_request_hop_headers(&downstream, &mut upstream).unwrap();
+        for name in [
+            &CONNECTION,
+            &KEEP_ALIVE,
+            &PROXY_AUTHORIZATION,
+            &HeaderName::from_static("x-private"),
+        ] {
+            assert!(!upstream.headers.contains_key(name));
+        }
+    }
+
+    #[test]
+    fn connection_option_cannot_hide_request_framing() {
+        let mut downstream = RequestHeader::build(Method::POST, b"/", None).unwrap();
+        downstream
+            .insert_header(CONNECTION, "transfer-encoding")
+            .unwrap();
+        downstream
+            .insert_header(TRANSFER_ENCODING, "chunked")
+            .unwrap();
+        let mut upstream = downstream.clone();
+        assert!(strip_request_hop_headers(&downstream, &mut upstream).is_err());
+    }
+
+    #[test]
+    fn response_hop_headers_are_removed_except_a_valid_h1_upgrade() {
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        response
+            .insert_header(CONNECTION, "keep-alive, x-private")
+            .unwrap();
+        response.insert_header("x-private", "secret").unwrap();
+        response.insert_header(KEEP_ALIVE, "timeout=5").unwrap();
+        response
+            .insert_header(PROXY_AUTHENTICATE, "Basic realm=proxy")
+            .unwrap();
+        strip_response_hop_headers(&mut response, false).unwrap();
+        for name in [
+            &CONNECTION,
+            &KEEP_ALIVE,
+            &PROXY_AUTHENTICATE,
+            &HeaderName::from_static("x-private"),
+        ] {
+            assert!(!response.headers.contains_key(name));
+        }
+
+        let mut switching = ResponseHeader::build(101, None).unwrap();
+        switching.insert_header(CONNECTION, "upgrade").unwrap();
+        switching.insert_header(UPGRADE, "websocket").unwrap();
+        strip_response_hop_headers(&mut switching, true).unwrap();
+        assert_eq!(switching.headers.get(CONNECTION).unwrap(), "upgrade");
+        assert_eq!(switching.headers.get(UPGRADE).unwrap(), "websocket");
+    }
+
+    #[test]
     fn retries_only_bodyless_get_and_head_requests() {
         let get = RequestHeader::build(Method::GET, b"/", None).unwrap();
         assert!(request_header_is_replay_safe(&get));
@@ -1246,6 +1638,10 @@ write_timeout_seconds: 9
         let prepared = prepare_upstream("test", &upstream).unwrap();
         assert_eq!(prepared.peer.options.alpn, ALPN::H2H1);
         assert_eq!(prepared.peer.options.max_h2_streams, 32);
+
+        let hub = prepare_route_peer(&prepared, RouteClass::VaultwardenHub);
+        assert_eq!(hub.options.alpn, ALPN::H1);
+        assert_eq!(hub.options.max_h2_streams, 1);
     }
 
     #[test]
@@ -1276,5 +1672,13 @@ write_timeout_seconds: 9
             resolve_client_ip(&runtime, peer, Some("invalid, 10.0.0.1")),
             peer
         );
+    }
+
+    #[test]
+    fn forwarded_port_uses_the_actual_listener_with_safe_defaults() {
+        assert_eq!(forwarded_port_value(Some(18_443), true).unwrap(), "18443");
+        assert_eq!(forwarded_port_value(Some(18_080), false).unwrap(), "18080");
+        assert_eq!(forwarded_port_value(None, true).unwrap(), "443");
+        assert_eq!(forwarded_port_value(None, false).unwrap(), "80");
     }
 }

@@ -1,5 +1,6 @@
 mod allocator;
 mod config;
+mod content_encoding;
 mod gateway;
 mod limits;
 mod preflight;

@@ -93,6 +93,18 @@ jq -e '.headers["x-forwarded-for"] == "198.51.100.50"' \
   <<<"${proxy_response}" >/dev/null
 jq -e '.headers["x-forwarded-proto"] == "https"' \
   <<<"${proxy_response}" >/dev/null
+jq -e '.headers["x-forwarded-port"] == "18443"' \
+  <<<"${proxy_response}" >/dev/null
+
+hop_response=$(curl --noproxy '*' -ksS --http1.1 \
+  --resolve app.test:18443:127.0.0.1 \
+  -H 'connection: keep-alive, x-private' \
+  -H 'x-private: must-not-reach-upstream' \
+  -H 'proxy-authorization: Basic must-not-reach-upstream' \
+  https://app.test:18443/headers)
+jq -e '.headers["x-private"] == null' <<<"${hop_response}" >/dev/null
+jq -e '.headers["proxy-authorization"] == null' <<<"${hop_response}" >/dev/null
+jq -e '.headers.connection == null' <<<"${hop_response}" >/dev/null
 
 # The server-level 500 request keepalive limit must count down across reused
 # HTTP/1.1 sessions. Resetting it in request_filter makes the connection
