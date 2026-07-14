@@ -18,6 +18,7 @@ system-allocator = []
 
 [dependencies]
 anyhow = "1.0"
+arrayvec = "0.7"
 async-trait = "0.1"
 brotli = "8.0"
 bytes = "1.12"
@@ -49,6 +50,7 @@ tokio = { version = "1.52", features = ["fs", "net", "rt-multi-thread", "sync", 
 zstd = "0.13"
 
 [dev-dependencies]
+h2 = "0.4"
 tempfile = "3.27"
 
 # Pingora 0.8.1's rustls adapter hardcodes Ring. Keep the upstream API while

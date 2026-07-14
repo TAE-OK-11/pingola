@@ -19,6 +19,7 @@ trusted_proxies: ["127.0.0.0/8", "::1/128"]
 upstreams:
   benchmark:
     address: "127.0.0.1:19095"
+    protocol: http1
     connect_timeout_seconds: 2
     read_timeout_seconds: 3600
     write_timeout_seconds: 3600

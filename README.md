@@ -189,6 +189,33 @@ pingora --healthcheck tcp:'[::1]:8080'
 
 실패 메시지는 실제 검사한 `unix:` 또는 `tcp:` target을 출력합니다.
 
+## Upstream HTTP/1.1과 HTTP/2
+
+각 upstream은 `protocol: auto | http1 | http2`를 지원합니다. 기본 `auto`는 TLS
+origin에 `h2, http/1.1` ALPN을 제안하고 HTTP/2를 우선 사용합니다. Origin이 H2를
+지원하지 않거나 잘못된 H2 응답을 반환하면 Pingora core가 H1으로 downgrade하고 해당
+peer의 H1 선호를 기억합니다. Plaintext `auto`는 협상 수단이 없으므로 안전하게 H1을
+사용합니다.
+
+```yaml
+upstreams:
+  tls_api:
+    address: "10.0.0.10:443"
+    tls: true
+    sni: api.internal.example
+    protocol: auto
+    http2_max_concurrent_streams: 32
+  trusted_h2c:
+    address: "10.0.0.11:8080"
+    protocol: http2 # 명시적 h2c prior knowledge; H1 fallback 없음
+```
+
+`http2_max_concurrent_streams`는 upstream H2 connection 하나에서 Pingora가 허용하는
+동시 stream 상한이며 1~1024만 허용합니다. 기본값은 32이고 DoH 기본 설정은 짧은
+요청의 multiplexing을 위해 64입니다. WebSocket Upgrade origin과 H2를 지원하지 않는
+Navidrome/Vaultwarden/CouchDB/AdGuard UI 기본 upstream은 명시적으로 `http1`을
+유지합니다. 설정 변경은 재시작 후 적용됩니다.
+
 ## Timeout, retry, limiter 설정
 
 Upstream `read_timeout_seconds`와 `write_timeout_seconds`를 생략하면 route 기본값을

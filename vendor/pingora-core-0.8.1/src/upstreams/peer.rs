@@ -585,6 +585,11 @@ pub struct HttpPeer {
     /// cannot share connections with each other.
     pub group_key: u64,
     pub options: PeerOptions,
+    /// Cached connection-pool identity for immutable, precomputed peers.
+    ///
+    /// Leave this as `None` while mutating public peer fields. Call
+    /// [`HttpPeer::cache_reuse_hash`] only after the peer is fully configured.
+    pub cached_reuse_hash: Option<u64>,
 }
 
 impl HttpPeer {
@@ -605,6 +610,7 @@ impl HttpPeer {
             client_cert_key: None,
             group_key: 0,
             options: PeerOptions::new(),
+            cached_reuse_hash: None,
         }
     }
 
@@ -647,6 +653,7 @@ impl HttpPeer {
             client_cert_key: None,
             group_key: 0,
             options: PeerOptions::new(),
+            cached_reuse_hash: None,
         }
     }
 
@@ -665,6 +672,11 @@ impl HttpPeer {
         let mut hasher = AHasher::default();
         self.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// Cache the connection reuse hash after all pool-relevant fields are set.
+    pub fn cache_reuse_hash(&mut self) {
+        self.cached_reuse_hash = Some(self.peer_hash());
     }
 }
 
@@ -719,7 +731,7 @@ impl Peer for HttpPeer {
 
     // TODO: change connection pool to accept u64 instead of String
     fn reuse_hash(&self) -> u64 {
-        self.peer_hash()
+        self.cached_reuse_hash.unwrap_or_else(|| self.peer_hash())
     }
 
     fn get_peer_options(&self) -> Option<&PeerOptions> {

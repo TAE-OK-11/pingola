@@ -1148,6 +1148,7 @@ name = "jbs-pingora"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrayvec",
  "async-trait",
  "brotli 8.0.4",
  "bytes",
@@ -1155,6 +1156,7 @@ dependencies = [
  "dashmap",
  "env_logger",
  "flate2",
+ "h2",
  "http",
  "httpdate",
  "ipnet",

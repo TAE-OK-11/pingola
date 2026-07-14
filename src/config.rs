@@ -57,6 +57,10 @@ fn default_idle_timeout() -> u64 {
     15
 }
 
+fn default_upstream_http2_streams() -> usize {
+    32
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -108,6 +112,10 @@ pub struct UpstreamConfig {
     #[serde(default)]
     pub tls: bool,
     #[serde(default)]
+    pub protocol: UpstreamProtocol,
+    #[serde(default = "default_upstream_http2_streams")]
+    pub http2_max_concurrent_streams: usize,
+    #[serde(default)]
     pub sni: Option<String>,
     #[serde(default = "default_true")]
     pub verify_certificate: bool,
@@ -119,6 +127,20 @@ pub struct UpstreamConfig {
     pub write_timeout_seconds: Option<u64>,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_seconds: u64,
+}
+
+/// HTTP version policy for a single upstream.
+///
+/// `auto` negotiates HTTP/2 with ALPN for TLS origins and retains HTTP/1.1 for
+/// plaintext origins. Plaintext HTTP/2 has no ALPN, so h2c prior knowledge must
+/// be explicitly selected with `http2`.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpstreamProtocol {
+    #[default]
+    Auto,
+    Http1,
+    Http2,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq)]
@@ -171,7 +193,6 @@ pub struct RouteLimitConfig {
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub config: Arc<Config>,
-    hosts_by_domain: HashMap<Arc<str>, String>,
 }
 
 impl RuntimeConfig {
@@ -186,28 +207,9 @@ impl RuntimeConfig {
     pub fn new(config: Config) -> Result<Self> {
         validate(&config)?;
 
-        let mut hosts_by_domain = HashMap::new();
-        for (name, host) in &config.hosts {
-            for domain in &host.domains {
-                hosts_by_domain.insert(Arc::from(domain.to_ascii_lowercase()), name.clone());
-            }
-        }
-
         Ok(Self {
             config: Arc::new(config),
-            hosts_by_domain,
         })
-    }
-
-    pub fn host(&self, authority: &str) -> Option<(&Arc<str>, &str, &HostConfig)> {
-        let domain = normalized_host(authority);
-        let (canonical_domain, name) =
-            self.hosts_by_domain.get_key_value::<str>(domain.as_ref())?;
-        Some((
-            canonical_domain,
-            name.as_str(),
-            self.config.hosts.get(name)?,
-        ))
     }
 
     pub fn is_trusted_proxy(&self, ip: std::net::IpAddr) -> bool {
@@ -222,7 +224,7 @@ pub fn normalize_host(authority: &str) -> String {
     normalized_host(authority).into_owned()
 }
 
-fn normalized_host(authority: &str) -> Cow<'_, str> {
+pub(crate) fn normalized_host(authority: &str) -> Cow<'_, str> {
     let authority = authority.trim().trim_end_matches('.');
     let host = if let Some(stripped) = authority.strip_prefix('[') {
         stripped.split_once(']').map_or(authority, |(host, _)| host)
@@ -341,6 +343,9 @@ fn validate(config: &Config) -> Result<()> {
         if upstream.read_timeout_seconds == Some(0) || upstream.write_timeout_seconds == Some(0) {
             bail!("upstream {name} explicit read/write timeouts must be greater than zero");
         }
+        if !(1..=1024).contains(&upstream.http2_max_concurrent_streams) {
+            bail!("upstream {name} http2_max_concurrent_streams must be between 1 and 1024");
+        }
     }
 
     const ROUTES: &[&str] = &[
@@ -411,11 +416,8 @@ hosts:
     }
 
     #[test]
-    fn resolves_host_case_insensitively() {
-        let runtime = RuntimeConfig::new(sample_config()).unwrap();
-        let (domain, name, _) = runtime.host("APP.EXAMPLE.COM:443").unwrap();
-        assert_eq!(domain.as_ref(), "app.example.com");
-        assert_eq!(name, "app");
+    fn accepts_unique_normalized_domains() {
+        assert!(RuntimeConfig::new(sample_config()).is_ok());
     }
 
     #[test]
@@ -447,6 +449,31 @@ hosts:
                 ..RouteLimitConfig::default()
             },
         );
+        assert!(RuntimeConfig::new(config).is_err());
+    }
+
+    #[test]
+    fn parses_upstream_protocol_policy() {
+        let automatic: UpstreamConfig = serde_yaml::from_str("address: 127.0.0.1:9000").unwrap();
+        assert_eq!(automatic.protocol, UpstreamProtocol::Auto);
+        assert_eq!(automatic.http2_max_concurrent_streams, 32);
+
+        let h2c: UpstreamConfig = serde_yaml::from_str(
+            "address: 127.0.0.1:9000\nprotocol: http2\nhttp2_max_concurrent_streams: 64",
+        )
+        .unwrap();
+        assert_eq!(h2c.protocol, UpstreamProtocol::Http2);
+        assert_eq!(h2c.http2_max_concurrent_streams, 64);
+    }
+
+    #[test]
+    fn rejects_unbounded_upstream_http2_streams() {
+        let mut config = sample_config();
+        config
+            .upstreams
+            .get_mut("app")
+            .unwrap()
+            .http2_max_concurrent_streams = 0;
         assert!(RuntimeConfig::new(config).is_err());
     }
 }

@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
+use arrayvec::ArrayString;
 use async_trait::async_trait;
 use bytes::Bytes;
 use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
@@ -15,14 +17,14 @@ use cloudflare_pingora::ErrorType;
 use cloudflare_pingora::ErrorType::HTTPStatus;
 use cloudflare_pingora::Result;
 use http::header::{
-    ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, EXPIRES, FORWARDED, HOST,
-    LAST_MODIFIED, PRAGMA, TRANSFER_ENCODING, UPGRADE,
+    HeaderName, HeaderValue, ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, EXPIRES,
+    FORWARDED, HOST, LAST_MODIFIED, PRAGMA, TRANSFER_ENCODING, UPGRADE,
 };
 use http::Method;
 use log::{info, warn};
 use serde_json::json;
 
-use crate::config::{HandlerKind, HostConfig, RuntimeConfig};
+use crate::config::{normalized_host, HandlerKind, RuntimeConfig, UpstreamProtocol};
 use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, RateLimiter};
 use crate::static_files::StaticFiles;
 
@@ -35,6 +37,40 @@ const STREAM_PREFIXES: &[&str] = &[
 ];
 const COVER_PREFIXES: &[&str] = &["/rest/getCoverArt", "/api/artwork", "/coverart", "/artwork"];
 static LEGACY_HEALTH_WARNING: Once = Once::new();
+const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
+const X_FORWARDED_PORT: HeaderName = HeaderName::from_static("x-forwarded-port");
+const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
+const X_FORWARDED_SSL: HeaderName = HeaderName::from_static("x-forwarded-ssl");
+const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
+const STRICT_TRANSPORT_SECURITY: HeaderName = HeaderName::from_static("strict-transport-security");
+const X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
+const REFERRER_POLICY: HeaderName = HeaderName::from_static("referrer-policy");
+const DIRECT_DOH_HOST: HeaderValue = HeaderValue::from_static("direct.tae00217.cloud");
+const PORT_443: HeaderValue = HeaderValue::from_static("443");
+const PORT_80: HeaderValue = HeaderValue::from_static("80");
+const HTTPS: HeaderValue = HeaderValue::from_static("https");
+const HTTP: HeaderValue = HeaderValue::from_static("http");
+const ON: HeaderValue = HeaderValue::from_static("on");
+const OFF: HeaderValue = HeaderValue::from_static("off");
+const UPGRADE_VALUE: HeaderValue = HeaderValue::from_static("upgrade");
+const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
+const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
+const HSTS_VALUE: HeaderValue =
+    HeaderValue::from_static("max-age=63072000; includeSubDomains; preload");
+const SAMEORIGIN: HeaderValue = HeaderValue::from_static("SAMEORIGIN");
+const REFERRER_POLICY_VALUE: HeaderValue =
+    HeaderValue::from_static("strict-origin-when-cross-origin");
+const STRIPPED_RESPONSE_HEADERS: [HeaderName; 7] = [
+    HeaderName::from_static("server"),
+    HeaderName::from_static("x-powered-by"),
+    HeaderName::from_static("alt-svc"),
+    STRICT_TRANSPORT_SECURITY,
+    X_CONTENT_TYPE_OPTIONS,
+    X_FRAME_OPTIONS,
+    REFERRER_POLICY,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -124,28 +160,75 @@ struct PreparedUpstream {
     write_timeout_seconds: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
+struct PreparedPlan {
+    domain: http::HeaderValue,
+    handler: HandlerKind,
+    peer: HttpPeer,
+    route: RouteClass,
+    max_body_bytes: usize,
+}
+
+#[derive(Debug)]
+struct PreparedHost {
+    domain: Arc<str>,
+    name: String,
+    handler: HandlerKind,
+    redirect_http: bool,
+    plans: [Option<Arc<PreparedPlan>>; RouteClass::ALL.len()],
+}
+
+impl PreparedHost {
+    fn plan(&self, path: &str) -> Option<Arc<PreparedPlan>> {
+        let route = match self.handler {
+            HandlerKind::Static => return None,
+            HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn => {
+                if STREAM_PREFIXES
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+                {
+                    RouteClass::NavidromeStream
+                } else if COVER_PREFIXES.iter().any(|prefix| path.starts_with(prefix)) {
+                    RouteClass::NavidromeCover
+                } else {
+                    RouteClass::NavidromeApi
+                }
+            }
+            HandlerKind::Vaultwarden => {
+                if vaultwarden_auth_path(path) {
+                    RouteClass::VaultwardenAuth
+                } else if path.starts_with("/notifications/hub") {
+                    RouteClass::VaultwardenHub
+                } else {
+                    RouteClass::Vaultwarden
+                }
+            }
+            HandlerKind::Couchdb => RouteClass::Couchdb,
+            HandlerKind::AdguardDns | HandlerKind::AdguardKorea => {
+                if path.starts_with("/dns-query") {
+                    RouteClass::Doh
+                } else {
+                    RouteClass::AdguardUi
+                }
+            }
+        };
+        self.plans[route.index()].clone()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RoutePolicy {
     rate_limit: Option<(f64, u32)>,
     active_request_override: Option<usize>,
 }
 
-#[derive(Clone)]
-struct RequestPlan {
-    domain: Arc<str>,
-    handler: HandlerKind,
-    upstream: Arc<PreparedUpstream>,
-    route: RouteClass,
-    max_body_bytes: usize,
-    tls: bool,
-}
-
 pub struct RequestContext {
-    plan: Option<RequestPlan>,
+    plan: Option<Arc<PreparedPlan>>,
     client_ip: IpAddr,
+    tls: bool,
     body_bytes: usize,
     retries: usize,
-    started_at: Instant,
+    started_at: Option<Instant>,
     _active_request_permit: Option<ActiveRequestPermit>,
     _global_request_permit: Option<ActiveRequestPermit>,
 }
@@ -155,9 +238,10 @@ impl Default for RequestContext {
         Self {
             plan: None,
             client_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            tls: false,
             body_bytes: 0,
             retries: 0,
-            started_at: Instant::now(),
+            started_at: None,
             _active_request_permit: None,
             _global_request_permit: None,
         }
@@ -167,7 +251,7 @@ impl Default for RequestContext {
 pub struct Gateway {
     runtime: Arc<RuntimeConfig>,
     static_files: StaticFiles,
-    upstreams: HashMap<String, Arc<PreparedUpstream>>,
+    hosts: HashMap<Arc<str>, PreparedHost>,
     route_policies: [RoutePolicy; RouteClass::ALL.len()],
     rates: RateLimiter,
     active_requests: ActiveRequestLimiter,
@@ -191,9 +275,49 @@ impl Gateway {
             .upstreams
             .iter()
             .map(|(name, upstream)| {
-                prepare_upstream(name, upstream).map(|prepared| (name.clone(), Arc::new(prepared)))
+                prepare_upstream(name, upstream).map(|prepared| (name.clone(), prepared))
             })
             .collect::<anyhow::Result<HashMap<_, _>>>()?;
+        let mut hosts = HashMap::with_capacity(
+            runtime
+                .config
+                .hosts
+                .values()
+                .map(|host| host.domains.len())
+                .sum(),
+        );
+        for (name, host) in &runtime.config.hosts {
+            for domain in &host.domains {
+                let canonical_domain: Arc<str> = Arc::from(domain.as_str());
+                let domain_header = http::HeaderValue::from_str(domain).with_context(|| {
+                    format!(
+                        "host domain cannot be encoded as a header: host={name} domain={domain}"
+                    )
+                })?;
+                let plans = RouteClass::ALL.map(|route| {
+                    let upstream_name =
+                        upstream_name_for_route(host.handler, host.upstream.as_deref(), route)?;
+                    let upstream = upstreams.get(upstream_name)?;
+                    Some(Arc::new(PreparedPlan {
+                        domain: domain_header.clone(),
+                        handler: host.handler,
+                        peer: prepare_route_peer(upstream, route),
+                        route,
+                        max_body_bytes: host.max_body_bytes,
+                    }))
+                });
+                hosts.insert(
+                    canonical_domain.clone(),
+                    PreparedHost {
+                        domain: canonical_domain,
+                        name: name.clone(),
+                        handler: host.handler,
+                        redirect_http: host.redirect_http,
+                        plans,
+                    },
+                );
+            }
+        }
         let route_policies = RouteClass::ALL.map(|route| RoutePolicy {
             rate_limit: effective_rate_limit(&runtime, route),
             active_request_override: runtime
@@ -205,68 +329,16 @@ impl Gateway {
         Ok(Self {
             runtime,
             static_files,
-            upstreams,
+            hosts,
             route_policies,
             rates: RateLimiter::new(),
             active_requests: ActiveRequestLimiter::new(),
         })
     }
 
-    fn request_plan(
-        &self,
-        domain: &Arc<str>,
-        host: &HostConfig,
-        path: &str,
-        tls: bool,
-    ) -> Option<RequestPlan> {
-        let (route, upstream_name) = match host.handler {
-            HandlerKind::Static => return None,
-            HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn => {
-                let route = if STREAM_PREFIXES
-                    .iter()
-                    .any(|prefix| path.starts_with(prefix))
-                {
-                    RouteClass::NavidromeStream
-                } else if COVER_PREFIXES.iter().any(|prefix| path.starts_with(prefix)) {
-                    RouteClass::NavidromeCover
-                } else {
-                    RouteClass::NavidromeApi
-                };
-                (route, host.upstream.as_deref()?)
-            }
-            HandlerKind::Vaultwarden => {
-                let route = if vaultwarden_auth_path(path) {
-                    RouteClass::VaultwardenAuth
-                } else if path.starts_with("/notifications/hub") {
-                    RouteClass::VaultwardenHub
-                } else {
-                    RouteClass::Vaultwarden
-                };
-                (route, host.upstream.as_deref()?)
-            }
-            HandlerKind::Couchdb => (RouteClass::Couchdb, host.upstream.as_deref()?),
-            HandlerKind::AdguardDns | HandlerKind::AdguardKorea => {
-                if path.starts_with("/dns-query") {
-                    let upstream = match host.handler {
-                        HandlerKind::AdguardDns => "adguard_dns_doh",
-                        HandlerKind::AdguardKorea => "adguard_korea_doh",
-                        _ => unreachable!(),
-                    };
-                    (RouteClass::Doh, upstream)
-                } else {
-                    (RouteClass::AdguardUi, host.upstream.as_deref()?)
-                }
-            }
-        };
-
-        Some(RequestPlan {
-            domain: domain.clone(),
-            handler: host.handler,
-            upstream: self.upstreams.get(upstream_name)?.clone(),
-            route,
-            max_body_bytes: host.max_body_bytes,
-            tls,
-        })
+    fn host(&self, authority: &str) -> Option<&PreparedHost> {
+        let domain = normalized_host(authority);
+        self.hosts.get::<str>(domain.as_ref())
     }
 }
 
@@ -275,7 +347,10 @@ impl ProxyHttp for Gateway {
     type CTX = RequestContext;
 
     fn new_ctx(&self) -> Self::CTX {
-        RequestContext::default()
+        RequestContext {
+            started_at: self.runtime.config.server.access_log.then(Instant::now),
+            ..RequestContext::default()
+        }
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
@@ -317,7 +392,7 @@ impl ProxyHttp for Gateway {
         let Some(authority) = request_authority(session.req_header()) else {
             return send_empty(session, 400, None, tls, &[]).await;
         };
-        let Some((domain, host_name, host)) = self.runtime.host(authority) else {
+        let Some(host) = self.host(authority) else {
             session.set_keepalive(None);
             return send_empty(session, 421, None, tls, &[]).await;
         };
@@ -328,7 +403,7 @@ impl ProxyHttp for Gateway {
                 .uri
                 .path_and_query()
                 .map_or("/", |value| value.as_str());
-            let location = format!("https://{}{path_and_query}", domain.as_ref());
+            let location = format!("https://{}{path_and_query}", host.domain.as_ref());
             return send_empty(
                 session,
                 308,
@@ -340,11 +415,11 @@ impl ProxyHttp for Gateway {
         }
 
         if host.handler == HandlerKind::Static {
-            return self.static_files.serve(host_name, session, tls).await;
+            return self.static_files.serve(&host.name, session, tls).await;
         }
 
         if host.handler == HandlerKind::NavidromeMain && path == "/" {
-            let location = format!("https://{}/app/", domain.as_ref());
+            let location = format!("https://{}/app/", host.domain.as_ref());
             return send_empty(
                 session,
                 308,
@@ -365,10 +440,11 @@ impl ProxyHttp for Gateway {
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok());
         let client_ip = resolve_client_ip(&self.runtime, peer_ip, forwarded_for);
-        let Some(plan) = self.request_plan(domain, host, path, tls) else {
+        let Some(plan) = host.plan(path) else {
             return send_empty(session, 500, Some(host.handler), tls, &[]).await;
         };
         ctx.client_ip = client_ip;
+        ctx.tls = tls;
 
         if content_length(session.req_header()).is_some_and(|length| length > plan.max_body_bytes) {
             return send_empty(session, 413, Some(plan.handler), tls, &[]).await;
@@ -444,12 +520,7 @@ impl ProxyHttp for Gateway {
             .plan
             .as_ref()
             .ok_or_else(|| Error::explain(HTTPStatus(500), "request plan is missing"))?;
-        let mut peer = plan.upstream.peer.clone();
-        peer.group_key = plan.route.upstream_pool_group();
-        let (read_timeout, write_timeout) = upstream_timeouts(plan.route, &plan.upstream);
-        peer.options.read_timeout = Some(read_timeout);
-        peer.options.write_timeout = Some(write_timeout);
-        Ok(Box::new(peer))
+        Ok(Box::new(plan.peer.clone()))
     }
 
     async fn upstream_request_filter(
@@ -462,37 +533,37 @@ impl ProxyHttp for Gateway {
             .plan
             .as_ref()
             .ok_or_else(|| Error::explain(HTTPStatus(500), "request plan is missing"))?;
-        let client_ip =
-            http::HeaderValue::from_str(&ctx.client_ip.to_string()).map_err(|error| {
-                Error::because(
-                    HTTPStatus(400),
-                    "resolved client IP could not be encoded as a header",
-                    error,
-                )
-            })?;
-        let domain = http::HeaderValue::from_str(plan.domain.as_ref()).map_err(|error| {
+        let mut client_ip_text = ArrayString::<64>::new();
+        write!(&mut client_ip_text, "{}", ctx.client_ip).map_err(|error| {
             Error::because(
                 HTTPStatus(400),
-                "host could not be encoded as a header",
+                "resolved client IP could not be formatted as a header",
+                error,
+            )
+        })?;
+        let client_ip = http::HeaderValue::from_str(&client_ip_text).map_err(|error| {
+            Error::because(
+                HTTPStatus(400),
+                "resolved client IP could not be encoded as a header",
                 error,
             )
         })?;
         let upstream_host = if plan.route == RouteClass::Doh {
-            http::HeaderValue::from_static("direct.tae00217.cloud")
+            DIRECT_DOH_HOST
         } else {
-            domain.clone()
+            plan.domain.clone()
         };
 
         upstream_request.remove_header(&FORWARDED);
-        upstream_request.remove_header("x-forwarded-for");
+        upstream_request.remove_header(&X_FORWARDED_FOR);
         upstream_request.insert_header(HOST, upstream_host)?;
-        upstream_request.insert_header("x-real-ip", client_ip.clone())?;
-        upstream_request.insert_header("x-forwarded-for", client_ip)?;
-        upstream_request.insert_header("x-forwarded-host", domain)?;
-        upstream_request.insert_header("x-forwarded-port", if plan.tls { "443" } else { "80" })?;
+        upstream_request.insert_header(X_REAL_IP, client_ip.clone())?;
+        upstream_request.insert_header(X_FORWARDED_FOR, client_ip)?;
+        upstream_request.insert_header(X_FORWARDED_HOST, plan.domain.clone())?;
         upstream_request
-            .insert_header("x-forwarded-proto", if plan.tls { "https" } else { "http" })?;
-        upstream_request.insert_header("x-forwarded-ssl", if plan.tls { "on" } else { "off" })?;
+            .insert_header(X_FORWARDED_PORT, if ctx.tls { PORT_443 } else { PORT_80 })?;
+        upstream_request.insert_header(X_FORWARDED_PROTO, if ctx.tls { HTTPS } else { HTTP })?;
+        upstream_request.insert_header(X_FORWARDED_SSL, if ctx.tls { ON } else { OFF })?;
 
         let navidrome_compressible = matches!(
             plan.route,
@@ -513,7 +584,7 @@ impl ProxyHttp for Gateway {
             upstream_request.remove_header(&CONNECTION);
         } else if let Some(upgrade) = session.req_header().headers.get(UPGRADE) {
             upstream_request.insert_header(UPGRADE, upgrade.clone())?;
-            upstream_request.insert_header(CONNECTION, "upgrade")?;
+            upstream_request.insert_header(CONNECTION, UPGRADE_VALUE)?;
         } else {
             upstream_request.remove_header(&UPGRADE);
             upstream_request.remove_header(&CONNECTION);
@@ -551,14 +622,14 @@ impl ProxyHttp for Gateway {
             return Ok(());
         };
         strip_upstream_headers(response);
-        insert_security_headers(response, plan.handler, plan.tls)?;
+        insert_security_headers(response, plan.handler, ctx.tls)?;
         if plan.route == RouteClass::Doh {
             response.remove_header(&CACHE_CONTROL);
             response.remove_header(&EXPIRES);
             response.remove_header(&PRAGMA);
             response.remove_header(&http::header::ETAG);
             response.remove_header(&LAST_MODIFIED);
-            response.insert_header(CACHE_CONTROL, "no-store")?;
+            response.insert_header(CACHE_CONTROL, NO_STORE)?;
         }
         Ok(())
     }
@@ -629,20 +700,29 @@ impl ProxyHttp for Gateway {
     }
 
     async fn logging(&self, session: &mut Session, error: Option<&Error>, ctx: &mut Self::CTX) {
-        let elapsed = ctx.started_at.elapsed();
         let status = session
             .response_written()
             .map_or(0, |response| response.status.as_u16());
         if let Some(error) = error {
-            warn!(
-                "proxy error client={} status={} retries={} elapsed_ms={} error={}",
-                ctx.client_ip,
-                status,
-                ctx.retries,
-                elapsed.as_millis(),
-                error
-            );
+            if let Some(started_at) = ctx.started_at {
+                warn!(
+                    "proxy error client={} status={} retries={} elapsed_ms={} error={}",
+                    ctx.client_ip,
+                    status,
+                    ctx.retries,
+                    started_at.elapsed().as_millis(),
+                    error
+                );
+            } else {
+                warn!(
+                    "proxy error client={} status={} retries={} error={}",
+                    ctx.client_ip, status, ctx.retries, error
+                );
+            }
         } else if self.runtime.config.server.access_log {
+            let elapsed = ctx
+                .started_at
+                .map_or(Duration::ZERO, |started_at| started_at.elapsed());
             info!(
                 "client={} method={} uri={} status={} elapsed_ms={}",
                 ctx.client_ip,
@@ -749,6 +829,40 @@ fn upstream_timeouts(route: RouteClass, upstream: &PreparedUpstream) -> (Duratio
     )
 }
 
+fn upstream_name_for_route(
+    handler: HandlerKind,
+    configured: Option<&str>,
+    route: RouteClass,
+) -> Option<&str> {
+    match (handler, route) {
+        (
+            HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn,
+            RouteClass::NavidromeStream | RouteClass::NavidromeCover | RouteClass::NavidromeApi,
+        )
+        | (
+            HandlerKind::Vaultwarden,
+            RouteClass::VaultwardenAuth | RouteClass::VaultwardenHub | RouteClass::Vaultwarden,
+        )
+        | (HandlerKind::Couchdb, RouteClass::Couchdb)
+        | (HandlerKind::AdguardDns | HandlerKind::AdguardKorea, RouteClass::AdguardUi) => {
+            configured
+        }
+        (HandlerKind::AdguardDns, RouteClass::Doh) => Some("adguard_dns_doh"),
+        (HandlerKind::AdguardKorea, RouteClass::Doh) => Some("adguard_korea_doh"),
+        _ => None,
+    }
+}
+
+fn prepare_route_peer(upstream: &PreparedUpstream, route: RouteClass) -> HttpPeer {
+    let mut peer = upstream.peer.clone();
+    peer.group_key = route.upstream_pool_group();
+    let (read_timeout, write_timeout) = upstream_timeouts(route, upstream);
+    peer.options.read_timeout = Some(read_timeout);
+    peer.options.write_timeout = Some(write_timeout);
+    peer.cache_reuse_hash();
+    peer
+}
+
 fn prepare_upstream(
     name: &str,
     upstream: &crate::config::UpstreamConfig,
@@ -780,7 +894,12 @@ fn prepare_upstream(
     peer.options.idle_timeout = Some(Duration::from_secs(upstream.idle_timeout_seconds));
     peer.options.verify_cert = upstream.verify_certificate;
     peer.options.verify_hostname = upstream.verify_certificate;
-    peer.options.alpn = ALPN::H1;
+    peer.options.alpn = match upstream.protocol {
+        UpstreamProtocol::Auto if upstream.tls => ALPN::H2H1,
+        UpstreamProtocol::Auto | UpstreamProtocol::Http1 => ALPN::H1,
+        UpstreamProtocol::Http2 => ALPN::H2,
+    };
+    peer.options.max_h2_streams = upstream.http2_max_concurrent_streams;
     peer.options.tcp_keepalive = Some(TcpKeepalive {
         idle: Duration::from_secs(60),
         interval: Duration::from_secs(10),
@@ -824,15 +943,7 @@ pub fn resolve_client_ip(
 }
 
 fn strip_upstream_headers(response: &mut ResponseHeader) {
-    for name in [
-        "server",
-        "x-powered-by",
-        "alt-svc",
-        "strict-transport-security",
-        "x-content-type-options",
-        "x-frame-options",
-        "referrer-policy",
-    ] {
+    for name in &STRIPPED_RESPONSE_HEADERS {
         response.remove_header(name);
     }
 }
@@ -842,19 +953,16 @@ fn insert_security_headers(
     handler: HandlerKind,
     tls: bool,
 ) -> Result<()> {
-    response.insert_header("x-content-type-options", "nosniff")?;
+    response.insert_header(X_CONTENT_TYPE_OPTIONS, NOSNIFF)?;
     if tls {
-        response.insert_header(
-            "strict-transport-security",
-            "max-age=63072000; includeSubDomains; preload",
-        )?;
+        response.insert_header(STRICT_TRANSPORT_SECURITY, HSTS_VALUE)?;
     }
     if matches!(
         handler,
         HandlerKind::Static | HandlerKind::Vaultwarden | HandlerKind::Couchdb
     ) {
-        response.insert_header("x-frame-options", "SAMEORIGIN")?;
-        response.insert_header("referrer-policy", "strict-origin-when-cross-origin")?;
+        response.insert_header(X_FRAME_OPTIONS, SAMEORIGIN)?;
+        response.insert_header(REFERRER_POLICY, REFERRER_POLICY_VALUE)?;
     }
     Ok(())
 }
@@ -978,6 +1086,15 @@ hosts:
     }
 
     #[test]
+    fn prepared_host_lookup_is_case_insensitive_and_peers_cache_pool_hash() {
+        let gateway = Gateway::new(Arc::new(runtime())).unwrap();
+        let host = gateway.host("APP.EXAMPLE.COM:443").unwrap();
+        assert_eq!(host.domain.as_ref(), "app.example.com");
+        let plan = host.plan("/rest/stream").unwrap();
+        assert!(plan.peer.cached_reuse_hash.is_some());
+    }
+
+    #[test]
     fn recursively_selects_first_untrusted_forwarded_address() {
         let runtime = runtime();
         let peer = "127.0.0.1".parse().unwrap();
@@ -1057,6 +1174,31 @@ write_timeout_seconds: 9
         let message = format!("{error:#}");
         assert!(message.contains("name=broken"));
         assert!(message.contains("127.0.0.1:not-a-port"));
+    }
+
+    #[test]
+    fn tls_upstream_auto_prefers_h2_with_h1_fallback() {
+        let upstream: crate::config::UpstreamConfig =
+            serde_yaml::from_str("address: 127.0.0.1:9443\ntls: true\nsni: upstream.test").unwrap();
+        let prepared = prepare_upstream("test", &upstream).unwrap();
+        assert_eq!(prepared.peer.options.alpn, ALPN::H2H1);
+        assert_eq!(prepared.peer.options.max_h2_streams, 32);
+    }
+
+    #[test]
+    fn plaintext_auto_stays_h1_and_explicit_http2_enables_h2c() {
+        let automatic: crate::config::UpstreamConfig =
+            serde_yaml::from_str("address: 127.0.0.1:9000").unwrap();
+        let automatic = prepare_upstream("auto", &automatic).unwrap();
+        assert_eq!(automatic.peer.options.alpn, ALPN::H1);
+
+        let h2c: crate::config::UpstreamConfig = serde_yaml::from_str(
+            "address: 127.0.0.1:9000\nprotocol: http2\nhttp2_max_concurrent_streams: 64",
+        )
+        .unwrap();
+        let h2c = prepare_upstream("h2c", &h2c).unwrap();
+        assert_eq!(h2c.peer.options.alpn, ALPN::H2);
+        assert_eq!(h2c.peer.options.max_h2_streams, 64);
     }
 
     #[test]

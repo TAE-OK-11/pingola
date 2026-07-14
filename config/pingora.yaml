@@ -51,20 +51,26 @@ trusted_proxies:
 upstreams:
   navidrome:
     address: "10.77.0.1:4533"
+    protocol: http1
     idle_timeout_seconds: 15
   vaultwarden:
     address: "10.77.0.1:8081"
+    protocol: http1
     idle_timeout_seconds: 15
   couchdb:
     address: "10.77.0.1:5984"
+    protocol: http1
     read_timeout_seconds: 3600
     write_timeout_seconds: 3600
     idle_timeout_seconds: 15
   adguard_dns:
     address: "10.77.0.1:3333"
+    protocol: http1
   adguard_dns_doh:
     address: "10.77.0.1:1852"
     tls: true
+    protocol: auto
+    http2_max_concurrent_streams: 64
     sni: direct.tae00217.cloud
     verify_certificate: false
     connect_timeout_seconds: 2
@@ -73,9 +79,12 @@ upstreams:
     idle_timeout_seconds: 30
   adguard_korea:
     address: "127.0.0.1:3333"
+    protocol: http1
   adguard_korea_doh:
     address: "127.0.0.1:1852"
     tls: true
+    protocol: auto
+    http2_max_concurrent_streams: 64
     sni: direct.tae00217.cloud
     verify_certificate: false
     connect_timeout_seconds: 2
