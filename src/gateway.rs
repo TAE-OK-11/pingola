@@ -438,19 +438,10 @@ impl ProxyHttp for Gateway {
             .await;
         }
 
-        let peer_ip = session
-            .client_addr()
-            .and_then(|address| address.as_inet())
-            .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |address| address.ip());
-        let forwarded_for = session
-            .req_header()
-            .headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok());
-        let client_ip = resolve_client_ip(&self.runtime, peer_ip, forwarded_for);
-        ctx.client_ip = client_ip;
-
         if host.handler == HandlerKind::Static {
+            if self.runtime.config.server.global_active_requests > 0 {
+                ctx.client_ip = session_client_ip(&self.runtime, session);
+            }
             if !self.acquire_global_request(ctx) {
                 return send_empty(
                     session,
@@ -463,6 +454,9 @@ impl ProxyHttp for Gateway {
             }
             return self.static_files.serve(&host.name, session, tls).await;
         }
+
+        let client_ip = session_client_ip(&self.runtime, session);
+        ctx.client_ip = client_ip;
 
         if host.handler == HandlerKind::NavidromeMain && path == "/" {
             let location = format!("https://{}/app/", host.domain.as_ref());
@@ -1051,6 +1045,19 @@ fn is_tls(session: &Session) -> bool {
         .digest()
         .and_then(|digest| digest.ssl_digest.as_ref())
         .is_some()
+}
+
+fn session_client_ip(runtime: &RuntimeConfig, session: &Session) -> IpAddr {
+    let peer_ip = session
+        .client_addr()
+        .and_then(|address| address.as_inet())
+        .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |address| address.ip());
+    let forwarded_for = session
+        .req_header()
+        .headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok());
+    resolve_client_ip(runtime, peer_ip, forwarded_for)
 }
 
 fn forwarded_port_value(port: Option<u16>, tls: bool) -> Result<HeaderValue> {
