@@ -9,6 +9,7 @@ use arrayvec::ArrayString;
 use async_trait::async_trait;
 use bytes::Bytes;
 use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
+use cloudflare_pingora::modules::http::compression::ResponseCompression;
 use cloudflare_pingora::prelude::HttpPeer;
 use cloudflare_pingora::protocols::{TcpKeepalive, ALPN};
 use cloudflare_pingora::proxy::{ProxyHttp, Session};
@@ -443,6 +444,7 @@ impl ProxyHttp for Gateway {
         let Some(plan) = host.plan(path) else {
             return send_empty(session, 500, Some(host.handler), tls, &[]).await;
         };
+        configure_downstream_compression(session, plan.route);
         ctx.client_ip = client_ip;
         ctx.tls = tls;
 
@@ -565,11 +567,7 @@ impl ProxyHttp for Gateway {
         upstream_request.insert_header(X_FORWARDED_PROTO, if ctx.tls { HTTPS } else { HTTP })?;
         upstream_request.insert_header(X_FORWARDED_SSL, if ctx.tls { ON } else { OFF })?;
 
-        let navidrome_compressible = matches!(
-            plan.route,
-            RouteClass::NavidromeApi | RouteClass::NavidromeCover
-        );
-        if navidrome_compressible {
+        if forwards_accept_encoding(plan.route) {
             if let Some(value) = session.req_header().headers.get(ACCEPT_ENCODING) {
                 upstream_request.insert_header(ACCEPT_ENCODING, value.clone())?;
             } else {
@@ -732,6 +730,37 @@ impl ProxyHttp for Gateway {
                 elapsed.as_millis()
             );
         }
+    }
+}
+
+/// Let selected application origins negotiate their own response encoding.
+///
+/// Audio, binary DoH, authentication responses and upgraded/long-lived
+/// connections deliberately stay uncompressed. Vaultwarden and CouchDB use a
+/// separate bounded streaming compressor in the downstream response path.
+fn forwards_accept_encoding(route: RouteClass) -> bool {
+    matches!(route, RouteClass::NavidromeApi | RouteClass::NavidromeCover)
+}
+
+fn uses_downstream_compression(route: RouteClass) -> bool {
+    matches!(route, RouteClass::Vaultwarden | RouteClass::Couchdb)
+}
+
+fn configure_downstream_compression(session: &mut Session, route: RouteClass) {
+    if !uses_downstream_compression(route) {
+        return;
+    }
+
+    // The default Pingora module starts disabled, so it skipped its earlier
+    // request-header hook. Enable the inexpensive level-1 encoder only for
+    // these text routes and feed it the request once to parse Accept-Encoding.
+    let request = session.downstream_session.req_header();
+    if let Some(compression) = session
+        .downstream_modules_ctx
+        .get_mut::<ResponseCompression>()
+    {
+        compression.adjust_level(1);
+        compression.request_filter(request);
     }
 }
 
@@ -1109,6 +1138,38 @@ hosts:
         assert!(vaultwarden_auth_path("/api/accounts/login"));
         assert!(vaultwarden_auth_path("/identity/connect/token/extra"));
         assert!(!vaultwarden_auth_path("/api/accounts/login-evil"));
+    }
+
+    #[test]
+    fn applies_compression_only_to_intended_routes() {
+        for route in [RouteClass::NavidromeApi, RouteClass::NavidromeCover] {
+            assert!(forwards_accept_encoding(route), "route={route:?}");
+        }
+        for route in [
+            RouteClass::NavidromeStream,
+            RouteClass::VaultwardenAuth,
+            RouteClass::VaultwardenHub,
+            RouteClass::Vaultwarden,
+            RouteClass::Couchdb,
+            RouteClass::Doh,
+            RouteClass::AdguardUi,
+        ] {
+            assert!(!forwards_accept_encoding(route), "route={route:?}");
+        }
+
+        assert!(uses_downstream_compression(RouteClass::Vaultwarden));
+        assert!(uses_downstream_compression(RouteClass::Couchdb));
+        for route in [
+            RouteClass::NavidromeStream,
+            RouteClass::NavidromeCover,
+            RouteClass::NavidromeApi,
+            RouteClass::VaultwardenAuth,
+            RouteClass::VaultwardenHub,
+            RouteClass::Doh,
+            RouteClass::AdguardUi,
+        ] {
+            assert!(!uses_downstream_compression(route), "route={route:?}");
+        }
     }
 
     #[test]

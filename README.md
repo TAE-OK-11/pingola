@@ -16,15 +16,18 @@ upstream dependency는 Rust 코드에서 `cloudflare_pingora` alias로 가져옵
 - IPv4/IPv6 listener와 IPv6 socket의 명시적 `IPV6_V6ONLY=true`
 - Host allowlist, trusted proxy 기반 `X-Forwarded-For`, body 크기 제한
 - 서비스·route별 rate limit 및 active request/H2 stream limit
-- Navidrome audio 무압축 streaming, Vaultwarden hub, CouchDB replication, DoH 정책
+- Navidrome audio 무압축 streaming, Vaultwarden/CouchDB route 압축, DoH 정책
 - PiKKY 정적 파일 gzip/Brotli/Zstd 동적·사전 압축, bounded LRU cache
 - AWS-LC TLS 파일 사전 검사와 UID/GID/mode/symlink 대상 진단
 - Rust global allocator로 정적 링크된 Google TCMalloc(8 KiB logical page)
 - UID/GID `10001:10001`, read-only root filesystem, 최소 capability
 
 Pingora 0.8.1은 다운스트림 HTTP/3/QUIC server를 제공하지 않으므로 HTTP/3와
-`Alt-Svc`는 지원하지 않습니다. gzip/Brotli/Zstd는 PiKKY 정적 파일에만 적용하며
-proxy 응답과 audio stream에는 동적 압축을 하지 않습니다.
+`Alt-Svc`는 지원하지 않습니다. gzip/Brotli/Zstd 동적 압축은 PiKKY 정적 파일에만
+직접 적용합니다. Navidrome API/cover는 client의 `Accept-Encoding`을 origin에
+전달하고, Vaultwarden 일반 API와 CouchDB의 압축 가능한 응답은 Pingora가 level 1
+gzip으로 streaming 압축합니다. Audio stream, Vaultwarden 인증·notifications hub 및
+DoH는 압축하지 않습니다.
 
 ## 새 이름과 한 릴리스 호환성
 

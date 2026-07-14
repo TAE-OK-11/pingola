@@ -25,7 +25,7 @@ bytes = "1.12"
 clap = { version = "4.6", features = ["derive", "env"] }
 dashmap = "6.2"
 env_logger = "0.11"
-flate2 = "1.1"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 http = "1.4"
 httpdate = "1.0"
 ipnet = { version = "2.12", features = ["serde"] }
@@ -34,7 +34,7 @@ lru = "0.18"
 mime_guess = "2.0"
 parking_lot = "0.12"
 percent-encoding = "2.3"
-cloudflare-pingora = { package = "pingora", version = "0.8.1", features = ["proxy", "rustls"] }
+cloudflare-pingora = { package = "pingora", version = "0.8.1", default-features = false, features = ["proxy", "rustls"] }
 rustls = { version = "0.23.42", default-features = false, features = ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"] }
 rustls-pemfile = "2.2"
 rustix = { version = "1.1", features = ["process"] }
@@ -42,7 +42,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 socket2 = "0.6"
-thiserror = "2.0"
 tcmalloc-better = { version = "0.1.19", optional = true }
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats", "use_std"], optional = true }
 tikv-jemallocator = { version = "0.7", features = ["stats"], optional = true }

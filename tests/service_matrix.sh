@@ -103,13 +103,24 @@ for _ in {1..100}; do
 done
 kill -0 "${GATEWAY_PID}"
 
-# API/cover routes may negotiate upstream compression; audio routes must not.
+# Text/API routes may negotiate upstream compression. Audio streams,
+# Vaultwarden auth/WebSocket and binary DoH routes must not.
 api_headers=$(curl --noproxy '*' -ksS --http2 --resolve nav.test:18550:127.0.0.1 \
   -H 'accept-encoding: gzip' https://nav.test:18550/headers)
 stream_headers=$(curl --noproxy '*' -ksS --http2 --resolve nav.test:18550:127.0.0.1 \
   -H 'accept-encoding: gzip' https://nav.test:18550/stream/headers)
+vault_headers=$(curl --noproxy '*' --compressed -ksS --http2 \
+  --resolve vault.test:18550:127.0.0.1 -D "${RUNTIME}/vault-compression.headers" \
+  -H 'accept-encoding: gzip' https://vault.test:18550/headers)
+couch_headers=$(curl --noproxy '*' --compressed -ksS --http2 \
+  --resolve couch.test:18550:127.0.0.1 -D "${RUNTIME}/couch-compression.headers" \
+  -H 'accept-encoding: gzip' https://couch.test:18550/headers)
 jq -e '.accept_encoding == "gzip"' <<<"${api_headers}" >/dev/null
 jq -e '.accept_encoding == null' <<<"${stream_headers}" >/dev/null
+jq -e '.accept_encoding == null' <<<"${vault_headers}" >/dev/null
+jq -e '.accept_encoding == null' <<<"${couch_headers}" >/dev/null
+grep -qi '^content-encoding: gzip' "${RUNTIME}/vault-compression.headers"
+grep -qi '^content-encoding: gzip' "${RUNTIME}/couch-compression.headers"
 
 for size in 1048576 10485760 104857600; do
   expected=$(direct_sha "/stream/${size}")

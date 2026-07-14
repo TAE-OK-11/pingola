@@ -564,8 +564,15 @@ mod tests {
 
     #[test]
     fn compressors_round_trip_nonempty_data() {
+        use std::io::Read;
+
         let data = b"pingora ".repeat(1024);
-        assert!(!compress(data.clone(), Encoding::Gzip).unwrap().is_empty());
+        let gzip = compress(data.clone(), Encoding::Gzip).unwrap();
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(gzip.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, data);
         assert!(!compress(data.clone(), Encoding::Brotli).unwrap().is_empty());
         assert!(!compress(data, Encoding::Zstd).unwrap().is_empty());
     }
