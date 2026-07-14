@@ -73,7 +73,10 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
          readelf -S target/release/pingora | grep -q '\.rela\.text'; \
          readelf -s target/release/pingora | grep -q 'FUNC'; \
          nm --defined-only --format=posix target/release/pingora \
-           | awk '$1 ~ /(TCMalloc|tcmalloc)/ { print $1 }' \
+           | awk '$1 ~ /(TCMalloc|tcmalloc|aws_lc|curve25519|edwards25519)/ || $1 ~ /^bn_/ { \
+               print $1; \
+               for (duplicate = 1; duplicate <= 8; duplicate++) print $1 "/" duplicate; \
+             }' \
            | sort -u > /tmp/pingora-bolt-skip-functions; \
          test -s /tmp/pingora-bolt-skip-functions; \
          llvm-bolt-19 target/release/pingora \
