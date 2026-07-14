@@ -68,7 +68,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target_cpu: [x86-64-v2, znver1]
+        include:
+          - target_cpu: x86-64-v2
+            lto: thin
+            runtime: true
+          - target_cpu: x86-64-v2
+            lto: fat
+            runtime: true
+          - target_cpu: znver1
+            lto: thin
+            runtime: false
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -77,24 +86,27 @@ jobs:
         with:
           context: .
           load: true
-          tags: pingora:ci-${{ matrix.target_cpu }}
+          tags: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}
+          pull: true
           build-args: |
             ALLOCATOR=tcmalloc
             RUST_TARGET_CPU=${{ matrix.target_cpu }}
+            RUST_LTO=${{ matrix.lto }}
             BUILD_VERSION=ci
             BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Non-root and read-only runtime checks
-        if: matrix.target_cpu == 'x86-64-v2'
+        if: matrix.runtime
         env:
-          PINGORA_TEST_IMAGE: pingora:ci-${{ matrix.target_cpu }}
+          PINGORA_TEST_IMAGE: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}
           PINGORA_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
+          PINGORA_EXPECTED_LTO: ${{ matrix.lto }}
         run: tests/docker_runtime.sh
       - name: Specialized image metadata and allocator smoke check
-        if: matrix.target_cpu == 'znver1'
+        if: ${{ !matrix.runtime }}
         env:
-          IMAGE: pingora:ci-${{ matrix.target_cpu }}
+          IMAGE: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}
         run: |
           # GitHub-hosted runner CPU models are not stable. Running the full
           # znver1 listener on an incompatible host can correctly SIGILL even
@@ -104,6 +116,7 @@ jobs:
           allocator=$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator"]')
           test "${target_cpu}" = "znver1"
           test "${allocator}" = "tcmalloc"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.lto"]')" = "thin"
           docker run --rm "${IMAGE}" --allocator-info | grep -q '^allocator=tcmalloc '
 
   image:
@@ -153,17 +166,59 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
+          pull: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             ALLOCATOR=tcmalloc
             RUST_TARGET_CPU=x86-64-v2
+            RUST_LTO=thin
             BUILD_VERSION=${{ steps.meta.outputs.version }}
             BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
+
+  image-fat-lto-candidate:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: image-test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish measured Fat LTO candidate
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          pull: true
+          tags: ghcr.io/tae-ok-11/pingora:lto-fat-candidate
+          labels: |
+            org.opencontainers.image.title=Pingora Fat LTO candidate
+            org.opencontainers.image.description=Temporary measured Fat LTO candidate; not an operational release tag
+            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingora
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.allocator=tcmalloc
+            org.opencontainers.image.rust.lto=fat
+          build-args: |
+            ALLOCATOR=tcmalloc
+            RUST_TARGET_CPU=x86-64-v2
+            RUST_LTO=fat
+            BUILD_VERSION=lto-fat-candidate
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   image-znver1:
     if: github.event_name == 'push'
@@ -204,11 +259,13 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
+          pull: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             ALLOCATOR=tcmalloc
             RUST_TARGET_CPU=znver1
+            RUST_LTO=thin
             BUILD_VERSION=${{ steps.meta.outputs.version }}
             BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha
