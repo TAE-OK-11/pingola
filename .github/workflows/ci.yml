@@ -71,15 +71,9 @@ jobs:
         include:
           - target_cpu: x86-64-v2
             lto: fat
-            bolt: true
-            runtime: true
-          - target_cpu: x86-64-v2
-            lto: fat
-            bolt: false
             runtime: true
           - target_cpu: znver1
             lto: fat
-            bolt: false
             runtime: false
     steps:
       - uses: actions/checkout@v7
@@ -89,13 +83,12 @@ jobs:
         with:
           context: .
           load: true
-          tags: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}-bolt-${{ matrix.bolt }}
+          tags: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}
           pull: true
           build-args: |
             ALLOCATOR=tcmalloc
             RUST_TARGET_CPU=${{ matrix.target_cpu }}
             RUST_LTO=${{ matrix.lto }}
-            BOLT_ENABLED=${{ matrix.bolt }}
             BUILD_VERSION=ci
             BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha
@@ -103,15 +96,14 @@ jobs:
       - name: Non-root and read-only runtime checks
         if: matrix.runtime
         env:
-          PINGORA_TEST_IMAGE: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}-bolt-${{ matrix.bolt }}
+          PINGORA_TEST_IMAGE: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}
           PINGORA_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
           PINGORA_EXPECTED_LTO: ${{ matrix.lto }}
-          PINGORA_EXPECTED_BOLT: ${{ matrix.bolt }}
         run: tests/docker_runtime.sh
       - name: Specialized image metadata and allocator smoke check
         if: ${{ !matrix.runtime }}
         env:
-          IMAGE: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}-bolt-${{ matrix.bolt }}
+          IMAGE: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}
         run: |
           # GitHub-hosted runner CPU models are not stable. Running the full
           # znver1 listener on an incompatible host can correctly SIGILL even
@@ -122,7 +114,6 @@ jobs:
           test "${target_cpu}" = "znver1"
           test "${allocator}" = "tcmalloc"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.lto"]')" = "fat"
-          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.bolt"]')" = "false"
           docker run --rm "${IMAGE}" --allocator-info | grep -q '^allocator=tcmalloc '
 
   image:
@@ -179,32 +170,7 @@ jobs:
             ALLOCATOR=tcmalloc
             RUST_TARGET_CPU=x86-64-v2
             RUST_LTO=fat
-            BOLT_ENABLED=true
             BUILD_VERSION=${{ steps.meta.outputs.version }}
-            BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: mode=max
-          sbom: true
-      - name: Publish Fat LTO baseline for measured BOLT comparisons
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          pull: true
-          tags: ghcr.io/tae-ok-11/pingora:fat-baseline
-          labels: |
-            org.opencontainers.image.title=Pingora Fat LTO baseline
-            org.opencontainers.image.description=Measurement-only Fat LTO image without BOLT
-            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingora
-            org.opencontainers.image.revision=${{ github.sha }}
-          build-args: |
-            ALLOCATOR=tcmalloc
-            RUST_TARGET_CPU=x86-64-v2
-            RUST_LTO=fat
-            BOLT_ENABLED=false
-            BUILD_VERSION=fat-baseline
             BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -257,7 +223,6 @@ jobs:
             ALLOCATOR=tcmalloc
             RUST_TARGET_CPU=znver1
             RUST_LTO=fat
-            BOLT_ENABLED=false
             BUILD_VERSION=${{ steps.meta.outputs.version }}
             BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha

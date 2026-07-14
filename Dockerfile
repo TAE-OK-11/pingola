@@ -4,7 +4,6 @@ ARG RUST_VERSION=1.97.0
 ARG RUST_TARGET_CPU=x86-64-v2
 ARG RUST_LTO=fat
 ARG RUST_CODEGEN_UNITS=1
-ARG BOLT_ENABLED=true
 ARG DEBIAN_SUITE=trixie
 
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS builder
@@ -12,17 +11,12 @@ FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS builder
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         build-essential \
-        bolt-19 \
         ca-certificates \
         clang \
         cmake \
-        curl \
         lld \
         ninja-build \
-        nghttp2-client \
-        openssl \
         perl \
-        python3-minimal \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -30,26 +24,21 @@ WORKDIR /src
 COPY --link Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY --link vendor ./vendor
 COPY --link src ./src
-COPY --link bench/backend.py ./bench/backend.py
-COPY --link tools/bolt-train.sh ./tools/bolt-train.sh
 
 ARG RUST_TARGET_CPU
 ARG RUST_LTO
 ARG RUST_CODEGEN_UNITS
-ARG BOLT_ENABLED
 ARG ALLOCATOR=tcmalloc
 ENV CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${RUST_CODEGEN_UNITS} \
     CARGO_PROFILE_RELEASE_LTO=${RUST_LTO} \
-    CARGO_PROFILE_RELEASE_STRIP=none \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang \
     CMAKE_GENERATOR=Ninja \
-    RUSTFLAGS="-C target-cpu=${RUST_TARGET_CPU} -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections -C link-arg=-Wl,--emit-relocs"
+    RUSTFLAGS="-C target-cpu=${RUST_TARGET_CPU} -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections"
 
 RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=pingora-target-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR},target=/src/target,sharing=locked \
-    set -eu; \
     case "${ALLOCATOR}" in \
       jemalloc|tcmalloc|system-allocator) ;; \
       *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; \
@@ -62,51 +51,10 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       1|2|4|8|16) ;; \
       *) echo "unsupported Rust codegen unit count: ${RUST_CODEGEN_UNITS}" >&2; exit 2 ;; \
     esac \
-    && case "${BOLT_ENABLED}" in \
-      true|false) ;; \
-      *) echo "BOLT_ENABLED must be true or false" >&2; exit 2 ;; \
-    esac \
     && cargo build --locked --release --no-default-features --features "${ALLOCATOR}" \
     && expected="${ALLOCATOR%-allocator}" \
     && target/release/pingora --allocator-info | grep -q "^allocator=${expected}" \
-    && if [ "${BOLT_ENABLED}" = true ]; then \
-         readelf -S target/release/pingora | grep -q '\.rela\.text'; \
-         readelf -s target/release/pingora | grep -q 'FUNC'; \
-         nm --defined-only --format=posix target/release/pingora \
-           | awk '$1 ~ /(TCMalloc|tcmalloc|aws_lc|curve25519|edwards25519)/ || $1 ~ /^bn_/ { \
-               print $1; \
-               for (duplicate = 1; duplicate <= 8; duplicate++) print $1 "/" duplicate; \
-             }' \
-           | sort -u > /tmp/pingora-bolt-skip-functions; \
-         test -s /tmp/pingora-bolt-skip-functions; \
-         llvm-bolt-19 target/release/pingora \
-           --instrument \
-           --skip-funcs-file=/tmp/pingora-bolt-skip-functions \
-           --runtime-instrumentation-lib=llvm-19/lib/libbolt_rt_instr.a \
-           --instrumentation-file=/tmp/pingora-bolt.fdata \
-           --instrumentation-sleep-time=1 \
-           --instrumentation-no-counters-clear \
-           -o /tmp/pingora-instrumented || exit $?; \
-         tools/bolt-train.sh /tmp/pingora-instrumented /tmp/pingora-bolt.fdata || exit $?; \
-         test -s /tmp/pingora-bolt.fdata || exit 1; \
-         llvm-bolt-19 target/release/pingora \
-           --data=/tmp/pingora-bolt.fdata \
-           --skip-funcs-file=/tmp/pingora-bolt-skip-functions \
-           --reorder-blocks=ext-tsp \
-           --reorder-functions=cdsort \
-           --split-functions \
-           --split-all-cold \
-           --split-eh \
-           --dyno-stats \
-           -o /out/pingora || exit $?; \
-       else \
-         install -Dm755 target/release/pingora /out/pingora; \
-       fi \
-    && strip --strip-all /out/pingora \
-    && if [ "${BOLT_ENABLED}" = true ]; then \
-         readelf -S /out/pingora | grep -q '\.note\.bolt_info'; \
-       fi \
-    && /out/pingora --allocator-info | grep -q "^allocator=${expected}"
+    && install -Dm755 target/release/pingora /out/pingora
 
 FROM debian:${DEBIAN_SUITE}-slim AS runtime
 
@@ -117,7 +65,6 @@ ARG RUST_VERSION
 ARG RUST_TARGET_CPU
 ARG RUST_LTO
 ARG RUST_CODEGEN_UNITS
-ARG BOLT_ENABLED
 ARG DEBIAN_SUITE
 
 LABEL org.opencontainers.image.title="Pingora" \
@@ -132,7 +79,6 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.rust.lto="${RUST_LTO}" \
       org.opencontainers.image.rust.codegen-units="${RUST_CODEGEN_UNITS}" \
       org.opencontainers.image.rust.linker="lld" \
-      org.opencontainers.image.rust.bolt="${BOLT_ENABLED}" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 RUN --mount=from=builder,source=/out,target=/out,ro \
