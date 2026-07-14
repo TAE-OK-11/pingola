@@ -4,6 +4,9 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGE=${PINGORA_IMAGE:-ghcr.io/tae-ok-11/pingora:local}
 OUTPUT=${PROFILE_OUTPUT:-${ROOT}/bench/results/profile-$(date -u +%Y%m%dT%H%M%SZ)}
+if [[ "${OUTPUT}" != /* ]]; then
+  OUTPUT=${ROOT}/${OUTPUT}
+fi
 BACKEND_PORT=${PROFILE_BACKEND_PORT:-18800}
 HTTP_PORT=${PROFILE_HTTP_PORT:-18880}
 HTTPS_PORT=${PROFILE_HTTPS_PORT:-18843}
@@ -22,8 +25,10 @@ if [[ -n "${MEMORY}" ]]; then
 fi
 
 cleanup() {
-  docker logs "${NAME}" >"${OUTPUT}/container.log" 2>&1 || true
-  docker rm -f "${NAME}" >/dev/null 2>&1 || true
+  if docker inspect "${NAME}" >/dev/null 2>&1; then
+    docker logs "${NAME}" >"${OUTPUT}/container.log" 2>&1 || true
+    docker rm -f "${NAME}" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${BACKEND_PID}" ]]; then
     kill "${BACKEND_PID}" >/dev/null 2>&1 || true
     wait "${BACKEND_PID}" >/dev/null 2>&1 || true
@@ -72,24 +77,43 @@ chmod 0644 "${OUTPUT}/pingora.yaml"
 python3 "${ROOT}/bench/backend.py" --port "${BACKEND_PORT}" \
   >"${OUTPUT}/backend.stdout" 2>"${OUTPUT}/backend.stderr" &
 BACKEND_PID=$!
+BACKEND_READY=false
 for _ in {1..100}; do
-  curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}/bytes/64" -o /dev/null && break
+  if curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}/bytes/64" \
+    -o /dev/null 2>/dev/null; then
+    BACKEND_READY=true
+    break
+  fi
+  kill -0 "${BACKEND_PID}" 2>/dev/null || break
   sleep 0.05
 done
+if [[ "${BACKEND_READY}" != true ]]; then
+  echo "profile backend failed readiness: port=${BACKEND_PORT} log=${OUTPUT}/backend.stderr" >&2
+  exit 2
+fi
 
-docker run --detach --name "${NAME}" --network host --read-only \
+if ! docker run --detach --name "${NAME}" --network host --read-only \
   "${DOCKER_RESOURCE_ARGS[@]}" \
   --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
   --tmpfs /tmp/pingora:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700 \
   --env PINGORA_ALLOCATOR_STATS=1 --volume "${OUTPUT}:/work:ro" \
-  --entrypoint /usr/local/bin/pingora "${IMAGE}" --config /work/pingora.yaml >/dev/null
+  --entrypoint /usr/local/bin/pingora "${IMAGE}" --config /work/pingora.yaml >/dev/null; then
+  echo "profile proxy failed to start: image=${IMAGE}" >&2
+  exit 2
+fi
+PROXY_READY=false
 for _ in {1..100}; do
   if curl --noproxy '*' -fsS -H 'host: profile.test' \
     "http://127.0.0.1:${HTTP_PORT}/bytes/64" -o /dev/null 2>/dev/null; then
+    PROXY_READY=true
     break
   fi
   sleep 0.05
 done
+if [[ "${PROXY_READY}" != true ]]; then
+  echo "profile proxy failed readiness: image=${IMAGE} port=${HTTP_PORT}" >&2
+  exit 2
+fi
 
 PID=$(docker inspect --format '{{.State.Pid}}' "${NAME}")
 cat >"${OUTPUT}/environment.txt" <<EOF
