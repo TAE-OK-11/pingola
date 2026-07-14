@@ -49,6 +49,7 @@ ENV CARGO_INCREMENTAL=0 \
 RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=pingora-target-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR},target=/src/target,sharing=locked \
+    set -eu; \
     case "${ALLOCATOR}" in \
       jemalloc|tcmalloc|system-allocator) ;; \
       *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; \
@@ -73,6 +74,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
          readelf -s target/release/pingora | grep -q 'FUNC'; \
          llvm-bolt-19 target/release/pingora \
            --instrument \
+           --runtime-instrumentation-lib=/usr/lib/llvm-19/lib/libbolt_rt_instr.a \
            --instrumentation-file=/tmp/pingora-bolt.fdata \
            --instrumentation-sleep-time=1 \
            --instrumentation-no-counters-clear \
