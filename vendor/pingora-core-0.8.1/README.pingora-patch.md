@@ -1,7 +1,7 @@
 # Local Pingora core patch
 
-This directory is the source of `pingora-core` 0.8.1 from crates.io with two
-small, documented local changes.
+This directory is the source of `pingora-core` 0.8.1 from crates.io with a
+small set of documented local changes.
 
 - Upstream package: `pingora-core` 0.8.1
 - License: Apache-2.0 (`LICENSE` in this directory)
@@ -12,6 +12,12 @@ small, documented local changes.
 - Reason: fully prepared immutable route peers otherwise hash their address,
   SNI and pool options repeatedly for every connection-pool operation. Mutable
   peers retain upstream behavior because the cache defaults to `None`.
+- Local change: `serde_yaml` to `serde-saphyr` 0.0.29.
+- Reason: remove the deprecated libyaml binding while retaining typed config
+  serialization and deserialization.
+- Local change: Brotli 3 to Brotli 8 and flate2 zlib-ng to zlib-rs.
+- Reason: use one Brotli version across the final binary and select exactly one
+  high-performance DEFLATE backend instead of compiling ambiguous backends.
 
-Remove the dependency patch after a released Pingora version adopts patched
-Prometheus. Re-evaluate the reuse-hash cache whenever `HttpPeer` changes.
+Remove dependency patches after a released Pingora version adopts equivalent
+versions. Re-evaluate the reuse-hash cache whenever `HttpPeer` changes.

@@ -160,11 +160,9 @@ impl StaticFiles {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let content_type = mime_guess::from_path(&path)
-            .first_or_octet_stream()
-            .essence_str()
-            .to_string();
+        let path_is_compressible = compressible_path(&path);
         if metadata.len() > MAX_BUFFERED_ASSET_BYTES {
+            let content_type = content_type(&path);
             return serve_streaming_file(
                 session,
                 &path,
@@ -176,7 +174,7 @@ impl StaticFiles {
             )
             .await;
         }
-        let requested_encoding = if metadata.len() >= 1024 && compressible(&content_type) {
+        let requested_encoding = if metadata.len() >= 1024 && path_is_compressible {
             negotiate_encoding(
                 session
                     .req_header()
@@ -205,7 +203,7 @@ impl StaticFiles {
             let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), modified_nanos);
             let asset = Arc::new(CachedAsset {
                 body,
-                content_type,
+                content_type: content_type(&path),
                 etag,
                 last_modified: httpdate::fmt_http_date(modified),
             });
@@ -441,29 +439,41 @@ fn negotiate_encoding(header: Option<&str>) -> Encoding {
     let Some(header) = header else {
         return Encoding::Identity;
     };
-    let mut quality = HashMap::<&str, f32>::new();
+    let mut zstd = None;
+    let mut brotli = None;
+    let mut gzip = None;
+    let mut wildcard = 0.0;
     for item in header.split(',') {
         let mut parts = item.trim().split(';');
         let name = parts.next().unwrap_or_default().trim();
         let mut q = 1.0;
         for parameter in parts {
-            if let Some(value) = parameter.trim().strip_prefix("q=") {
-                q = value.parse::<f32>().unwrap_or(0.0).clamp(0.0, 1.0);
+            if let Some((key, value)) = parameter.trim().split_once('=') {
+                if key.trim().eq_ignore_ascii_case("q") {
+                    q = value.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1.0);
+                }
             }
         }
-        quality.insert(name, q);
+        if name.eq_ignore_ascii_case("zstd") {
+            zstd = Some(q);
+        } else if name.eq_ignore_ascii_case("br") {
+            brotli = Some(q);
+        } else if name.eq_ignore_ascii_case("gzip") {
+            gzip = Some(q);
+        } else if name == "*" {
+            wildcard = q;
+        }
     }
 
-    let wildcard = *quality.get("*").unwrap_or(&0.0);
     let candidates = [
-        (Encoding::Zstd, "zstd"),
-        (Encoding::Brotli, "br"),
-        (Encoding::Gzip, "gzip"),
+        (Encoding::Zstd, zstd),
+        (Encoding::Brotli, brotli),
+        (Encoding::Gzip, gzip),
     ];
     let mut selected = Encoding::Identity;
     let mut selected_quality = 0.0;
-    for (encoding, name) in candidates {
-        let candidate_quality = *quality.get(name).unwrap_or(&wildcard);
+    for (encoding, quality) in candidates {
+        let candidate_quality = quality.unwrap_or(wildcard);
         if candidate_quality > selected_quality {
             selected = encoding;
             selected_quality = candidate_quality;
@@ -472,7 +482,49 @@ fn negotiate_encoding(header: Option<&str>) -> Encoding {
     selected
 }
 
-fn compressible(content_type: &str) -> bool {
+fn content_type(path: &Path) -> String {
+    mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string()
+}
+
+fn compressible_path(path: &Path) -> bool {
+    const EXTENSIONS: &[&str] = &[
+        "css",
+        "eot",
+        "htm",
+        "html",
+        "js",
+        "json",
+        "ldjson",
+        "map",
+        "markdown",
+        "md",
+        "mjs",
+        "otf",
+        "rss",
+        "svg",
+        "ttf",
+        "txt",
+        "vtt",
+        "wasm",
+        "webmanifest",
+        "xhtml",
+        "xml",
+    ];
+    let known_compressible = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            EXTENSIONS
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        });
+    known_compressible || compressible_content_type(&content_type(path))
+}
+
+fn compressible_content_type(content_type: &str) -> bool {
     content_type.starts_with("text/")
         || matches!(
             content_type,
@@ -547,7 +599,16 @@ mod tests {
             Encoding::Gzip
         );
         assert_eq!(negotiate_encoding(Some("br, gzip")), Encoding::Brotli);
+        assert_eq!(negotiate_encoding(Some("GZIP; Q=0.7")), Encoding::Gzip);
+        assert_eq!(negotiate_encoding(Some("*;q=0.5, br;q=0")), Encoding::Zstd);
         assert_eq!(negotiate_encoding(None), Encoding::Identity);
+    }
+
+    #[test]
+    fn compressible_extensions_are_detected_without_mime_allocation() {
+        assert!(compressible_path(Path::new("asset.JSON")));
+        assert!(compressible_path(Path::new("index.html")));
+        assert!(!compressible_path(Path::new("audio.flac")));
     }
 
     #[tokio::test]

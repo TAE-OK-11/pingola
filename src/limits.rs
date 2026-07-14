@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
 const MAX_RATE_BUCKETS: usize = 262_144;
@@ -36,6 +37,7 @@ struct Bucket {
 /// contend on a global lock.
 pub struct RateLimiter {
     buckets: DashMap<ClientKey, Bucket>,
+    bucket_count: AtomicUsize,
     observations: AtomicU64,
     max_buckets: usize,
 }
@@ -48,6 +50,7 @@ impl RateLimiter {
     fn with_max_buckets(max_buckets: usize) -> Self {
         Self {
             buckets: DashMap::new(),
+            bucket_count: AtomicUsize::new(0),
             observations: AtomicU64::new(0),
             max_buckets,
         }
@@ -64,16 +67,26 @@ impl RateLimiter {
         let now = Instant::now();
         let capacity = f64::from(burst) + 1.0;
         let key = ClientKey { zone, ip };
-        // Bound memory even during a sustained unique-source flood. Existing
-        // clients continue to use their buckets; unseen clients fail closed
-        // until the periodic idle cleanup frees capacity.
-        if self.buckets.len() >= self.max_buckets && !self.buckets.contains_key(&key) {
-            return false;
-        }
-        let mut bucket = self.buckets.entry(key).or_insert_with(|| Bucket {
-            tokens: capacity,
-            updated_at: now,
-        });
+        // Use a single sharded-map lookup. New clients atomically reserve one
+        // bounded slot; existing clients do not pay for len()+contains_key().
+        let mut bucket = match self.buckets.entry(key) {
+            Entry::Occupied(entry) => entry.into_ref(),
+            Entry::Vacant(entry) => {
+                if self
+                    .bucket_count
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        (count < self.max_buckets).then_some(count + 1)
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
+                entry.insert(Bucket {
+                    tokens: capacity,
+                    updated_at: now,
+                })
+            }
+        };
         let elapsed = now.duration_since(bucket.updated_at).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * requests_per_second).min(capacity);
         bucket.updated_at = now;
@@ -87,8 +100,13 @@ impl RateLimiter {
         // Bound memory during long-running scans. Cleanup is deliberately rare
         // and only removes buckets that have been idle for ten minutes.
         if self.observations.fetch_add(1, Ordering::Relaxed) & 0x3fff == 0x3fff {
-            self.buckets
-                .retain(|_, bucket| now.duration_since(bucket.updated_at).as_secs() < 600);
+            let mut removed = 0;
+            self.buckets.retain(|_, bucket| {
+                let keep = now.duration_since(bucket.updated_at).as_secs() < 600;
+                removed += usize::from(!keep);
+                keep
+            });
+            self.bucket_count.fetch_sub(removed, Ordering::AcqRel);
         }
 
         allowed

@@ -4,6 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
+use ahash::AHashMap;
 use anyhow::{anyhow, Context};
 use arrayvec::ArrayString;
 use async_trait::async_trait;
@@ -252,7 +253,7 @@ impl Default for RequestContext {
 pub struct Gateway {
     runtime: Arc<RuntimeConfig>,
     static_files: StaticFiles,
-    hosts: HashMap<Arc<str>, PreparedHost>,
+    hosts: AHashMap<Arc<str>, PreparedHost>,
     route_policies: [RoutePolicy; RouteClass::ALL.len()],
     rates: RateLimiter,
     active_requests: ActiveRequestLimiter,
@@ -279,7 +280,7 @@ impl Gateway {
                 prepare_upstream(name, upstream).map(|prepared| (name.clone(), prepared))
             })
             .collect::<anyhow::Result<HashMap<_, _>>>()?;
-        let mut hosts = HashMap::with_capacity(
+        let mut hosts = AHashMap::with_capacity(
             runtime
                 .config
                 .hosts
@@ -1083,7 +1084,7 @@ mod tests {
     use crate::config::{Config, RuntimeConfig};
 
     fn runtime() -> RuntimeConfig {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = serde_saphyr::from_str(
             r#"
 server:
   http_listen: ["127.0.0.1:8080"]
@@ -1189,7 +1190,7 @@ hosts:
 
     #[test]
     fn explicit_upstream_timeout_overrides_long_route_default() {
-        let upstream: crate::config::UpstreamConfig = serde_yaml::from_str(
+        let upstream: crate::config::UpstreamConfig = serde_saphyr::from_str(
             r#"
 address: "127.0.0.1:9000"
 read_timeout_seconds: 7
@@ -1211,7 +1212,7 @@ write_timeout_seconds: 9
     #[test]
     fn omitted_upstream_timeout_uses_each_route_default() {
         let upstream: crate::config::UpstreamConfig =
-            serde_yaml::from_str("address: 127.0.0.1:9000").unwrap();
+            serde_saphyr::from_str("address: 127.0.0.1:9000").unwrap();
         let upstream = prepare_upstream("test", &upstream).unwrap();
         assert_eq!(
             upstream_timeouts(RouteClass::NavidromeStream, &upstream),
@@ -1230,7 +1231,7 @@ write_timeout_seconds: 9
     #[test]
     fn invalid_upstream_address_is_rejected_before_serving_requests() {
         let upstream: crate::config::UpstreamConfig =
-            serde_yaml::from_str("address: '127.0.0.1:not-a-port'").unwrap();
+            serde_saphyr::from_str("address: '127.0.0.1:not-a-port'").unwrap();
         let error = prepare_upstream("broken", &upstream).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("name=broken"));
@@ -1240,7 +1241,8 @@ write_timeout_seconds: 9
     #[test]
     fn tls_upstream_auto_prefers_h2_with_h1_fallback() {
         let upstream: crate::config::UpstreamConfig =
-            serde_yaml::from_str("address: 127.0.0.1:9443\ntls: true\nsni: upstream.test").unwrap();
+            serde_saphyr::from_str("address: 127.0.0.1:9443\ntls: true\nsni: upstream.test")
+                .unwrap();
         let prepared = prepare_upstream("test", &upstream).unwrap();
         assert_eq!(prepared.peer.options.alpn, ALPN::H2H1);
         assert_eq!(prepared.peer.options.max_h2_streams, 32);
@@ -1249,11 +1251,11 @@ write_timeout_seconds: 9
     #[test]
     fn plaintext_auto_stays_h1_and_explicit_http2_enables_h2c() {
         let automatic: crate::config::UpstreamConfig =
-            serde_yaml::from_str("address: 127.0.0.1:9000").unwrap();
+            serde_saphyr::from_str("address: 127.0.0.1:9000").unwrap();
         let automatic = prepare_upstream("auto", &automatic).unwrap();
         assert_eq!(automatic.peer.options.alpn, ALPN::H1);
 
-        let h2c: crate::config::UpstreamConfig = serde_yaml::from_str(
+        let h2c: crate::config::UpstreamConfig = serde_saphyr::from_str(
             "address: 127.0.0.1:9000\nprotocol: http2\nhttp2_max_concurrent_streams: 64",
         )
         .unwrap();

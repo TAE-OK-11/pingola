@@ -199,7 +199,7 @@ impl RuntimeConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let data = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        let config: Config = serde_yaml::from_str(&data)
+        let config: Config = serde_saphyr::from_str(&data)
             .with_context(|| format!("failed to parse config {}", path.display()))?;
         Self::new(config)
     }
@@ -388,8 +388,18 @@ fn validate(config: &Config) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn repository_configs_parse_with_saphyr() {
+        for relative in ["config/pingora.yaml", "config/benchmark.yaml"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+            let yaml = fs::read_to_string(&path).unwrap();
+            serde_saphyr::from_str::<Config>(&yaml)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        }
+    }
+
     fn sample_config() -> Config {
-        serde_yaml::from_str(
+        serde_saphyr::from_str(
             r#"
 server:
   http_listen: ["127.0.0.1:8080"]
@@ -454,11 +464,11 @@ hosts:
 
     #[test]
     fn parses_upstream_protocol_policy() {
-        let automatic: UpstreamConfig = serde_yaml::from_str("address: 127.0.0.1:9000").unwrap();
+        let automatic: UpstreamConfig = serde_saphyr::from_str("address: 127.0.0.1:9000").unwrap();
         assert_eq!(automatic.protocol, UpstreamProtocol::Auto);
         assert_eq!(automatic.http2_max_concurrent_streams, 32);
 
-        let h2c: UpstreamConfig = serde_yaml::from_str(
+        let h2c: UpstreamConfig = serde_saphyr::from_str(
             "address: 127.0.0.1:9000\nprotocol: http2\nhttp2_max_concurrent_streams: 64",
         )
         .unwrap();

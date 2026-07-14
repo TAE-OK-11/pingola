@@ -299,9 +299,10 @@ ALLOCATOR_BENCH_CPUS=0.5 ALLOCATOR_BENCH_MEMORY=1g \
 
 Rust toolchain은 1.97.0이며 Cargo lockfile은 직접 의존성의 최신 호환 버전을
 고정합니다. GitHub Actions는 RustSec audit를 image 게시 전 실행하고, Dependabot이
-Cargo, Docker base image, Actions를 매주 확인합니다. Cloudflare Pingora 0.8.1이
-직접 고정한 일부 transitive crate와 deprecated `serde_yaml`은 upstream 제약 때문에
-별도로 남아 있으며 `cargo update --dry-run --verbose`로 추적합니다. Pingora 0.8.1의
+Cargo, Docker base image, Actions를 매주 확인합니다. Deprecated `serde_yaml`은
+typed YAML parser인 `serde-saphyr`로 교체했으며, 직접 코드와 vendored Pingora core가
+동일한 Brotli 8 및 zlib-rs backend를 사용합니다. 나머지 transitive crate는
+`cargo update --dry-run --verbose`로 추적합니다. Pingora 0.8.1의
 `prometheus 0.13`이 취약한 `protobuf 2.28`을 가져오는 경로는 core API를 바꾸지 않는
 로컬 최소 패치로 `prometheus 0.14`/`protobuf 3.7.2` 이상을 사용합니다. 패치 근거와
 범위는 `vendor/pingora-core-0.8.1/README.pingora-patch.md`에 기록합니다.

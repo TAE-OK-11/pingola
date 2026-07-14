@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn runtime_check_reports_invalid_upstream_address_without_panicking() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = serde_saphyr::from_str(
             r#"
 server:
   http_listen: ["127.0.0.1:0"]

@@ -235,7 +235,7 @@ impl ServerConf {
 
     pub fn from_yaml(conf_str: &str) -> Result<Self> {
         trace!("Read conf file: {conf_str}");
-        let conf: ServerConf = serde_yaml::from_str(conf_str).or_err_with(ReadError, || {
+        let conf: ServerConf = serde_saphyr::from_str(conf_str).or_err_with(ReadError, || {
             format!("Unable to parse yaml conf {conf_str}")
         })?;
 
@@ -244,7 +244,7 @@ impl ServerConf {
     }
 
     pub fn to_yaml(&self) -> String {
-        serde_yaml::to_string(self).unwrap()
+        serde_saphyr::to_string(self).unwrap()
     }
 
     pub fn validate(self) -> Result<Self> {
