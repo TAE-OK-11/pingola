@@ -9,6 +9,7 @@ CPU_LIMIT=${BENCH_CPUS:-0.5}
 MEMORY_LIMIT=${BENCH_MEMORY:-1g}
 MIN_FREE_BYTES=${BENCH_MIN_FREE_BYTES:-1073741824}
 BACKEND_PORT=${BACKEND_PORT:-18700}
+BACKEND_SOURCE=${BENCH_BACKEND_SOURCE:-${ROOT}/bench/backend.rs}
 HTTP_PORT=${HTTP_PORT:-18780}
 HTTPS_PORT=${HTTPS_PORT:-18743}
 DURATION=${BENCH_DURATION:-3s}
@@ -69,15 +70,25 @@ if ((AVAILABLE_BYTES < MIN_FREE_BYTES)); then
   echo "insufficient benchmark disk space: available=${AVAILABLE_BYTES} required=${MIN_FREE_BYTES} path=${OUTPUT}" >&2
   exit 2
 fi
-chmod +x "${ROOT}/bench/backend.py" "${ROOT}/bench/summarize_h2load.py" \
+chmod +x "${ROOT}/bench/summarize_h2load.py" \
   "${ROOT}/bench/summarize_resources.py" "${ROOT}/bench/summarize_compare.py"
 
-for command in docker curl wrk h2load openssl python3 sha256sum jq numfmt; do
+for command in docker curl wrk h2load openssl python3 rustc sha256sum jq numfmt; do
   if ! command -v "${command}" >/dev/null; then
     echo "missing required command: ${command}" >&2
     exit 2
   fi
 done
+
+BACKEND_BIN=${OUTPUT}/backend-rust
+if ! rustc --edition=2021 -D warnings -C opt-level=3 -C codegen-units=1 -C panic=abort \
+  -C target-cpu=native -C strip=symbols \
+  --remap-path-prefix="${ROOT}=." "${BACKEND_SOURCE}" -o "${BACKEND_BIN}" \
+  >"${OUTPUT}/backend-build.stdout" 2>"${OUTPUT}/backend-build.stderr"; then
+  echo "Rust benchmark backend build failed: source=${BACKEND_SOURCE} log=${OUTPUT}/backend-build.stderr" >&2
+  sed -n '1,120p' "${OUTPUT}/backend-build.stderr" >&2
+  exit 2
+fi
 
 CPU_NANO=$(python3 - "${CPU_LIMIT}" <<'PY'
 import sys
@@ -99,8 +110,12 @@ memory_bytes=${MEMORY_BYTES}
 minimum_free_bytes=${MIN_FREE_BYTES}
 available_bytes_at_start=${AVAILABLE_BYTES}
 stability_requests=${STABILITY_REQUESTS}
+backend=rust-std-http1
+backend_source=${BACKEND_SOURCE}
+backend_binary_sha256=$(sha256sum "${BACKEND_BIN}" | cut -d' ' -f1)
 note=load generator and backend share this host; each proxy container has identical CPU and memory limits
 EOF
+rustc -vV | sed 's/^/backend_rustc_/' >>"${OUTPUT}/environment.txt"
 lscpu >>"${OUTPUT}/environment.txt" 2>&1
 docker image inspect "${PINGORA_IMAGE}" >"${OUTPUT}/pingora-inspect.json"
 docker image inspect "${NGINX_IMAGE}" >"${OUTPUT}/nginx-inspect.json"
@@ -225,12 +240,12 @@ http {
 EOF
 chmod 0644 "${OUTPUT}/pingora.yaml" "${OUTPUT}/nginx.conf"
 
-python3 "${ROOT}/bench/backend.py" --port "${BACKEND_PORT}" \
+"${BACKEND_BIN}" --port "${BACKEND_PORT}" \
   >"${OUTPUT}/backend.stdout" 2>"${OUTPUT}/backend.stderr" &
 BACKEND_PID=$!
 backend_ready=false
 for _ in {1..100}; do
-  if curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}/bytes/64" -o /dev/null 2>/dev/null; then
+  if curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}/health" -o /dev/null 2>/dev/null; then
     backend_ready=true
     break
   fi
@@ -238,6 +253,12 @@ for _ in {1..100}; do
 done
 if [[ "${backend_ready}" != true ]]; then
   echo "benchmark backend did not become ready at 127.0.0.1:${BACKEND_PORT}" >&2
+  exit 1
+fi
+BACKEND_64_SHA=$(curl --noproxy '*' -fsS \
+  "http://127.0.0.1:${BACKEND_PORT}/bytes/64" | sha256sum | cut -d' ' -f1)
+if [[ "${BACKEND_64_SHA}" != fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108 ]]; then
+  echo "Rust benchmark backend returned an invalid deterministic 64-byte body: sha256=${BACKEND_64_SHA}" >&2
   exit 1
 fi
 

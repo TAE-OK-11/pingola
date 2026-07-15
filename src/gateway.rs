@@ -7,13 +7,15 @@ use std::time::{Duration, Instant};
 use ahash::AHashMap;
 use anyhow::{anyhow, Context};
 use arrayvec::ArrayString;
-use async_trait::async_trait;
 use bytes::Bytes;
 use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
 use cloudflare_pingora::modules::http::compression::ResponseCompression;
 use cloudflare_pingora::prelude::HttpPeer;
-use cloudflare_pingora::protocols::{TcpKeepalive, ALPN};
-use cloudflare_pingora::proxy::{ProxyHttp, Session};
+use cloudflare_pingora::protocols::{Digest, TcpKeepalive, ALPN};
+use cloudflare_pingora::proxy::{
+    default_fail_to_proxy, CacheMeta, FailToProxy, ForcedFreshness, HitHandler, ProxyHttp,
+    RawSocketHandle, Session,
+};
 use cloudflare_pingora::Error;
 use cloudflare_pingora::ErrorType;
 use cloudflare_pingora::ErrorType::HTTPStatus;
@@ -26,6 +28,7 @@ use http::header::{
 use http::{Method, Version};
 use log::{info, warn};
 use serde_json::json;
+use tokio::sync::mpsc;
 
 use crate::config::{normalized_host, HandlerKind, RuntimeConfig, UpstreamProtocol};
 use crate::content_encoding::{negotiate, ContentCoding, EncodingNegotiation};
@@ -41,12 +44,8 @@ const STREAM_PREFIXES: &[&str] = &[
 ];
 const COVER_PREFIXES: &[&str] = &["/rest/getCoverArt", "/api/artwork", "/coverart", "/artwork"];
 static LEGACY_HEALTH_WARNING: Once = Once::new();
-const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
+const NO_PLAN: usize = usize::MAX;
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
-const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
-const X_FORWARDED_PORT: HeaderName = HeaderName::from_static("x-forwarded-port");
-const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
-const X_FORWARDED_SSL: HeaderName = HeaderName::from_static("x-forwarded-ssl");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const PROXY_AUTHENTICATE: HeaderName = HeaderName::from_static("proxy-authenticate");
@@ -185,11 +184,11 @@ struct PreparedHost {
     name: String,
     handler: HandlerKind,
     redirect_http: bool,
-    plans: [Option<Arc<PreparedPlan>>; RouteClass::ALL.len()],
+    plans: [Option<usize>; RouteClass::ALL.len()],
 }
 
 impl PreparedHost {
-    fn plan(&self, path: &str) -> Option<Arc<PreparedPlan>> {
+    fn plan(&self, path: &str) -> Option<usize> {
         let route = match self.handler {
             HandlerKind::Static => return None,
             HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn => {
@@ -222,7 +221,7 @@ impl PreparedHost {
                 }
             }
         };
-        self.plans[route.index()].clone()
+        self.plans[route.index()]
     }
 }
 
@@ -233,12 +232,13 @@ struct RoutePolicy {
 }
 
 pub struct RequestContext {
-    plan: Option<Arc<PreparedPlan>>,
+    plan_index: usize,
     client_ip: IpAddr,
     tls: bool,
     body_bytes: usize,
     retries: usize,
     identity_acceptable: bool,
+    compression_selected: bool,
     started_at: Option<Instant>,
     _active_request_permit: Option<ActiveRequestPermit>,
     _global_request_permit: Option<ActiveRequestPermit>,
@@ -247,12 +247,13 @@ pub struct RequestContext {
 impl Default for RequestContext {
     fn default() -> Self {
         Self {
-            plan: None,
+            plan_index: NO_PLAN,
             client_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             tls: false,
             body_bytes: 0,
             retries: 0,
             identity_acceptable: true,
+            compression_selected: false,
             started_at: None,
             _active_request_permit: None,
             _global_request_permit: None,
@@ -264,6 +265,7 @@ pub struct Gateway {
     runtime: Arc<RuntimeConfig>,
     static_files: StaticFiles,
     hosts: AHashMap<Arc<str>, PreparedHost>,
+    plans: Box<[PreparedPlan]>,
     route_policies: [RoutePolicy; RouteClass::ALL.len()],
     rates: RateLimiter,
     active_requests: ActiveRequestLimiter,
@@ -298,6 +300,7 @@ impl Gateway {
                 .map(|host| host.domains.len())
                 .sum(),
         );
+        let mut prepared_plans = Vec::new();
         for (name, host) in &runtime.config.hosts {
             for domain in &host.domains {
                 let canonical_domain: Arc<str> = Arc::from(domain.as_str());
@@ -310,13 +313,15 @@ impl Gateway {
                     let upstream_name =
                         upstream_name_for_route(host.handler, host.upstream.as_deref(), route)?;
                     let upstream = upstreams.get(upstream_name)?;
-                    Some(Arc::new(PreparedPlan {
+                    let plan_index = prepared_plans.len();
+                    prepared_plans.push(PreparedPlan {
                         domain: domain_header.clone(),
                         handler: host.handler,
                         peer: prepare_route_peer(upstream, route),
                         route,
                         max_body_bytes: host.max_body_bytes,
-                    }))
+                    });
+                    Some(plan_index)
                 });
                 hosts.insert(
                     canonical_domain.clone(),
@@ -342,6 +347,7 @@ impl Gateway {
             runtime,
             static_files,
             hosts,
+            plans: prepared_plans.into_boxed_slice(),
             route_policies,
             rates: RateLimiter::new(),
             active_requests: ActiveRequestLimiter::new(),
@@ -364,9 +370,14 @@ impl Gateway {
         ctx._global_request_permit = Some(permit);
         true
     }
+
+    fn request_plan(&self, ctx: &RequestContext) -> Result<&PreparedPlan> {
+        self.plans
+            .get(ctx.plan_index)
+            .ok_or_else(|| Error::explain(HTTPStatus(500), "request plan is missing"))
+    }
 }
 
-#[async_trait]
 impl ProxyHttp for Gateway {
     type CTX = RequestContext;
 
@@ -375,6 +386,33 @@ impl ProxyHttp for Gateway {
             started_at: self.runtime.config.server.access_log.then(Instant::now),
             ..RequestContext::default()
         }
+    }
+
+    async fn early_request_filter(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn cache_hit_filter(
+        &self,
+        _session: &mut Session,
+        _meta: &CacheMeta,
+        _hit_handler: &mut HitHandler,
+        _is_fresh: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<ForcedFreshness>> {
+        Ok(None)
+    }
+
+    async fn proxy_upstream_filter(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<bool> {
+        Ok(true)
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
@@ -470,14 +508,16 @@ impl ProxyHttp for Gateway {
             .await;
         }
 
-        let Some(plan) = host.plan(path) else {
+        let Some(plan_index) = host.plan(path) else {
             return send_empty(session, 500, Some(host.handler), tls, &[]).await;
         };
+        let plan = &self.plans[plan_index];
         let encoding = configure_downstream_compression(session, plan.route)?;
         if encoding.preferred == ContentCoding::NotAcceptable {
             return send_empty(session, 406, Some(plan.handler), tls, &[]).await;
         }
         ctx.identity_acceptable = encoding.identity_acceptable;
+        ctx.compression_selected = encoding.preferred.as_str().is_some();
         ctx.tls = tls;
 
         if content_length(session.req_header()).is_some_and(|length| length > plan.max_body_bytes) {
@@ -533,7 +573,7 @@ impl ProxyHttp for Gateway {
         session.set_read_timeout(Some(timeout));
         session.set_write_timeout(Some(timeout));
         session.set_keepalive(Some(30));
-        ctx.plan = Some(plan);
+        ctx.plan_index = plan_index;
 
         Ok(false)
     }
@@ -543,11 +583,12 @@ impl ProxyHttp for Gateway {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let plan = ctx
-            .plan
-            .as_ref()
-            .ok_or_else(|| Error::explain(HTTPStatus(500), "request plan is missing"))?;
+        let plan = self.request_plan(ctx)?;
         Ok(Box::new(plan.peer.clone()))
+    }
+
+    fn precomputed_upstream_peer<'a>(&'a self, ctx: &Self::CTX) -> Option<&'a HttpPeer> {
+        self.plans.get(ctx.plan_index).map(|plan| &plan.peer)
     }
 
     async fn upstream_request_filter(
@@ -556,11 +597,9 @@ impl ProxyHttp for Gateway {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let plan = ctx
-            .plan
-            .as_ref()
-            .ok_or_else(|| Error::explain(HTTPStatus(500), "request plan is missing"))?;
+        let plan = self.request_plan(ctx)?;
         strip_request_hop_headers(session.req_header(), upstream_request)?;
+        upstream_request.headers.reserve(6);
         let mut client_ip_text = ArrayString::<64>::new();
         write!(&mut client_ip_text, "{}", ctx.client_ip).map_err(|error| {
             Error::because(
@@ -585,19 +624,19 @@ impl ProxyHttp for Gateway {
         upstream_request.remove_header(&FORWARDED);
         upstream_request.remove_header(&X_FORWARDED_FOR);
         upstream_request.insert_header(HOST, upstream_host)?;
-        upstream_request.insert_header(X_REAL_IP, client_ip.clone())?;
-        upstream_request.insert_header(X_FORWARDED_FOR, client_ip)?;
-        upstream_request.insert_header(X_FORWARDED_HOST, plan.domain.clone())?;
+        upstream_request.insert_header("x-real-ip", client_ip.clone())?;
+        upstream_request.insert_header("x-forwarded-for", client_ip)?;
+        upstream_request.insert_header("x-forwarded-host", plan.domain.clone())?;
         let listener_port = session
             .server_addr()
             .and_then(|address| address.as_inet())
             .map(|address| address.port());
         upstream_request.insert_header(
-            X_FORWARDED_PORT,
+            "x-forwarded-port",
             forwarded_port_value(listener_port, ctx.tls)?,
         )?;
-        upstream_request.insert_header(X_FORWARDED_PROTO, if ctx.tls { HTTPS } else { HTTP })?;
-        upstream_request.insert_header(X_FORWARDED_SSL, if ctx.tls { ON } else { OFF })?;
+        upstream_request.insert_header("x-forwarded-proto", if ctx.tls { HTTPS } else { HTTP })?;
+        upstream_request.insert_header("x-forwarded-ssl", if ctx.tls { ON } else { OFF })?;
 
         if forwards_accept_encoding(plan.route) {
             if let Some(value) = session.req_header().headers.get(ACCEPT_ENCODING) {
@@ -621,11 +660,47 @@ impl ProxyHttp for Gateway {
             })?;
             upstream_request.insert_header(UPGRADE, upgrade.clone())?;
             upstream_request.insert_header(CONNECTION, UPGRADE_VALUE)?;
-        } else {
-            upstream_request.remove_header(&UPGRADE);
-            upstream_request.remove_header(&CONNECTION);
         }
         Ok(())
+    }
+
+    async fn upstream_response_filter(
+        &self,
+        _session: &mut Session,
+        _upstream_response: &mut ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn custom_forwarding(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        _custom_message_to_upstream: Option<mpsc::Sender<Bytes>>,
+        _custom_message_to_downstream: mpsc::Sender<Bytes>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn downstream_custom_message_proxy_filter(
+        &self,
+        _session: &mut Session,
+        custom_message: Bytes,
+        _ctx: &mut Self::CTX,
+        _final_hop: bool,
+    ) -> Result<Option<Bytes>> {
+        Ok(Some(custom_message))
+    }
+
+    async fn upstream_custom_message_proxy_filter(
+        &self,
+        _session: &mut Session,
+        custom_message: Bytes,
+        _ctx: &mut Self::CTX,
+        _final_hop: bool,
+    ) -> Result<Option<Bytes>> {
+        Ok(Some(custom_message))
     }
 
     async fn request_body_filter(
@@ -638,9 +713,9 @@ impl ProxyHttp for Gateway {
         ctx.body_bytes = ctx
             .body_bytes
             .saturating_add(body.as_ref().map_or(0, Bytes::len));
-        if ctx
-            .plan
-            .as_ref()
+        if self
+            .plans
+            .get(ctx.plan_index)
             .is_some_and(|plan| ctx.body_bytes > plan.max_body_bytes)
         {
             return Err(Error::explain(HTTPStatus(413), "request body is too large"));
@@ -654,7 +729,7 @@ impl ProxyHttp for Gateway {
         response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let Some(plan) = ctx.plan.as_ref() else {
+        let Some(plan) = self.plans.get(ctx.plan_index) else {
             return Ok(());
         };
         let forwards_upgrade = response.status.as_u16() == 101
@@ -663,9 +738,7 @@ impl ProxyHttp for Gateway {
         strip_response_hop_headers(response, forwards_upgrade)?;
         strip_upstream_headers(response);
         insert_security_headers(response, plan.handler, ctx.tls)?;
-        if uses_downstream_compression(plan.route)
-            && response_status_is_interim(response.status.as_u16())
-        {
+        if ctx.compression_selected && response_status_is_interim(response.status.as_u16()) {
             // 100/103 are interim headers. Do not permanently disable the
             // compressor before the final response arrives.
             return Ok(());
@@ -674,9 +747,7 @@ impl ProxyHttp for Gateway {
         // HEAD still describes the corresponding GET representation, so it
         // must follow the same content-coding acceptability decision as GET.
         let bodyless = response_status_has_no_body(response.status.as_u16());
-        if uses_downstream_compression(plan.route)
-            && (bodyless || !response_allows_compression(response))
-        {
+        if ctx.compression_selected && (bodyless || !response_allows_compression(response)) {
             if let Some(compression) = session
                 .downstream_modules_ctx
                 .get_mut::<ResponseCompression>()
@@ -698,6 +769,36 @@ impl ProxyHttp for Gateway {
             response.remove_header(&LAST_MODIFIED);
             response.insert_header(CACHE_CONTROL, NO_STORE)?;
         }
+        Ok(())
+    }
+
+    async fn response_trailer_filter(
+        &self,
+        _session: &mut Session,
+        _upstream_trailers: &mut http::HeaderMap,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Bytes>> {
+        Ok(None)
+    }
+
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        error: &Error,
+        _ctx: &mut Self::CTX,
+    ) -> FailToProxy {
+        default_fail_to_proxy(session, error).await
+    }
+
+    async fn connected_to_upstream(
+        &self,
+        _session: &mut Session,
+        _reused: bool,
+        _peer: &HttpPeer,
+        _socket: RawSocketHandle,
+        _digest: Option<&Digest>,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -767,6 +868,9 @@ impl ProxyHttp for Gateway {
     }
 
     async fn logging(&self, session: &mut Session, error: Option<&Error>, ctx: &mut Self::CTX) {
+        if error.is_none() && !self.runtime.config.server.access_log {
+            return;
+        }
         let status = session
             .response_written()
             .map_or(0, |response| response.status.as_u16());
@@ -1012,13 +1116,12 @@ fn strip_response_hop_headers(response: &mut ResponseHeader, forwards_upgrade: b
 }
 
 fn request_authority(request: &RequestHeader) -> Option<&str> {
-    if request.headers.get_all(HOST).iter().count() > 1 {
+    let mut host_values = request.headers.get_all(HOST).iter();
+    let host = host_values.next();
+    if host_values.next().is_some() {
         return None;
     }
-    request
-        .headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
+    host.and_then(|value| value.to_str().ok())
         .or_else(|| request.uri.authority().map(|value| value.as_str()))
 }
 
@@ -1052,12 +1155,15 @@ fn session_client_ip(runtime: &RuntimeConfig, session: &Session) -> IpAddr {
         .client_addr()
         .and_then(|address| address.as_inet())
         .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |address| address.ip());
-    let forwarded_for = session
+    let Some(forwarded_for) = session
         .req_header()
         .headers
         .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok());
-    resolve_client_ip(runtime, peer_ip, forwarded_for)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return peer_ip;
+    };
+    resolve_client_ip(runtime, peer_ip, Some(forwarded_for))
 }
 
 fn forwarded_port_value(port: Option<u16>, tls: bool) -> Result<HeaderValue> {
@@ -1274,16 +1380,17 @@ fn insert_security_headers(
     handler: HandlerKind,
     tls: bool,
 ) -> Result<()> {
-    response.insert_header(X_CONTENT_TYPE_OPTIONS, NOSNIFF)?;
+    response.headers.reserve(4);
+    response.insert_header("x-content-type-options", NOSNIFF)?;
     if tls {
-        response.insert_header(STRICT_TRANSPORT_SECURITY, HSTS_VALUE)?;
+        response.insert_header("strict-transport-security", HSTS_VALUE)?;
     }
     if matches!(
         handler,
         HandlerKind::Static | HandlerKind::Vaultwarden | HandlerKind::Couchdb
     ) {
-        response.insert_header(X_FRAME_OPTIONS, SAMEORIGIN)?;
-        response.insert_header(REFERRER_POLICY, REFERRER_POLICY_VALUE)?;
+        response.insert_header("x-frame-options", SAMEORIGIN)?;
+        response.insert_header("referrer-policy", REFERRER_POLICY_VALUE)?;
     }
     Ok(())
 }
@@ -1411,7 +1518,7 @@ hosts:
         let gateway = Gateway::new(Arc::new(runtime())).unwrap();
         let host = gateway.host("APP.EXAMPLE.COM:443").unwrap();
         assert_eq!(host.domain.as_ref(), "app.example.com");
-        let plan = host.plan("/rest/stream").unwrap();
+        let plan = &gateway.plans[host.plan("/rest/stream").unwrap()];
         assert!(plan.peer.cached_reuse_hash.is_some());
     }
 

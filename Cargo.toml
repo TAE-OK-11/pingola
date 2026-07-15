@@ -30,7 +30,7 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 http = "1.4"
 httpdate = "1.0"
 ipnet = { version = "2.12", features = ["serde"] }
-log = "0.4"
+log = { version = "0.4", features = ["release_max_level_info"] }
 lru = "0.18"
 mime_guess = "2.0"
 parking_lot = "0.12"
@@ -57,6 +57,7 @@ tempfile = "3.27"
 # selecting AWS-LC for both Pingora and this binary, avoiding two crypto stacks.
 [patch.crates-io]
 pingora-core = { path = "vendor/pingora-core-0.8.1" }
+pingora-proxy = { path = "vendor/pingora-proxy-0.8.1" }
 pingora-rustls = { path = "vendor/pingora-rustls-aws-lc" }
 
 [profile.release]

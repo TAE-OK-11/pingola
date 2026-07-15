@@ -24,6 +24,7 @@ mod tls;
 #[cfg(not(feature = "any_tls"))]
 use crate::tls::connectors as tls;
 
+use crate::protocols::l4::socket::SocketAddr as PeerSocketAddr;
 use crate::protocols::Stream;
 use crate::server::configuration::ServerConf;
 use crate::upstreams::peer::{Peer, ALPN};
@@ -150,6 +151,25 @@ pub struct TransportConnector {
 
 const DEFAULT_POOL_SIZE: usize = 128;
 
+fn matches_cached_peer_addr_or_else<P, F>(
+    peer: &P,
+    cached_peer_addr: Option<&PeerSocketAddr>,
+    validate_socket: F,
+) -> bool
+where
+    P: Peer,
+    F: FnOnce() -> bool,
+{
+    if cached_peer_addr
+        .map(|addr| peer.matches_cached_peer_addr(addr))
+        .unwrap_or(false)
+    {
+        true
+    } else {
+        validate_socket()
+    }
+}
+
 impl TransportConnector {
     /// Create a new [TransportConnector] with the given [ConnectorOptions]
     pub fn new(mut options: Option<ConnectorOptions>) -> Self {
@@ -209,10 +229,23 @@ impl TransportConnector {
                 match Arc::try_unwrap(s) {
                     Ok(l) => {
                         let mut stream = l.into_inner();
+                        // L4 connection setup eagerly records the actual next-hop address in the
+                        // SocketDigest. Direct built-in peers can use that immutable value instead
+                        // of issuing getpeername() again on every H1 reuse. Missing or lazy digests,
+                        // proxies, custom connectors, custom peers, and address mismatches retain
+                        // the live-socket validation below.
+                        let socket_digest = stream.get_socket_digest();
+                        let cached_peer_addr = socket_digest
+                            .as_deref()
+                            .and_then(|digest| digest.peer_addr.get())
+                            .and_then(Option::as_ref);
                         // test_reusable_stream: we assume server would never actively send data
                         // first on an idle stream.
                         #[cfg(unix)]
-                        if peer.matches_fd(stream.id()) && test_reusable_stream(&mut stream) {
+                        if matches_cached_peer_addr_or_else(peer, cached_peer_addr, || {
+                            peer.matches_fd(stream.id())
+                        }) && test_reusable_stream(&mut stream)
+                        {
                             Some(stream)
                         } else {
                             None
@@ -226,8 +259,9 @@ impl TransportConnector {
                                     self.0
                                 }
                             }
-                            if peer.matches_sock(WrappedRawSocket(stream.id() as RawSocket))
-                                && test_reusable_stream(&mut stream)
+                            if matches_cached_peer_addr_or_else(peer, cached_peer_addr, || {
+                                peer.matches_sock(WrappedRawSocket(stream.id() as RawSocket))
+                            }) && test_reusable_stream(&mut stream)
                             {
                                 Some(stream)
                             } else {
@@ -300,6 +334,120 @@ impl TransportConnector {
     /// Tell the connector to always send h1 for ALPN for the given peer in the future.
     pub fn prefer_h1(&self, peer: &impl Peer) {
         self.preferred_http_version.add(peer, 1);
+    }
+}
+
+#[cfg(test)]
+mod reuse_address_tests {
+    use std::cell::Cell;
+    use std::fmt::{Display, Formatter, Result as FmtResult};
+
+    use super::*;
+    use crate::upstreams::peer::HttpPeer;
+
+    #[derive(Clone)]
+    struct CustomPeer(HttpPeer);
+
+    impl Display for CustomPeer {
+        fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+            self.0.fmt(f)
+        }
+    }
+
+    impl Peer for CustomPeer {
+        fn address(&self) -> &PeerSocketAddr {
+            self.0.address()
+        }
+
+        fn tls(&self) -> bool {
+            self.0.tls()
+        }
+
+        fn sni(&self) -> &str {
+            self.0.sni()
+        }
+
+        fn reuse_hash(&self) -> u64 {
+            self.0.reuse_hash()
+        }
+    }
+
+    #[test]
+    fn direct_peer_with_matching_digest_skips_socket_validation() {
+        let peer = HttpPeer::new(("127.0.0.1", 8080), false, String::new());
+        let socket_validation_called = Cell::new(false);
+
+        let matches = matches_cached_peer_addr_or_else(&peer, Some(peer.address()), || {
+            socket_validation_called.set(true);
+            false
+        });
+
+        assert!(matches);
+        assert!(!socket_validation_called.get());
+    }
+
+    #[test]
+    fn missing_digest_falls_back_to_socket_validation() {
+        let peer = HttpPeer::new(("127.0.0.1", 8080), false, String::new());
+        let socket_validation_called = Cell::new(false);
+
+        let matches = matches_cached_peer_addr_or_else(&peer, None, || {
+            socket_validation_called.set(true);
+            true
+        });
+
+        assert!(matches);
+        assert!(socket_validation_called.get());
+    }
+
+    #[test]
+    fn address_mismatch_falls_back_to_socket_validation() {
+        let peer = HttpPeer::new(("127.0.0.1", 8080), false, String::new());
+        let other_peer = HttpPeer::new(("127.0.0.1", 8081), false, String::new());
+        let socket_validation_called = Cell::new(false);
+
+        let matches = matches_cached_peer_addr_or_else(&peer, Some(other_peer.address()), || {
+            socket_validation_called.set(true);
+            false
+        });
+
+        assert!(!matches);
+        assert!(socket_validation_called.get());
+    }
+
+    #[test]
+    fn proxy_next_hop_falls_back_to_socket_validation() {
+        let peer = HttpPeer::new_proxy(
+            "/tmp/pingora-test-proxy.sock",
+            "127.0.0.1".parse().unwrap(),
+            8080,
+            false,
+            "",
+            Default::default(),
+        );
+        let socket_validation_called = Cell::new(false);
+
+        let matches = matches_cached_peer_addr_or_else(&peer, Some(peer.address()), || {
+            socket_validation_called.set(true);
+            true
+        });
+
+        assert!(matches);
+        assert!(socket_validation_called.get());
+    }
+
+    #[test]
+    fn custom_peer_requires_socket_validation_even_when_address_matches() {
+        let peer = CustomPeer(HttpPeer::new(("127.0.0.1", 8080), false, String::new()));
+        let socket_validation_called = Cell::new(false);
+
+        let matches = matches_cached_peer_addr_or_else(&peer, Some(peer.address()), || {
+            socket_validation_called.set(true);
+            false
+        });
+
+        assert!(!matches);
+        assert!(socket_validation_called.get());
     }
 }
 
