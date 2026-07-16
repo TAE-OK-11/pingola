@@ -15,6 +15,7 @@ RUN apt-get update \
         ca-certificates \
         clang \
         cmake \
+        git \
         lld \
         ninja-build \
         perl \
