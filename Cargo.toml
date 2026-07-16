@@ -16,7 +16,6 @@ jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemallocator"]
 tcmalloc = ["dep:tcmalloc-better"]
 system-allocator = []
 tls-aws-lc = ["cloudflare-pingora/rustls"]
-tls-boringssl = ["cloudflare-pingora/boringssl"]
 
 [dependencies]
 anyhow = "1.0"

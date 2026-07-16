@@ -31,10 +31,8 @@ use crate::config::RuntimeConfig;
 use crate::gateway::Gateway;
 use crate::preflight::check_runtime;
 
-#[cfg(all(feature = "tls-aws-lc", feature = "tls-boringssl"))]
-compile_error!("select exactly one TLS provider: tls-aws-lc or tls-boringssl");
-#[cfg(not(any(feature = "tls-aws-lc", feature = "tls-boringssl")))]
-compile_error!("a TLS provider is required: tls-aws-lc or tls-boringssl");
+#[cfg(not(feature = "tls-aws-lc"))]
+compile_error!("the AWS-LC TLS provider is required: enable tls-aws-lc");
 
 const PRIMARY_CONFIG: &str = "/etc/pingora/pingora.yaml";
 const LEGACY_CONFIG: &str = "/etc/pingola/pingola.yaml";
@@ -247,30 +245,9 @@ fn install_aws_lc_tls13_provider() -> Result<()> {
 
 #[inline]
 fn tls_provider_name() -> &'static str {
-    #[cfg(feature = "tls-aws-lc")]
-    {
-        "AWS-LC/rustls"
-    }
-    #[cfg(feature = "tls-boringssl")]
-    {
-        "BoringSSL"
-    }
+    "AWS-LC/rustls"
 }
 
-#[cfg(feature = "tls-boringssl")]
-fn enforce_tls13(tls: &mut TlsSettings) -> Result<()> {
-    use cloudflare_pingora::tls::ssl::SslVersion;
-
-    tls.set_curves_list("X25519MLKEM768:X25519:P-256:P-384:P-521")
-        .context("failed to configure BoringSSL TLS groups")?;
-    tls.set_min_proto_version(Some(SslVersion::TLS1_3))
-        .context("failed to set BoringSSL minimum protocol to TLS 1.3")?;
-    tls.set_max_proto_version(Some(SslVersion::TLS1_3))
-        .context("failed to set BoringSSL maximum protocol to TLS 1.3")?;
-    Ok(())
-}
-
-#[cfg(feature = "tls-aws-lc")]
 fn enforce_tls13(_tls: &mut TlsSettings) -> Result<()> {
     // The vendored rustls adapter constructs the listener with TLS 1.3 as its
     // only protocol version, and the process provider contains TLS 1.3 suites only.

@@ -17,9 +17,11 @@ RUN apt-get update \
         ca-certificates \
         clang \
         cmake \
-        git \
+        curl \
         lld \
+        nghttp2-client \
         ninja-build \
+        openssl \
         perl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -55,8 +57,8 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; \
     esac \
     && case "${TLS_PROVIDER}" in \
-      aws-lc|boringssl) ;; \
-      *) echo "unsupported TLS provider: ${TLS_PROVIDER}" >&2; exit 2 ;; \
+      aws-lc) ;; \
+      *) echo "unsupported TLS provider (AWS-LC is required): ${TLS_PROVIDER}" >&2; exit 2 ;; \
     esac \
     && case "${PGO_MODE}" in \
       off|train) ;; \

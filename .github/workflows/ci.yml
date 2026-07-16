@@ -39,6 +39,15 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal --component clippy,rustfmt
       - name: Format
         run: cargo fmt --check
+      - name: AWS-LC-only TLS dependency graph
+        run: |
+          cargo tree --locked > /tmp/cargo-tree.txt
+          grep -q 'aws-lc-rs v' /tmp/cargo-tree.txt
+          grep -q 'rustls v' /tmp/cargo-tree.txt
+          if grep -Eiq '(^|[[:space:]])(boring|boring-sys|pingora-boringssl) v' /tmp/cargo-tree.txt; then
+            echo 'BoringSSL unexpectedly appears in the selected dependency graph' >&2
+            exit 1
+          fi
       - name: Unit tests
         run: cargo test --all-targets --locked
       - name: Build integration-test binary
@@ -187,56 +196,6 @@ jobs:
           PINGORA_EXPECTED_TARGET_CPU: x86-64-v2
           PINGORA_EXPECTED_LTO: fat
           PINGORA_EXPECTED_TLS_PROVIDER: aws-lc
-        run: tests/docker_runtime.sh
-
-  image-boringssl:
-    if: github.event_name == 'push'
-    needs: [audit, verify]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - name: Sign in to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and publish BoringSSL comparison image
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          pull: true
-          tags: |
-            ghcr.io/tae-ok-11/pingora:tls-boringssl-x86-64-v2
-            ghcr.io/tae-ok-11/pingora:sha-${{ github.sha }}-boringssl
-          labels: |
-            org.opencontainers.image.title=Pingora
-            org.opencontainers.image.description=Pingora BoringSSL performance comparison image
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.allocator=tcmalloc
-            org.opencontainers.image.tls.provider=boringssl
-          build-args: |
-            ALLOCATOR=tcmalloc
-            TLS_PROVIDER=boringssl
-            RUST_TARGET_CPU=x86-64-v2
-            RUST_LTO=fat
-            BUILD_VERSION=tls-ab
-            BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Verify the exact BoringSSL image
-        env:
-          PINGORA_TEST_IMAGE: ghcr.io/tae-ok-11/pingora@${{ steps.build.outputs.digest }}
-          PINGORA_EXPECTED_TARGET_CPU: x86-64-v2
-          PINGORA_EXPECTED_LTO: fat
-          PINGORA_EXPECTED_TLS_PROVIDER: boringssl
         run: tests/docker_runtime.sh
 
   image-znver1:

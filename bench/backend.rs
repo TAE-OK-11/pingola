@@ -24,6 +24,7 @@ const STREAM_CHUNK_BYTES: usize = 16 * 1024;
 const SMALL_RESPONSE_BYTES: usize = 16 * 1024;
 
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Method {
@@ -82,6 +83,7 @@ fn run() -> io::Result<()> {
                 continue;
             }
         };
+        TOTAL_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         let active = ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
         if active > MAX_CONNECTIONS {
             ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
@@ -293,6 +295,19 @@ fn respond(stream: &mut TcpStream, request: Request) -> io::Result<()> {
     if path == "/health" || path == "/status/204" {
         return write_empty_response(stream, 204, "No Content", request.close);
     }
+    if path == "/stats/connections" {
+        let body = format!("{}\n", TOTAL_CONNECTIONS.load(Ordering::Relaxed));
+        return write_text_response(stream, 200, "OK", body.as_bytes(), request.close);
+    }
+    if path == "/status/500" {
+        return write_text_response(
+            stream,
+            500,
+            "Internal Server Error",
+            b"backend error\n",
+            request.close,
+        );
+    }
     if path == "/reset" {
         let _ = stream.shutdown(Shutdown::Both);
         return Err(io::Error::new(
@@ -308,6 +323,10 @@ fn respond(stream: &mut TcpStream, request: Request) -> io::Result<()> {
         let size = parse_payload_size(value)?;
         return write_chunked_response(stream, size, send_body, false, request.close);
     }
+    if let Some(value) = path.strip_prefix("/json/") {
+        let size = parse_payload_size(value)?;
+        return write_json_response(stream, size, send_body, request.close);
+    }
     if let Some(value) = path.strip_prefix("/bytes/") {
         let size = parse_payload_size(value)?;
         return write_bytes_response(
@@ -319,6 +338,52 @@ fn respond(stream: &mut TcpStream, request: Request) -> io::Result<()> {
         );
     }
     write_text_response(stream, 404, "Not Found", b"not found\n", request.close)
+}
+
+fn write_json_response(
+    stream: &mut TcpStream,
+    size: usize,
+    send_body: bool,
+    close: bool,
+) -> io::Result<()> {
+    const PREFIX: &[u8] = b"{\"data\":\"";
+    const SUFFIX: &[u8] = b"\"}\n";
+    if size < PREFIX.len() + SUFFIX.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "JSON payload must be at least 12 bytes",
+        ));
+    }
+
+    let mut response = Vec::with_capacity(192 + size.min(SMALL_RESPONSE_BYTES));
+    write!(
+        response,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {size}\r\n{}\r\n",
+        connection_header(close)
+    )
+    .expect("writing to Vec cannot fail");
+    if !send_body {
+        return stream.write_all(&response);
+    }
+
+    let fill = size - PREFIX.len() - SUFFIX.len();
+    if size <= SMALL_RESPONSE_BYTES {
+        response.extend_from_slice(PREFIX);
+        response.resize(response.len() + fill, b'a');
+        response.extend_from_slice(SUFFIX);
+        return stream.write_all(&response);
+    }
+
+    stream.write_all(&response)?;
+    stream.write_all(PREFIX)?;
+    let chunk = [b'a'; STREAM_CHUNK_BYTES];
+    let mut remaining = fill;
+    while remaining > 0 {
+        let count = remaining.min(chunk.len());
+        stream.write_all(&chunk[..count])?;
+        remaining -= count;
+    }
+    stream.write_all(SUFFIX)
 }
 
 fn parse_payload_size(value: &str) -> io::Result<usize> {
