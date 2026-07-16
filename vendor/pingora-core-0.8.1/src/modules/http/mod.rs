@@ -132,6 +132,10 @@ impl HttpModules {
 
     /// Build the contexts of all the modules added to this [HttpModules]
     pub fn build_ctx(&self) -> HttpModuleCtx {
+        if self.modules.is_empty() {
+            return HttpModuleCtx::empty();
+        }
+
         let module_ctx: Vec<_> = self.modules.iter().map(|b| b.init()).collect();
         let module_index = self
             .module_index
@@ -149,7 +153,7 @@ impl HttpModules {
 
         HttpModuleCtx {
             module_ctx,
-            module_index,
+            module_index: Some(module_index),
         }
     }
 }
@@ -162,7 +166,7 @@ pub struct HttpModuleCtx {
     // the modules in the order of execution
     module_ctx: Vec<Module>,
     // find the module in the vec with its type ID
-    module_index: Arc<HashMap<TypeId, usize>>,
+    module_index: Option<Arc<HashMap<TypeId, usize>>>,
 }
 
 impl HttpModuleCtx {
@@ -172,13 +176,13 @@ impl HttpModuleCtx {
     pub fn empty() -> Self {
         HttpModuleCtx {
             module_ctx: vec![],
-            module_index: Arc::new(HashMap::new()),
+            module_index: None,
         }
     }
 
     /// Get a ref to [HttpModule] if any.
     pub fn get<T: 'static>(&self) -> Option<&T> {
-        let idx = self.module_index.get(&TypeId::of::<T>())?;
+        let idx = self.module_index.as_ref()?.get(&TypeId::of::<T>())?;
         let ctx = &self.module_ctx[*idx];
         Some(
             ctx.as_any()
@@ -189,7 +193,7 @@ impl HttpModuleCtx {
 
     /// Get a mut ref to [HttpModule] if any.
     pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
-        let idx = self.module_index.get(&TypeId::of::<T>())?;
+        let idx = self.module_index.as_ref()?.get(&TypeId::of::<T>())?;
         let ctx = &mut self.module_ctx[*idx];
         Some(
             ctx.as_any_mut()
@@ -338,6 +342,17 @@ mod tests {
         fn init(&self) -> Module {
             Box::new(MyOtherModule)
         }
+    }
+
+    #[test]
+    fn test_empty_module_context_has_no_allocated_index() {
+        let modules = HttpModules::new();
+        let mut ctx = modules.build_ctx();
+
+        assert_eq!(ctx.module_ctx.capacity(), 0);
+        assert!(ctx.module_index.is_none());
+        assert!(ctx.get::<MyModule>().is_none());
+        assert!(ctx.get_mut::<MyModule>().is_none());
     }
 
     #[test]

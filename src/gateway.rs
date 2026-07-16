@@ -9,7 +9,10 @@ use anyhow::{anyhow, Context};
 use arrayvec::ArrayString;
 use bytes::Bytes;
 use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
-use cloudflare_pingora::modules::http::compression::ResponseCompression;
+use cloudflare_pingora::modules::http::compression::{
+    ResponseCompression, ResponseCompressionBuilder,
+};
+use cloudflare_pingora::modules::http::HttpModules;
 use cloudflare_pingora::prelude::HttpPeer;
 use cloudflare_pingora::protocols::{Digest, TcpKeepalive, ALPN};
 use cloudflare_pingora::proxy::{
@@ -380,6 +383,13 @@ impl Gateway {
 
 impl ProxyHttp for Gateway {
     type CTX = RequestContext;
+
+    fn init_downstream_modules(&self, _modules: &mut HttpModules) {
+        // Most routes deliberately use identity encoding or let Navidrome
+        // negotiate with its origin. Install the bounded response compressor
+        // lazily only for requests that actually selected a coding, avoiding a
+        // boxed module and its async filter futures on the common identity path.
+    }
 
     fn new_ctx(&self) -> Self::CTX {
         RequestContext {
@@ -943,14 +953,20 @@ fn configure_downstream_compression(
         .downstream_session
         .req_header_mut()
         .insert_header(ACCEPT_ENCODING, encoding)?;
+    let mut modules = HttpModules::new();
+    modules.add_module(ResponseCompressionBuilder::enable(1));
+    session.downstream_modules_ctx = modules.build_ctx();
     let request = session.downstream_session.req_header();
-    if let Some(compression) = session
+    let Some(compression) = session
         .downstream_modules_ctx
         .get_mut::<ResponseCompression>()
-    {
-        compression.adjust_level(1);
-        compression.request_filter(request);
-    }
+    else {
+        return Error::e_explain(
+            ErrorType::InternalError,
+            "failed to initialize selected response compressor",
+        );
+    };
+    compression.request_filter(request);
     Ok(negotiation)
 }
 
