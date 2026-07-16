@@ -9,6 +9,12 @@ HTTP/1.1, HTTP/2를 지원하는 JBS 리버스 프록시입니다. 기본 설정
 crate와 충돌하지 않도록 `jbs-pingora`, 실행 binary와 제품명은 `pingora`입니다.
 upstream dependency는 Rust 코드에서 `cloudflare_pingora` alias로 가져옵니다.
 
+TLS 성능 비교용 BoringSSL 빌드는 시스템 OpenSSL이나 제3자 포크를 사용하지
+않습니다. Cloudflare의 `pingora-boringssl`과
+[`cloudflare/boring`](https://github.com/cloudflare/boring)만 사용합니다. 공급자 비교가
+끝나기 전까지 기본 이미지는 AWS-LC를 유지하며, 비교 빌드는
+`--build-arg TLS_PROVIDER=boringssl`로 재현할 수 있습니다.
+
 ## 주요 기능과 한계
 
 - AWS-LC를 사용하는 rustls와 다운스트림 TLS 1.3 전용 정책
