@@ -27,7 +27,6 @@ use crate::tls::ext::{
     ssl_use_private_key, ssl_use_second_key_share,
 };
 #[cfg(feature = "boringssl")]
-use crate::tls::ssl::SslCurve;
 use crate::tls::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use crate::tls::x509::store::X509StoreBuilder;
 use crate::upstreams::peer::{Peer, ALPN};
@@ -72,12 +71,7 @@ const SIGALG_LIST: &str = "ECDSA_SECP256R1_SHA256\
  * that are both computationally cheaper and more supported.
  */
 #[cfg(feature = "boringssl")]
-const BORINGSSL_CURVE_LIST: &[SslCurve] = &[
-    SslCurve::X25519,
-    SslCurve::SECP256R1,
-    SslCurve::SECP384R1,
-    SslCurve::SECP521R1,
-];
+const BORINGSSL_CURVE_LIST: &str = "X25519MLKEM768:X25519:P-256:P-384:P-521";
 
 static INIT_CA_ENV: Once = Once::new();
 fn init_ssl_cert_env_vars() {
@@ -104,12 +98,12 @@ impl Connector {
             .set_sigalgs_list(&SIGALG_LIST.to_lowercase())
             .unwrap();
         #[cfg(feature = "boringssl")]
-        builder.set_curves(BORINGSSL_CURVE_LIST).unwrap();
+        builder.set_curves_list(BORINGSSL_CURVE_LIST).unwrap();
         builder
             .set_max_proto_version(Some(SslVersion::TLS1_3))
             .unwrap();
         builder
-            .set_min_proto_version(Some(SslVersion::TLS1))
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
             .unwrap();
         if let Some(conf) = options.as_ref() {
             if let Some(ca_file_path) = conf.ca_file.as_ref() {

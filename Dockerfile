@@ -4,6 +4,7 @@ ARG RUST_VERSION=1.97.0
 ARG RUST_TARGET_CPU=x86-64-v2
 ARG RUST_LTO=fat
 ARG RUST_CODEGEN_UNITS=1
+ARG TLS_PROVIDER=aws-lc
 ARG DEBIAN_SUITE=trixie
 
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS builder
@@ -29,6 +30,7 @@ ARG RUST_TARGET_CPU
 ARG RUST_LTO
 ARG RUST_CODEGEN_UNITS
 ARG ALLOCATOR=tcmalloc
+ARG TLS_PROVIDER
 ENV CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${RUST_CODEGEN_UNITS} \
     CARGO_PROFILE_RELEASE_LTO=${RUST_LTO} \
@@ -41,10 +43,14 @@ ENV CARGO_INCREMENTAL=0 \
 # by tests/docker_runtime.sh; specialized images are verified on their target.
 RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=pingora-target-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR},target=/src/target,sharing=locked \
+    --mount=type=cache,id=pingora-target-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR}-${TLS_PROVIDER},target=/src/target,sharing=locked \
     case "${ALLOCATOR}" in \
       jemalloc|tcmalloc|system-allocator) ;; \
       *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; \
+    esac \
+    && case "${TLS_PROVIDER}" in \
+      aws-lc|boringssl) ;; \
+      *) echo "unsupported TLS provider: ${TLS_PROVIDER}" >&2; exit 2 ;; \
     esac \
     && case "${RUST_LTO}" in \
       thin|fat) ;; \
@@ -54,7 +60,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       1|2|4|8|16) ;; \
       *) echo "unsupported Rust codegen unit count: ${RUST_CODEGEN_UNITS}" >&2; exit 2 ;; \
     esac \
-    && cargo build --locked --release --no-default-features --features "${ALLOCATOR}" \
+    && cargo build --locked --release --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}" \
     && install -Dm755 target/release/pingora /out/pingora
 
 FROM debian:${DEBIAN_SUITE}-slim AS runtime
@@ -62,6 +68,7 @@ FROM debian:${DEBIAN_SUITE}-slim AS runtime
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=unknown
 ARG ALLOCATOR=tcmalloc
+ARG TLS_PROVIDER
 ARG RUST_VERSION
 ARG RUST_TARGET_CPU
 ARG RUST_LTO
@@ -69,11 +76,12 @@ ARG RUST_CODEGEN_UNITS
 ARG DEBIAN_SUITE
 
 LABEL org.opencontainers.image.title="Pingora" \
-      org.opencontainers.image.description="High-performance AWS-LC JBS Pingora reverse proxy" \
+      org.opencontainers.image.description="High-performance JBS Pingora reverse proxy" \
       org.opencontainers.image.source="https://github.com/TAE-OK-11/pingora" \
       org.opencontainers.image.version="${BUILD_VERSION}" \
       org.opencontainers.image.revision="${BUILD_REVISION}" \
       org.opencontainers.image.allocator="${ALLOCATOR}" \
+      org.opencontainers.image.tls.provider="${TLS_PROVIDER}" \
       org.opencontainers.image.base.name="debian:${DEBIAN_SUITE}-slim" \
       org.opencontainers.image.rust.version="${RUST_VERSION}" \
       org.opencontainers.image.rust.target-cpu="${RUST_TARGET_CPU}" \

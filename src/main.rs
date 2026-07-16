@@ -31,6 +31,11 @@ use crate::config::RuntimeConfig;
 use crate::gateway::Gateway;
 use crate::preflight::check_runtime;
 
+#[cfg(all(feature = "tls-aws-lc", feature = "tls-boringssl"))]
+compile_error!("select exactly one TLS provider: tls-aws-lc or tls-boringssl");
+#[cfg(not(any(feature = "tls-aws-lc", feature = "tls-boringssl")))]
+compile_error!("a TLS provider is required: tls-aws-lc or tls-boringssl");
+
 const PRIMARY_CONFIG: &str = "/etc/pingora/pingora.yaml";
 const LEGACY_CONFIG: &str = "/etc/pingola/pingola.yaml";
 
@@ -240,6 +245,38 @@ fn install_aws_lc_tls13_provider() -> Result<()> {
         .map_err(|_| anyhow!("a process-wide rustls crypto provider was installed before AWS-LC"))
 }
 
+#[inline]
+fn tls_provider_name() -> &'static str {
+    #[cfg(feature = "tls-aws-lc")]
+    {
+        "AWS-LC/rustls"
+    }
+    #[cfg(feature = "tls-boringssl")]
+    {
+        "BoringSSL"
+    }
+}
+
+#[cfg(feature = "tls-boringssl")]
+fn enforce_tls13(tls: &mut TlsSettings) -> Result<()> {
+    use cloudflare_pingora::tls::ssl::SslVersion;
+
+    tls.set_curves_list("X25519MLKEM768:X25519:P-256:P-384:P-521")
+        .context("failed to configure BoringSSL TLS groups")?;
+    tls.set_min_proto_version(Some(SslVersion::TLS1_3))
+        .context("failed to set BoringSSL minimum protocol to TLS 1.3")?;
+    tls.set_max_proto_version(Some(SslVersion::TLS1_3))
+        .context("failed to set BoringSSL maximum protocol to TLS 1.3")?;
+    Ok(())
+}
+
+#[cfg(feature = "tls-aws-lc")]
+fn enforce_tls13(_tls: &mut TlsSettings) -> Result<()> {
+    // The vendored rustls adapter constructs the listener with TLS 1.3 as its
+    // only protocol version, and the process provider contains TLS 1.3 suites only.
+    Ok(())
+}
+
 fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     let server_config = &runtime.config.server;
     let pingora_config = ServerConf {
@@ -305,6 +342,8 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
                 certificate, private_key,
             )
         })?;
+        enforce_tls13(&mut tls)
+            .with_context(|| format!("TLS 1.3 policy creation failed for listener={address}"))?;
         tls.enable_h2();
         service.add_tls_with_settings(address, Some(listener_options(address)?), tls);
     }
@@ -315,7 +354,8 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     );
 
     info!(
-        "starting Pingora with AWS-LC TLS 1.3: http={:?} https={:?} health_socket={} threads={}",
+        "starting Pingora with {} TLS 1.3: http={:?} https={:?} health_socket={} threads={}",
+        tls_provider_name(),
         server_config.http_listen,
         server_config.https_listen,
         server_config.health_socket.display(),

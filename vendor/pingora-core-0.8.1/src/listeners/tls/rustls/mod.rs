@@ -59,8 +59,7 @@ impl TlsSettings {
             )
         };
 
-        let builder =
-            ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
+        let builder = ServerConfig::builder_with_protocol_versions(&[&version::TLS13]);
         let builder = if let Some(verifier) = self.client_cert_verifier {
             builder.with_client_cert_verifier(verifier)
         } else {
