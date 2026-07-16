@@ -7,6 +7,7 @@ EXPECTED_ALLOCATOR=${PINGORA_EXPECTED_ALLOCATOR:-tcmalloc}
 EXPECTED_TARGET_CPU=${PINGORA_EXPECTED_TARGET_CPU:-x86-64-v2}
 EXPECTED_LTO=${PINGORA_EXPECTED_LTO:-fat}
 EXPECTED_TLS_PROVIDER=${PINGORA_EXPECTED_TLS_PROVIDER:-aws-lc}
+EXPECTED_PGO=${PINGORA_EXPECTED_PGO:-off}
 RUNTIME=${PINGORA_DOCKER_TEST_RUNTIME:-/tmp/pingora-docker-runtime}
 CONTAINERS=()
 
@@ -91,6 +92,7 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.target-cpu"}}' "${name}") == "${EXPECTED_TARGET_CPU}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.lto"}}' "${name}") == "${EXPECTED_LTO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.tls.provider"}}' "${name}") == "${EXPECTED_TLS_PROVIDER}" ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.pgo"}}' "${name}") == "${EXPECTED_PGO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.linker"}}' "${name}") == lld ]]
   if docker exec "${name}" sh -c 'command -v setcap >/dev/null || dpkg-query -W libcap2-bin >/dev/null 2>&1'; then
     echo "runtime image unexpectedly contains libcap2-bin" >&2
@@ -131,4 +133,4 @@ curl --noproxy '*' -gkfsS --http2 --resolve health.test:18571:[::1] \
 docker exec pingora-test-https-ipv6 /usr/local/bin/pingora \
   --config /etc/pingora/pingora.yaml --check >/dev/null
 
-echo "Docker UID 10001, read-only filesystem, HTTP-only, HTTPS-only, IPv6-only, healthcheck, ${EXPECTED_ALLOCATOR}, and ${EXPECTED_TLS_PROVIDER} tests passed"
+echo "Docker UID 10001, read-only filesystem, HTTP-only, HTTPS-only, IPv6-only, healthcheck, ${EXPECTED_ALLOCATOR}, ${EXPECTED_TLS_PROVIDER}, and pgo=${EXPECTED_PGO} tests passed"
