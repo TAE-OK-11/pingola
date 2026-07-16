@@ -242,8 +242,10 @@ fn install_aws_lc_tls13_provider() -> Result<()> {
 
 fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     let server_config = &runtime.config.server;
+    let work_stealing = server_config.use_work_stealing();
     let pingora_config = ServerConf {
         threads: server_config.threads,
+        work_stealing,
         upstream_keepalive_pool_size: server_config.upstream_keepalive_pool_size,
         // Pingora's value is total attempts, while the public config is retry count.
         max_retries: server_config
@@ -315,11 +317,12 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     );
 
     info!(
-        "starting Pingora with AWS-LC TLS 1.3: http={:?} https={:?} health_socket={} threads={}",
+        "starting Pingora with AWS-LC TLS 1.3: http={:?} https={:?} health_socket={} threads={} work_stealing={}",
         server_config.http_listen,
         server_config.https_listen,
         server_config.health_socket.display(),
-        server_config.threads
+        server_config.threads,
+        work_stealing
     );
     server.add_service(service);
     server.run_forever();
