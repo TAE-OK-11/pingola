@@ -29,6 +29,11 @@ case "${PROFILE}" in
     PAYLOADS=(64)
     CONCURRENCIES=(1)
     ;;
+  h1)
+    PROTOCOLS=(h1-keepalive)
+    PAYLOADS=(64 4096)
+    CONCURRENCIES=(1 8 32)
+    ;;
   standard)
     PROTOCOLS=(h1-keepalive h2-single h2-multi)
     PAYLOADS=(64 4096)
@@ -40,7 +45,7 @@ case "${PROFILE}" in
     CONCURRENCIES=(1 8 32)
     ;;
   *)
-    echo "ALLOCATOR_BENCH_PROFILE must be smoke, standard, or tls" >&2
+    echo "ALLOCATOR_BENCH_PROFILE must be smoke, h1, standard, or tls" >&2
     exit 2
     ;;
 esac

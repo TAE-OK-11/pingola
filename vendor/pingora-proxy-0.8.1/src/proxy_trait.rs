@@ -64,7 +64,8 @@ pub trait LocalProxyHttp {
     ///
     /// The proxy core still verifies that the downstream is HTTP/1, the request has no body or
     /// upgrade, and caching is inactive. Implementations must only return `true` when their body
-    /// filters do not synthesize a request body and the route does not require full-duplex I/O.
+    /// filters neither synthesize a request body nor require an end-of-stream callback, and the
+    /// route does not require full-duplex I/O.
     fn h1_bodyless_fast_path(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
         false
     }

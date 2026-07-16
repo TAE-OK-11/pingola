@@ -122,6 +122,19 @@ jq -e '.accept_encoding == null' <<<"${couch_headers}" >/dev/null
 grep -qi '^content-encoding: gzip' "${RUNTIME}/vault-compression.headers"
 grep -qi '^content-encoding: gzip' "${RUNTIME}/couch-compression.headers"
 
+# Keep the HTTP/1 bodyless proxy fast path covered: it must still run the
+# downstream response compressor and preserve the decoded response body.
+vault_h1_headers=$(curl --noproxy '*' --compressed -ksS --http1.1 \
+  --resolve vault.test:18550:127.0.0.1 -D "${RUNTIME}/vault-h1-compression.headers" \
+  -H 'accept-encoding: gzip' https://vault.test:18550/headers)
+couch_h1_headers=$(curl --noproxy '*' --compressed -ksS --http1.1 \
+  --resolve couch.test:18550:127.0.0.1 -D "${RUNTIME}/couch-h1-compression.headers" \
+  -H 'accept-encoding: gzip' https://couch.test:18550/headers)
+jq -e '.accept_encoding == null' <<<"${vault_h1_headers}" >/dev/null
+jq -e '.accept_encoding == null' <<<"${couch_h1_headers}" >/dev/null
+grep -qi '^content-encoding: gzip' "${RUNTIME}/vault-h1-compression.headers"
+grep -qi '^content-encoding: gzip' "${RUNTIME}/couch-h1-compression.headers"
+
 curl --noproxy '*' -ksS --http2 --resolve vault.test:18550:127.0.0.1 \
   -H 'accept-encoding: gzip;q=0' -D "${RUNTIME}/vault-q0.headers" \
   https://vault.test:18550/headers -o "${RUNTIME}/vault-q0.body"

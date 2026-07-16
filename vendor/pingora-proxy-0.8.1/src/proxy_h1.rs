@@ -161,23 +161,11 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        session.as_mut().enable_retry_buffering();
-        let mut request_data = session.as_ref().get_retry_buffer();
-        session
-            .downstream_modules_ctx
-            .request_body_filter(&mut request_data, true)
-            .await?;
-        self.inner
-            .request_body_filter(session, &mut request_data, true, ctx)
-            .await?;
-        send_body_to1(
-            client_session,
-            Some(HttpTask::Body(request_data, true)),
-        )
-        .await?;
-
-        let mut serve_from_cache = ServeFromCache::new();
-        let mut range_body_filter = RangeBodyFilter::new();
+        // The caller and opt-in contract guarantee that this request has no
+        // body and that filters do not synthesize one. Finish the upstream
+        // request directly instead of allocating retry/filter state for an
+        // empty body.
+        client_session.finish_body().await.map_err(|e| e.into_up())?;
 
         loop {
             tokio::select! {
@@ -185,14 +173,7 @@ where
                 task = client_session.read_response_task() => {
                     let mut task = task.map_err(|e| e.into_up())?;
                     session.upstream_compression.response_filter(&mut task);
-                    let task = self.h1_response_filter(
-                        session,
-                        task,
-                        ctx,
-                        &mut serve_from_cache,
-                        &mut range_body_filter,
-                        false,
-                    ).await?;
+                    let task = self.h1_uncached_response_filter(session, task, ctx).await?;
                     let done = session.write_response_task(task).await?;
                     if done {
                         break;
@@ -214,6 +195,66 @@ where
 
         session.as_mut().finish_body().await.map_err(|e| e.into_down())?;
         Ok(true)
+    }
+
+    /// Apply the response callbacks and HTTP/1 framing needed by the bodyless
+    /// fast path without constructing cache/range state for a cache-disabled
+    /// request.
+    async fn h1_uncached_response_filter(
+        &self,
+        session: &mut Session,
+        mut task: HttpTask,
+        ctx: &mut SV::CTX,
+    ) -> Result<HttpTask>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        if let Some(duration) = self.upstream_filter(session, &mut task, ctx).await? {
+            trace!("delaying upstream response for {duration:?}");
+            time::sleep(duration).await;
+        }
+
+        match task {
+            HttpTask::Header(mut header, end) => {
+                let no_body = session.req_header().method == Method::HEAD
+                    || matches!(header.status.as_u16(), 204 | 304);
+                if !no_body
+                    && !header.status.is_informational()
+                    && header.headers.get(header::TRANSFER_ENCODING).is_none()
+                    && header.headers.get(header::CONTENT_LENGTH).is_none()
+                    && !end
+                {
+                    header.set_version(Version::HTTP_11);
+                    header.insert_header(header::TRANSFER_ENCODING, "chunked")?;
+                }
+                self.inner.response_filter(session, &mut header, ctx).await?;
+                Ok(HttpTask::Header(header, end))
+            }
+            HttpTask::Body(mut data, end) => {
+                if let Some(duration) = self
+                    .inner
+                    .response_body_filter(session, &mut data, end, ctx)?
+                {
+                    trace!("delaying downstream response for {duration:?}");
+                    time::sleep(duration).await;
+                }
+                Ok(HttpTask::Body(data, end))
+            }
+            HttpTask::UpgradedBody(mut data, end) => {
+                if let Some(duration) = self
+                    .inner
+                    .response_body_filter(session, &mut data, end, ctx)?
+                {
+                    trace!("delaying downstream upgraded response for {duration:?}");
+                    time::sleep(duration).await;
+                }
+                Ok(HttpTask::UpgradedBody(data, end))
+            }
+            HttpTask::Trailer(trailers) => Ok(HttpTask::Trailer(trailers)),
+            HttpTask::Done => Ok(HttpTask::Done),
+            HttpTask::Failed(error) => Ok(HttpTask::Failed(error)),
+        }
     }
 
     pub(crate) async fn proxy_to_h1_upstream(
