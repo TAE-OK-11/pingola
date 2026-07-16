@@ -6,6 +6,7 @@ ARG RUST_LTO=fat
 ARG RUST_CODEGEN_UNITS=1
 ARG TLS_PROVIDER=aws-lc
 ARG PGO_MODE=off
+ARG PGO_TRAIN_TARGET_CPU=x86-64-v2
 ARG DEBIAN_SUITE=trixie
 
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS builder
@@ -35,6 +36,7 @@ ARG RUST_CODEGEN_UNITS
 ARG ALLOCATOR=tcmalloc
 ARG TLS_PROVIDER
 ARG PGO_MODE
+ARG PGO_TRAIN_TARGET_CPU
 ENV CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${RUST_CODEGEN_UNITS} \
     CARGO_PROFILE_RELEASE_LTO=${RUST_LTO} \
@@ -47,7 +49,7 @@ ENV CARGO_INCREMENTAL=0 \
 # by tests/docker_runtime.sh; specialized images are verified on their target.
 RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=pingora-target-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR}-${TLS_PROVIDER}-${PGO_MODE},target=/src/target,sharing=locked \
+    --mount=type=cache,id=pingora-target-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR}-${TLS_PROVIDER}-${PGO_MODE}-${PGO_TRAIN_TARGET_CPU},target=/src/target,sharing=locked \
     case "${ALLOCATOR}" in \
       jemalloc|tcmalloc|system-allocator) ;; \
       *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; \
@@ -59,6 +61,10 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
     && case "${PGO_MODE}" in \
       off|train) ;; \
       *) echo "unsupported PGO mode: ${PGO_MODE}" >&2; exit 2 ;; \
+    esac \
+    && case "${PGO_TRAIN_TARGET_CPU}" in \
+      x86-64-v2) ;; \
+      *) echo "unsupported PGO training target: ${PGO_TRAIN_TARGET_CPU}" >&2; exit 2 ;; \
     esac \
     && case "${RUST_LTO}" in \
       thin|fat) ;; \
@@ -74,15 +80,15 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
        else \
          rustup component add llvm-tools-preview \
          && rustc --edition=2021 -D warnings -C opt-level=3 -C codegen-units=1 \
-              -C panic=abort -C target-cpu=native -C strip=symbols \
+              -C panic=abort -C target-cpu="${PGO_TRAIN_TARGET_CPU}" -C strip=symbols \
               bench/backend.rs -o /tmp/pgo-backend \
          && rustc --edition=2021 -D warnings -C opt-level=3 -C codegen-units=1 \
-              -C panic=abort -C target-cpu=native -C strip=symbols \
+              -C panic=abort -C target-cpu="${PGO_TRAIN_TARGET_CPU}" -C strip=symbols \
               bench/pgo_client.rs -o /tmp/pgo-client \
          && rm -rf /src/pgo-data \
          && mkdir -p /src/pgo-data/raw \
          && CARGO_TARGET_DIR=/src/target/pgo-generate \
-              RUSTFLAGS="${RUSTFLAGS} -C profile-generate=/src/pgo-data/raw" \
+              RUSTFLAGS="${RUSTFLAGS} -C target-cpu=${PGO_TRAIN_TARGET_CPU} -C profile-generate=/src/pgo-data/raw" \
               cargo build --locked --release --no-default-features \
                 --features "${ALLOCATOR},tls-${TLS_PROVIDER}" \
          && bench/pgo_train.sh /src/target/pgo-generate/release/pingora \
@@ -105,6 +111,7 @@ ARG BUILD_REVISION=unknown
 ARG ALLOCATOR=tcmalloc
 ARG TLS_PROVIDER
 ARG PGO_MODE
+ARG PGO_TRAIN_TARGET_CPU
 ARG RUST_VERSION
 ARG RUST_TARGET_CPU
 ARG RUST_LTO
@@ -119,6 +126,7 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.allocator="${ALLOCATOR}" \
       org.opencontainers.image.tls.provider="${TLS_PROVIDER}" \
       org.opencontainers.image.rust.pgo="${PGO_MODE}" \
+      org.opencontainers.image.rust.pgo-train-target-cpu="${PGO_TRAIN_TARGET_CPU}" \
       org.opencontainers.image.base.name="debian:${DEBIAN_SUITE}-slim" \
       org.opencontainers.image.rust.version="${RUST_VERSION}" \
       org.opencontainers.image.rust.target-cpu="${RUST_TARGET_CPU}" \

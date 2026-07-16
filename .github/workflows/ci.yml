@@ -275,10 +275,12 @@ jobs:
             org.opencontainers.image.tls.provider=aws-lc
             org.opencontainers.image.rust.target-cpu=znver1
             org.opencontainers.image.rust.pgo=train
+            org.opencontainers.image.rust.pgo-train-target-cpu=x86-64-v2
           build-args: |
             ALLOCATOR=tcmalloc
             TLS_PROVIDER=aws-lc
             PGO_MODE=train
+            PGO_TRAIN_TARGET_CPU=x86-64-v2
             RUST_TARGET_CPU=znver1
             RUST_LTO=fat
             BUILD_VERSION=pgo-ab
