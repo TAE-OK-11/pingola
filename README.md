@@ -488,6 +488,8 @@ bind 검사와 기동을 수행합니다.
 ```bash
 cd /opt/pingora
 git pull --ff-only
+# Zen 1 이상 운영 서버에서는 검증한 oracle-znver1 content digest를 고정합니다.
+export PINGORA_IMAGE=ghcr.io/tae-ok-11/pingora@sha256:...
 docker compose pull pingora
 docker compose run --rm --no-deps pingora --check
 docker stop jbs-nginx
