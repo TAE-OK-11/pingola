@@ -239,59 +239,6 @@ jobs:
           PINGORA_EXPECTED_TLS_PROVIDER: boringssl
         run: tests/docker_runtime.sh
 
-  image-pgo-znver1:
-    if: github.event_name == 'push' && contains(github.event.head_commit.message, '[pgo]')
-    needs: [audit, verify]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - name: Sign in to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and publish trained PGO Oracle image
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          pull: true
-          tags: |
-            ghcr.io/tae-ok-11/pingora:pgo-znver1
-            ghcr.io/tae-ok-11/pingora:sha-${{ github.sha }}-pgo-znver1
-          labels: |
-            org.opencontainers.image.title=Pingora
-            org.opencontainers.image.description=Pingora trained PGO comparison image for AMD Zen 1 or newer
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.allocator=tcmalloc
-            org.opencontainers.image.tls.provider=aws-lc
-            org.opencontainers.image.rust.target-cpu=znver1
-            org.opencontainers.image.rust.pgo=train
-            org.opencontainers.image.rust.pgo-train-target-cpu=x86-64-v2
-          build-args: |
-            ALLOCATOR=tcmalloc
-            TLS_PROVIDER=aws-lc
-            PGO_MODE=train
-            PGO_TRAIN_TARGET_CPU=x86-64-v2
-            RUST_TARGET_CPU=znver1
-            RUST_LTO=fat
-            BUILD_VERSION=pgo-ab
-            BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Record exact PGO digest
-        run: |
-          test -n '${{ steps.build.outputs.digest }}'
-          printf 'pgo_image=%s\n' 'ghcr.io/tae-ok-11/pingora@${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
-
   image-znver1:
     if: github.event_name == 'push'
     needs: image-test
@@ -317,16 +264,19 @@ jobs:
           images: ghcr.io/tae-ok-11/pingora
           tags: |
             type=raw,value=oracle-znver1
+            type=raw,value=pgo-znver1
             type=sha,prefix=sha-,suffix=-znver1
           labels: |
             org.opencontainers.image.title=Pingora
-            org.opencontainers.image.description=High-performance AWS-LC JBS Pingora reverse proxy for AMD Zen 1 or newer
+            org.opencontainers.image.description=Trained PGO AWS-LC JBS Pingora reverse proxy for AMD Zen 1 or newer
             org.opencontainers.image.source=https://github.com/TAE-OK-11/pingora
             org.opencontainers.image.url=https://github.com/TAE-OK-11/pingora
             org.opencontainers.image.allocator=tcmalloc
             org.opencontainers.image.tls.provider=aws-lc
             org.opencontainers.image.rust.target-cpu=znver1
-      - name: Build and publish Oracle image
+            org.opencontainers.image.rust.pgo=train
+            org.opencontainers.image.rust.pgo-train-target-cpu=x86-64-v2
+      - name: Build and publish trained PGO Oracle image
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -338,6 +288,8 @@ jobs:
           build-args: |
             ALLOCATOR=tcmalloc
             TLS_PROVIDER=aws-lc
+            PGO_MODE=train
+            PGO_TRAIN_TARGET_CPU=x86-64-v2
             RUST_TARGET_CPU=znver1
             RUST_LTO=fat
             BUILD_VERSION=${{ steps.meta.outputs.version }}
