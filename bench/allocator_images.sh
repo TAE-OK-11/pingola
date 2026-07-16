@@ -34,8 +34,13 @@ case "${PROFILE}" in
     PAYLOADS=(64 4096)
     CONCURRENCIES=(1 8 32)
     ;;
+  tls)
+    PROTOCOLS=(h1-tls-keepalive h1-new-tls h2-single h2-multi)
+    PAYLOADS=(64 4096)
+    CONCURRENCIES=(1 8 32)
+    ;;
   *)
-    echo "ALLOCATOR_BENCH_PROFILE must be smoke or standard" >&2
+    echo "ALLOCATOR_BENCH_PROFILE must be smoke, standard, or tls" >&2
     exit 2
     ;;
 esac
@@ -304,6 +309,13 @@ run_case() {
       -H 'accept-encoding: identity' -D "${actual_prefix}.headers" \
       -o "${actual_prefix}.body" -w '%{http_code} %{http_version}' \
       "https://bench.test:${HTTPS_PORT}${path}")
+  elif [[ "${protocol}" == h1-*-tls || "${protocol}" == h1-tls-* ]]; then
+    url="https://127.0.0.1:${HTTPS_PORT}${path}"
+    actual_meta=$(curl --noproxy '*' -ksS --http1.1 \
+      --resolve "bench.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'accept-encoding: identity' -D "${actual_prefix}.headers" \
+      -o "${actual_prefix}.body" -w '%{http_code} %{http_version}' \
+      "https://bench.test:${HTTPS_PORT}${path}")
   else
     url="http://127.0.0.1:${HTTP_PORT}${path}"
     actual_meta=$(curl --noproxy '*' -sS -H 'host: bench.test' \
@@ -327,8 +339,12 @@ run_case() {
     return
   fi
 
-  if [[ "${protocol}" == h1-keepalive ]]; then
+  if [[ "${protocol}" == h1-keepalive || "${protocol}" == h1-tls-keepalive ]]; then
     wrk -t1 -c "${concurrency}" -d "${WARMUP}" -s "${ROOT}/bench/wrk-keepalive.lua" \
+      -H 'Host: bench.test' -H 'Accept-Encoding: identity' \
+      "${url}" >"${warmup_raw}" 2>&1 || true
+  elif [[ "${protocol}" == h1-new-tls ]]; then
+    wrk -t1 -c "${concurrency}" -d "${WARMUP}" -s "${ROOT}/bench/wrk-close.lua" \
       -H 'Host: bench.test' -H 'Accept-Encoding: identity' \
       "${url}" >"${warmup_raw}" 2>&1 || true
   fi
@@ -340,9 +356,15 @@ run_case() {
   sampler_pid=$!
   sleep 0.05
   case "${protocol}" in
-    h1-keepalive)
+    h1-keepalive|h1-tls-keepalive)
       wrk --latency -t1 -c "${concurrency}" -d "${DURATION}" \
         -s "${ROOT}/bench/wrk-keepalive.lua" -H 'Host: bench.test' \
+        -H 'Accept-Encoding: identity' "${url}" >"${raw}" 2>&1
+      rc=$?
+      ;;
+    h1-new-tls)
+      wrk --latency -t1 -c "${concurrency}" -d "${DURATION}" \
+        -s "${ROOT}/bench/wrk-close.lua" -H 'Host: bench.test' \
         -H 'Accept-Encoding: identity' "${url}" >"${raw}" 2>&1
       rc=$?
       ;;
