@@ -8,6 +8,7 @@ if [[ "${OUTPUT}" != /* ]]; then
   OUTPUT=${ROOT}/${OUTPUT}
 fi
 BACKEND_PORT=${PROFILE_BACKEND_PORT:-18800}
+BACKEND_SOURCE=${PROFILE_BACKEND_SOURCE:-${ROOT}/bench/backend.rs}
 HTTP_PORT=${PROFILE_HTTP_PORT:-18880}
 HTTPS_PORT=${PROFILE_HTTPS_PORT:-18843}
 DURATION=${PROFILE_DURATION_SECONDS:-5}
@@ -38,6 +39,23 @@ trap cleanup EXIT INT TERM
 
 mkdir -p "${OUTPUT}"
 chmod 0755 "${OUTPUT}"
+for command in docker curl wrk openssl rustc perf strace; do
+  if ! command -v "${command}" >/dev/null; then
+    echo "missing required command: ${command}" >&2
+    exit 2
+  fi
+done
+
+BACKEND_BIN=${OUTPUT}/backend-rust
+if ! rustc --edition=2021 -D warnings -C opt-level=3 -C codegen-units=1 -C panic=abort \
+  -C target-cpu=native -C strip=symbols \
+  --remap-path-prefix="${ROOT}=." "${BACKEND_SOURCE}" -o "${BACKEND_BIN}" \
+  >"${OUTPUT}/backend-build.stdout" 2>"${OUTPUT}/backend-build.stderr"; then
+  echo "Rust profile backend build failed: source=${BACKEND_SOURCE} log=${OUTPUT}/backend-build.stderr" >&2
+  sed -n '1,120p' "${OUTPUT}/backend-build.stderr" >&2
+  exit 2
+fi
+
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj '/CN=profile.test' -addext 'subjectAltName=DNS:profile.test' \
   -keyout "${OUTPUT}/key.pem" -out "${OUTPUT}/cert.pem" >/dev/null 2>&1
@@ -74,7 +92,7 @@ route_limits:
 EOF
 chmod 0644 "${OUTPUT}/pingora.yaml"
 
-python3 "${ROOT}/bench/backend.py" --port "${BACKEND_PORT}" \
+"${BACKEND_BIN}" --port "${BACKEND_PORT}" \
   >"${OUTPUT}/backend.stdout" 2>"${OUTPUT}/backend.stderr" &
 BACKEND_PID=$!
 BACKEND_READY=false
@@ -123,8 +141,12 @@ container_pid=${PID}
 duration_seconds=${DURATION}
 container_cpus=${CPUS:-unlimited}
 container_memory=${MEMORY:-unlimited}
+backend=rust-std-http1
+backend_source=${BACKEND_SOURCE}
+backend_binary_sha256=$(sha256sum "${BACKEND_BIN}" | cut -d' ' -f1)
 perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo unknown)
 EOF
+rustc -vV | sed 's/^/backend_rustc_/' >>"${OUTPUT}/environment.txt"
 lscpu >>"${OUTPUT}/environment.txt" 2>&1
 
 curl --noproxy '*' -fsS -H 'host: profile.test' \

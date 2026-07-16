@@ -648,6 +648,45 @@ impl Session {
         self.downstream_session.response_duplex_vec(tasks).await
     }
 
+    /// Write one filtered response task without allocating a temporary task vector on HTTP/1.
+    pub async fn write_response_task(&mut self, mut task: HttpTask) -> Result<bool> {
+        let seen_upgraded = self.was_upgraded();
+        match &mut task {
+            HttpTask::Header(resp, end) => {
+                self.downstream_modules_ctx
+                    .response_header_filter(resp, *end)
+                    .await?;
+            }
+            HttpTask::Body(data, end) => {
+                self.downstream_modules_ctx
+                    .response_body_filter(data, *end)?;
+            }
+            HttpTask::UpgradedBody(data, end) => {
+                self.downstream_modules_ctx
+                    .response_body_filter(data, *end)?;
+            }
+            HttpTask::Trailer(trailers) => {
+                if let Some(buf) = self
+                    .downstream_modules_ctx
+                    .response_trailer_filter(trailers)?
+                {
+                    task = HttpTask::Body(Some(buf), true);
+                }
+            }
+            HttpTask::Done => {
+                if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
+                    task = if seen_upgraded {
+                        HttpTask::UpgradedBody(Some(buf), true)
+                    } else {
+                        HttpTask::Body(Some(buf), true)
+                    };
+                }
+            }
+            HttpTask::Failed(_) => {}
+        }
+        self.downstream_session.response_duplex_one(task).await
+    }
+
     /// Mark the upstream headers as modified by caching. This should lead to range filters being
     /// skipped when responding to the downstream.
     pub fn mark_upstream_headers_mutated_for_cache(&mut self) {

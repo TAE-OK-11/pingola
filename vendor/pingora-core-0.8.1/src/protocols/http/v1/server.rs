@@ -1145,7 +1145,7 @@ impl HttpSession {
         Ok(())
     }
 
-    async fn response_duplex(&mut self, task: HttpTask) -> Result<bool> {
+    pub(crate) async fn response_duplex(&mut self, task: HttpTask) -> Result<bool> {
         let end_stream = match task {
             HttpTask::Header(header, end_stream) => {
                 self.write_response_header(header)

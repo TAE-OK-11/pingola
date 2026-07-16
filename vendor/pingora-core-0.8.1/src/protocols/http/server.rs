@@ -276,6 +276,16 @@ impl Session {
         }
     }
 
+    /// Write one response task without constructing a temporary task vector for HTTP/1.
+    pub async fn response_duplex_one(&mut self, task: HttpTask) -> Result<bool> {
+        match self {
+            Self::H1(s) => s.response_duplex(task).await,
+            Self::H2(s) => s.response_duplex_vec(vec![task]).await,
+            Self::Subrequest(s) => s.response_duplex_vec(vec![task]).await,
+            Self::Custom(s) => s.response_duplex_vec(vec![task]).await,
+        }
+    }
+
     /// Set connection reuse. `duration` defines how long the connection is kept open for the next
     /// request to reuse. Noop for h2 and subrequest
     pub fn set_keepalive(&mut self, duration: Option<u64>) {

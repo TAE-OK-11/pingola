@@ -92,6 +92,24 @@ where
             }
         }
 
+        let use_bodyless_fast_path = session.downstream_session.as_http1().is_some()
+            && matches!(session.req_header().method, Method::GET | Method::HEAD)
+            && session.as_mut().is_body_empty()
+            && !session.cache.enabled()
+            && !session.cache.bypassing()
+            && !session.is_upgrade_req()
+            && self.inner.h1_bodyless_fast_path(session, ctx);
+
+        if use_bodyless_fast_path {
+            return match self
+                .proxy_bodyless_h1(session, client_session, ctx)
+                .await
+            {
+                Ok(reuse_downstream) => (reuse_downstream, true, None),
+                Err(e) => (false, false, Some(e)),
+            };
+        }
+
         let mut downstream_custom_message_writer = session
             .downstream_session
             .as_custom_mut()
@@ -130,6 +148,72 @@ where
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, true, None),
             Err(e) => (false, false, Some(e)),
         }
+    }
+
+    /// Proxy a non-upgraded, cache-disabled HTTP/1 GET/HEAD without per-request channels.
+    async fn proxy_bodyless_h1(
+        &self,
+        session: &mut Session,
+        client_session: &mut HttpSessionV1,
+        ctx: &mut SV::CTX,
+    ) -> Result<bool>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        session.as_mut().enable_retry_buffering();
+        let mut request_data = session.as_ref().get_retry_buffer();
+        session
+            .downstream_modules_ctx
+            .request_body_filter(&mut request_data, true)
+            .await?;
+        self.inner
+            .request_body_filter(session, &mut request_data, true, ctx)
+            .await?;
+        send_body_to1(
+            client_session,
+            Some(HttpTask::Body(request_data, true)),
+        )
+        .await?;
+
+        let mut serve_from_cache = ServeFromCache::new();
+        let mut range_body_filter = RangeBodyFilter::new();
+
+        loop {
+            tokio::select! {
+                biased;
+                task = client_session.read_response_task() => {
+                    let mut task = task.map_err(|e| e.into_up())?;
+                    session.upstream_compression.response_filter(&mut task);
+                    let task = self.h1_response_filter(
+                        session,
+                        task,
+                        ctx,
+                        &mut serve_from_cache,
+                        &mut range_body_filter,
+                        false,
+                    ).await?;
+                    let done = session.write_response_task(task).await?;
+                    if done {
+                        break;
+                    }
+                }
+                downstream = session.downstream_session.read_body_or_idle(true) => {
+                    match downstream {
+                        Err(e) => return Err(e.into_down()),
+                        Ok(_) => {
+                            return Error::explain(
+                                ReadError,
+                                "unexpected downstream body on an empty HTTP/1 request",
+                            ).into_err();
+                        }
+                    }
+                }
+            }
+        }
+
+        session.as_mut().finish_body().await.map_err(|e| e.into_down())?;
+        Ok(true)
     }
 
     pub(crate) async fn proxy_to_h1_upstream(

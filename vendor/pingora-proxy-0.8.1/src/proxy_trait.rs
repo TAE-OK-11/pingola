@@ -60,6 +60,15 @@ pub trait LocalProxyHttp {
         None
     }
 
+    /// Opt in to the allocation-light HTTP/1 response path for an empty GET or HEAD request.
+    ///
+    /// The proxy core still verifies that the downstream is HTTP/1, the request has no body or
+    /// upgrade, and caching is inactive. Implementations must only return `true` when their body
+    /// filters do not synthesize a request body and the route does not require full-duplex I/O.
+    fn h1_bodyless_fast_path(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
+        false
+    }
+
     /// Set up downstream modules.
     ///
     /// In this phase, users can add or configure [HttpModules] before the server starts up.

@@ -163,6 +163,13 @@ impl RouteClass {
             Self::AdguardUi => 9,
         }
     }
+
+    fn supports_h1_bodyless_fast_path(self) -> bool {
+        !matches!(
+            self,
+            Self::NavidromeStream | Self::VaultwardenHub | Self::Couchdb
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -599,6 +606,13 @@ impl ProxyHttp for Gateway {
 
     fn precomputed_upstream_peer<'a>(&'a self, ctx: &Self::CTX) -> Option<&'a HttpPeer> {
         self.plans.get(ctx.plan_index).map(|plan| &plan.peer)
+    }
+
+    fn h1_bodyless_fast_path(&self, session: &Session, ctx: &Self::CTX) -> bool {
+        let Some(plan) = self.plans.get(ctx.plan_index) else {
+            return false;
+        };
+        plan.route.supports_h1_bodyless_fast_path() && !session.is_upgrade_req()
     }
 
     async fn upstream_request_filter(
@@ -1810,5 +1824,26 @@ write_timeout_seconds: 9
         assert_eq!(forwarded_port_value(Some(18_080), false).unwrap(), "18080");
         assert_eq!(forwarded_port_value(None, true).unwrap(), "443");
         assert_eq!(forwarded_port_value(None, false).unwrap(), "80");
+    }
+
+    #[test]
+    fn h1_bodyless_fast_path_excludes_streaming_and_duplex_routes() {
+        for route in [
+            RouteClass::NavidromeStream,
+            RouteClass::VaultwardenHub,
+            RouteClass::Couchdb,
+        ] {
+            assert!(!route.supports_h1_bodyless_fast_path(), "{route:?}");
+        }
+        for route in [
+            RouteClass::NavidromeCover,
+            RouteClass::NavidromeApi,
+            RouteClass::VaultwardenAuth,
+            RouteClass::Vaultwarden,
+            RouteClass::Doh,
+            RouteClass::AdguardUi,
+        ] {
+            assert!(route.supports_h1_bodyless_fast_path(), "{route:?}");
+        }
     }
 }
