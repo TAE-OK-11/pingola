@@ -111,17 +111,6 @@ pub struct ServerConfig {
     pub http2_max_concurrent_streams: u32,
 }
 
-impl ServerConfig {
-    /// A single Tokio worker cannot steal work from another worker. Selecting
-    /// Pingora's current-thread runtime in that case avoids the multi-thread
-    /// scheduler overhead while retaining work stealing for multi-worker
-    /// deployments.
-    #[inline]
-    pub(crate) fn use_work_stealing(&self) -> bool {
-        self.threads > 1
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
@@ -463,17 +452,6 @@ hosts:
     fn accepts_unique_normalized_domains() {
         let config = sample_config();
         assert_eq!(config.server.downstream_keepalive_requests, 500);
-        assert!(RuntimeConfig::new(config).is_ok());
-    }
-
-    #[test]
-    fn runtime_flavor_follows_validated_worker_count() {
-        let mut config = sample_config();
-        assert_eq!(config.server.threads, 1);
-        assert!(!config.server.use_work_stealing());
-
-        config.server.threads = 2;
-        assert!(config.server.use_work_stealing());
         assert!(RuntimeConfig::new(config).is_ok());
     }
 

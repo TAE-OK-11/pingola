@@ -58,7 +58,6 @@ tempfile = "3.27"
 [patch.crates-io]
 pingora-core = { path = "vendor/pingora-core-0.8.1" }
 pingora-proxy = { path = "vendor/pingora-proxy-0.8.1" }
-pingora-runtime = { path = "vendor/pingora-runtime-0.8.1" }
 pingora-rustls = { path = "vendor/pingora-rustls-aws-lc" }
 
 [profile.release]
