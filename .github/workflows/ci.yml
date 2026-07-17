@@ -36,7 +36,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes cmake ninja-build jq nghttp2-client
-          rustup toolchain install 1.97.0 --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          rustup show active-toolchain
+      - name: PGO trainer preflight
+        run: |
+          bash -n bench/pgo_train.sh
+          rustc --edition=2021 -D warnings bench/backend.rs -o /tmp/pgo-backend
+          rustc --edition=2021 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
+          /tmp/pgo-client \
+            --port 19080 \
+            --threads 0 \
+            --requests-per-thread 1 \
+            --requests-per-connection 500 \
+            2>/tmp/pgo-client-validation.log && exit 1 || true
+          grep -q 'threads must be 1..=64' /tmp/pgo-client-validation.log
       - name: Format
         run: cargo fmt --check
       - name: AWS-LC-only TLS dependency graph
