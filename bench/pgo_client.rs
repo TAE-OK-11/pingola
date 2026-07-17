@@ -29,6 +29,7 @@ struct TrainingConfig {
     port: u16,
     host: String,
     requests_per_thread: usize,
+    requests_per_connection: usize,
     workload: Workload,
 }
 
@@ -43,6 +44,9 @@ fn run() -> io::Result<()> {
     let mut port = 19_080_u16;
     let mut threads = 1_usize;
     let mut requests_per_thread = 1_000_usize;
+    // Match the production downstream keepalive cap. Reconnecting proactively
+    // keeps long PGO workloads valid when the server closes at the cap.
+    let mut requests_per_connection = 500_usize;
     let mut host = "pgo.test".to_owned();
     let mut path = None;
     let mut expected_status = 200_u16;
@@ -61,6 +65,9 @@ fn run() -> io::Result<()> {
             "--threads" => threads = parse_number(&value, "threads")?,
             "--requests-per-thread" => {
                 requests_per_thread = parse_number(&value, "requests-per-thread")?;
+            }
+            "--requests-per-connection" => {
+                requests_per_connection = parse_number(&value, "requests-per-connection")?;
             }
             "--host" => host = value,
             "--path" => path = Some(value),
@@ -86,10 +93,13 @@ fn run() -> io::Result<()> {
             }
         }
     }
-    if !(1..=64).contains(&threads) || requests_per_thread == 0 {
+    if !(1..=64).contains(&threads)
+        || requests_per_thread == 0
+        || !(1..=1_000_000).contains(&requests_per_connection)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "threads must be 1..=64 and requests-per-thread must be positive",
+            "threads must be 1..=64, requests-per-thread must be positive, and requests-per-connection must be 1..=1000000",
         ));
     }
     if host.is_empty()
@@ -127,6 +137,7 @@ fn run() -> io::Result<()> {
         port,
         host,
         requests_per_thread,
+        requests_per_connection,
         workload,
     });
 
@@ -155,58 +166,136 @@ where
     })
 }
 
-fn train(config: &TrainingConfig, worker: usize) -> io::Result<()> {
-    let mut stream = TcpStream::connect(("127.0.0.1", config.port))?;
+fn connect(port: u16) -> io::Result<TcpStream> {
+    let stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    Ok(stream)
+}
+
+fn train(config: &TrainingConfig, worker: usize) -> io::Result<()> {
+    let mut stream = connect(config.port)?;
     let mut buffered = Vec::with_capacity(16 * 1024);
+    let mut requests_on_connection = 0_usize;
 
     for request_index in 0..config.requests_per_thread {
-        let (path, expected_status, expected_length, body_validation) = match &config.workload {
-            Workload::AlternatingPattern => {
-                let size = if (worker + request_index) % 4 == 0 {
-                    4096
-                } else {
-                    64
-                };
-                (
-                    if size == 4096 {
-                        "/bytes/4096"
-                    } else {
-                        "/bytes/64"
-                    },
-                    200,
-                    size,
-                    BodyValidation::Pattern,
-                )
-            }
-            Workload::Fixed {
-                path,
-                expected_status,
-                expected_length,
-                body_validation,
-            } => (
-                path.as_str(),
-                *expected_status,
-                *expected_length,
-                *body_validation,
-            ),
-        };
-        write!(
-            stream,
-            "GET {path} HTTP/1.1\r\nHost: {}\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n\r\n",
-            config.host
-        )?;
-        read_response(
+        if requests_on_connection >= config.requests_per_connection {
+            stream = connect(config.port)?;
+            buffered.clear();
+            requests_on_connection = 0;
+        }
+
+        let (path, expected_status, expected_length, body_validation) =
+            request_spec(config, worker, request_index);
+
+        let closed = match send_request(
             &mut stream,
             &mut buffered,
+            &config.host,
+            path,
             expected_status,
             expected_length,
             body_validation,
-        )?;
+        ) {
+            Ok(closed) => closed,
+            Err(error) if is_reconnectable(&error) => {
+                // GET training requests are idempotent. A server-side keepalive
+                // close can race with the next write, so reconnect and retry the
+                // current request exactly once instead of aborting the PGO build.
+                stream = connect(config.port)?;
+                buffered.clear();
+                requests_on_connection = 0;
+                send_request(
+                    &mut stream,
+                    &mut buffered,
+                    &config.host,
+                    path,
+                    expected_status,
+                    expected_length,
+                    body_validation,
+                )?
+            }
+            Err(error) => return Err(error),
+        };
+
+        requests_on_connection += 1;
+        if closed {
+            buffered.clear();
+            requests_on_connection = config.requests_per_connection;
+        }
     }
     Ok(())
+}
+
+fn request_spec(
+    config: &TrainingConfig,
+    worker: usize,
+    request_index: usize,
+) -> (&str, u16, usize, BodyValidation) {
+    match &config.workload {
+        Workload::AlternatingPattern => {
+            let size = if (worker + request_index) % 4 == 0 {
+                4096
+            } else {
+                64
+            };
+            (
+                if size == 4096 {
+                    "/bytes/4096"
+                } else {
+                    "/bytes/64"
+                },
+                200,
+                size,
+                BodyValidation::Pattern,
+            )
+        }
+        Workload::Fixed {
+            path,
+            expected_status,
+            expected_length,
+            body_validation,
+        } => (
+            path.as_str(),
+            *expected_status,
+            *expected_length,
+            *body_validation,
+        ),
+    }
+}
+
+fn is_reconnectable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+    )
+}
+
+fn send_request(
+    stream: &mut TcpStream,
+    buffered: &mut Vec<u8>,
+    host: &str,
+    path: &str,
+    expected_status: u16,
+    expected_length: usize,
+    body_validation: BodyValidation,
+) -> io::Result<bool> {
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n\r\n"
+    )?;
+    read_response(
+        stream,
+        buffered,
+        expected_status,
+        expected_length,
+        body_validation,
+    )
 }
 
 fn read_response(
@@ -215,7 +304,7 @@ fn read_response(
     expected_status: u16,
     expected_length: usize,
     body_validation: BodyValidation,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let header_end = loop {
         if let Some(position) = buffered.windows(4).position(|part| part == b"\r\n\r\n") {
             break position;
@@ -256,6 +345,15 @@ fn read_response(
             "response body length does not match the training request",
         ));
     }
+    let connection_close = header.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.eq_ignore_ascii_case("connection")
+            && value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("close"))
+    });
 
     let message_length = header_end + 4 + content_length;
     while buffered.len() < message_length {
@@ -273,7 +371,7 @@ fn read_response(
         ));
     }
     buffered.drain(..message_length);
-    Ok(())
+    Ok(connection_close)
 }
 
 fn read_more(stream: &mut TcpStream, buffered: &mut Vec<u8>) -> io::Result<()> {
