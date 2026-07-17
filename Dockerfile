@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.25
 # check=error=true
 
-ARG RUST_VERSION=1.97.0
+ARG RUST_VERSION=1.97.1
 ARG RUST_TARGET_TRIPLE=x86_64-unknown-linux-gnu
 ARG RUST_TARGET_CPU=x86-64-v2
 ARG RUST_LTO=fat
@@ -9,21 +9,17 @@ ARG RUST_CODEGEN_UNITS=1
 ARG TLS_PROVIDER=aws-lc
 ARG PGO_MODE=off
 ARG PGO_TRAIN_TARGET_CPU=x86-64-v2
-
-# PGO weighted-profile multipliers. These are deliberately not percentages:
-# TLS and tail workloads execute fewer requests, so they need enough weight to
-# avoid being classified as cold compared with high-throughput H1/H2 paths.
-ARG PGO_WEIGHT_H1=30
-ARG PGO_WEIGHT_H2=45
-ARG PGO_WEIGHT_TLS=40
-ARG PGO_WEIGHT_TAIL=20
-
-# Let's Encrypt ECDSA keys normally use P-256. Override with secp384r1 if the
-# production certificate was explicitly issued with a P-384 private key.
+ARG PGO_WEIGHT_H1=45
+ARG PGO_WEIGHT_H2=60
+ARG PGO_WEIGHT_TLS=180
+ARG PGO_WEIGHT_TAIL=10
+ARG PGO_TRAIN_ROUNDS=2
 ARG PGO_ECDSA_CURVE=prime256v1
 ARG DEBIAN_SUITE=trixie
 
-FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS builder
+FROM debian:${DEBIAN_SUITE}-slim AS builder
+
+ARG RUST_VERSION
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -37,7 +33,14 @@ RUN apt-get update \
         ninja-build \
         openssl \
         perl \
-    && rm -rf /var/lib/apt/lists/*
+        pkg-config \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 --fail --show-error --silent \
+         https://sh.rustup.rs \
+       | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}" \
+    && /root/.cargo/bin/rustc --version \
+    && /root/.cargo/bin/cargo --version
 
 WORKDIR /src
 
@@ -59,19 +62,20 @@ ARG PGO_WEIGHT_H2
 ARG PGO_WEIGHT_TLS
 ARG PGO_WEIGHT_TAIL
 ARG PGO_ECDSA_CURVE
+ARG PGO_TRAIN_ROUNDS
 
-ENV CARGO_INCREMENTAL=0 \
+ENV PATH="/root/.cargo/bin:${PATH}" \
+    RUSTUP_HOME=/root/.rustup \
+    CARGO_HOME=/root/.cargo \
+    CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${RUST_CODEGEN_UNITS} \
     CARGO_PROFILE_RELEASE_LTO=${RUST_LTO} \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang \
     CMAKE_GENERATOR=Ninja \
     RUSTFLAGS_COMMON="-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections"
 
-# The default PGO training target is x86-64-v2 so the instrumented binary can
-# run on generic CI hosts. For the best CPU-specific result, build on the target
-# host and set PGO_TRAIN_TARGET_CPU equal to RUST_TARGET_CPU.
-RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+RUN --mount=type=cache,id=pingora-cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=pingora-cargo-git,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,id=pingora-target-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR}-${TLS_PROVIDER}-${PGO_MODE}-${PGO_TRAIN_TARGET_CPU},target=/src/target,sharing=locked \
     set -eux; \
     case "${ALLOCATOR}" in \
@@ -102,116 +106,47 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       prime256v1|secp384r1) ;; \
       *) echo "unsupported ECDSA curve: ${PGO_ECDSA_CURVE}" >&2; exit 2 ;; \
     esac; \
-    for weight in \
-      "${PGO_WEIGHT_H1}" \
-      "${PGO_WEIGHT_H2}" \
-      "${PGO_WEIGHT_TLS}" \
-      "${PGO_WEIGHT_TAIL}"; do \
-        case "${weight}" in \
-          ''|*[!0-9]*) echo "PGO weights must be positive integers" >&2; exit 2 ;; \
-        esac; \
-        if [ "${weight}" -le 0 ]; then \
-          echo "PGO weights must be greater than zero" >&2; \
-          exit 2; \
-        fi; \
+    for value in "${PGO_WEIGHT_H1}" "${PGO_WEIGHT_H2}" "${PGO_WEIGHT_TLS}" "${PGO_WEIGHT_TAIL}" "${PGO_TRAIN_ROUNDS}"; do \
+      case "${value}" in ''|*[!0-9]*) echo "PGO weights/rounds must be positive integers" >&2; exit 2 ;; esac; \
+      test "${value}" -gt 0; \
     done; \
     chmod 755 bench/pgo_train.sh; \
     if [ "${PGO_MODE}" = off ]; then \
       CARGO_TARGET_DIR=/src/target/release \
       RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU}" \
-        cargo build \
-          --locked \
-          --release \
-          --target "${RUST_TARGET_TRIPLE}" \
-          --no-default-features \
-          --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
-      install -Dm755 \
-        "/src/target/release/${RUST_TARGET_TRIPLE}/release/pingora" \
-        /out/pingora; \
+        cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
+          --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
+      install -Dm755 "/src/target/release/${RUST_TARGET_TRIPLE}/release/pingora" /out/pingora; \
     else \
       rustup component add llvm-tools-preview; \
-      rustc \
-        --edition=2021 \
-        -D warnings \
-        -C opt-level=3 \
-        -C codegen-units=1 \
-        -C panic=abort \
-        -C target-cpu="${PGO_TRAIN_TARGET_CPU}" \
-        -C strip=symbols \
-        bench/backend.rs \
-        -o /tmp/pgo-backend; \
-      rustc \
-        --edition=2021 \
-        -D warnings \
-        -C opt-level=3 \
-        -C codegen-units=1 \
-        -C panic=abort \
-        -C target-cpu="${PGO_TRAIN_TARGET_CPU}" \
-        -C strip=symbols \
-        bench/pgo_client.rs \
-        -o /tmp/pgo-client; \
+      rustc --edition=2021 -D warnings -C opt-level=3 -C codegen-units=1 \
+        -C panic=abort -C target-cpu="${PGO_TRAIN_TARGET_CPU}" -C strip=symbols \
+        bench/backend.rs -o /tmp/pgo-backend; \
+      rustc --edition=2021 -D warnings -C opt-level=3 -C codegen-units=1 \
+        -C panic=abort -C target-cpu="${PGO_TRAIN_TARGET_CPU}" -C strip=symbols \
+        bench/pgo_client.rs -o /tmp/pgo-client; \
       rm -rf /src/pgo-data; \
-      install -d \
-        /src/pgo-data/raw/h1 \
-        /src/pgo-data/raw/h2 \
-        /src/pgo-data/raw/tls \
-        /src/pgo-data/raw/tail; \
+      install -d /src/pgo-data/raw/h1 /src/pgo-data/raw/h2 /src/pgo-data/raw/tls /src/pgo-data/raw/tail; \
       CARGO_TARGET_DIR=/src/target/pgo-generate \
       RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${PGO_TRAIN_TARGET_CPU} -C profile-generate=/src/pgo-data/raw" \
-        cargo build \
-          --locked \
-          --release \
-          --target "${RUST_TARGET_TRIPLE}" \
-          --no-default-features \
-          --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
+        cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
+          --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
       PGO_BIN="/src/target/pgo-generate/${RUST_TARGET_TRIPLE}/release/pingora"; \
       test -x "${PGO_BIN}"; \
-      PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" \
-        bench/pgo_train.sh \
-          "${PGO_BIN}" \
-          /tmp/pgo-backend \
-          /tmp/pgo-client \
-          /src/pgo-data/raw/h1 \
-          h1; \
-      PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" \
-        bench/pgo_train.sh \
-          "${PGO_BIN}" \
-          /tmp/pgo-backend \
-          /tmp/pgo-client \
-          /src/pgo-data/raw/h2 \
-          h2; \
-      PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" \
-        bench/pgo_train.sh \
-          "${PGO_BIN}" \
-          /tmp/pgo-backend \
-          /tmp/pgo-client \
-          /src/pgo-data/raw/tls \
-          tls; \
-      PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" \
-        bench/pgo_train.sh \
-          "${PGO_BIN}" \
-          /tmp/pgo-backend \
-          /tmp/pgo-client \
-          /src/pgo-data/raw/tail \
-          tail; \
+      for round in $(seq 1 "${PGO_TRAIN_ROUNDS}"); do \
+        for scenario in h1 h2 tls tail; do \
+          echo "PGO training scenario=${scenario} round=${round}/${PGO_TRAIN_ROUNDS}"; \
+          PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" PGO_TRAIN_ROUND="${round}" \
+            bench/pgo_train.sh "${PGO_BIN}" /tmp/pgo-backend /tmp/pgo-client \
+              "/src/pgo-data/raw/${scenario}" "${scenario}"; \
+        done; \
+      done; \
       LLVM_PROFDATA="$(rustc --print target-libdir)/../bin/llvm-profdata"; \
       test -x "${LLVM_PROFDATA}"; \
-      "${LLVM_PROFDATA}" merge \
-        --failure-mode=any \
-        -o /src/pgo-data/h1.profdata \
-        /src/pgo-data/raw/h1/*.profraw; \
-      "${LLVM_PROFDATA}" merge \
-        --failure-mode=any \
-        -o /src/pgo-data/h2.profdata \
-        /src/pgo-data/raw/h2/*.profraw; \
-      "${LLVM_PROFDATA}" merge \
-        --failure-mode=any \
-        -o /src/pgo-data/tls.profdata \
-        /src/pgo-data/raw/tls/*.profraw; \
-      "${LLVM_PROFDATA}" merge \
-        --failure-mode=any \
-        -o /src/pgo-data/tail.profdata \
-        /src/pgo-data/raw/tail/*.profraw; \
+      for scenario in h1 h2 tls tail; do \
+        "${LLVM_PROFDATA}" merge --failure-mode=any \
+          -o "/src/pgo-data/${scenario}.profdata" "/src/pgo-data/raw/${scenario}"/*.profraw; \
+      done; \
       "${LLVM_PROFDATA}" merge \
         --weighted-input="${PGO_WEIGHT_H1},/src/pgo-data/h1.profdata" \
         --weighted-input="${PGO_WEIGHT_H2},/src/pgo-data/h2.profdata" \
@@ -219,28 +154,25 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
         --weighted-input="${PGO_WEIGHT_TAIL},/src/pgo-data/tail.profdata" \
         -o /src/pgo-data/merged.profdata; \
       test -s /src/pgo-data/merged.profdata; \
-      "${LLVM_PROFDATA}" show \
-        --counts \
-        --covered \
-        /src/pgo-data/merged.profdata \
-        > /src/pgo-data/profile-summary.txt; \
+      { \
+        echo "weights h1=${PGO_WEIGHT_H1} h2=${PGO_WEIGHT_H2} tls=${PGO_WEIGHT_TLS} tail=${PGO_WEIGHT_TAIL} rounds=${PGO_TRAIN_ROUNDS}"; \
+        "${LLVM_PROFDATA}" show --counts --covered --topn=100 /src/pgo-data/merged.profdata; \
+        echo; echo "=== h1 vs h2 overlap ==="; \
+        "${LLVM_PROFDATA}" overlap /src/pgo-data/h1.profdata /src/pgo-data/h2.profdata || true; \
+        echo; echo "=== h2 vs tls overlap ==="; \
+        "${LLVM_PROFDATA}" overlap /src/pgo-data/h2.profdata /src/pgo-data/tls.profdata || true; \
+        echo; echo "=== h2 vs tail overlap ==="; \
+        "${LLVM_PROFDATA}" overlap /src/pgo-data/h2.profdata /src/pgo-data/tail.profdata || true; \
+      } > /src/pgo-data/profile-summary.txt; \
       PROFILE_SHA="$(sha256sum /src/pgo-data/merged.profdata | cut -d ' ' -f 1)"; \
       PROFILE_PATH="/src/pgo-data/merged-${PROFILE_SHA}.profdata"; \
       cp /src/pgo-data/merged.profdata "${PROFILE_PATH}"; \
       CARGO_TARGET_DIR=/src/target/pgo-use \
       RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU} -C profile-use=${PROFILE_PATH} -C llvm-args=-pgo-warn-missing-function" \
-        cargo build \
-          --locked \
-          --release \
-          --target "${RUST_TARGET_TRIPLE}" \
-          --no-default-features \
-          --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
-      install -Dm755 \
-        "/src/target/pgo-use/${RUST_TARGET_TRIPLE}/release/pingora" \
-        /out/pingora; \
-      install -Dm644 \
-        /src/pgo-data/profile-summary.txt \
-        /out/pgo-profile-summary.txt; \
+        cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
+          --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
+      install -Dm755 "/src/target/pgo-use/${RUST_TARGET_TRIPLE}/release/pingora" /out/pingora; \
+      install -Dm644 /src/pgo-data/profile-summary.txt /out/pgo-profile-summary.txt; \
     fi
 
 FROM debian:${DEBIAN_SUITE}-slim AS runtime
@@ -256,6 +188,7 @@ ARG PGO_WEIGHT_H2
 ARG PGO_WEIGHT_TLS
 ARG PGO_WEIGHT_TAIL
 ARG PGO_ECDSA_CURVE
+ARG PGO_TRAIN_ROUNDS
 ARG RUST_VERSION
 ARG RUST_TARGET_TRIPLE
 ARG RUST_TARGET_CPU
@@ -277,6 +210,7 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.rust.pgo-weight-tls="${PGO_WEIGHT_TLS}" \
       org.opencontainers.image.rust.pgo-weight-tail="${PGO_WEIGHT_TAIL}" \
       org.opencontainers.image.rust.pgo-ecdsa-curve="${PGO_ECDSA_CURVE}" \
+      org.opencontainers.image.rust.pgo-train-rounds="${PGO_TRAIN_ROUNDS}" \
       org.opencontainers.image.base.name="debian:${DEBIAN_SUITE}-slim" \
       org.opencontainers.image.rust.version="${RUST_VERSION}" \
       org.opencontainers.image.rust.target="${RUST_TARGET_TRIPLE}" \
@@ -288,36 +222,19 @@ LABEL org.opencontainers.image.title="Pingora" \
 
 RUN --mount=from=builder,source=/out,target=/out,ro \
     apt-get update \
-    && apt-get install --yes --no-install-recommends \
-        ca-certificates \
-        libcap2-bin \
-        libstdc++6 \
+    && apt-get install --yes --no-install-recommends ca-certificates libcap2-bin libstdc++6 \
     && groupadd --gid 10001 pingora \
-    && useradd \
-        --uid 10001 \
-        --gid 10001 \
-        --no-create-home \
-        --shell /usr/sbin/nologin \
-        pingora \
-    && install -d \
-        -o 10001 \
-        -g 10001 \
-        /etc/pingora \
-        /var/www/pikky \
-        /tmp/pingora \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin pingora \
+    && install -d -o 10001 -g 10001 /etc/pingora /var/www/pikky /tmp/pingora \
     && install -Dm755 /out/pingora /usr/local/bin/pingora \
     && if [ -f /out/pgo-profile-summary.txt ]; then \
-         install -Dm644 \
-           /out/pgo-profile-summary.txt \
-           /usr/share/doc/pingora/pgo-profile-summary.txt; \
+         install -Dm644 /out/pgo-profile-summary.txt /usr/share/doc/pingora/pgo-profile-summary.txt; \
        fi \
     && setcap cap_net_bind_service=+ep /usr/local/bin/pingora \
     && apt-get purge --yes --auto-remove libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --link --chown=10001:10001 \
-    config/pingora.yaml \
-    /etc/pingora/pingora.yaml
+COPY --link --chown=10001:10001 config/pingora.yaml /etc/pingora/pingora.yaml
 
 USER 10001:10001
 WORKDIR /tmp/pingora
