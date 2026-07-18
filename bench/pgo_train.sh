@@ -217,7 +217,8 @@ train_tls() {
   : >"${OUTPUT_DIR}/tls-resumption.log"
   for _ in $(seq 1 256); do
     set +e
-    { printf 'GET /json/512 HTTP/1.1\r\nHost: pgo.test\r\nConnection: keep-alive\r\n\r\n'; sleep 0.05; } | \
+    rm -f "${OUTPUT_DIR}/tls-session-next.pem"
+    { printf 'GET /json/512 HTTP/1.1\r\nHost: pgo.test\r\nConnection: keep-alive\r\n\r\n'; sleep 0.2; } | \
       timeout 4 openssl s_client -connect "127.0.0.1:${HTTPS_PORT}" \
         -servername pgo.test -tls1_3 -alpn http/1.1 \
         -sess_in "${OUTPUT_DIR}/tls-session.pem" \
@@ -226,6 +227,9 @@ train_tls() {
     resume_rc=$?
     set -e
 
+    # Give the replacement NewSessionTicket enough time to arrive. At 50 ms
+    # the handshake succeeded but sess_out was intermittently absent; 200 ms
+    # was verified for 20 consecutive rotations on the target AWS-LC host.
     if [[ ${resume_rc} -ne 0 && ${resume_rc} -ne 124 ]] || \
       [[ ! -s "${OUTPUT_DIR}/tls-session-next.pem" ]]; then
       echo "TLS resumption failed: exit=${resume_rc}" >&2
