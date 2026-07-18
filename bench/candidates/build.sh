@@ -26,6 +26,18 @@ case "${CANDIDATE}" in
     package=river
     binary=river
     ;;
+  pingpong)
+    repository=https://github.com/Bluemangoo/Pingpong.git
+    revision=13174d0321f1c384f3c75079b557682b6875d595
+    package=pingpong
+    binary=pingpong
+    ;;
+  zentinel)
+    repository=https://github.com/zentinelproxy/zentinel.git
+    revision=33ffdecb4a13702fa2bd4a3d9a3840ec7f1348e8
+    package=zentinel-proxy
+    binary=zentinel
+    ;;
   *)
     echo "unsupported candidate: ${CANDIDATE}" >&2
     exit 2
