@@ -88,6 +88,18 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       x86-64-v2|znver1|znver2|znver3|znver4) ;; \
       *) echo "unsupported PGO training target: ${PGO_TRAIN_TARGET_CPU}" >&2; exit 2 ;; \
     esac; \
+    case "${RUST_TARGET_CPU}" in \
+      x86-64-v2|znver1|znver2|znver3|znver4) ;; \
+      *) echo "unsupported Rust target CPU: ${RUST_TARGET_CPU}" >&2; exit 2 ;; \
+    esac; \
+    case "${RUST_TARGET_CPU}" in \
+      x86-64-v2) TARGET_NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic' ;; \
+      *) TARGET_NATIVE_FLAGS="-O3 -march=${RUST_TARGET_CPU} -mtune=${RUST_TARGET_CPU}" ;; \
+    esac; \
+    case "${PGO_TRAIN_TARGET_CPU}" in \
+      x86-64-v2) TRAIN_NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic' ;; \
+      *) TRAIN_NATIVE_FLAGS="-O3 -march=${PGO_TRAIN_TARGET_CPU} -mtune=${PGO_TRAIN_TARGET_CPU}" ;; \
+    esac; \
     case "${RUST_LTO}" in \
       thin|fat) ;; \
       *) echo "unsupported Rust LTO mode: ${RUST_LTO}" >&2; exit 2 ;; \
@@ -107,6 +119,8 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
     chmod 755 bench/pgo_train.sh; \
     if [ "${PGO_MODE}" = off ]; then \
       CARGO_TARGET_DIR=/src/target/release \
+      CFLAGS="${TARGET_NATIVE_FLAGS}" \
+      CXXFLAGS="${TARGET_NATIVE_FLAGS}" \
       RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU}" \
         cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
           --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
@@ -122,6 +136,8 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       rm -rf /src/pgo-data; \
       install -d /src/pgo-data/raw/h1 /src/pgo-data/raw/h2 /src/pgo-data/raw/tls /src/pgo-data/raw/tail; \
       CARGO_TARGET_DIR=/src/target/pgo-generate \
+      CFLAGS="${TRAIN_NATIVE_FLAGS}" \
+      CXXFLAGS="${TRAIN_NATIVE_FLAGS}" \
       RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${PGO_TRAIN_TARGET_CPU} -C profile-generate=/src/pgo-data/raw" \
         cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
           --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
@@ -162,6 +178,8 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       PROFILE_PATH="/src/pgo-data/merged-${PROFILE_SHA}.profdata"; \
       cp /src/pgo-data/merged.profdata "${PROFILE_PATH}"; \
       CARGO_TARGET_DIR=/src/target/pgo-use \
+      CFLAGS="${TARGET_NATIVE_FLAGS}" \
+      CXXFLAGS="${TARGET_NATIVE_FLAGS}" \
       RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU} -C profile-use=${PROFILE_PATH} -C llvm-args=-pgo-warn-missing-function" \
         cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
           --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
