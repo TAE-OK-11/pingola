@@ -29,6 +29,8 @@ def median(items, field):
 
 def geometric_mean(values):
     positive = [value for value in values if value > 0]
+    if not positive:
+        return None
     return math.exp(sum(math.log(value) for value in positive) / len(positive))
 
 
@@ -106,24 +108,31 @@ with summary_path.open("w", newline="") as target:
 
 print(f"paired_cases={len(ratios['rps'])} failed_rows={len(failures)}")
 if ratios["rps"]:
-    print(
-        "pingora_rps_geomean_delta_pct="
-        f"{(geometric_mean(ratios['rps']) - 1) * 100:.2f}"
-    )
+    rps_geomean = geometric_mean(ratios["rps"])
+    if rps_geomean is not None:
+        print(
+            "pingora_rps_geomean_delta_pct="
+            f"{(rps_geomean - 1) * 100:.2f}"
+        )
     print(
         "pingora_p99_median_delta_pct="
         f"{(statistics.median(ratios['p99']) - 1) * 100:.2f}"
     )
-    print(
-        "pingora_cpu_efficiency_geomean_delta_pct="
-        f"{(geometric_mean(ratios['efficiency']) - 1) * 100:.2f}"
-    )
+    efficiency_geomean = geometric_mean(ratios["efficiency"])
+    if efficiency_geomean is not None:
+        print(
+            "pingora_cpu_efficiency_geomean_delta_pct="
+            f"{(efficiency_geomean - 1) * 100:.2f}"
+        )
     print(
         "pingora_peak_rss_median_delta_pct="
         f"{(statistics.median(ratios['rss']) - 1) * 100:.2f}"
     )
     for name in sorted(key for key in ratios if key.startswith("protocol:")):
+        protocol_geomean = geometric_mean(ratios[name])
+        if protocol_geomean is None:
+            continue
         print(
             f"{name[9:]}_rps_geomean_delta_pct="
-            f"{(geometric_mean(ratios[name]) - 1) * 100:.2f}"
+            f"{(protocol_geomean - 1) * 100:.2f}"
         )

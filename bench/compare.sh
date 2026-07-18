@@ -335,7 +335,10 @@ sample_resources() {
   local output=$2
   local cg
   cg=/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' "/proc/${pid}/cgroup")
-  while kill -0 "${pid}" 2>/dev/null; do
+  # A non-root benchmark user cannot signal a root/UID-10001 container
+  # process, so `kill -0` reports EPERM even while it is healthy. The host
+  # proc entry remains visible for the exact lifetime we need to sample.
+  while [[ -d "/proc/${pid}" ]]; do
     local timestamp usage rss=0 member value
     timestamp=$(date +%s%N)
     timestamp=${timestamp::-3}
@@ -374,8 +377,12 @@ run_case() {
     expected_status=200
   fi
   if [[ "${protocol}" == h2-* || "${protocol}" == h1-new-tls ]]; then
-    url="https://127.0.0.1:${HTTPS_PORT}${path}"
-    curl_args=(-k --resolve "bench.test:${HTTPS_PORT}:127.0.0.1")
+    if [[ "${protocol}" == h2-* ]]; then
+      url="https://bench.test:${HTTPS_PORT}${path}"
+    else
+      url="https://127.0.0.1:${HTTPS_PORT}${path}"
+      curl_args=(-k --resolve "bench.test:${HTTPS_PORT}:127.0.0.1")
+    fi
   else
     url="http://127.0.0.1:${HTTP_PORT}${path}"
   fi
@@ -456,15 +463,17 @@ run_case() {
         >"${warmup_raw}" 2>&1 || true
       ;;
     h2-single)
-      h2load -n "${concurrency}" -c 1 -m "${concurrency}" --sni bench.test \
-        -H 'host: bench.test' -H 'accept-encoding: identity' \
+      h2load -n "${concurrency}" -c 1 -m "${concurrency}" \
+        --connect-to="127.0.0.1:${HTTPS_PORT}" \
+        -H 'accept-encoding: identity' \
         "${url}" >"${warmup_raw}" 2>&1 || true
       ;;
     h2-multi)
       local warm_clients=$((concurrency < 4 ? concurrency : 4))
       local warm_streams=$(((concurrency + warm_clients - 1) / warm_clients))
       h2load -n "${concurrency}" -c "${warm_clients}" -m "${warm_streams}" \
-        --sni bench.test -H 'host: bench.test' -H 'accept-encoding: identity' \
+        --connect-to="127.0.0.1:${HTTPS_PORT}" \
+        -H 'accept-encoding: identity' \
         "${url}" >"${warmup_raw}" 2>&1 || true
       ;;
   esac
@@ -491,13 +500,15 @@ run_case() {
     h2-single)
       if ((size < 10485760)); then
         h2load -D "${DURATION}" --warm-up-time="${WARMUP}" -c 1 -m "${concurrency}" \
-          --sni bench.test -H 'host: bench.test' -H 'accept-encoding: identity' \
+          --connect-to="127.0.0.1:${HTTPS_PORT}" \
+          -H 'accept-encoding: identity' \
           --log-file "${request_log}" "${url}" >"${raw}" 2>&1
       else
         local requests=$((concurrency * 2))
         ((size >= 104857600)) && requests=${concurrency}
         h2load -n "${requests}" -c 1 -m "${concurrency}" \
-          --sni bench.test -H 'host: bench.test' -H 'accept-encoding: identity' \
+          --connect-to="127.0.0.1:${HTTPS_PORT}" \
+          -H 'accept-encoding: identity' \
           --log-file "${request_log}" "${url}" >"${raw}" 2>&1
       fi
       rc=$?
@@ -507,14 +518,15 @@ run_case() {
       local streams=$(((concurrency + clients - 1) / clients))
       if ((size < 10485760)); then
         h2load -D "${DURATION}" --warm-up-time="${WARMUP}" \
-          -c "${clients}" -m "${streams}" --sni bench.test \
-          -H 'host: bench.test' -H 'accept-encoding: identity' \
+          -c "${clients}" -m "${streams}" --connect-to="127.0.0.1:${HTTPS_PORT}" \
+          -H 'accept-encoding: identity' \
           --log-file "${request_log}" "${url}" >"${raw}" 2>&1
       else
         local requests=$((concurrency * 2))
         ((size >= 104857600)) && requests=${concurrency}
         h2load -n "${requests}" -c "${clients}" -m "${streams}" \
-          --sni bench.test -H 'host: bench.test' -H 'accept-encoding: identity' \
+          --connect-to="127.0.0.1:${HTTPS_PORT}" \
+          -H 'accept-encoding: identity' \
           --log-file "${request_log}" "${url}" >"${raw}" 2>&1
       fi
       rc=$?
@@ -578,9 +590,10 @@ for ((round = 1; round <= ROUNDS; round++)); do
     sleep 0.5
     stability_raw=${OUTPUT}/raw/${proxy}-r${round}-h2-single-connection-${STABILITY_REQUESTS}.txt
     stability_log=${OUTPUT}/raw/${proxy}-r${round}-h2-single-connection-${STABILITY_REQUESTS}.requests.tsv
-    h2load -n "${STABILITY_REQUESTS}" -c 1 -m 32 --sni bench.test \
-      -H 'host: bench.test' -H 'accept-encoding: identity' --log-file "${stability_log}" \
-      "https://127.0.0.1:${HTTPS_PORT}/bytes/64" >"${stability_raw}" 2>&1
+    h2load -n "${STABILITY_REQUESTS}" -c 1 -m 32 \
+      --connect-to="127.0.0.1:${HTTPS_PORT}" \
+      -H 'accept-encoding: identity' --log-file "${stability_log}" \
+      "https://bench.test:${HTTPS_PORT}/bytes/64" >"${stability_raw}" 2>&1
     stability_rc=$?
     stability_errors=$(sed -nE 's/requests: [0-9]+ total, [0-9]+ started, [0-9]+ done, [0-9]+ succeeded, ([0-9]+) failed.*/\1/p' \
       "${stability_raw}" | tail -1)
