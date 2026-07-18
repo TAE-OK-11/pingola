@@ -40,9 +40,10 @@ jobs:
               "bench/${source}.rs" \
               -o "$RUNNER_TEMP/artifact/${source}"
           done
-          sha256sum "$RUNNER_TEMP/artifact/backend" \
-            "$RUNNER_TEMP/artifact/pgo_client" \
-            > "$RUNNER_TEMP/artifact/sha256.txt"
+          (
+            cd "$RUNNER_TEMP/artifact"
+            sha256sum backend pgo_client > sha256.txt
+          )
           {
             echo "revision=$GITHUB_SHA"
             echo "rustc=$(rustc --version)"
@@ -55,12 +56,17 @@ jobs:
         run: |
           set -euo pipefail
           "$RUNNER_TEMP/artifact/backend" --help
-          "$RUNNER_TEMP/artifact/pgo_client" \
+          set +e
+          output=$("$RUNNER_TEMP/artifact/pgo_client" \
             --port 1 \
             --threads 0 \
             --requests-per-thread 1 \
             --requests-per-connection 1 \
-            2>&1 | grep -F "threads must be 1..=64"
+            2>&1)
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -F "threads must be 1..=64" <<<"$output"
       - name: Upload benchmark tools and provenance
         uses: actions/upload-artifact@v4
         with:
