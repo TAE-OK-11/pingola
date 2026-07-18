@@ -6,6 +6,7 @@ PROFILE=${BENCH_PROFILE:-smoke}
 PINGORA_IMAGE=${PINGORA_IMAGE:-ghcr.io/tae-ok-11/pingora:local}
 NGINX_IMAGE=${NGINX_IMAGE:-tae00217/jbs-nginx:ultra-4.0}
 CPU_LIMIT=${BENCH_CPUS:-0.5}
+WORKERS=${BENCH_WORKERS:-1}
 MEMORY_LIMIT=${BENCH_MEMORY:-1g}
 MIN_FREE_BYTES=${BENCH_MIN_FREE_BYTES:-1073741824}
 BACKEND_PORT=${BACKEND_PORT:-18700}
@@ -44,6 +45,11 @@ case "${PROFILE}" in
     exit 2
     ;;
 esac
+
+if [[ ! "${WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "BENCH_WORKERS must be a positive integer" >&2
+  exit 2
+fi
 
 cleanup() {
   if [[ -n "${PROXY_NAME}" ]]; then
@@ -105,6 +111,7 @@ pingora_image=${PINGORA_IMAGE}
 nginx_image=${NGINX_IMAGE}
 cpu_limit=${CPU_LIMIT}
 cpu_nano=${CPU_NANO}
+workers=${WORKERS}
 memory_limit=${MEMORY_LIMIT}
 memory_bytes=${MEMORY_BYTES}
 minimum_free_bytes=${MIN_FREE_BYTES}
@@ -140,7 +147,7 @@ server:
   certificate: /work/cert.pem
   private_key: /work/key.pem
   health_socket: /tmp/pingora/health.sock
-  threads: 1
+  threads: ${WORKERS}
   upstream_keepalive_pool_size: 128
   downstream_keepalive_requests: 1000000
   max_retries: 0
@@ -170,7 +177,7 @@ EOF
 
 cat >"${OUTPUT}/nginx.conf" <<EOF
 user nginx;
-worker_processes 1;
+worker_processes ${WORKERS};
 error_log /dev/stderr warn;
 pid /tmp/nginx.pid;
 events { worker_connections 8192; }
