@@ -5,6 +5,13 @@ concurrency:
   cancel-in-progress: true
 
 on:
+  workflow_dispatch:
+    inputs:
+      publish_images:
+        description: Publish GHCR images from Actions (normally disabled; final native image is built on the benchmark host)
+        required: false
+        default: false
+        type: boolean
   push:
     branches:
       - main
@@ -142,7 +149,7 @@ jobs:
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.lto"]')" = "fat"
 
   image:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_images
     needs: image-test
     runs-on: ubuntu-24.04
     permissions:
@@ -213,7 +220,7 @@ jobs:
         run: tests/docker_runtime.sh
 
   image-znver1:
-    if: github.event_name == 'push'
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_images
     needs: image-test
     runs-on: ubuntu-24.04
     permissions:
