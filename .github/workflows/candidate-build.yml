@@ -1,0 +1,50 @@
+name: Candidate proxy builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - bench/candidates/build.sh
+      - .github/workflows/candidate-build.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.candidate }} znver1 fat-LTO
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        candidate: [pingap, aralez, river]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential clang cmake libssl-dev lld ninja-build \
+            perl pkg-config time
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Cache Cargo downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: candidate-${{ matrix.candidate }}-${{ runner.os }}-${{ hashFiles('bench/candidates/build.sh') }}
+      - name: Build pinned candidate
+        run: bash bench/candidates/build.sh "${{ matrix.candidate }}" "$RUNNER_TEMP/artifact"
+      - name: Upload candidate binary and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-${{ matrix.candidate }}-znver1-fat
+          path: ${{ runner.temp }}/artifact/
+          if-no-files-found: error
+          retention-days: 14
