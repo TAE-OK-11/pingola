@@ -76,3 +76,25 @@ ALLOCATOR_BENCH_WARMUP=2s \
 ALLOCATOR_BENCH_DURATION=10s \
 bench/allocator_images.sh
 ```
+
+## 후속 최적화: upstream request case map 제거
+
+2026-07-18 UTC에 bodyless fast path를 baseline으로 두고, HTTP/1 upstream
+request를 만들 때 의미 없는 원본 header-name 대소문자 map을 복제하지 않는
+후속 변경을 같은 조건으로 3회 A/B 측정했다. HTTP 의미와 header value는
+그대로 유지하며 raw request target fallback도 보존한다.
+
+| 항목 | baseline 대비 변화 |
+|---|---:|
+| RPS 기하평균 | +1.71% |
+| p99 중앙값 | -3.54% |
+| RPS/CPU 기하평균 | +2.26% |
+| peak RSS 중앙값 | +4.55% |
+| 실패 row / body mismatch | 0 / 0 |
+
+절대 RSS는 약 25 MiB 범위였고 증가량은 bounded 상태였다. 64 B 및 4096 B,
+concurrency 1/8/32의 총 36개 측정 row가 모두 성공했다. 유효한 percent-encoded
+raw target과 혼합 대소문자 header value가 upstream에 그대로 도달하는 통합
+회귀 검사도 추가했다. raw 결과는
+`bench/results/h1-no-case-ab-0.5cpu-1g-3r/`에 보존된다. 이 수치는 변경 채택용
+개발 A/B이며 최종 NGINX 비교 결론에는 사용하지 않는다.

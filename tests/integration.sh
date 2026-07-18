@@ -106,6 +106,57 @@ jq -e '.headers["x-private"] == null' <<<"${hop_response}" >/dev/null
 jq -e '.headers["proxy-authorization"] == null' <<<"${hop_response}" >/dev/null
 jq -e '.headers.connection == null' <<<"${hop_response}" >/dev/null
 
+# The optimized HTTP/1 upstream request clone intentionally drops only the
+# header-spelling side map. Header values and the raw percent-encoded request
+# target must still reach the upstream byte-for-byte.
+python3 - <<'PY'
+import json
+import socket
+import ssl
+
+raw_target = b"/raw-%FF?x=1"
+context = ssl.create_default_context()
+context.check_hostname = False
+context.verify_mode = ssl.CERT_NONE
+context.set_alpn_protocols(["http/1.1"])
+raw = socket.create_connection(("127.0.0.1", 18443), timeout=5)
+connection = context.wrap_socket(raw, server_hostname="app.test")
+connection.settimeout(5)
+connection.sendall(
+    b"GET "
+    + raw_target
+    + b" HTTP/1.1\r\nhOsT: app.test\r\nX-MiXeD: preserved\r\nConnection: close\r\n\r\n"
+)
+
+buffer = b""
+while b"\r\n\r\n" not in buffer:
+    chunk = connection.recv(65536)
+    if not chunk:
+        raise SystemExit("raw-path response closed before headers")
+    buffer += chunk
+header, body = buffer.split(b"\r\n\r\n", 1)
+lines = header.split(b"\r\n")
+if b" 200 " not in lines[0]:
+    raise SystemExit(f"raw-path request failed: {lines[0]!r}")
+headers = {}
+for line in lines[1:]:
+    name, value = line.split(b":", 1)
+    headers[name.lower()] = value.strip()
+length = int(headers[b"content-length"])
+while len(body) < length:
+    chunk = connection.recv(65536)
+    if not chunk:
+        raise SystemExit("raw-path response body was truncated")
+    body += chunk
+connection.close()
+
+payload = json.loads(body[:length])
+if payload["path"].encode("latin-1") != raw_target:
+    raise SystemExit(f"raw path changed in proxy: {payload['path']!r}")
+if payload["headers"].get("x-mixed") != "preserved":
+    raise SystemExit("mixed-case request header value was not preserved")
+PY
+
 # The configured request keepalive limit must count down across reused HTTP/1.1
 # sessions. Resetting it in request_filter makes the connection effectively
 # unlimited and retains per-connection allocations indefinitely.

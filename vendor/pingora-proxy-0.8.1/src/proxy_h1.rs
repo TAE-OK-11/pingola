@@ -41,7 +41,18 @@ where
 
         // phase 2 send to upstream
 
-        let mut req = session.req_header().clone();
+        // Header field names are case-insensitive and upstreams do not need
+        // the downstream spelling map. Clone only the semantic request parts
+        // so every subsequent header mutation updates one map instead of two.
+        // Keep the raw non-UTF-8 request target when it differs from the URI's
+        // lossy representation.
+        let downstream_raw_path = session.req_header().raw_path();
+        let mut req = RequestHeader::from(session.req_header().as_owned_parts());
+        if req.raw_path() != downstream_raw_path {
+            if let Err(error) = req.set_raw_path(downstream_raw_path) {
+                return (false, true, Some(error));
+            }
+        }
 
         // Convert HTTP2 headers to H1
         if req.version == Version::HTTP_2 {
