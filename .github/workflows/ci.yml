@@ -102,9 +102,13 @@ jobs:
         include:
           - target_cpu: x86-64-v2
             lto: fat
+            pgo_mode: off
+            pgo_train_target_cpu: x86-64-v2
             runtime: true
           - target_cpu: znver1
             lto: fat
+            pgo_mode: train
+            pgo_train_target_cpu: x86-64-v2
             runtime: false
     steps:
       - uses: actions/checkout@v7
@@ -114,11 +118,13 @@ jobs:
         with:
           context: .
           load: true
-          tags: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}
+          tags: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}-${{ matrix.pgo_mode }}
           pull: true
           build-args: |
             ALLOCATOR=tcmalloc
             TLS_PROVIDER=aws-lc
+            PGO_MODE=${{ matrix.pgo_mode }}
+            PGO_TRAIN_TARGET_CPU=${{ matrix.pgo_train_target_cpu }}
             RUST_TARGET_CPU=${{ matrix.target_cpu }}
             RUST_LTO=${{ matrix.lto }}
             BUILD_VERSION=ci
@@ -128,7 +134,7 @@ jobs:
       - name: Non-root and read-only runtime checks
         if: matrix.runtime
         env:
-          PINGORA_TEST_IMAGE: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}
+          PINGORA_TEST_IMAGE: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}-${{ matrix.pgo_mode }}
           PINGORA_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
           PINGORA_EXPECTED_LTO: ${{ matrix.lto }}
           PINGORA_EXPECTED_TLS_PROVIDER: aws-lc
@@ -136,7 +142,7 @@ jobs:
       - name: Specialized image metadata check
         if: ${{ !matrix.runtime }}
         env:
-          IMAGE: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}
+          IMAGE: pingora:ci-${{ matrix.target_cpu }}-${{ matrix.lto }}-${{ matrix.pgo_mode }}
         run: |
           # GitHub-hosted runner CPU models are not stable. Running the full
           # znver1 listener on an incompatible host can correctly SIGILL even
@@ -147,6 +153,7 @@ jobs:
           test "${target_cpu}" = "znver1"
           test "${allocator}" = "tcmalloc"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.lto"]')" = "fat"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo"]')" = "${{ matrix.pgo_mode }}"
 
   image:
     if: github.event_name == 'workflow_dispatch' && inputs.publish_images
