@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_images:
-        description: Publish GHCR images from Actions (normally disabled; final native image is built on the benchmark host)
+        description: Publish the generic x86-64-v2 GHCR image from this manual run
         required: false
         default: false
         type: boolean
@@ -156,7 +156,10 @@ jobs:
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo"]')" = "${{ matrix.pgo_mode }}"
 
   image:
-    if: github.event_name == 'workflow_dispatch' && inputs.publish_images
+    # Generic images are reproducibly built on GitHub-hosted runners. The
+    # Oracle/znver1 image is deliberately excluded: it is trained and built on
+    # the matching benchmark host, then pushed by the release script.
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_images)
     needs: image-test
     runs-on: ubuntu-24.04
     permissions:
@@ -225,63 +228,3 @@ jobs:
           PINGORA_EXPECTED_LTO: fat
           PINGORA_EXPECTED_TLS_PROVIDER: aws-lc
         run: tests/docker_runtime.sh
-
-  image-znver1:
-    if: github.event_name == 'workflow_dispatch' && inputs.publish_images
-    needs: image-test
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-      attestations: write
-      id-token: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - name: Sign in to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Oracle image metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/tae-ok-11/pingora
-          tags: |
-            type=raw,value=oracle-znver1
-            type=raw,value=pgo-znver1
-            type=sha,prefix=sha-,suffix=-znver1
-          labels: |
-            org.opencontainers.image.title=Pingora
-            org.opencontainers.image.description=Trained PGO AWS-LC JBS Pingora reverse proxy for AMD Zen 1 or newer
-            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
-            org.opencontainers.image.url=https://github.com/TAE-OK-11/pingola
-            org.opencontainers.image.allocator=tcmalloc
-            org.opencontainers.image.tls.provider=aws-lc
-            org.opencontainers.image.rust.target-cpu=znver1
-            org.opencontainers.image.rust.pgo=train
-            org.opencontainers.image.rust.pgo-train-target-cpu=x86-64-v2
-      - name: Build and publish trained PGO Oracle image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          pull: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            ALLOCATOR=tcmalloc
-            TLS_PROVIDER=aws-lc
-            PGO_MODE=train
-            PGO_TRAIN_TARGET_CPU=x86-64-v2
-            RUST_TARGET_CPU=znver1
-            RUST_LTO=fat
-            BUILD_VERSION=${{ steps.meta.outputs.version }}
-            BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: mode=max
-          sbom: true

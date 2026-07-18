@@ -9,6 +9,8 @@ ARG RUST_CODEGEN_UNITS=1
 ARG TLS_PROVIDER=aws-lc
 ARG PGO_MODE=off
 ARG PGO_TRAIN_TARGET_CPU=x86-64-v2
+ARG BOLT_MODE=off
+ARG BOLT_TRAIN_ROUNDS=1
 # Rebalanced from low-noise Oracle A/B results: favor steady-state H2,
 # keep enough H1 coverage, reduce duplicated standalone TLS influence,
 # and retain explicit tail-path training.
@@ -21,6 +23,8 @@ ARG PGO_ECDSA_CURVE=prime256v1
 ARG DEBIAN_SUITE=trixie
 
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS builder
+
+ARG BOLT_MODE
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -35,6 +39,9 @@ RUN apt-get update \
         openssl \
         perl \
         pkg-config \
+    && if [ "${BOLT_MODE}" = train ]; then \
+         apt-get install --yes --no-install-recommends bolt-19; \
+       fi \
     && rm -rf /var/lib/apt/lists/* \
     && rustc --version \
     && cargo --version
@@ -54,6 +61,8 @@ ARG ALLOCATOR=tcmalloc
 ARG TLS_PROVIDER
 ARG PGO_MODE
 ARG PGO_TRAIN_TARGET_CPU
+ARG BOLT_MODE
+ARG BOLT_TRAIN_ROUNDS
 ARG PGO_WEIGHT_H1
 ARG PGO_WEIGHT_H2
 ARG PGO_WEIGHT_TLS
@@ -84,20 +93,30 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       off|train) ;; \
       *) echo "unsupported PGO mode: ${PGO_MODE}" >&2; exit 2 ;; \
     esac; \
+    case "${BOLT_MODE}" in \
+      off|train) ;; \
+      *) echo "unsupported BOLT mode: ${BOLT_MODE}" >&2; exit 2 ;; \
+    esac; \
+    if [ "${BOLT_MODE}" = train ] && [ "${PGO_MODE}" != train ]; then \
+      echo 'BOLT training requires PGO_MODE=train' >&2; \
+      exit 2; \
+    fi; \
     case "${PGO_TRAIN_TARGET_CPU}" in \
-      x86-64-v2|znver1|znver2|znver3|znver4) ;; \
+      native|x86-64-v2|znver1|znver2|znver3|znver4) ;; \
       *) echo "unsupported PGO training target: ${PGO_TRAIN_TARGET_CPU}" >&2; exit 2 ;; \
     esac; \
     case "${RUST_TARGET_CPU}" in \
-      x86-64-v2|znver1|znver2|znver3|znver4) ;; \
+      native|x86-64-v2|znver1|znver2|znver3|znver4) ;; \
       *) echo "unsupported Rust target CPU: ${RUST_TARGET_CPU}" >&2; exit 2 ;; \
     esac; \
     case "${RUST_TARGET_CPU}" in \
       x86-64-v2) TARGET_NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic' ;; \
+      native) TARGET_NATIVE_FLAGS='-O3 -march=native -mtune=native' ;; \
       *) TARGET_NATIVE_FLAGS="-O3 -march=${RUST_TARGET_CPU} -mtune=${RUST_TARGET_CPU}" ;; \
     esac; \
     case "${PGO_TRAIN_TARGET_CPU}" in \
       x86-64-v2) TRAIN_NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic' ;; \
+      native) TRAIN_NATIVE_FLAGS='-O3 -march=native -mtune=native' ;; \
       *) TRAIN_NATIVE_FLAGS="-O3 -march=${PGO_TRAIN_TARGET_CPU} -mtune=${PGO_TRAIN_TARGET_CPU}" ;; \
     esac; \
     case "${RUST_LTO}" in \
@@ -112,7 +131,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       prime256v1|secp384r1) ;; \
       *) echo "unsupported ECDSA curve: ${PGO_ECDSA_CURVE}" >&2; exit 2 ;; \
     esac; \
-    for value in "${PGO_WEIGHT_H1}" "${PGO_WEIGHT_H2}" "${PGO_WEIGHT_TLS}" "${PGO_WEIGHT_TAIL}" "${PGO_TRAIN_ROUNDS}"; do \
+    for value in "${PGO_WEIGHT_H1}" "${PGO_WEIGHT_H2}" "${PGO_WEIGHT_TLS}" "${PGO_WEIGHT_TAIL}" "${PGO_TRAIN_ROUNDS}" "${BOLT_TRAIN_ROUNDS}"; do \
       case "${value}" in ''|*[!0-9]*) echo "PGO weights/rounds must be positive integers" >&2; exit 2 ;; esac; \
       test "${value}" -gt 0; \
     done; \
@@ -177,13 +196,60 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       PROFILE_SHA="$(sha256sum /src/pgo-data/merged.profdata | cut -d ' ' -f 1)"; \
       PROFILE_PATH="/src/pgo-data/merged-${PROFILE_SHA}.profdata"; \
       cp /src/pgo-data/merged.profdata "${PROFILE_PATH}"; \
+      FINAL_RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU} -C profile-use=${PROFILE_PATH} -C llvm-args=-pgo-warn-missing-function"; \
+      if [ "${BOLT_MODE}" = train ]; then \
+        FINAL_RUSTFLAGS="${FINAL_RUSTFLAGS} -C link-arg=-Wl,--emit-relocs"; \
+      fi; \
       CARGO_TARGET_DIR=/src/target/pgo-use \
+      CARGO_PROFILE_RELEASE_STRIP="$([ "${BOLT_MODE}" = train ] && echo none || echo symbols)" \
       CFLAGS="${TARGET_NATIVE_FLAGS}" \
       CXXFLAGS="${TARGET_NATIVE_FLAGS}" \
-      RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU} -C profile-use=${PROFILE_PATH} -C llvm-args=-pgo-warn-missing-function" \
+      RUSTFLAGS="${FINAL_RUSTFLAGS}" \
         cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
           --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
-      install -Dm755 "/src/target/pgo-use/${RUST_TARGET_TRIPLE}/release/pingora" /out/pingora; \
+      FINAL_BIN="/src/target/pgo-use/${RUST_TARGET_TRIPLE}/release/pingora"; \
+      if [ "${BOLT_MODE}" = train ]; then \
+        test -x /usr/bin/llvm-bolt-19; \
+        test -x /usr/bin/merge-fdata-19; \
+        rm -rf /src/bolt-data; \
+        install -d /src/bolt-data/profile; \
+        llvm-bolt-19 "${FINAL_BIN}" \
+          --instrument \
+          --instrumentation-file=/src/bolt-data/profile/pingora.fdata \
+          --instrumentation-file-append-pid \
+          -o /src/bolt-data/pingora.instrumented; \
+        chmod 755 /src/bolt-data/pingora.instrumented; \
+        for round in $(seq 1 "${BOLT_TRAIN_ROUNDS}"); do \
+          for scenario in h1 h2 tls tail; do \
+            echo "BOLT training scenario=${scenario} round=${round}/${BOLT_TRAIN_ROUNDS}"; \
+            PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" PGO_TRAIN_ROUND="${round}" \
+              PGO_REQUIRE_PROFILE=false \
+              bench/pgo_train.sh /src/bolt-data/pingora.instrumented \
+                /tmp/pgo-backend /tmp/pgo-client \
+                "/src/bolt-data/${scenario}-${round}" "${scenario}"; \
+          done; \
+        done; \
+        test -n "$(find /src/bolt-data/profile -maxdepth 1 -type f -name 'pingora.fdata.*' -print -quit)"; \
+        merge-fdata-19 /src/bolt-data/profile/pingora.fdata.* \
+          > /src/bolt-data/merged.fdata; \
+        test -s /src/bolt-data/merged.fdata; \
+        llvm-bolt-19 "${FINAL_BIN}" \
+          --data=/src/bolt-data/merged.fdata \
+          --reorder-blocks=ext-tsp \
+          --reorder-functions=hfsort+ \
+          --split-functions \
+          --split-all-cold \
+          --dyno-stats \
+          -o /out/pingora; \
+        strip --strip-all /out/pingora; \
+        { \
+          echo "tool=$(llvm-bolt-19 --version | head -n 1)"; \
+          echo "training_rounds=${BOLT_TRAIN_ROUNDS}"; \
+          sha256sum /src/bolt-data/merged.fdata; \
+        } > /out/bolt-profile-summary.txt; \
+      else \
+        install -Dm755 "${FINAL_BIN}" /out/pingora; \
+      fi; \
       install -Dm644 /src/pgo-data/profile-summary.txt /out/pgo-profile-summary.txt; \
     fi
 
@@ -195,6 +261,8 @@ ARG ALLOCATOR=tcmalloc
 ARG TLS_PROVIDER
 ARG PGO_MODE
 ARG PGO_TRAIN_TARGET_CPU
+ARG BOLT_MODE
+ARG BOLT_TRAIN_ROUNDS
 ARG PGO_WEIGHT_H1
 ARG PGO_WEIGHT_H2
 ARG PGO_WEIGHT_TLS
@@ -216,6 +284,8 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.allocator="${ALLOCATOR}" \
       org.opencontainers.image.tls.provider="${TLS_PROVIDER}" \
       org.opencontainers.image.rust.pgo="${PGO_MODE}" \
+      org.opencontainers.image.llvm.bolt="${BOLT_MODE}" \
+      org.opencontainers.image.llvm.bolt-train-rounds="${BOLT_TRAIN_ROUNDS}" \
       org.opencontainers.image.rust.pgo-train-target-cpu="${PGO_TRAIN_TARGET_CPU}" \
       org.opencontainers.image.rust.pgo-weight-h1="${PGO_WEIGHT_H1}" \
       org.opencontainers.image.rust.pgo-weight-h2="${PGO_WEIGHT_H2}" \
@@ -241,6 +311,9 @@ RUN --mount=from=builder,source=/out,target=/out,ro \
     && install -Dm755 /out/pingora /usr/local/bin/pingora \
     && if [ -f /out/pgo-profile-summary.txt ]; then \
          install -Dm644 /out/pgo-profile-summary.txt /usr/share/doc/pingora/pgo-profile-summary.txt; \
+       fi \
+    && if [ -f /out/bolt-profile-summary.txt ]; then \
+         install -Dm644 /out/bolt-profile-summary.txt /usr/share/doc/pingora/bolt-profile-summary.txt; \
        fi \
     && setcap cap_net_bind_service=+ep /usr/local/bin/pingora \
     && apt-get purge --yes --auto-remove libcap2-bin \
