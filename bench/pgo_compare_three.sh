@@ -16,6 +16,8 @@ PROBE_SECONDS=${PROBE_SECONDS:-12}
 WARMUP_SECONDS=${WARMUP_SECONDS:-4}
 TEST_SECONDS=${TEST_SECONDS:-30}
 LOAD_FACTOR=${LOAD_FACTOR:-0.65}
+COOLDOWN_SECONDS=${COOLDOWN_SECONDS:-1}
+MIN_FREE_BYTES=${MIN_FREE_BYTES:-1073741824}
 SUT_CPU=${SUT_CPU:-0}
 BACKEND_CPU=${BACKEND_CPU:-1}
 CLIENT_CPU=${CLIENT_CPU:-}
@@ -33,6 +35,7 @@ SUMMARY=${OUTPUT}/summary.txt
 BACKEND_BIN=${OUTPUT}/backend-rust
 BACKEND_PID=
 SUT_NAME=
+SUT_SEQUENCE=0
 
 declare -A IMAGES=(
   [baseline]="${BASE_IMAGE}"
@@ -44,11 +47,16 @@ log(){ printf '\n[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
 cleanup_sut(){
+  local stopped=false
   if [[ -n "${SUT_NAME}" ]] && docker inspect "${SUT_NAME}" >/dev/null 2>&1; then
     docker logs "${SUT_NAME}" >"${OUTPUT}/${SUT_NAME}.log" 2>&1 || true
     docker rm -f "${SUT_NAME}" >/dev/null 2>&1 || true
+    stopped=true
   fi
   SUT_NAME=
+  if [[ "${stopped}" == true ]] && [[ "${COOLDOWN_SECONDS}" != 0 ]]; then
+    sleep "${COOLDOWN_SECONDS}"
+  fi
 }
 cleanup(){
   cleanup_sut
@@ -57,9 +65,15 @@ cleanup(){
     wait "${BACKEND_PID}" 2>/dev/null || true
   fi
 }
-trap cleanup EXIT INT TERM
+handle_signal(){
+  trap - EXIT INT TERM
+  cleanup
+  exit 130
+}
+trap cleanup EXIT
+trap handle_signal INT TERM
 
-for c in docker curl jq openssl rustc taskset awk sort lscpu; do
+for c in docker curl jq numfmt openssl rustc sha256sum taskset awk sort lscpu; do
   command -v "$c" >/dev/null || die "missing command: $c"
 done
 docker info >/dev/null 2>&1 || die "Docker unavailable"
@@ -79,6 +93,9 @@ done
 
 mkdir -p "${OUTPUT}" "${RAW}"
 chmod 755 "${OUTPUT}"
+AVAILABLE_BYTES=$(df --output=avail -B1 "${OUTPUT}" | tail -1 | tr -d ' ')
+((AVAILABLE_BYTES >= MIN_FREE_BYTES)) || \
+  die "insufficient disk: available=${AVAILABLE_BYTES} required=${MIN_FREE_BYTES}"
 
 log "3개 이미지 pull"
 docker pull "${BASE_IMAGE}"
@@ -89,6 +106,7 @@ docker pull "${OHA_IMAGE}"
 BASE_ID=$(docker image inspect -f '{{.Id}}' "${BASE_IMAGE}")
 OLD_ID=$(docker image inspect -f '{{.Id}}' "${OLD_PGO_IMAGE}")
 NEW_ID=$(docker image inspect -f '{{.Id}}' "${NEW_PGO_IMAGE}")
+OHA_ID=$(docker image inspect -f '{{.Id}}' "${OHA_IMAGE}")
 [[ "$BASE_ID" != "$OLD_ID" ]] || die "baseline=old-pgo image ID"
 [[ "$BASE_ID" != "$NEW_ID" ]] || die "baseline=new-pgo image ID"
 [[ "$OLD_ID" != "$NEW_ID" ]] || die "pgo-znver1 tag is still the OLD PGO image; wait for Actions and pull again"
@@ -96,11 +114,37 @@ NEW_ID=$(docker image inspect -f '{{.Id}}' "${NEW_PGO_IMAGE}")
 digest(){
   docker image inspect "$1" | jq -r '.[0].RepoDigests[]? | select(startswith("ghcr.io/tae-ok-11/pingora@"))' | head -n1
 }
+image_digest(){
+  docker image inspect "$1" | jq -r '.[0].RepoDigests[0] // empty'
+}
 BASE_DIGEST=$(digest "${BASE_IMAGE}")
 OLD_DIGEST=$(digest "${OLD_PGO_IMAGE}")
 NEW_DIGEST=$(digest "${NEW_PGO_IMAGE}")
+OHA_DIGEST=$(image_digest "${OHA_IMAGE}")
 printf 'baseline=%s\nold-pgo=%s\nnew-pgo=%s\n' \
   "${BASE_DIGEST:-$BASE_ID}" "${OLD_DIGEST:-$OLD_ID}" "${NEW_DIGEST:-$NEW_ID}" >&2
+
+printf 'image\treference\tdigest\trevision\tallocator\ttls_provider\ttarget_cpu\tpgo\n' \
+  >"${OUTPUT}/images.tsv"
+for key in baseline old-pgo new-pgo; do
+  image=${IMAGES[$key]}
+  docker image inspect "${image}" >"${OUTPUT}/${key}-inspect.json"
+  allocator=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.allocator"}}' "${image}")
+  tls=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.tls.provider"}}' "${image}")
+  target_cpu=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.rust.target-cpu"}}' "${image}")
+  pgo=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.rust.pgo"}}' "${image}")
+  revision=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${image}")
+  [[ "${allocator}" == tcmalloc ]] || die "${key} allocator=${allocator}, expected=tcmalloc"
+  [[ "${tls}" == aws-lc ]] || die "${key} TLS provider=${tls}, expected=aws-lc"
+  docker run --rm --entrypoint /usr/local/bin/pingora "${image}" --allocator-info \
+    >"${OUTPUT}/${key}-allocator.txt"
+  grep -q '^allocator=tcmalloc ' "${OUTPUT}/${key}-allocator.txt" || \
+    die "${key} process is not using TCMalloc"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${key}" "${image}" "$(image_digest "${image}")" "${revision}" \
+    "${allocator}" "${tls}" "${target_cpu}" "${pgo}" >>"${OUTPUT}/images.tsv"
+done
+docker image inspect "${OHA_IMAGE}" >"${OUTPUT}/oha-inspect.json"
 
 log "backend 컴파일"
 rustc --edition=2021 -D warnings -C opt-level=3 -C codegen-units=1 \
@@ -160,11 +204,40 @@ for _ in {1..160}; do
 done
 curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}/bytes/64" -o /dev/null || die "backend readiness failed"
 [[ "$(awk '/Cpus_allowed_list/{print $2}' /proc/${BACKEND_PID}/status)" == "${BACKEND_CPU}" ]] || die "backend affinity mismatch"
+BACKEND_SHA_64=$(curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}/bytes/64" | sha256sum | awk '{print $1}')
+BACKEND_SHA_4096=$(curl --noproxy '*' -fsS "http://127.0.0.1:${BACKEND_PORT}/bytes/4096" | sha256sum | awk '{print $1}')
+printf 'sequence\timage\tprotocol\tpayload_bytes\tsha256\tstatus\n' >"${OUTPUT}/body-checks.tsv"
+
+verify_bodies(){
+  local key=$1 protocol size expected output actual
+  for protocol in h1 h2; do
+    for size in 64 4096; do
+      [[ "${size}" == 64 ]] && expected=${BACKEND_SHA_64} || expected=${BACKEND_SHA_4096}
+      output="${RAW}/body-${SUT_SEQUENCE}-${key}-${protocol}-${size}.bin"
+      if [[ "${protocol}" == h1 ]]; then
+        curl --noproxy '*' --http1.1 --insecure --fail --silent --show-error \
+          --resolve "${BENCH_HOST}:${HTTPS_PORT}:127.0.0.1" \
+          "https://${BENCH_HOST}:${HTTPS_PORT}/bytes/${size}" -o "${output}"
+      else
+        curl --noproxy '*' --http2 --insecure --fail --silent --show-error \
+          --resolve "${BENCH_HOST}:${HTTPS_PORT}:127.0.0.1" \
+          "https://${BENCH_HOST}:${HTTPS_PORT}/bytes/${size}" -o "${output}"
+      fi
+      actual=$(sha256sum "${output}" | awk '{print $1}')
+      [[ "${actual}" == "${expected}" ]] || \
+        die "body mismatch: image=${key} protocol=${protocol} bytes=${size} expected=${expected} actual=${actual}"
+      printf '%s\t%s\t%s\t%s\t%s\tPASS\n' \
+        "${SUT_SEQUENCE}" "${key}" "${protocol}" "${size}" "${actual}" \
+        >>"${OUTPUT}/body-checks.tsv"
+    done
+  done
+}
 
 start_sut(){
   local key=$1 image=${IMAGES[$1]} numa=()
   cleanup_sut
-  SUT_NAME="pingora-3way-${key}-$$"
+  SUT_SEQUENCE=$((SUT_SEQUENCE + 1))
+  SUT_NAME="pingora-3way-${SUT_SEQUENCE}-${key}-$$"
   [[ -d /sys/devices/system/node/node${NUMA_NODE} ]] && numa=(--cpuset-mems "${NUMA_NODE}")
   docker run -d --name "${SUT_NAME}" --network host --read-only \
     --cpuset-cpus "${SUT_CPU}" "${numa[@]}" \
@@ -180,17 +253,25 @@ start_sut(){
     sleep .05
   done
   [[ "$ok" == true ]] || die "$key readiness failed"
-  local pid allowed nano cg quota period
+  local pid allowed nano memory memory_swap expected_memory expected_swap cg quota period
   pid=$(docker inspect -f '{{.State.Pid}}' "${SUT_NAME}")
   allowed=$(awk '/Cpus_allowed_list/{print $2}' /proc/${pid}/status)
   nano=$(docker inspect -f '{{.HostConfig.NanoCpus}}' "${SUT_NAME}")
+  memory=$(docker inspect -f '{{.HostConfig.Memory}}' "${SUT_NAME}")
+  memory_swap=$(docker inspect -f '{{.HostConfig.MemorySwap}}' "${SUT_NAME}")
+  expected_memory=$(numfmt --from=iec "${MEMORY^^}")
+  expected_swap=$(numfmt --from=iec "${MEMORY_SWAP^^}")
   [[ "$allowed" == "${SUT_CPU}" ]] || die "$key affinity=$allowed"
   [[ "$nano" -eq 0 ]] || die "$key CFS NanoCpus=$nano"
+  [[ "$memory" -eq "$expected_memory" ]] || die "$key memory=$memory expected=$expected_memory"
+  [[ "$memory_swap" -eq "$expected_swap" ]] || die "$key memory-swap=$memory_swap expected=$expected_swap"
   cg=$(awk -F: '$1=="0"{print $3}' /proc/${pid}/cgroup)
   if [[ -r /sys/fs/cgroup${cg}/cpu.max ]]; then
     read -r quota period </sys/fs/cgroup${cg}/cpu.max
     [[ "$quota" == max ]] || die "$key cpu.max=$quota $period"
   fi
+  docker inspect "${SUT_NAME}" >"${RAW}/sut-${SUT_SEQUENCE}-${key}-inspect.json"
+  verify_bodies "${key}"
   log "$key: CPU ${SUT_CPU} 고정 / CFS quota 없음"
 }
 
@@ -235,6 +316,7 @@ cat >"${OUTPUT}/environment.txt" <<EOF
 baseline=${BASE_DIGEST:-$BASE_ID}
 old_pgo=${OLD_DIGEST:-$OLD_ID}
 new_pgo=${NEW_DIGEST:-$NEW_ID}
+oha=${OHA_DIGEST:-$OHA_ID}
 sut_cpu=${SUT_CPU}
 backend_cpu=${BACKEND_CPU}
 client_cpu=${CLIENT_CPU}
@@ -242,7 +324,11 @@ cfs_quota=disabled
 probe_runs=${PROBE_RUNS}
 latency_runs=${LATENCY_RUNS}
 load_factor=${LOAD_FACTOR}
+cooldown_seconds=${COOLDOWN_SECONDS}
+available_bytes_at_start=${AVAILABLE_BYTES}
 EOF
+lscpu >>"${OUTPUT}/environment.txt"
+docker version >>"${OUTPUT}/environment.txt"
 
 printf 'image\tprotocol\tround\trps\tp50_ms\tp95_ms\tp99_ms\n' >"${PROBES}"
 log "1단계 probe ${PROBE_RUNS}회"

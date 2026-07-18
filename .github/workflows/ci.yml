@@ -41,6 +41,7 @@ jobs:
       - name: PGO trainer preflight
         run: |
           bash -n bench/pgo_train.sh
+          bash -n bench/pgo_compare_three.sh
           rustc --edition=2021 -D warnings bench/backend.rs -o /tmp/pgo-backend
           rustc --edition=2021 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
           /tmp/pgo-client \
@@ -172,14 +173,14 @@ jobs:
             type=sha,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-          # metadata-action derives these from the current repository name by
-          # default. Pin the post-migration identity before the GitHub repo is
-          # renamed so it cannot overwrite the Dockerfile's Pingora labels.
+          # OCI source/url must resolve to the repository that produced the
+          # image. Change both to /pingora atomically when the GitHub repository
+          # itself is renamed; the product and image names are already Pingora.
           labels: |
             org.opencontainers.image.title=Pingora
             org.opencontainers.image.description=High-performance AWS-LC JBS Pingora reverse proxy
-            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingora
-            org.opencontainers.image.url=https://github.com/TAE-OK-11/pingora
+            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
+            org.opencontainers.image.url=https://github.com/TAE-OK-11/pingola
             org.opencontainers.image.allocator=tcmalloc
             org.opencontainers.image.tls.provider=aws-lc
       - name: Build and publish
@@ -241,8 +242,8 @@ jobs:
           labels: |
             org.opencontainers.image.title=Pingora
             org.opencontainers.image.description=Trained PGO AWS-LC JBS Pingora reverse proxy for AMD Zen 1 or newer
-            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingora
-            org.opencontainers.image.url=https://github.com/TAE-OK-11/pingora
+            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
+            org.opencontainers.image.url=https://github.com/TAE-OK-11/pingola
             org.opencontainers.image.allocator=tcmalloc
             org.opencontainers.image.tls.provider=aws-lc
             org.opencontainers.image.rust.target-cpu=znver1

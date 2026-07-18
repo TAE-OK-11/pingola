@@ -20,9 +20,7 @@ ARG PGO_TRAIN_ROUNDS=2
 ARG PGO_ECDSA_CURVE=prime256v1
 ARG DEBIAN_SUITE=trixie
 
-FROM debian:${DEBIAN_SUITE}-slim AS builder
-
-ARG RUST_VERSION
+FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS builder
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -37,13 +35,9 @@ RUN apt-get update \
         openssl \
         perl \
         pkg-config \
-        xz-utils \
     && rm -rf /var/lib/apt/lists/* \
-    && curl --proto '=https' --tlsv1.2 --fail --show-error --silent \
-         https://sh.rustup.rs \
-       | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}" \
-    && /root/.cargo/bin/rustc --version \
-    && /root/.cargo/bin/cargo --version
+    && rustc --version \
+    && cargo --version
 
 WORKDIR /src
 
@@ -67,18 +61,15 @@ ARG PGO_WEIGHT_TAIL
 ARG PGO_ECDSA_CURVE
 ARG PGO_TRAIN_ROUNDS
 
-ENV PATH="/root/.cargo/bin:${PATH}" \
-    RUSTUP_HOME=/root/.rustup \
-    CARGO_HOME=/root/.cargo \
-    CARGO_INCREMENTAL=0 \
+ENV CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${RUST_CODEGEN_UNITS} \
     CARGO_PROFILE_RELEASE_LTO=${RUST_LTO} \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang \
     CMAKE_GENERATOR=Ninja \
     RUSTFLAGS_COMMON="-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections"
 
-RUN --mount=type=cache,id=pingora-cargo-registry,target=/root/.cargo/registry,sharing=locked \
-    --mount=type=cache,id=pingora-cargo-git,target=/root/.cargo/git,sharing=locked \
+RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=pingora-target-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR}-${TLS_PROVIDER}-${PGO_MODE}-${PGO_TRAIN_TARGET_CPU},target=/src/target,sharing=locked \
     set -eux; \
     case "${ALLOCATOR}" in \
