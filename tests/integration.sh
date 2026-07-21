@@ -125,13 +125,18 @@ connection.settimeout(5)
 spill_headers = b"".join(
     f"X-Spill-{index}: value-{index}\r\n".encode() for index in range(20)
 )
-connection.sendall(
+request = (
     b"GET "
     + raw_target
     + b" HTTP/1.1\r\nhOsT: app.test\r\nX-MiXeD: preserved\r\n"
     + spill_headers
     + b"Connection: close\r\n\r\n"
 )
+# Exercise the H1 partial-parse path as well as the inline-to-heap header
+# offset spill. The first write deliberately ends in the middle of a field.
+split = request.index(b"X-Spill-10") + len(b"X-Spi")
+connection.sendall(request[:split])
+connection.sendall(request[split:])
 
 buffer = b""
 while b"\r\n\r\n" not in buffer:

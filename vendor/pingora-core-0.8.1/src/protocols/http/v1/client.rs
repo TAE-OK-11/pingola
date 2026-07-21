@@ -21,6 +21,7 @@ use pingora_error::{Error, ErrorType::*, OrErr, Result, RetryType};
 use pingora_http::{HMap, RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use std::io::ErrorKind;
+use std::mem::MaybeUninit;
 use std::str;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -292,9 +293,9 @@ impl HttpSession {
                 }
             };
             already_read += n;
-            let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-            let mut resp = httparse::Response::new(&mut headers);
-            let parsed = parse_resp_buffer(&mut resp, &buf);
+            let mut headers = [MaybeUninit::uninit(); MAX_HEADERS];
+            let mut resp = httparse::Response::new(&mut []);
+            let parsed = parse_resp_buffer(&mut resp, &buf, &mut headers);
             match parsed {
                 HeaderParseState::Complete(s) => {
                     self.raw_header = Some(BufRef(0, s));
@@ -844,14 +845,15 @@ impl HttpSession {
 }
 
 #[inline]
-fn parse_resp_buffer<'buf>(
-    resp: &mut httparse::Response<'_, 'buf>,
+fn parse_resp_buffer<'headers, 'buf>(
+    resp: &mut httparse::Response<'headers, 'buf>,
     buf: &'buf [u8],
+    headers: &'headers mut [MaybeUninit<httparse::Header<'buf>>],
 ) -> HeaderParseState {
     let mut parser = httparse::ParserConfig::default();
     parser.allow_spaces_after_header_name_in_responses(true);
     parser.allow_obsolete_multiline_headers_in_responses(true);
-    let res = match parser.parse_response(resp, buf) {
+    let res = match parser.parse_response_with_uninit_headers(resp, buf, headers) {
         Ok(s) => s,
         Err(e) => {
             return HeaderParseState::Invalid(e);

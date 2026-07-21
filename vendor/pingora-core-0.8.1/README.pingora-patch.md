@@ -39,6 +39,12 @@ small set of documented local changes.
 - Reason: typical proxy traffic no longer performs a separate allocation just
   to transfer zero-copy header offsets. Large requests retain the same
   `MAX_HEADERS = 256` behavior and are covered by a spill-path regression test.
+- Local change: parse ordinary downstream requests and upstream responses into
+  `MaybeUninit` header arrays through httparse's safe public APIs.
+- Reason: the previous hot path initialized all 256 header slots (about 8 KiB)
+  for every request and response even though most traffic uses only a handful.
+  The upstream `patched_http1` feature retains its initialized buffer because
+  its separate unchecked parser does not expose the uninitialized-header API.
 
 Remove dependency patches after a released Pingora version adopts equivalent
 versions. Re-evaluate the reuse-hash cache whenever `HttpPeer` changes.

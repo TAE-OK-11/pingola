@@ -27,6 +27,8 @@ use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use regex::bytes::Regex;
+#[cfg(not(feature = "patched_http1"))]
+use std::mem::MaybeUninit;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -207,9 +209,18 @@ impl HttpSession {
 
             // Use loop as GOTO to retry escaped request buffer, not a real loop
             loop {
+                #[cfg(feature = "patched_http1")]
                 let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+                #[cfg(not(feature = "patched_http1"))]
+                let mut headers = [MaybeUninit::uninit(); MAX_HEADERS];
+                #[cfg(feature = "patched_http1")]
                 let mut req = httparse::Request::new(&mut headers);
+                #[cfg(not(feature = "patched_http1"))]
+                let mut req = httparse::Request::new(&mut []);
+                #[cfg(feature = "patched_http1")]
                 let parsed = parse_req_buffer(&mut req, &buf);
+                #[cfg(not(feature = "patched_http1"))]
+                let parsed = parse_req_buffer(&mut req, &buf, &mut headers);
                 match parsed {
                     HeaderParseState::Complete(s) => {
                         self.raw_header = Some(BufRef(0, s));
@@ -1291,6 +1302,7 @@ fn escape_illegal_request_line(buf: &BytesMut) -> Option<BytesMut> {
     }
 }
 
+#[cfg(feature = "patched_http1")]
 #[inline]
 fn parse_req_buffer<'buf>(
     req: &mut httparse::Request<'_, 'buf>,
@@ -1298,17 +1310,26 @@ fn parse_req_buffer<'buf>(
 ) -> HeaderParseState {
     use httparse::Result;
 
-    #[cfg(feature = "patched_http1")]
-    fn parse<'buf>(req: &mut httparse::Request<'_, 'buf>, buf: &'buf [u8]) -> Result<usize> {
-        req.parse_unchecked(buf)
+    let res = match req.parse_unchecked(buf) {
+        Ok(s) => s,
+        Err(e) => {
+            return HeaderParseState::Invalid(e);
+        }
+    };
+    match res {
+        httparse::Status::Complete(s) => HeaderParseState::Complete(s),
+        _ => HeaderParseState::Partial,
     }
+}
 
-    #[cfg(not(feature = "patched_http1"))]
-    fn parse<'buf>(req: &mut httparse::Request<'_, 'buf>, buf: &'buf [u8]) -> Result<usize> {
-        req.parse(buf)
-    }
-
-    let res = match parse(req, buf) {
+#[cfg(not(feature = "patched_http1"))]
+#[inline]
+fn parse_req_buffer<'headers, 'buf>(
+    req: &mut httparse::Request<'headers, 'buf>,
+    buf: &'buf [u8],
+    headers: &'headers mut [MaybeUninit<httparse::Header<'buf>>],
+) -> HeaderParseState {
+    let res = match req.parse_with_uninit_headers(buf, headers) {
         Ok(s) => s,
         Err(e) => {
             return HeaderParseState::Invalid(e);
