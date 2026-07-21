@@ -308,7 +308,11 @@ run_case() {
     -w '%{http_code} %{http_version}' "http://127.0.0.1:${BACKEND_PORT}${path}")
   expected_rc=$?
   if [[ "${protocol}" == h2-* ]]; then
-    url="https://127.0.0.1:${HTTPS_PORT}${path}"
+    # Keep the URL host as the TLS SNI and route h2load to localhost with its
+    # long-supported --connect-to option. The separate --sni option was only
+    # added in newer nghttp2 releases and made otherwise valid benchmarks fail
+    # on stable distributions such as Ubuntu's nghttp2 1.59.
+    url="https://bench.test:${HTTPS_PORT}${path}"
     actual_meta=$(curl --noproxy '*' -ksS --http2 \
       --resolve "bench.test:${HTTPS_PORT}:127.0.0.1" \
       -H 'accept-encoding: identity' -D "${actual_prefix}.headers" \
@@ -375,7 +379,8 @@ run_case() {
       ;;
     h2-single)
       h2load -D "${DURATION}" --warm-up-time="${WARMUP}" -c 1 -m "${concurrency}" \
-        --sni bench.test -H 'host: bench.test' -H 'accept-encoding: identity' \
+        --connect-to="127.0.0.1:${HTTPS_PORT}" \
+        -H 'host: bench.test' -H 'accept-encoding: identity' \
         --log-file "${request_log}" "${url}" >"${raw}" 2>&1
       rc=$?
       ;;
@@ -383,7 +388,8 @@ run_case() {
       clients=$((concurrency < 4 ? concurrency : 4))
       streams=$(((concurrency + clients - 1) / clients))
       h2load -D "${DURATION}" --warm-up-time="${WARMUP}" -c "${clients}" -m "${streams}" \
-        --sni bench.test -H 'host: bench.test' -H 'accept-encoding: identity' \
+        --connect-to="127.0.0.1:${HTTPS_PORT}" \
+        -H 'host: bench.test' -H 'accept-encoding: identity' \
         --log-file "${request_log}" "${url}" >"${raw}" 2>&1
       rc=$?
       ;;
