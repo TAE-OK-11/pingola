@@ -27,6 +27,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
+
+// Most API responses and their headers fit in 8 KiB. Keeping the upstream
+// response read buffer slightly larger than the generic 4-KiB header buffer
+// prevents a 4-KiB body from being split at `capacity - header_len`.
+const INIT_UPSTREAM_RESPONSE_BUF_SIZE: usize = 8 * 1024;
 use crate::protocols::http::HttpTask;
 use crate::protocols::{Digest, SocketAddr, Stream, UniqueID, UniqueIDType};
 use crate::utils::{BufRef, KVRef};
@@ -228,7 +233,7 @@ impl HttpSession {
             // self.buf will be reset to the last response + any body.
             self.buf.clear();
         }
-        let mut buf = BytesMut::with_capacity(INIT_HEADER_BUF_SIZE);
+        let mut buf = BytesMut::with_capacity(INIT_UPSTREAM_RESPONSE_BUF_SIZE);
         let mut already_read: usize = 0;
         loop {
             if already_read > MAX_HEADER_SIZE {
@@ -434,16 +439,18 @@ impl HttpSession {
     /// Read the response body into the internal buffer.
     /// Return `Ok(Some(ref)) after a successful read.
     /// Return `Ok(None)` if there is no more body to read.
-    pub async fn read_body_ref(&mut self) -> Result<Option<&[u8]>> {
-        let result = match self.read_timeout {
+    async fn read_body_buf_ref(&mut self) -> Result<Option<BufRef>> {
+        match self.read_timeout {
             Some(t) => match timeout(t, self.do_read_body()).await {
                 Ok(res) => res,
                 Err(_) => Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}")),
             },
             None => self.do_read_body().await,
-        };
+        }
+    }
 
-        result.map(|maybe_body| {
+    pub async fn read_body_ref(&mut self) -> Result<Option<&[u8]>> {
+        self.read_body_buf_ref().await.map(|maybe_body| {
             maybe_body.map(|body_ref| {
                 let slice = self.body_reader.get_body(&body_ref);
                 self.body_recv = self.body_recv.saturating_add(slice.len());
@@ -454,8 +461,17 @@ impl HttpSession {
 
     /// Similar to [`Self::read_body_ref`] but return `Bytes` instead of a slice reference.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        let read = self.read_body_ref().await?;
-        Ok(read.map(Bytes::copy_from_slice))
+        let Some(body_ref) = self.read_body_buf_ref().await? else {
+            return Ok(None);
+        };
+        let length = self.body_reader.get_body(&body_ref).len();
+        self.body_recv = self.body_recv.saturating_add(length);
+        if let Some(body) = self.body_reader.take_completed_body(&body_ref) {
+            return Ok(Some(body));
+        }
+        Ok(Some(Bytes::copy_from_slice(
+            self.body_reader.get_body(&body_ref),
+        )))
     }
 
     /// Upstream response body bytes received (payload only; excludes headers/framing).

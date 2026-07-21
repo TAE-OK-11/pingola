@@ -252,6 +252,27 @@ impl BodyReader {
         buf_ref.get(self.body_buf.as_ref().unwrap())
     }
 
+    /// Move a complete upstream body chunk out without copying it.
+    ///
+    /// This is intentionally limited to an exact, final chunk. Partial,
+    /// chunk-framed, downstream and overread ranges keep the established copy
+    /// path so their parsing and connection-reuse semantics do not change.
+    pub fn take_completed_body(&mut self, buf_ref: &BufRef) -> Option<Bytes> {
+        if !self.upstream
+            || !self.body_done()
+            || self.has_bytes_overread()
+            || buf_ref.0 != 0
+        {
+            return None;
+        }
+        let body_buf = self.body_buf.take()?;
+        if buf_ref.1 != body_buf.len() {
+            self.body_buf = Some(body_buf);
+            return None;
+        }
+        Some(body_buf.freeze())
+    }
+
     #[allow(dead_code)]
     pub fn get_body_overread(&self) -> Option<&[u8]> {
         self.body_buf_overread.as_deref()
@@ -1164,6 +1185,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_upstream_body_moves_into_bytes_without_copying() {
+        let preread = b"complete-body";
+        let mut mock_io = Builder::new().build();
+        let mut body_reader = BodyReader::new(true);
+        body_reader.init_content_length(preread.len(), preread);
+
+        let body_ref = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        let original_ptr = body_reader.get_body(&body_ref).as_ptr();
+        let body = body_reader.take_completed_body(&body_ref).unwrap();
+
+        assert_eq!(body, &preread[..]);
+        assert_eq!(body.as_ptr(), original_ptr);
+        assert!(body_reader.body_buf.is_none());
+    }
+
+    #[tokio::test]
     async fn upstream_content_length_fully_preread_preserves_overread() {
         init_log();
         let preread = b"abcd";
@@ -1179,6 +1216,7 @@ mod tests {
         assert_eq!(body_reader.get_body(&res), b"abc");
         assert_eq!(body_reader.get_body_overread(), Some(&b"d"[..]));
         assert!(body_reader.has_bytes_overread());
+        assert!(body_reader.take_completed_body(&res).is_none());
     }
 
     #[tokio::test]
