@@ -34,7 +34,7 @@ use super::body::{BodyReader, BodyWriter};
 use super::common::*;
 use crate::protocols::http::{body_buffer::FixedBuffer, date, HttpTask};
 use crate::protocols::{Digest, SocketAddr, Stream};
-use crate::utils::{BufRef, KVRef};
+use crate::utils::BufRef;
 
 /// The HTTP 1.x server session
 pub struct HttpSession {
@@ -221,7 +221,7 @@ impl HttpSession {
                         // `KVRef`s to record the offset of each piece of data, drop `req`, convert
                         // buf, the do the 0 copy update
                         let base = buf.as_ptr() as usize;
-                        let mut header_refs = Vec::<KVRef>::with_capacity(req.headers.len());
+                        let mut header_refs = HeaderRefs::with_capacity(req.headers.len());
                         // Note: req.headers has the correct number of headers
                         // while header_refs doesn't as it is still empty
                         let _num_headers = populate_headers(base, &mut header_refs, req.headers);

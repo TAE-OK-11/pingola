@@ -23,6 +23,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(payload)))
+        for index in range(20):
+            self.send_header(f"x-spill-response-{index}", f"value-{index}")
         self.end_headers()
         if include_body:
             self.wfile.write(payload)
@@ -42,4 +44,3 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     ThreadingHTTPServer(("127.0.0.1", 19090), Handler).serve_forever()
-

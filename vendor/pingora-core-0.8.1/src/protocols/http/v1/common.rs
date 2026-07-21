@@ -18,6 +18,7 @@ use http::{header, HeaderValue};
 use log::warn;
 use pingora_error::{Error, ErrorType::*, Result};
 use pingora_http::{HMap, RequestHeader, ResponseHeader};
+use smallvec::SmallVec;
 use std::str;
 use std::time::Duration;
 
@@ -25,6 +26,10 @@ use super::body::BodyWriter;
 use crate::utils::KVRef;
 
 pub(super) const MAX_HEADERS: usize = 256;
+
+/// Header offsets fit on the stack for ordinary proxy traffic while retaining
+/// the existing 256-header limit through SmallVec's automatic heap spill.
+pub(super) type HeaderRefs = SmallVec<[KVRef; 16]>;
 
 pub(super) const INIT_HEADER_BUF_SIZE: usize = 4096;
 pub(super) const MAX_HEADER_SIZE: usize = 1048575;
@@ -258,7 +263,7 @@ pub(super) fn is_buf_keepalive(header_value: Option<&HeaderValue>) -> Option<boo
 #[inline]
 pub(super) fn populate_headers(
     base: usize,
-    header_ref: &mut Vec<KVRef>,
+    header_ref: &mut HeaderRefs,
     headers: &[httparse::Header],
 ) -> usize {
     let mut used_header_index = 0;
@@ -325,6 +330,29 @@ mod test {
 
         headers.append(TRANSFER_ENCODING, "chunkeds".try_into().unwrap());
         assert!(check_dup_content_length(&headers).is_ok());
+    }
+
+    #[test]
+    fn test_header_refs_spill_without_losing_headers() {
+        let mut wire = String::from("GET / HTTP/1.1\r\n");
+        for index in 0..20 {
+            wire.push_str(&format!("X-Test-{index}: value-{index}\r\n"));
+        }
+        wire.push_str("\r\n");
+
+        let bytes = wire.as_bytes();
+        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        let mut request = httparse::Request::new(&mut headers);
+        assert!(request.parse(bytes).unwrap().is_complete());
+
+        let mut refs = HeaderRefs::new();
+        assert_eq!(populate_headers(bytes.as_ptr() as usize, &mut refs, request.headers), 20);
+        assert!(refs.spilled());
+        assert_eq!(refs.len(), 20);
+        assert_eq!(refs[0].get_name(bytes), b"X-Test-0");
+        assert_eq!(refs[0].get_value(bytes), b"value-0");
+        assert_eq!(refs[19].get_name(bytes), b"X-Test-19");
+        assert_eq!(refs[19].get_value(bytes), b"value-19");
     }
 
     #[test]

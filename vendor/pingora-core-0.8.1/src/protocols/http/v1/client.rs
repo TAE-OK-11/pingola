@@ -34,7 +34,7 @@ use super::common::*;
 const INIT_UPSTREAM_RESPONSE_BUF_SIZE: usize = 8 * 1024;
 use crate::protocols::http::HttpTask;
 use crate::protocols::{Digest, SocketAddr, Stream, UniqueID, UniqueIDType};
-use crate::utils::{BufRef, KVRef};
+use crate::utils::BufRef;
 
 /// The HTTP 1.x client session
 pub struct HttpSession {
@@ -300,7 +300,7 @@ impl HttpSession {
                     self.raw_header = Some(BufRef(0, s));
                     self.preread_body = Some(BufRef(s, already_read));
                     let base = buf.as_ptr() as usize;
-                    let mut header_refs = Vec::<KVRef>::with_capacity(resp.headers.len());
+                    let mut header_refs = HeaderRefs::with_capacity(resp.headers.len());
 
                     // Note: resp.headers has the correct number of headers
                     // while header_refs doesn't as it is still empty

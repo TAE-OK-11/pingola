@@ -122,10 +122,15 @@ context.set_alpn_protocols(["http/1.1"])
 raw = socket.create_connection(("127.0.0.1", 18443), timeout=5)
 connection = context.wrap_socket(raw, server_hostname="app.test")
 connection.settimeout(5)
+spill_headers = b"".join(
+    f"X-Spill-{index}: value-{index}\r\n".encode() for index in range(20)
+)
 connection.sendall(
     b"GET "
     + raw_target
-    + b" HTTP/1.1\r\nhOsT: app.test\r\nX-MiXeD: preserved\r\nConnection: close\r\n\r\n"
+    + b" HTTP/1.1\r\nhOsT: app.test\r\nX-MiXeD: preserved\r\n"
+    + spill_headers
+    + b"Connection: close\r\n\r\n"
 )
 
 buffer = b""
@@ -142,6 +147,10 @@ headers = {}
 for line in lines[1:]:
     name, value = line.split(b":", 1)
     headers[name.lower()] = value.strip()
+if headers.get(b"x-spill-response-0") != b"value-0":
+    raise SystemExit("first inline/spill response header was not preserved")
+if headers.get(b"x-spill-response-19") != b"value-19":
+    raise SystemExit("last spilled response header was not preserved")
 length = int(headers[b"content-length"])
 while len(body) < length:
     chunk = connection.recv(65536)
@@ -155,6 +164,10 @@ if payload["path"].encode("latin-1") != raw_target:
     raise SystemExit(f"raw path changed in proxy: {payload['path']!r}")
 if payload["headers"].get("x-mixed") != "preserved":
     raise SystemExit("mixed-case request header value was not preserved")
+if payload["headers"].get("x-spill-0") != "value-0":
+    raise SystemExit("first inline/spill request header was not preserved")
+if payload["headers"].get("x-spill-19") != "value-19":
+    raise SystemExit("last spilled request header was not preserved")
 PY
 
 # The configured request keepalive limit must count down across reused HTTP/1.1

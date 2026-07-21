@@ -34,6 +34,11 @@ small set of documented local changes.
   of original field-name spelling therefore allocated and copied every header
   without affecting HTTP semantics. Header values, duplicate ordering and
   case-insensitive lookup are unchanged.
+- Local change: store up to 16 temporary H1 parsed-header offsets inline with
+  `SmallVec`, spilling to the heap for larger requests and responses.
+- Reason: typical proxy traffic no longer performs a separate allocation just
+  to transfer zero-copy header offsets. Large requests retain the same
+  `MAX_HEADERS = 256` behavior and are covered by a spill-path regression test.
 
 Remove dependency patches after a released Pingora version adopts equivalent
 versions. Re-evaluate the reuse-hash cache whenever `HttpPeer` changes.
