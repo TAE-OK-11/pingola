@@ -9,6 +9,8 @@ if [[ "${OUTPUT}" != /* ]]; then
 fi
 BACKEND_PORT=${PROFILE_BACKEND_PORT:-18800}
 BACKEND_SOURCE=${PROFILE_BACKEND_SOURCE:-${ROOT}/bench/backend.rs}
+PREBUILT_BACKEND=${PROFILE_BACKEND_BIN:-}
+PERF_BIN=${PROFILE_PERF_BIN:-perf}
 HTTP_PORT=${PROFILE_HTTP_PORT:-18880}
 HTTPS_PORT=${PROFILE_HTTPS_PORT:-18843}
 DURATION=${PROFILE_DURATION_SECONDS:-5}
@@ -39,21 +41,39 @@ trap cleanup EXIT INT TERM
 
 mkdir -p "${OUTPUT}"
 chmod 0755 "${OUTPUT}"
-for command in docker curl wrk openssl rustc perf strace; do
+REQUIRED_COMMANDS=(docker curl wrk openssl strace)
+if [[ -z "${PREBUILT_BACKEND}" ]]; then
+  REQUIRED_COMMANDS+=(rustc)
+fi
+for command in "${REQUIRED_COMMANDS[@]}"; do
   if ! command -v "${command}" >/dev/null; then
     echo "missing required command: ${command}" >&2
     exit 2
   fi
 done
+if ! command -v "${PERF_BIN}" >/dev/null && [[ ! -x "${PERF_BIN}" ]]; then
+  echo "missing perf executable: ${PERF_BIN}" >&2
+  exit 2
+fi
 
 BACKEND_BIN=${OUTPUT}/backend-rust
-if ! rustc --edition=2021 -D warnings -C opt-level=3 -C codegen-units=1 -C panic=abort \
-  -C target-cpu=native -C strip=symbols \
-  --remap-path-prefix="${ROOT}=." "${BACKEND_SOURCE}" -o "${BACKEND_BIN}" \
-  >"${OUTPUT}/backend-build.stdout" 2>"${OUTPUT}/backend-build.stderr"; then
-  echo "Rust profile backend build failed: source=${BACKEND_SOURCE} log=${OUTPUT}/backend-build.stderr" >&2
-  sed -n '1,120p' "${OUTPUT}/backend-build.stderr" >&2
-  exit 2
+if [[ -n "${PREBUILT_BACKEND}" ]]; then
+  if [[ ! -x "${PREBUILT_BACKEND}" ]]; then
+    echo "prebuilt profile backend is not executable: ${PREBUILT_BACKEND}" >&2
+    exit 2
+  fi
+  install -m 0755 "${PREBUILT_BACKEND}" "${BACKEND_BIN}"
+  printf 'prebuilt=%s\n' "${PREBUILT_BACKEND}" >"${OUTPUT}/backend-build.stdout"
+  : >"${OUTPUT}/backend-build.stderr"
+else
+  if ! rustc --edition=2021 -D warnings -C opt-level=3 -C codegen-units=1 -C panic=abort \
+    -C target-cpu=native -C strip=symbols \
+    --remap-path-prefix="${ROOT}=." "${BACKEND_SOURCE}" -o "${BACKEND_BIN}" \
+    >"${OUTPUT}/backend-build.stdout" 2>"${OUTPUT}/backend-build.stderr"; then
+    echo "Rust profile backend build failed: source=${BACKEND_SOURCE} log=${OUTPUT}/backend-build.stderr" >&2
+    sed -n '1,120p' "${OUTPUT}/backend-build.stderr" >&2
+    exit 2
+  fi
 fi
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
@@ -143,10 +163,13 @@ container_cpus=${CPUS:-unlimited}
 container_memory=${MEMORY:-unlimited}
 backend=rust-std-http1
 backend_source=${BACKEND_SOURCE}
+backend_prebuilt=${PREBUILT_BACKEND:-false}
 backend_binary_sha256=$(sha256sum "${BACKEND_BIN}" | cut -d' ' -f1)
 perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo unknown)
 EOF
-rustc -vV | sed 's/^/backend_rustc_/' >>"${OUTPUT}/environment.txt"
+if [[ -z "${PREBUILT_BACKEND}" ]]; then
+  rustc -vV | sed 's/^/backend_rustc_/' >>"${OUTPUT}/environment.txt"
+fi
 lscpu >>"${OUTPUT}/environment.txt" 2>&1
 
 curl --noproxy '*' -fsS -H 'host: profile.test' \
@@ -157,7 +180,7 @@ wrk --latency -t1 -c8 -d "${DURATION}s" -s "${ROOT}/bench/wrk-keepalive.lua" \
   -H 'Host: profile.test' "http://127.0.0.1:${HTTP_PORT}/bytes/64" \
   >"${OUTPUT}/perf-stat-wrk.txt" 2>&1 &
 LOAD_PID=$!
-perf stat -p "${PID}" \
+"${PERF_BIN}" stat -p "${PID}" \
   -e task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses,context-switches,cpu-migrations,page-faults \
   -o "${OUTPUT}/perf-stat.txt" -- sleep "${DURATION}" \
   >"${OUTPUT}/perf-stat.stdout" 2>"${OUTPUT}/perf-stat.stderr"
@@ -169,16 +192,16 @@ wrk -t1 -c8 -d "${DURATION}s" -s "${ROOT}/bench/wrk-keepalive.lua" \
   -H 'Host: profile.test' "http://127.0.0.1:${HTTP_PORT}/bytes/64" \
   >"${OUTPUT}/perf-record-wrk.txt" 2>&1 &
 LOAD_PID=$!
-perf record -F 99 -g --call-graph fp -p "${PID}" -o "${OUTPUT}/perf.data" \
+"${PERF_BIN}" record -F 99 -g --call-graph fp -p "${PID}" -o "${OUTPUT}/perf.data" \
   -- sleep "${DURATION}" >"${OUTPUT}/perf-record.stdout" 2>"${OUTPUT}/perf-record.stderr"
 PERF_RECORD_RC=$?
 wait "${LOAD_PID}" || true
 echo "perf_record_rc=${PERF_RECORD_RC}" >>"${OUTPUT}/environment.txt"
 if ((PERF_RECORD_RC == 0)); then
-  timeout 20 env DEBUGINFOD_URLS= perf report --stdio --percent-limit 0.5 \
+  timeout 20 env DEBUGINFOD_URLS= "${PERF_BIN}" report --stdio --percent-limit 0.5 \
     --sort comm,dso,symbol --no-children -i "${OUTPUT}/perf.data" \
     >"${OUTPUT}/perf-report.txt" 2>&1 || true
-  timeout 20 env DEBUGINFOD_URLS= perf script -i "${OUTPUT}/perf.data" \
+  timeout 20 env DEBUGINFOD_URLS= "${PERF_BIN}" script -i "${OUTPUT}/perf.data" \
     >"${OUTPUT}/perf-script.txt" 2>&1 || true
   if command -v stackcollapse-perf.pl >/dev/null && command -v flamegraph.pl >/dev/null; then
     stackcollapse-perf.pl "${OUTPUT}/perf-script.txt" >"${OUTPUT}/perf.folded"

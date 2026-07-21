@@ -14,7 +14,7 @@ use http::header::{
     ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
     IF_NONE_MATCH, LAST_MODIFIED, VARY,
 };
-use http::Method;
+use http::{HeaderValue, Method};
 use lru::LruCache;
 use parking_lot::Mutex;
 use percent_encoding::percent_decode_str;
@@ -25,6 +25,14 @@ use crate::content_encoding::{negotiate, ContentCoding};
 
 const MAX_BUFFERED_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
+const ZERO: HeaderValue = HeaderValue::from_static("0");
+const ACCEPT_ENCODING_VALUE: HeaderValue = HeaderValue::from_static("Accept-Encoding");
+const NO_CACHE: HeaderValue = HeaderValue::from_static("no-cache");
+const IMMUTABLE_CACHE: HeaderValue = HeaderValue::from_static("public, max-age=2592000, immutable");
+const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
+const SAMEORIGIN: HeaderValue = HeaderValue::from_static("SAMEORIGIN");
+const STRICT_REFERRER: HeaderValue = HeaderValue::from_static("strict-origin-when-cross-origin");
+const HSTS: HeaderValue = HeaderValue::from_static("max-age=63072000; includeSubDomains; preload");
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Encoding {
@@ -64,9 +72,10 @@ struct CacheKey {
 
 struct CachedAsset {
     body: Bytes,
-    content_type: String,
-    etag: String,
-    last_modified: String,
+    content_type: HeaderValue,
+    content_length: HeaderValue,
+    etag: HeaderValue,
+    last_modified: HeaderValue,
 }
 
 struct CacheState {
@@ -228,10 +237,11 @@ impl StaticFiles {
                     };
                     let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), modified_nanos);
                     let asset = Arc::new(CachedAsset {
+                        content_type: cached_header_value(&content_type(&path))?,
+                        content_length: cached_header_value(&body.len().to_string())?,
                         body,
-                        content_type: content_type(&path),
-                        etag,
-                        last_modified: httpdate::fmt_http_date(modified),
+                        etag: cached_header_value(&etag)?,
+                        last_modified: cached_header_value(&httpdate::fmt_http_date(modified))?,
                     });
                     let actual_key = CacheKey {
                         encoding: actual_encoding,
@@ -247,12 +257,12 @@ impl StaticFiles {
             .req_header()
             .headers
             .get(IF_NONE_MATCH)
-            .is_some_and(|value| value.as_bytes() == asset.etag.as_bytes())
+            .is_some_and(|value| value == asset.etag)
         {
             let mut response = ResponseHeader::build(304, Some(8)).unwrap();
-            response.insert_header(ETAG, asset.etag.as_str())?;
-            response.insert_header(LAST_MODIFIED, asset.last_modified.as_str())?;
-            response.insert_header(VARY, "Accept-Encoding")?;
+            response.insert_header(ETAG, asset.etag.clone())?;
+            response.insert_header(LAST_MODIFIED, asset.last_modified.clone())?;
+            response.insert_header(VARY, ACCEPT_ENCODING_VALUE)?;
             insert_cache_header(&mut response, &path, spa_fallback)?;
             insert_security_headers(&mut response, tls)?;
             session
@@ -262,11 +272,11 @@ impl StaticFiles {
         }
 
         let mut response = ResponseHeader::build(200, Some(12)).unwrap();
-        response.insert_header(CONTENT_TYPE, asset.content_type.as_str())?;
-        response.insert_header(CONTENT_LENGTH, asset.body.len().to_string())?;
-        response.insert_header(ETAG, asset.etag.as_str())?;
-        response.insert_header(LAST_MODIFIED, asset.last_modified.as_str())?;
-        response.insert_header(VARY, "Accept-Encoding")?;
+        response.insert_header(CONTENT_TYPE, asset.content_type.clone())?;
+        response.insert_header(CONTENT_LENGTH, asset.content_length.clone())?;
+        response.insert_header(ETAG, asset.etag.clone())?;
+        response.insert_header(LAST_MODIFIED, asset.last_modified.clone())?;
+        response.insert_header(VARY, ACCEPT_ENCODING_VALUE)?;
         if let Some(encoding) = requested_encoding.header() {
             response.insert_header(CONTENT_ENCODING, encoding)?;
         }
@@ -311,6 +321,16 @@ impl StaticFiles {
             .map_err(std::io::Error::other)??;
         Ok((Bytes::from(compressed), encoding))
     }
+}
+
+fn cached_header_value(value: &str) -> Result<HeaderValue> {
+    HeaderValue::try_from(value).map_err(|error| {
+        cloudflare_pingora::Error::because(
+            cloudflare_pingora::ErrorType::InternalError,
+            "generated static metadata is not a valid header value",
+            error,
+        )
+    })
 }
 
 async fn read_bounded_sidecar(path: &Path) -> std::io::Result<Option<Bytes>> {
@@ -560,22 +580,19 @@ fn insert_cache_header(
 ) -> Result<()> {
     let index = path.file_name().is_some_and(|name| name == "index.html");
     if spa_fallback || index {
-        response.insert_header(CACHE_CONTROL, "no-cache")?;
+        response.insert_header(CACHE_CONTROL, NO_CACHE)?;
     } else {
-        response.insert_header(CACHE_CONTROL, "public, max-age=2592000, immutable")?;
+        response.insert_header(CACHE_CONTROL, IMMUTABLE_CACHE)?;
     }
     Ok(())
 }
 
 fn insert_security_headers(response: &mut ResponseHeader, tls: bool) -> Result<()> {
-    response.insert_header("x-content-type-options", "nosniff")?;
-    response.insert_header("x-frame-options", "SAMEORIGIN")?;
-    response.insert_header("referrer-policy", "strict-origin-when-cross-origin")?;
+    response.insert_header("x-content-type-options", NOSNIFF)?;
+    response.insert_header("x-frame-options", SAMEORIGIN)?;
+    response.insert_header("referrer-policy", STRICT_REFERRER)?;
     if tls {
-        response.insert_header(
-            "strict-transport-security",
-            "max-age=63072000; includeSubDomains; preload",
-        )?;
+        response.insert_header("strict-transport-security", HSTS)?;
     }
     Ok(())
 }
@@ -587,7 +604,7 @@ async fn send_empty(
     tls: bool,
 ) -> Result<bool> {
     let mut response = ResponseHeader::build(status, Some(headers.len() + 6)).unwrap();
-    response.insert_header(CONTENT_LENGTH, "0")?;
+    response.insert_header(CONTENT_LENGTH, ZERO)?;
     for (name, value) in headers {
         response.insert_header(*name, *value)?;
     }
@@ -649,9 +666,10 @@ mod tests {
                 },
                 Arc::new(CachedAsset {
                     body: Bytes::from_static(b"x"),
-                    content_type: "text/plain".to_string(),
-                    etag: format!("etag-{index}"),
-                    last_modified: "Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+                    content_type: HeaderValue::from_static("text/plain"),
+                    content_length: HeaderValue::from_static("1"),
+                    etag: HeaderValue::try_from(format!("etag-{index}")).unwrap(),
+                    last_modified: HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"),
                 }),
             );
         }

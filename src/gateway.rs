@@ -185,6 +185,9 @@ struct PreparedPlan {
     handler: HandlerKind,
     peer: HttpPeer,
     route: RouteClass,
+    rate_limit: Option<(f64, u32)>,
+    active_request_limit: usize,
+    downstream_timeout: Duration,
     max_body_bytes: usize,
 }
 
@@ -235,12 +238,6 @@ impl PreparedHost {
     }
 }
 
-#[derive(Clone, Copy)]
-struct RoutePolicy {
-    rate_limit: Option<(f64, u32)>,
-    active_request_override: Option<usize>,
-}
-
 pub struct RequestContext {
     plan_index: usize,
     client_ip: IpAddr,
@@ -276,7 +273,6 @@ pub struct Gateway {
     static_files: StaticFiles,
     hosts: AHashMap<Arc<str>, PreparedHost>,
     plans: Box<[PreparedPlan]>,
-    route_policies: [RoutePolicy; RouteClass::ALL.len()],
     rates: RateLimiter,
     active_requests: ActiveRequestLimiter,
 }
@@ -329,6 +325,14 @@ impl Gateway {
                         handler: host.handler,
                         peer: prepare_route_peer(upstream, route),
                         route,
+                        rate_limit: effective_rate_limit(&runtime, route),
+                        active_request_limit: runtime
+                            .config
+                            .route_limits
+                            .get(route.name())
+                            .and_then(|limit| limit.active_requests)
+                            .unwrap_or_else(|| default_active_limit(host.handler, route)),
+                        downstream_timeout: Duration::from_secs(route.timeout_seconds()),
                         max_body_bytes: host.max_body_bytes,
                     });
                     Some(plan_index)
@@ -345,20 +349,11 @@ impl Gateway {
                 );
             }
         }
-        let route_policies = RouteClass::ALL.map(|route| RoutePolicy {
-            rate_limit: effective_rate_limit(&runtime, route),
-            active_request_override: runtime
-                .config
-                .route_limits
-                .get(route.name())
-                .and_then(|limit| limit.active_requests),
-        });
         Ok(Self {
             runtime,
             static_files,
             hosts,
             plans: prepared_plans.into_boxed_slice(),
-            route_policies,
             rates: RateLimiter::new(),
             active_requests: ActiveRequestLimiter::new(),
         })
@@ -541,8 +536,7 @@ impl ProxyHttp for Gateway {
             return send_empty(session, 413, Some(plan.handler), tls, &[]).await;
         }
 
-        let policy = self.route_policies[plan.route.index()];
-        if let Some((rate, burst)) = policy.rate_limit {
+        if let Some((rate, burst)) = plan.rate_limit {
             if !self.rates.allow(plan.route.name(), client_ip, rate, burst) {
                 return send_empty(
                     session,
@@ -566,14 +560,12 @@ impl ProxyHttp for Gateway {
             .await;
         }
 
-        let active_limit = policy
-            .active_request_override
-            .unwrap_or_else(|| default_active_limit(plan.handler, plan.route));
-        if active_limit > 0 {
-            let Some(permit) =
-                self.active_requests
-                    .acquire(plan.route.name(), client_ip, active_limit)
-            else {
+        if plan.active_request_limit > 0 {
+            let Some(permit) = self.active_requests.acquire(
+                plan.route.name(),
+                client_ip,
+                plan.active_request_limit,
+            ) else {
                 return send_empty(
                     session,
                     429,
@@ -586,9 +578,8 @@ impl ProxyHttp for Gateway {
             ctx._active_request_permit = Some(permit);
         }
 
-        let timeout = Duration::from_secs(plan.route.timeout_seconds());
-        session.set_read_timeout(Some(timeout));
-        session.set_write_timeout(Some(timeout));
+        session.set_read_timeout(Some(plan.downstream_timeout));
+        session.set_write_timeout(Some(plan.downstream_timeout));
         session.set_keepalive(Some(30));
         ctx.plan_index = plan_index;
 
@@ -1095,8 +1086,29 @@ fn strip_request_hop_headers(
     downstream: &RequestHeader,
     upstream: &mut RequestHeader,
 ) -> Result<()> {
-    for name in connection_option_names(&downstream.headers, 400)? {
-        upstream.remove_header(&name);
+    // The downstream and upstream maps are distinct here, so remove dynamic
+    // Connection options as they are parsed. This preserves the full RFC
+    // validation while avoiding a per-request Vec allocation on HTTP/1
+    // keep-alive traffic.
+    for field in [&CONNECTION, &PROXY_CONNECTION] {
+        for value in downstream.headers.get_all(field).iter() {
+            for token in value.as_bytes().split(|byte| *byte == b',') {
+                let token = token.trim_ascii();
+                if token.is_empty() {
+                    continue;
+                }
+                let name = HeaderName::from_bytes(token).map_err(|error| {
+                    Error::because(HTTPStatus(400), "invalid Connection header option", error)
+                })?;
+                if name == CONTENT_LENGTH || name == TRANSFER_ENCODING || name == HOST {
+                    return Err(Error::explain(
+                        HTTPStatus(400),
+                        format!("Connection header names critical framing field {name}"),
+                    ));
+                }
+                upstream.remove_header(&name);
+            }
+        }
     }
     for name in [
         &CONNECTION,

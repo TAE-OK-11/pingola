@@ -28,7 +28,6 @@ impl ContentCoding {
 
 #[derive(Default)]
 struct Preferences {
-    header_present: bool,
     gzip: Option<u16>,
     brotli: Option<u16>,
     zstd: Option<u16>,
@@ -77,16 +76,42 @@ impl Preferences {
 }
 
 pub fn negotiate<'a>(values: impl IntoIterator<Item = &'a HeaderValue>) -> EncodingNegotiation {
-    let mut preferences = Preferences::default();
-    for value in values {
-        preferences.header_present = true;
-        preferences.parse_value(value);
-    }
-    if !preferences.header_present {
+    let mut values = values.into_iter();
+    let Some(first) = values.next() else {
         return EncodingNegotiation {
             preferred: ContentCoding::Identity,
             identity_acceptable: true,
         };
+    };
+    let second = values.next();
+    if second.is_none() {
+        let value = first.as_bytes();
+        let preferred = if value.eq_ignore_ascii_case(b"identity") {
+            Some(ContentCoding::Identity)
+        } else if value.eq_ignore_ascii_case(b"gzip") {
+            Some(ContentCoding::Gzip)
+        } else if value.eq_ignore_ascii_case(b"br") {
+            Some(ContentCoding::Brotli)
+        } else if value.eq_ignore_ascii_case(b"zstd") || value == b"*" {
+            Some(ContentCoding::Zstd)
+        } else {
+            None
+        };
+        if let Some(preferred) = preferred {
+            return EncodingNegotiation {
+                preferred,
+                identity_acceptable: true,
+            };
+        }
+    }
+
+    let mut preferences = Preferences::default();
+    preferences.parse_value(first);
+    if let Some(second) = second {
+        preferences.parse_value(second);
+    }
+    for value in values {
+        preferences.parse_value(value);
     }
 
     let wildcard = preferences.wildcard.unwrap_or(0);
@@ -189,6 +214,15 @@ mod tests {
         assert_eq!(select(&["gzip;q=0", "br"]), ContentCoding::Brotli);
         assert_eq!(select(&["*;q=0.5", "br;q=0"]), ContentCoding::Zstd);
         assert_eq!(select(&["gzip;q=0.4", "gzip;q=0.8"]), ContentCoding::Gzip);
+    }
+
+    #[test]
+    fn exact_common_tokens_use_the_same_negotiation_semantics() {
+        assert_eq!(select(&["identity"]), ContentCoding::Identity);
+        assert_eq!(select(&["gzip"]), ContentCoding::Gzip);
+        assert_eq!(select(&["BR"]), ContentCoding::Brotli);
+        assert_eq!(select(&["zstd"]), ContentCoding::Zstd);
+        assert_eq!(select(&["*"]), ContentCoding::Zstd);
     }
 
     #[test]
