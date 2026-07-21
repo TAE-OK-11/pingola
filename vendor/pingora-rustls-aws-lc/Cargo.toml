@@ -13,7 +13,7 @@ name = "pingora_rustls"
 path = "src/lib.rs"
 
 [dependencies]
-aws-lc-rs = "1.17.1"
+aws-lc-rs = "1.17.3"
 log = "0.4.33"
 no_debug = "3.1.0"
 pingora-error = "0.8.1"
