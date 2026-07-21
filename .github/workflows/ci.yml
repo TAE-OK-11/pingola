@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_images:
-        description: Publish the generic x86-64-v2 GHCR image from this manual run
+        description: Publish the generic and Oracle Zen 1 GHCR images from this manual run
         required: false
         default: false
         type: boolean
@@ -94,6 +94,7 @@ jobs:
         run: tests/http2_matrix.sh
 
   image-test:
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.publish_images != true)
     needs: [audit, verify]
     runs-on: ubuntu-24.04
     strategy:
@@ -102,7 +103,7 @@ jobs:
         include:
           - target_cpu: x86-64-v2
             lto: fat
-            pgo_mode: off
+            pgo_mode: train
             pgo_train_target_cpu: x86-64-v2
             runtime: true
           - target_cpu: znver1
@@ -129,8 +130,8 @@ jobs:
             RUST_LTO=${{ matrix.lto }}
             BUILD_VERSION=ci
             BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=image-test-${{ matrix.target_cpu }}
+          cache-to: type=gha,mode=max,scope=image-test-${{ matrix.target_cpu }}
       - name: Non-root and read-only runtime checks
         if: matrix.runtime
         env:
@@ -138,6 +139,7 @@ jobs:
           PINGORA_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
           PINGORA_EXPECTED_LTO: ${{ matrix.lto }}
           PINGORA_EXPECTED_TLS_PROVIDER: aws-lc
+          PINGORA_EXPECTED_PGO: ${{ matrix.pgo_mode }}
         run: tests/docker_runtime.sh
       - name: Specialized image metadata check
         if: ${{ !matrix.runtime }}
@@ -156,11 +158,11 @@ jobs:
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo"]')" = "${{ matrix.pgo_mode }}"
 
   image:
-    # Generic images are reproducibly built on GitHub-hosted runners. The
-    # Oracle/znver1 image is deliberately excluded: it is trained and built on
-    # the matching benchmark host, then pushed by the release script.
+    # Both production variants are reproducibly built by GitHub Actions. The
+    # generic image targets x86-64-v2; the Oracle image targets AMD Zen 1
+    # explicitly rather than inheriting the hosted runner's native CPU.
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_images)
-    needs: image-test
+    needs: [audit, verify]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -213,12 +215,14 @@ jobs:
           build-args: |
             ALLOCATOR=tcmalloc
             TLS_PROVIDER=aws-lc
+            PGO_MODE=train
+            PGO_TRAIN_TARGET_CPU=x86-64-v2
             RUST_TARGET_CPU=x86-64-v2
             RUST_LTO=fat
             BUILD_VERSION=${{ steps.meta.outputs.version }}
             BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=image-generic-x86-64-v2
+          cache-to: type=gha,mode=max,scope=image-generic-x86-64-v2
           provenance: mode=max
           sbom: true
       - name: Verify the exact published generic image
@@ -227,4 +231,77 @@ jobs:
           PINGORA_EXPECTED_TARGET_CPU: x86-64-v2
           PINGORA_EXPECTED_LTO: fat
           PINGORA_EXPECTED_TLS_PROVIDER: aws-lc
+          PINGORA_EXPECTED_PGO: train
         run: tests/docker_runtime.sh
+
+  image-oracle-zen1:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_images)
+    needs: [audit, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Oracle Zen 1 image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ghcr.io/tae-ok-11/pingora
+            ghcr.io/tae-ok-11/pingola
+          tags: |
+            type=raw,value=oracle-zen1
+            type=raw,value=pgo-znver1
+            type=sha,prefix=sha-,suffix=-znver1
+            type=semver,pattern={{version}},suffix=-znver1
+          labels: |
+            org.opencontainers.image.title=Pingora (Oracle Zen 1)
+            org.opencontainers.image.description=AMD Zen 1 optimized AWS-LC JBS Pingora reverse proxy
+            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
+            org.opencontainers.image.url=https://github.com/TAE-OK-11/pingola
+            org.opencontainers.image.allocator=tcmalloc
+            org.opencontainers.image.tls.provider=aws-lc
+      - name: Build and publish Oracle Zen 1 image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ALLOCATOR=tcmalloc
+            TLS_PROVIDER=aws-lc
+            PGO_MODE=train
+            PGO_TRAIN_TARGET_CPU=x86-64-v2
+            RUST_TARGET_CPU=znver1
+            RUST_LTO=fat
+            BUILD_VERSION=${{ steps.meta.outputs.version }}-znver1
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=image-oracle-zen1
+          cache-to: type=gha,mode=max,scope=image-oracle-zen1
+          provenance: mode=max
+          sbom: true
+      - name: Verify published Oracle image metadata
+        env:
+          IMAGE: ghcr.io/tae-ok-11/pingora@${{ steps.build.outputs.digest }}
+        run: |
+          docker pull "${IMAGE}"
+          test "$(docker image inspect --format '{{.Config.User}}' "${IMAGE}")" = "10001:10001"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.target-cpu"]')" = "znver1"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.lto"]')" = "fat"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo"]')" = "train"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator"]')" = "tcmalloc"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.tls.provider"]')" = "aws-lc"
