@@ -165,10 +165,12 @@ impl RouteClass {
     }
 
     fn supports_h1_bodyless_fast_path(self) -> bool {
-        !matches!(
-            self,
-            Self::NavidromeStream | Self::VaultwardenHub | Self::Couchdb
-        )
+        // The proxy core independently requires an H1 GET/HEAD with an empty
+        // request body and no Upgrade. Response streaming remains bounded to
+        // one awaited chunk, so Navidrome streams and bodyless CouchDB reads
+        // retain backpressure and prompt disconnect propagation without the
+        // per-request duplex channels needed by POST/PUT replication.
+        self != Self::VaultwardenHub
     }
 }
 
@@ -1839,19 +1841,15 @@ write_timeout_seconds: 9
     }
 
     #[test]
-    fn h1_bodyless_fast_path_excludes_streaming_and_duplex_routes() {
+    fn h1_bodyless_fast_path_keeps_upgrade_route_on_duplex_path() {
+        assert!(!RouteClass::VaultwardenHub.supports_h1_bodyless_fast_path());
         for route in [
             RouteClass::NavidromeStream,
-            RouteClass::VaultwardenHub,
-            RouteClass::Couchdb,
-        ] {
-            assert!(!route.supports_h1_bodyless_fast_path(), "{route:?}");
-        }
-        for route in [
             RouteClass::NavidromeCover,
             RouteClass::NavidromeApi,
             RouteClass::VaultwardenAuth,
             RouteClass::Vaultwarden,
+            RouteClass::Couchdb,
             RouteClass::Doh,
             RouteClass::AdguardUi,
         ] {

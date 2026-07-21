@@ -15,10 +15,10 @@
 //! HTTP/1.x client session
 
 use bytes::{BufMut, Bytes, BytesMut};
-use http::{header, header::AsHeaderName, HeaderValue, StatusCode, Version};
+use http::{header, header::AsHeaderName, HeaderName, HeaderValue, StatusCode, Version};
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result, RetryType};
-use pingora_http::{HMap, IntoCaseHeaderName, RequestHeader, ResponseHeader};
+use pingora_http::{HMap, RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use std::io::ErrorKind;
 use std::str;
@@ -306,7 +306,11 @@ impl HttpSession {
                     // while header_refs doesn't as it is still empty
                     let _num_headers = populate_headers(base, &mut header_refs, resp.headers);
 
-                    let mut response_header = Box::new(ResponseHeader::build(
+                    // HTTP field names are case-insensitive and the gateway's response
+                    // filters only use semantic HeaderName lookups. Avoid retaining a
+                    // second map of upstream spelling that is discarded by H2 and has no
+                    // observable HTTP meaning for H1 clients.
+                    let mut response_header = Box::new(ResponseHeader::build_no_case(
                         resp.code.unwrap(),
                         Some(resp.headers.len()),
                     )?);
@@ -326,7 +330,8 @@ impl HttpSession {
 
                     for header in header_refs {
                         let header_name = header.get_name_bytes(&buf);
-                        let header_name = header_name.into_case_header_name();
+                        let header_name = HeaderName::from_bytes(&header_name)
+                            .or_err(InvalidHTTPHeader, "while parsing response header name")?;
                         let value_bytes = header.get_value_bytes(&buf);
                         let header_value = if cfg!(debug_assertions) {
                             // from_maybe_shared_unchecked() in debug mode still checks whether
@@ -350,9 +355,7 @@ impl HttpSession {
                             // safe because this is from what we parsed
                             unsafe { http::HeaderValue::from_maybe_shared_unchecked(value_bytes) }
                         };
-                        response_header
-                            .append_header(header_name, header_value)
-                            .or_err(InvalidHTTPHeader, "while parsing request header")?;
+                        response_header.headers.append(header_name, header_value);
                     }
 
                     let contains_transfer_encoding = response_header
@@ -1087,6 +1090,7 @@ mod tests_stream {
             HttpTask::Header(h, eob) => {
                 assert_eq!(h.status, 100);
                 assert!(!eob);
+                assert!(!h.has_case());
             }
             _ => panic!("expected informational header"),
         }
@@ -1428,6 +1432,7 @@ mod tests_stream {
             HttpTask::Header(h, eob) => {
                 assert_eq!(h.status, 204);
                 assert!(eob);
+                assert!(!h.has_case());
             }
             _ => {
                 panic!("task should be header")

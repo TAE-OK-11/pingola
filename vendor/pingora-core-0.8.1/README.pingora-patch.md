@@ -27,6 +27,13 @@ small set of documented local changes.
   overread and downstream body paths retain their original semantics. The
   header storage lives for that response because parsed HeaderValue instances
   share it.
+- Local change: parse downstream H1 requests and upstream H1 responses directly
+  into the no-case representation used by this proxy.
+- Reason: the proxy cloned only semantic request parts before forwarding and
+  all response filters use semantic HeaderName lookups. Preserving a second map
+  of original field-name spelling therefore allocated and copied every header
+  without affecting HTTP semantics. Header values, duplicate ordering and
+  case-insensitive lookup are unchanged.
 
 Remove dependency patches after a released Pingora version adopts equivalent
 versions. Re-evaluate the reuse-hash cache whenever `HttpPeer` changes.

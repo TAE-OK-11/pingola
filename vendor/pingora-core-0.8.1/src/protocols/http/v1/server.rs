@@ -17,14 +17,14 @@
 use bstr::ByteSlice;
 use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
-use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+use http::header::{HeaderName, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderValue;
 use http::{header, header::AsHeaderName, Method, Version};
 use log::{debug, trace, warn};
 use once_cell::sync::Lazy;
 use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
-use pingora_http::{IntoCaseHeaderName, RequestHeader, ResponseHeader};
+use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use regex::bytes::Regex;
 use std::time::Duration;
@@ -226,7 +226,12 @@ impl HttpSession {
                         // while header_refs doesn't as it is still empty
                         let _num_headers = populate_headers(base, &mut header_refs, req.headers);
 
-                        let mut request_header = Box::new(RequestHeader::build(
+                        // The proxy immediately clones semantic request parts into a no-case
+                        // upstream header map. Keeping a second map solely for the downstream
+                        // spelling therefore allocates and copies every H1 header name without
+                        // affecting forwarding. HTTP field names are case-insensitive, so parse
+                        // directly into the representation the proxy consumes.
+                        let mut request_header = Box::new(RequestHeader::build_no_case(
                             req.method.unwrap_or(""),
                             // we path httparse to allow unsafe bytes in the str
                             req.path.unwrap_or("").as_bytes(),
@@ -243,16 +248,15 @@ impl HttpSession {
 
                         for header in header_refs {
                             let header_name = header.get_name_bytes(&buf);
-                            let header_name = header_name.into_case_header_name();
+                            let header_name = HeaderName::from_bytes(&header_name)
+                                .or_err(InvalidHTTPHeader, "while parsing request header name")?;
                             let value_bytes = header.get_value_bytes(&buf);
                             // safe because this is from what we parsed
                             let header_value = unsafe {
                                 http::HeaderValue::from_maybe_shared_unchecked(value_bytes)
                             };
 
-                            request_header
-                                .append_header(header_name, header_value)
-                                .or_err(InvalidHTTPHeader, "while parsing request header")?;
+                            request_header.headers.append(header_name, header_value);
                         }
 
                         let contains_transfer_encoding =
@@ -1405,6 +1409,7 @@ mod tests_stream {
         assert_eq!(Version::HTTP_11, http_stream.req_header().version);
 
         assert_eq!(b"pingora.org", http_stream.get_header_bytes("Host"));
+        assert!(!http_stream.req_header().has_case());
     }
 
     #[tokio::test]

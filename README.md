@@ -469,6 +469,12 @@ sudo BENCH_PROFILE=smoke BENCH_ROUNDS=3 BENCH_WORKERS=2 \
 sudo PROFILE_CPUS=0.5 PROFILE_MEMORY=1g PROFILE_DURATION_SECONDS=30 \
   bench/profile.sh
 
+# 동일 backend의 direct 요청과 Pingora 경유 요청을 교대해 proxy overhead 측정
+PINGORA_IMAGE="$PINGORA_DIGEST" OVERHEAD_ROUNDS=3 \
+  OVERHEAD_CPUS=2 OVERHEAD_MEMORY=1g \
+  OVERHEAD_OUTPUT=/var/tmp/pingora-overhead-$(date -u +%Y%m%dT%H%M%SZ) \
+  bench/proxy_overhead.sh
+
 # max concurrent streams 32/64/128/256 교차 측정
 sudo bench/h2_tuning.sh
 ```
@@ -482,6 +488,9 @@ memory가 유의미하게 낮아 p99 우선 정책으로 선택했습니다. 운
 같은 CPU를 경쟁합니다. 결과는 절대 RPS만 보지 말고 오류/SHA-256, p99, CPU당
 처리량, peak RSS 순서로 평가합니다. `bench/profile.sh`는 운영 binary가 stripped라
 source symbol이 제한될 수 있어 `perf.data`와 `perf script` 입력을 모두 남깁니다.
+`bench/proxy_overhead.sh`는 direct backend와 proxy를 라운드마다 교대하고 body
+SHA-256을 먼저 비교합니다. `OVERHEAD_HANDLER`, `OVERHEAD_PATH`,
+`OVERHEAD_ACTIVE_LIMIT`으로 route와 limiter 비용을 분리할 수 있습니다.
 
 공식 generic image는 `x86-64-v2`이고 `latest` tag로 게시됩니다. GitHub Actions가
 동시에 게시하는 Oracle 전용 image는 `oracle-zen1` 및 호환 tag `pgo-znver1`입니다.

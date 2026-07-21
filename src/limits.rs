@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 const MAX_RATE_BUCKETS: usize = 262_144;
 const RATE_BUCKET_IDLE: Duration = Duration::from_secs(600);
 const RATE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_ACTIVE_COUNTERS: usize = 32_768;
 
 #[derive(Clone, Eq)]
 struct ClientKey {
@@ -141,14 +142,38 @@ impl RateLimiter {
 /// Counts active requests per IP. HTTP/2 requests are streams, not TCP
 /// connections, so the type intentionally describes what is actually bounded.
 pub struct ActiveRequestLimiter {
-    counters: Arc<DashMap<ClientKey, Arc<AtomicUsize>>>,
+    counters: DashMap<ClientKey, Arc<AtomicUsize>>,
+    counter_count: AtomicUsize,
+    max_counters: usize,
+    cleanup: Mutex<()>,
 }
 
 impl ActiveRequestLimiter {
     pub fn new() -> Self {
+        Self::with_max_counters(MAX_ACTIVE_COUNTERS)
+    }
+
+    fn with_max_counters(max_counters: usize) -> Self {
         Self {
-            counters: Arc::new(DashMap::new()),
+            counters: DashMap::new(),
+            counter_count: AtomicUsize::new(0),
+            max_counters,
+            cleanup: Mutex::new(()),
         }
+    }
+
+    fn cleanup_inactive(&self) -> bool {
+        let Some(_cleanup) = self.cleanup.try_lock() else {
+            return false;
+        };
+        let mut removed = 0;
+        self.counters.retain(|_, counter| {
+            let keep = counter.load(Ordering::Acquire) != 0;
+            removed += usize::from(!keep);
+            keep
+        });
+        self.counter_count.fetch_sub(removed, Ordering::AcqRel);
+        true
     }
 
     pub fn acquire(
@@ -158,39 +183,66 @@ impl ActiveRequestLimiter {
         limit: usize,
     ) -> Option<ActiveRequestPermit> {
         let key = ClientKey { zone, ip };
-        let counter = self
-            .counters
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
 
-        counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < limit).then_some(current + 1)
-            })
-            .ok()?;
-        let counter = counter.clone();
+        // Existing clients are the overwhelmingly common path. A read lookup
+        // avoids constructing a DashMap entry and cloning ClientKey on every
+        // request. Holding the map guard through the increment prevents a
+        // capacity cleanup from removing this counter concurrently.
+        if let Some(counter) = self.counters.get(&key) {
+            counter
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current < limit).then_some(current + 1)
+                })
+                .ok()?;
+            return Some(ActiveRequestPermit {
+                counter: counter.clone(),
+            });
+        }
 
-        Some(ActiveRequestPermit {
-            counters: self.counters.clone(),
-            key,
-            counter,
-        })
+        let mut retried_after_cleanup = false;
+        let counter = loop {
+            match self.counters.entry(key.clone()) {
+                Entry::Occupied(entry) => {
+                    let counter = entry.get().clone();
+                    counter
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                            (current < limit).then_some(current + 1)
+                        })
+                        .ok()?;
+                    break counter;
+                }
+                Entry::Vacant(entry) => {
+                    if self
+                        .counter_count
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            (count < self.max_counters).then_some(count + 1)
+                        })
+                        .is_ok()
+                    {
+                        let counter = Arc::new(AtomicUsize::new(1));
+                        entry.insert(counter.clone());
+                        break counter;
+                    }
+                    drop(entry);
+                    if retried_after_cleanup || !self.cleanup_inactive() {
+                        return None;
+                    }
+                    retried_after_cleanup = true;
+                }
+            }
+        };
+
+        Some(ActiveRequestPermit { counter })
     }
 }
 
 pub struct ActiveRequestPermit {
-    counters: Arc<DashMap<ClientKey, Arc<AtomicUsize>>>,
-    key: ClientKey,
     counter: Arc<AtomicUsize>,
 }
 
 impl Drop for ActiveRequestPermit {
     fn drop(&mut self) {
-        if self.counter.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.counters.remove_if(&self.key, |_, current| {
-                Arc::ptr_eq(current, &self.counter) && current.load(Ordering::Acquire) == 0
-            });
-        }
+        self.counter.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -220,6 +272,31 @@ mod tests {
         assert!(limiter.acquire("host", ip, 1).is_none());
         drop(permit);
         assert!(limiter.acquire("host", ip, 1).is_some());
+    }
+
+    #[test]
+    fn inactive_active_request_counter_is_reused_without_map_churn() {
+        let limiter = ActiveRequestLimiter::new();
+        let ip = "192.0.2.4".parse().unwrap();
+        drop(limiter.acquire("api", ip, 1).unwrap());
+        assert_eq!(limiter.counters.len(), 1);
+        drop(limiter.acquire("api", ip, 1).unwrap());
+        assert_eq!(limiter.counters.len(), 1);
+        assert_eq!(limiter.counter_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn inactive_active_request_counter_is_reclaimed_at_capacity() {
+        let limiter = ActiveRequestLimiter::with_max_counters(1);
+        drop(
+            limiter
+                .acquire("api", "192.0.2.40".parse().unwrap(), 1)
+                .unwrap(),
+        );
+        assert!(limiter
+            .acquire("api", "192.0.2.41".parse().unwrap(), 1)
+            .is_some());
+        assert_eq!(limiter.counter_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
