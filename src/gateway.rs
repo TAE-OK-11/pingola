@@ -57,6 +57,12 @@ thread_local! {
     static CLIENT_IP_HEADER_CACHE: RefCell<Option<(IpAddr, HeaderValue)>> = const {
         RefCell::new(None)
     };
+    // Standard ports use static HeaderValues below. Cache the last nonstandard
+    // listener port so development, sidecar, and benchmark listeners do not
+    // repeat decimal formatting and validation on every keep-alive request.
+    static FORWARDED_PORT_HEADER_CACHE: RefCell<Option<(u16, HeaderValue)>> = const {
+        RefCell::new(None)
+    };
 }
 const NO_PLAN: usize = usize::MAX;
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -1212,6 +1218,16 @@ fn forwarded_port_value(port: Option<u16>, tls: bool) -> Result<HeaderValue> {
         Some(80) => Ok(PORT_80),
         Some(443) => Ok(PORT_443),
         Some(port) => {
+            if let Some(value) = FORWARDED_PORT_HEADER_CACHE.with(|cache| {
+                cache
+                    .borrow()
+                    .as_ref()
+                    .filter(|(cached_port, _)| *cached_port == port)
+                    .map(|(_, value)| value.clone())
+            }) {
+                return Ok(value);
+            }
+
             let mut value = ArrayString::<5>::new();
             write!(&mut value, "{port}").map_err(|error| {
                 Error::because(
@@ -1220,13 +1236,17 @@ fn forwarded_port_value(port: Option<u16>, tls: bool) -> Result<HeaderValue> {
                     error,
                 )
             })?;
-            HeaderValue::from_str(&value).map_err(|error| {
+            let value = HeaderValue::from_str(&value).map_err(|error| {
                 Error::because(
                     HTTPStatus(500),
                     "listener port could not be encoded as a header",
                     error,
                 )
-            })
+            })?;
+            FORWARDED_PORT_HEADER_CACHE.with(|cache| {
+                *cache.borrow_mut() = Some((port, value.clone()));
+            });
+            Ok(value)
         }
         None if tls => Ok(PORT_443),
         None => Ok(PORT_80),
@@ -1864,7 +1884,11 @@ write_timeout_seconds: 9
     #[test]
     fn forwarded_port_uses_the_actual_listener_with_safe_defaults() {
         assert_eq!(forwarded_port_value(Some(18_443), true).unwrap(), "18443");
+        assert_eq!(forwarded_port_value(Some(18_443), false).unwrap(), "18443");
         assert_eq!(forwarded_port_value(Some(18_080), false).unwrap(), "18080");
+        assert_eq!(forwarded_port_value(Some(18_080), true).unwrap(), "18080");
+        assert_eq!(forwarded_port_value(Some(80), true).unwrap(), "80");
+        assert_eq!(forwarded_port_value(Some(443), false).unwrap(), "443");
         assert_eq!(forwarded_port_value(None, true).unwrap(), "443");
         assert_eq!(forwarded_port_value(None, false).unwrap(), "80");
     }
