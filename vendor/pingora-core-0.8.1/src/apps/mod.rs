@@ -18,10 +18,13 @@ pub mod http_app;
 pub mod prometheus_http_app;
 
 use crate::server::ShutdownWatch;
+use crate::{Error, ErrorType};
 use async_trait::async_trait;
 use log::{debug, error};
+use pingora_timeout::timeout;
 use std::future::poll_fn;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::protocols::http::v2::server;
 use crate::protocols::http::ServerSession;
@@ -82,6 +85,9 @@ pub struct HttpServerOptions {
     ///
     /// Unlike nginx, the default behavior here is _no limit_.
     pub keepalive_request_limit: Option<u32>,
+
+    /// Total time allowed to receive the first request header or HTTP/2 preface.
+    pub request_header_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -222,7 +228,21 @@ where
             });
 
             let h2_options = self.h2_options();
-            let h2_conn = server::handshake(stream, h2_options).await;
+            let h2_conn = match self
+                .server_options()
+                .and_then(|options| options.request_header_timeout)
+            {
+                Some(deadline) => {
+                    match timeout(deadline, server::handshake(stream, h2_options)).await {
+                        Ok(result) => result,
+                        Err(_) => Error::e_explain(
+                            ErrorType::ReadTimedout,
+                            format!("downstream HTTP/2 preface timeout: {deadline:?}"),
+                        ),
+                    }
+                }
+                None => server::handshake(stream, h2_options).await,
+            };
             let mut h2_conn = match h2_conn {
                 Err(e) => {
                     error!("H2 handshake error {e}");

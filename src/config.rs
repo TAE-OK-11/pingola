@@ -29,6 +29,14 @@ fn default_http2_max_concurrent_streams() -> u32 {
     32
 }
 
+fn default_downstream_max_connections() -> usize {
+    4096
+}
+
+fn default_downstream_request_header_timeout() -> u64 {
+    15
+}
+
 fn default_health_socket() -> PathBuf {
     PathBuf::from("/tmp/pingora/health.sock")
 }
@@ -109,6 +117,10 @@ pub struct ServerConfig {
     pub global_active_requests: usize,
     #[serde(default = "default_http2_max_concurrent_streams")]
     pub http2_max_concurrent_streams: u32,
+    #[serde(default = "default_downstream_max_connections")]
+    pub downstream_max_connections: usize,
+    #[serde(default = "default_downstream_request_header_timeout")]
+    pub downstream_request_header_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -265,6 +277,12 @@ fn validate(config: &Config) -> Result<()> {
     }
     if !(1..=1024).contains(&config.server.http2_max_concurrent_streams) {
         bail!("server.http2_max_concurrent_streams must be between 1 and 1024");
+    }
+    if !(1..=1_000_000).contains(&config.server.downstream_max_connections) {
+        bail!("server.downstream_max_connections must be between 1 and 1000000");
+    }
+    if !(1..=300).contains(&config.server.downstream_request_header_timeout_seconds) {
+        bail!("server.downstream_request_header_timeout_seconds must be between 1 and 300");
     }
     if config.server.static_cache_bytes == 0 {
         bail!("server.static_cache_bytes must be greater than zero");
@@ -456,10 +474,38 @@ hosts:
     }
 
     #[test]
+    fn checked_in_production_config_uses_narrow_proxy_trust_and_verified_tls() {
+        let config: Config =
+            serde_saphyr::from_str(include_str!("../config/pingora.yaml")).unwrap();
+        for broad in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] {
+            let network: IpNet = broad.parse().unwrap();
+            assert!(!config.trusted_proxies.contains(&network), "{broad}");
+        }
+        for name in ["adguard_dns_doh", "adguard_korea_doh"] {
+            let upstream = config.upstreams.get(name).unwrap();
+            assert!(upstream.tls && upstream.verify_certificate, "{name}");
+        }
+    }
+
+    #[test]
     fn rejects_unbounded_downstream_keepalive_requests() {
         for invalid in [0, 1_000_001] {
             let mut config = sample_config();
             config.server.downstream_keepalive_requests = invalid;
+            assert!(RuntimeConfig::new(config).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_unbounded_downstream_admission_settings() {
+        for invalid in [0, 1_000_001] {
+            let mut config = sample_config();
+            config.server.downstream_max_connections = invalid;
+            assert!(RuntimeConfig::new(config).is_err());
+        }
+        for invalid in [0, 301] {
+            let mut config = sample_config();
+            config.server.downstream_request_header_timeout_seconds = invalid;
             assert!(RuntimeConfig::new(config).is_err());
         }
     }

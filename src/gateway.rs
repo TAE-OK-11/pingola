@@ -235,7 +235,7 @@ impl PreparedHost {
             }
             HandlerKind::Couchdb => RouteClass::Couchdb,
             HandlerKind::AdguardDns | HandlerKind::AdguardKorea => {
-                if path.starts_with("/dns-query") {
+                if path == "/dns-query" {
                     RouteClass::Doh
                 } else {
                     RouteClass::AdguardUi
@@ -464,7 +464,11 @@ impl ProxyHttp for Gateway {
             return send_empty(session, 404, None, tls, &[("x-proxy-product", "Pingora")]).await;
         }
         if path == "/pingora-health/details" {
-            if !self.runtime.config.server.health_details {
+            let unix_socket = session
+                .client_addr()
+                .and_then(|address| address.as_inet())
+                .is_none();
+            if !self.runtime.config.server.health_details || !unix_socket {
                 return send_empty(session, 404, None, tls, &[("x-proxy-product", "Pingora")])
                     .await;
             }
@@ -497,6 +501,10 @@ impl ProxyHttp for Gateway {
         }
 
         if host.handler == HandlerKind::Static {
+            // Bound slow readers while a cold-asset memory permit is held.
+            session.set_read_timeout(Some(Duration::from_secs(30)));
+            session.set_write_timeout(Some(Duration::from_secs(30)));
+            session.set_keepalive(Some(30));
             if self.runtime.config.server.global_active_requests > 0 {
                 ctx.client_ip = session_client_ip(&self.runtime, session);
             }
@@ -906,7 +914,7 @@ impl ProxyHttp for Gateway {
                 "client={} method={} uri={} status={} elapsed_ms={}",
                 ctx.client_ip,
                 session.req_header().method,
-                session.req_header().uri,
+                session.req_header().uri.path(),
                 status,
                 elapsed.as_millis()
             );
@@ -1640,6 +1648,24 @@ hosts:
         assert!(vaultwarden_auth_path("/api/accounts/login"));
         assert!(vaultwarden_auth_path("/identity/connect/token/extra"));
         assert!(!vaultwarden_auth_path("/api/accounts/login-evil"));
+    }
+
+    #[test]
+    fn doh_route_matches_only_the_exact_endpoint() {
+        let mut plans = [None; RouteClass::ALL.len()];
+        plans[RouteClass::Doh.index()] = Some(1);
+        plans[RouteClass::AdguardUi.index()] = Some(2);
+        let host = PreparedHost {
+            domain: Arc::from("dns.example.com"),
+            name: "dns".into(),
+            handler: HandlerKind::AdguardDns,
+            redirect_http: true,
+            plans,
+        };
+
+        assert_eq!(host.plan("/dns-query"), Some(1));
+        assert_eq!(host.plan("/dns-queryfoo"), Some(2));
+        assert_eq!(host.plan("/dns-query/"), Some(2));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
 use cloudflare_pingora::http::ResponseHeader;
+use cloudflare_pingora::protocols::http::conditional_filter::weak_validate_etag;
 use cloudflare_pingora::proxy::Session;
 use cloudflare_pingora::Result;
 use http::header::{
@@ -125,7 +126,7 @@ impl AssetCache {
 pub struct StaticFiles {
     roots: HashMap<String, PathBuf>,
     cache: AssetCache,
-    compression_slot: Semaphore,
+    cold_read_slot: Semaphore,
 }
 
 impl StaticFiles {
@@ -143,8 +144,8 @@ impl StaticFiles {
         Ok(Self {
             roots: canonical_roots,
             cache: AssetCache::new(cache_bytes),
-            // One compressor keeps cold-cache bursts bounded on a 1 vCPU host.
-            compression_slot: Semaphore::new(1),
+            // Bound whole-file allocations as well as CPU-heavy compression.
+            cold_read_slot: Semaphore::new(1),
         })
     }
 
@@ -210,27 +211,26 @@ impl StaticFiles {
             encoding: requested_encoding,
         };
 
+        let mut cold_read_permit = None;
         let asset = match self.cache.get(&key) {
             Some(asset) => asset,
             None => {
-                let _compression_permit = if requested_encoding == Encoding::Identity {
-                    None
-                } else {
-                    Some(self.compression_slot.acquire().await.map_err(|error| {
-                        cloudflare_pingora::Error::because(
-                            cloudflare_pingora::ErrorType::InternalError,
-                            "compression scheduler closed",
-                            error,
-                        )
-                    })?)
-                };
+                cold_read_permit = Some(self.cold_read_slot.acquire().await.map_err(|error| {
+                    cloudflare_pingora::Error::because(
+                        cloudflare_pingora::ErrorType::InternalError,
+                        "cold read scheduler closed",
+                        error,
+                    )
+                })?);
 
                 // Another cold request can populate the representation while
                 // this request waits for the bounded compressor.
                 if let Some(asset) = self.cache.get(&key) {
                     asset
                 } else {
-                    let body = self.read_representation(&path, requested_encoding).await;
+                    let body = self
+                        .read_representation(root, &path, requested_encoding)
+                        .await;
                     let (body, actual_encoding) = match body {
                         Ok(value) => value,
                         Err(_) => return send_empty(session, 500, &[], tls).await,
@@ -253,12 +253,7 @@ impl StaticFiles {
             }
         };
 
-        if session
-            .req_header()
-            .headers
-            .get(IF_NONE_MATCH)
-            .is_some_and(|value| value == asset.etag)
-        {
+        if if_none_match_matches(&session.req_header().headers, asset.etag.as_bytes()) {
             let mut response = ResponseHeader::build(304, Some(8)).unwrap();
             response.insert_header(ETAG, asset.etag.clone())?;
             response.insert_header(LAST_MODIFIED, asset.last_modified.clone())?;
@@ -292,11 +287,13 @@ impl StaticFiles {
                 .write_response_body(Some(asset.body.clone()), true)
                 .await?;
         }
+        drop(cold_read_permit);
         Ok(true)
     }
 
     async fn read_representation(
         &self,
+        root: &Path,
         path: &Path,
         encoding: Encoding,
     ) -> std::io::Result<(Bytes, Encoding)> {
@@ -304,7 +301,7 @@ impl StaticFiles {
             let mut sidecar: OsString = path.as_os_str().to_owned();
             sidecar.push(".");
             sidecar.push(extension);
-            if let Some(data) = read_bounded_sidecar(&PathBuf::from(sidecar)).await? {
+            if let Some(data) = read_bounded_sidecar(root, &PathBuf::from(sidecar)).await? {
                 return Ok((data, encoding));
             }
         }
@@ -333,8 +330,14 @@ fn cached_header_value(value: &str) -> Result<HeaderValue> {
     })
 }
 
-async fn read_bounded_sidecar(path: &Path) -> std::io::Result<Option<Bytes>> {
-    let file = match tokio::fs::File::open(path).await {
+async fn read_bounded_sidecar(root: &Path, path: &Path) -> std::io::Result<Option<Bytes>> {
+    let canonical = match tokio::fs::canonicalize(path).await {
+        Ok(path) if path.starts_with(root) => path,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(None),
+    };
+    let file = match tokio::fs::File::open(canonical).await {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Ok(None),
@@ -417,15 +420,11 @@ async fn serve_streaming_file(
         .as_nanos();
     let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), modified_nanos);
 
-    if session
-        .req_header()
-        .headers
-        .get(IF_NONE_MATCH)
-        .is_some_and(|value| value.as_bytes() == etag.as_bytes())
-    {
+    if if_none_match_matches(&session.req_header().headers, etag.as_bytes()) {
         let mut response = ResponseHeader::build(304, Some(8)).unwrap();
         response.insert_header(ETAG, etag)?;
         response.insert_header(LAST_MODIFIED, httpdate::fmt_http_date(modified))?;
+        response.insert_header(VARY, ACCEPT_ENCODING_VALUE)?;
         insert_cache_header(&mut response, path, spa_fallback)?;
         insert_security_headers(&mut response, tls)?;
         session
@@ -451,6 +450,7 @@ async fn serve_streaming_file(
     response.insert_header(CONTENT_LENGTH, metadata.len().to_string())?;
     response.insert_header(ETAG, etag)?;
     response.insert_header(LAST_MODIFIED, httpdate::fmt_http_date(modified))?;
+    response.insert_header(VARY, ACCEPT_ENCODING_VALUE)?;
     insert_cache_header(&mut response, path, spa_fallback)?;
     insert_security_headers(&mut response, tls)?;
     session
@@ -486,6 +486,13 @@ async fn serve_streaming_file(
         }
     }
     Ok(true)
+}
+
+fn if_none_match_matches(headers: &http::HeaderMap, target: &[u8]) -> bool {
+    headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .any(|value| weak_validate_etag(value.as_bytes(), target))
 }
 
 fn compress(data: Vec<u8>, encoding: Encoding) -> std::io::Result<Vec<u8>> {
@@ -654,6 +661,29 @@ mod tests {
     }
 
     #[test]
+    fn if_none_match_accepts_lists_wildcards_and_weak_equivalence() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(IF_NONE_MATCH, HeaderValue::from_static("\"other\""));
+        headers.append(
+            IF_NONE_MATCH,
+            HeaderValue::from_static("\"miss\", \"asset\""),
+        );
+        assert!(if_none_match_matches(&headers, b"W/\"asset\""));
+        assert!(!if_none_match_matches(&headers, b"W/\"missing\""));
+
+        headers.clear();
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
+        assert!(if_none_match_matches(&headers, b"W/\"anything\""));
+
+        headers.clear();
+        headers.insert(
+            IF_NONE_MATCH,
+            HeaderValue::from_static("\"other\", \"asset,part\""),
+        );
+        assert!(if_none_match_matches(&headers, b"W/\"asset,part\""));
+    }
+
+    #[test]
     fn cache_byte_accounting_tracks_capacity_evictions() {
         let cache = AssetCache::new(usize::MAX);
         for index in 0..513_u128 {
@@ -696,12 +726,43 @@ mod tests {
         let file = std::fs::File::create(&sidecar).unwrap();
         file.set_len(MAX_BUFFERED_ASSET_BYTES + 1).unwrap();
 
+        let root = std::fs::canonicalize(directory.path()).unwrap();
         let files = StaticFiles::new(HashMap::new(), 1024 * 1024).unwrap();
         let (compressed, encoding) = files
-            .read_representation(&path, Encoding::Gzip)
+            .read_representation(&root, &path, Encoding::Gzip)
             .await
             .unwrap();
         assert_eq!(encoding, Encoding::Gzip);
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_ref())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, source);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn precompressed_sidecar_symlink_cannot_escape_static_root() {
+        use std::io::Read;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = directory.path().join("asset.txt");
+        let source = b"inside static root".repeat(128);
+        std::fs::write(&path, &source).unwrap();
+        let outside_sidecar = outside.path().join("secret.gz");
+        std::fs::write(&outside_sidecar, b"outside sentinel").unwrap();
+        symlink(&outside_sidecar, directory.path().join("asset.txt.gz")).unwrap();
+
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let files = StaticFiles::new(HashMap::new(), 1024 * 1024).unwrap();
+        let (compressed, encoding) = files
+            .read_representation(&root, &path, Encoding::Gzip)
+            .await
+            .unwrap();
+        assert_eq!(encoding, Encoding::Gzip);
+        assert_ne!(compressed.as_ref(), b"outside sentinel");
         let mut decoded = Vec::new();
         flate2::read::GzDecoder::new(compressed.as_ref())
             .read_to_end(&mut decoded)

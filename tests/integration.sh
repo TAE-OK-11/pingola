@@ -62,9 +62,32 @@ grep -q 'pingora-static-response' <<<"${static_body}"
 curl --noproxy '*' -sSI -H 'host: static.test' -H 'accept-encoding: zstd' \
   http://127.0.0.1:80/ | grep -qi '^content-encoding: zstd'
 
+etag=$(curl --noproxy '*' -sSI -H 'host: static.test' \
+  http://127.0.0.1:80/ | awk -F': ' \
+  'tolower($1) == "etag" {gsub("\r", "", $2); print $2}')
+[[ -n "${etag}" ]]
+status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+  -H 'host: static.test' -H "if-none-match: \"other\", ${etag}" \
+  http://127.0.0.1:80/)
+[[ "${status}" == "304" ]]
+status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+  -H 'host: static.test' -H 'if-none-match: *' http://127.0.0.1:80/)
+[[ "${status}" == "304" ]]
+
 curl --noproxy '*' -fsS -H 'host: static.test' \
   http://127.0.0.1:80/large.bin -o "${RUNTIME}/large-response.bin"
 [[ "$(stat -c '%s' "${RUNTIME}/large-response.bin")" == "8388609" ]]
+curl --noproxy '*' -sSI -H 'host: static.test' \
+  http://127.0.0.1:80/large.bin | grep -qi '^vary: Accept-Encoding'
+large_etag=$(curl --noproxy '*' -sSI -H 'host: static.test' \
+  http://127.0.0.1:80/large.bin | awk -F': ' \
+  'tolower($1) == "etag" {gsub("\r", "", $2); print $2}')
+[[ -n "${large_etag}" ]]
+curl --noproxy '*' -sS -D "${RUNTIME}/large-not-modified.headers" -o /dev/null \
+  -H 'host: static.test' -H "if-none-match: \"other\", ${large_etag}" \
+  http://127.0.0.1:80/large.bin
+grep -q '^HTTP/1.1 304 ' "${RUNTIME}/large-not-modified.headers"
+grep -qi '^vary: Accept-Encoding' "${RUNTIME}/large-not-modified.headers"
 
 http_version=$(curl --noproxy '*' -ksS --http2 \
   --resolve static.test:443:127.0.0.1 -o /dev/null -w '%{http_version}' \

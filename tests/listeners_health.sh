@@ -95,6 +95,10 @@ status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
 [[ "${status}" == 404 ]]
 details_status=$(curl --noproxy '*' -sS -o "${RUNTIME}/details.json" -w '%{http_code}' \
   -H 'host: health.invalid' 'http://127.0.0.1:80/pingora-health/details?upstreams=1')
+[[ "${details_status}" == 404 ]]
+details_status=$(curl --noproxy '*' --unix-socket "${RUNTIME}/dual.sock" -sS \
+  -o "${RUNTIME}/details.json" -w '%{http_code}' \
+  'http://localhost/pingora-health/details?upstreams=1')
 [[ "${details_status}" == 503 ]]
 jq -e '.product == "Pingora" and .readiness == false and .upstreams.unavailable == false' \
   "${RUNTIME}/details.json" >/dev/null

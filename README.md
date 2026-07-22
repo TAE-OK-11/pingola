@@ -255,6 +255,12 @@ Navidrome/Vaultwarden/CouchDB/AdGuard UI 기본 upstream은 명시적으로 `htt
 유지하십시오. 짧은 duration benchmark만 내부 warm-up이 측정 시작 시점에 connection을
 닫지 않도록 두 프록시에 동일하게 1,000,000을 사용합니다.
 
+`server.downstream_max_connections`는 handshake/HTTP 처리 중인 전체 downstream
+connection 수를 제한하며 기본값은 4096입니다.
+`server.downstream_request_header_timeout_seconds`는 HTTP/1 header 전체와 HTTP/2
+preface를 받는 총시간 제한이며 기본값은 15초입니다. 두 값 모두 Slowloris와 socket
+고갈 방어이므로 비활성화할 수 없습니다.
+
 ## Timeout, retry, limiter 설정
 
 Upstream `read_timeout_seconds`와 `write_timeout_seconds`를 생략하면 route 기본값을
@@ -517,6 +523,8 @@ cd /opt/pingora
 git pull --ff-only
 # Zen 1 이상 운영 서버에서는 검증한 oracle-zen1 content digest를 고정합니다.
 export PINGORA_IMAGE=ghcr.io/tae-ok-11/pingora@sha256:...
+# 원격 production 이미지를 사용할 때는 반드시 immutable digest를 지정합니다.
+export PINGORA_IMAGE='ghcr.io/tae-ok-11/pingora@sha256:<release-digest>'
 docker compose pull pingora
 docker compose run --rm --no-deps pingora --check
 docker stop jbs-nginx
@@ -542,9 +550,11 @@ curl --fail http://127.0.0.1/nginx-health
 - 알 수 없는 Host는 비표준 444 대신 `421 Misdirected Request`로 거부합니다.
 - HTTP/3는 지원하지 않습니다.
 - Navidrome audio는 전체 buffering하거나 동적 압축하지 않습니다.
-- DoH upstream의 기존 운영 동작을 맞추기 위해 기본 config의
-  `verify_certificate: false`가 유지됩니다. 내부 CA를 배포할 수 있으면 반드시
-  `true`로 전환하십시오.
+- 기본 config의 DoH TLS upstream은 인증서와 hostname을 검증합니다. 사설 CA를
+  사용한다면 해당 CA를 container의 신뢰 저장소에 배포하십시오.
+- `trusted_proxies`에는 실제로 관리하는 proxy의 정확한 CIDR만 추가하십시오.
+  RFC1918 전체 대역을 신뢰하면 같은 사설망의 client가 `X-Forwarded-For`를
+  위조해 client별 rate limit을 우회할 수 있습니다.
 
 ## 라이선스
 

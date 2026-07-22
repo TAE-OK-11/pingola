@@ -219,9 +219,27 @@ where
     {
         // phase 1 read request header
 
+        let read_request = async {
+            match self
+                .server_options
+                .as_ref()
+                .and_then(|options| options.request_header_timeout)
+            {
+                Some(deadline) => {
+                    match time::timeout(deadline, downstream_session.read_request()).await {
+                        Ok(result) => result,
+                        Err(_) => Error::e_explain(
+                            ReadTimedout,
+                            format!("downstream request header timeout: {deadline:?}"),
+                        ),
+                    }
+                }
+                None => downstream_session.read_request().await,
+            }
+        };
         let res = tokio::select! {
             biased; // biased select is cheaper, and we don't want to drop already buffered requests
-            res = downstream_session.read_request() => { res }
+            res = read_request => { res }
             _ = self.shutdown.notified() => {
                 // service shutting down, dropping the connection to stop more req from coming in
                 return None;
@@ -250,10 +268,7 @@ where
                 return None;
             }
         }
-        trace!(
-            "Request header: {:?}",
-            downstream_session.req_header().as_ref()
-        );
+        trace!("downstream request header received");
         // CONNECT method proxying is not default supported by the proxy http logic itself,
         // since the tunneling process changes the request-response flow.
         // https://datatracker.ietf.org/doc/html/rfc9110#name-connect

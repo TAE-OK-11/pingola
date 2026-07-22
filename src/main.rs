@@ -276,6 +276,9 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
 
     let gateway = Gateway::new(runtime.clone()).context("service bootstrap failed")?;
     let mut http_options = HttpServerOptions::default();
+    http_options.request_header_timeout = Some(Duration::from_secs(
+        server_config.downstream_request_header_timeout_seconds,
+    ));
     // Pingora 0.8.1 interprets this value as the number of HTTP/1.1 reuses
     // after the first request, while the public setting follows NGINX and
     // counts the first request. Validation guarantees this subtraction.
@@ -289,6 +292,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         .name("pingora-gateway")
         .server_options(http_options)
         .build();
+    service.set_connection_limit(server_config.downstream_max_connections);
 
     let mut h2_options = default_h2_options();
     h2_options.max_concurrent_streams(server_config.http2_max_concurrent_streams);

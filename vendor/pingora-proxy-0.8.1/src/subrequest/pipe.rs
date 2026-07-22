@@ -217,7 +217,7 @@ where
 
         tokio::select! {
             task = rx.recv(), if !response_state.upstream_done() => {
-                debug!("upstream event: {:?}", task);
+                debug!("subrequest upstream event received");
                 if let Some(t) = task {
                     // pull as many tasks as we can
                     const TASK_BUFFER_SIZE: usize = 4;
