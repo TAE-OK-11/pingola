@@ -9,6 +9,7 @@ TCMALLOC_EXPECTED_ALLOCATOR=${ALLOCATOR_BENCH_TCMALLOC_EXPECTED:-tcmalloc}
 BACKEND_IMAGE=${ALLOCATOR_BACKEND_IMAGE:-tae00217/jbs-nginx:ultra-4.0}
 CPU_LIMIT=${ALLOCATOR_BENCH_CPUS:-0.5}
 MEMORY_LIMIT=${ALLOCATOR_BENCH_MEMORY:-1g}
+CERT_GID=${ALLOCATOR_BENCH_CERT_GID:-$(id -g)}
 MIN_FREE_BYTES=${ALLOCATOR_BENCH_MIN_FREE_BYTES:-1073741824}
 ROUNDS=${ALLOCATOR_BENCH_ROUNDS:-5}
 DURATION=${ALLOCATOR_BENCH_DURATION:-3s}
@@ -74,6 +75,10 @@ for command in docker curl wrk h2load openssl python3 sha256sum jq numfmt dd; do
     exit 2
   fi
 done
+if [[ ! "${CERT_GID}" =~ ^[0-9]+$ ]]; then
+  echo "ALLOCATOR_BENCH_CERT_GID must be a numeric group ID" >&2
+  exit 2
+fi
 
 mkdir -p "${OUTPUT}/raw"
 chmod 0755 "${OUTPUT}" "${OUTPUT}/raw"
@@ -100,6 +105,7 @@ cpu_limit=${CPU_LIMIT}
 cpu_nano=${CPU_NANO}
 memory_limit=${MEMORY_LIMIT}
 memory_bytes=${MEMORY_BYTES}
+certificate_gid=${CERT_GID}
 minimum_free_bytes=${MIN_FREE_BYTES}
 available_bytes_at_start=${AVAILABLE_BYTES}
 rounds=${ROUNDS}
@@ -133,7 +139,7 @@ docker image inspect "${BACKEND_IMAGE}" >"${OUTPUT}/backend-inspect.json"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj '/CN=bench.test' -addext 'subjectAltName=DNS:bench.test' \
   -keyout "${OUTPUT}/key.pem" -out "${OUTPUT}/cert.pem" >/dev/null 2>&1
-chown 0:10001 "${OUTPUT}/key.pem" "${OUTPUT}/cert.pem"
+chgrp "${CERT_GID}" "${OUTPUT}/key.pem" "${OUTPUT}/cert.pem"
 chmod 0640 "${OUTPUT}/key.pem" "${OUTPUT}/cert.pem"
 
 cat >"${OUTPUT}/pingora.yaml" <<EOF
@@ -245,6 +251,7 @@ start_proxy() {
     --cpus "${CPU_LIMIT}" --memory "${MEMORY_LIMIT}" --memory-swap "${MEMORY_LIMIT}" \
     --ulimit nofile=32768:32768 \
     --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
+    --group-add "${CERT_GID}" \
     --tmpfs /tmp/pingora:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700 \
     --volume "${OUTPUT}:/work:ro" --entrypoint /usr/local/bin/pingora \
     "${image}" --config /work/pingora.yaml >/dev/null
