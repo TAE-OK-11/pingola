@@ -8,6 +8,7 @@ use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
 use cloudflare_pingora::http::ResponseHeader;
+use cloudflare_pingora::protocols::http::conditional_filter::weak_validate_etag;
 use cloudflare_pingora::proxy::Session;
 use cloudflare_pingora::Result;
 use http::header::{
@@ -253,12 +254,7 @@ impl StaticFiles {
             }
         };
 
-        if session
-            .req_header()
-            .headers
-            .get(IF_NONE_MATCH)
-            .is_some_and(|value| value == asset.etag)
-        {
+        if if_none_match_matches(&session.req_header().headers, asset.etag.as_bytes()) {
             let mut response = ResponseHeader::build(304, Some(8)).unwrap();
             response.insert_header(ETAG, asset.etag.clone())?;
             response.insert_header(LAST_MODIFIED, asset.last_modified.clone())?;
@@ -417,15 +413,11 @@ async fn serve_streaming_file(
         .as_nanos();
     let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), modified_nanos);
 
-    if session
-        .req_header()
-        .headers
-        .get(IF_NONE_MATCH)
-        .is_some_and(|value| value.as_bytes() == etag.as_bytes())
-    {
+    if if_none_match_matches(&session.req_header().headers, etag.as_bytes()) {
         let mut response = ResponseHeader::build(304, Some(8)).unwrap();
         response.insert_header(ETAG, etag)?;
         response.insert_header(LAST_MODIFIED, httpdate::fmt_http_date(modified))?;
+        response.insert_header(VARY, ACCEPT_ENCODING_VALUE)?;
         insert_cache_header(&mut response, path, spa_fallback)?;
         insert_security_headers(&mut response, tls)?;
         session
@@ -451,6 +443,7 @@ async fn serve_streaming_file(
     response.insert_header(CONTENT_LENGTH, metadata.len().to_string())?;
     response.insert_header(ETAG, etag)?;
     response.insert_header(LAST_MODIFIED, httpdate::fmt_http_date(modified))?;
+    response.insert_header(VARY, ACCEPT_ENCODING_VALUE)?;
     insert_cache_header(&mut response, path, spa_fallback)?;
     insert_security_headers(&mut response, tls)?;
     session
@@ -486,6 +479,13 @@ async fn serve_streaming_file(
         }
     }
     Ok(true)
+}
+
+fn if_none_match_matches(headers: &http::HeaderMap, target: &[u8]) -> bool {
+    headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .any(|value| weak_validate_etag(value.as_bytes(), target))
 }
 
 fn compress(data: Vec<u8>, encoding: Encoding) -> std::io::Result<Vec<u8>> {
@@ -651,6 +651,29 @@ mod tests {
         assert_eq!(decoded, data);
         assert!(!compress(data.clone(), Encoding::Brotli).unwrap().is_empty());
         assert!(!compress(data, Encoding::Zstd).unwrap().is_empty());
+    }
+
+    #[test]
+    fn if_none_match_accepts_lists_wildcards_and_weak_equivalence() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(IF_NONE_MATCH, HeaderValue::from_static("\"other\""));
+        headers.append(
+            IF_NONE_MATCH,
+            HeaderValue::from_static("\"miss\", \"asset\""),
+        );
+        assert!(if_none_match_matches(&headers, b"W/\"asset\""));
+        assert!(!if_none_match_matches(&headers, b"W/\"missing\""));
+
+        headers.clear();
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
+        assert!(if_none_match_matches(&headers, b"W/\"anything\""));
+
+        headers.clear();
+        headers.insert(
+            IF_NONE_MATCH,
+            HeaderValue::from_static("\"other\", \"asset,part\""),
+        );
+        assert!(if_none_match_matches(&headers, b"W/\"asset,part\""));
     }
 
     #[test]
