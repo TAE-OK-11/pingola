@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
@@ -47,6 +48,16 @@ const STREAM_PREFIXES: &[&str] = &[
 ];
 const COVER_PREFIXES: &[&str] = &["/rest/getCoverArt", "/api/artwork", "/coverart", "/artwork"];
 static LEGACY_HEALTH_WARNING: Once = Once::new();
+thread_local! {
+    // A keep-alive or H2 connection normally sends many requests for the same
+    // client. Keep only the most recently formatted address per worker thread
+    // so the forwarded-header hot path avoids repeating integer formatting and
+    // HeaderValue validation. The single entry is bounded and cannot grow with
+    // attacker-controlled X-Forwarded-For values.
+    static CLIENT_IP_HEADER_CACHE: RefCell<Option<(IpAddr, HeaderValue)>> = const {
+        RefCell::new(None)
+    };
+}
 const NO_PLAN: usize = usize::MAX;
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
@@ -617,21 +628,7 @@ impl ProxyHttp for Gateway {
         let plan = self.request_plan(ctx)?;
         strip_request_hop_headers(session.req_header(), upstream_request)?;
         upstream_request.headers.reserve(6);
-        let mut client_ip_text = ArrayString::<64>::new();
-        write!(&mut client_ip_text, "{}", ctx.client_ip).map_err(|error| {
-            Error::because(
-                HTTPStatus(400),
-                "resolved client IP could not be formatted as a header",
-                error,
-            )
-        })?;
-        let client_ip = http::HeaderValue::from_str(&client_ip_text).map_err(|error| {
-            Error::because(
-                HTTPStatus(400),
-                "resolved client IP could not be encoded as a header",
-                error,
-            )
-        })?;
+        let client_ip = forwarded_client_ip_value(ctx.client_ip)?;
         let upstream_host = if plan.route == RouteClass::Doh {
             DIRECT_DOH_HOST
         } else {
@@ -1236,6 +1233,38 @@ fn forwarded_port_value(port: Option<u16>, tls: bool) -> Result<HeaderValue> {
     }
 }
 
+fn forwarded_client_ip_value(ip: IpAddr) -> Result<HeaderValue> {
+    if let Some(value) = CLIENT_IP_HEADER_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(cached_ip, _)| *cached_ip == ip)
+            .map(|(_, value)| value.clone())
+    }) {
+        return Ok(value);
+    }
+
+    let mut text = ArrayString::<64>::new();
+    write!(&mut text, "{ip}").map_err(|error| {
+        Error::because(
+            HTTPStatus(400),
+            "resolved client IP could not be formatted as a header",
+            error,
+        )
+    })?;
+    let value = HeaderValue::from_str(&text).map_err(|error| {
+        Error::because(
+            HTTPStatus(400),
+            "resolved client IP could not be encoded as a header",
+            error,
+        )
+    })?;
+    CLIENT_IP_HEADER_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some((ip, value.clone()));
+    });
+    Ok(value)
+}
+
 fn vaultwarden_auth_path(path: &str) -> bool {
     [
         "/api/accounts/login",
@@ -1838,6 +1867,17 @@ write_timeout_seconds: 9
         assert_eq!(forwarded_port_value(Some(18_080), false).unwrap(), "18080");
         assert_eq!(forwarded_port_value(None, true).unwrap(), "443");
         assert_eq!(forwarded_port_value(None, false).unwrap(), "80");
+    }
+
+    #[test]
+    fn forwarded_client_ip_header_cache_preserves_ipv4_and_ipv6_values() {
+        let ipv4 = "192.0.2.17".parse().unwrap();
+        let ipv6 = "2001:db8::17".parse().unwrap();
+
+        assert_eq!(forwarded_client_ip_value(ipv4).unwrap(), "192.0.2.17");
+        assert_eq!(forwarded_client_ip_value(ipv4).unwrap(), "192.0.2.17");
+        assert_eq!(forwarded_client_ip_value(ipv6).unwrap(), "2001:db8::17");
+        assert_eq!(forwarded_client_ip_value(ipv4).unwrap(), "192.0.2.17");
     }
 
     #[test]
