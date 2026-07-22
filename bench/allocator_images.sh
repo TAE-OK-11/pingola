@@ -8,6 +8,7 @@ JEMALLOC_EXPECTED_ALLOCATOR=${ALLOCATOR_BENCH_JEMALLOC_EXPECTED:-jemalloc}
 TCMALLOC_EXPECTED_ALLOCATOR=${ALLOCATOR_BENCH_TCMALLOC_EXPECTED:-tcmalloc}
 BACKEND_IMAGE=${ALLOCATOR_BACKEND_IMAGE:-tae00217/jbs-nginx:ultra-4.0}
 CPU_LIMIT=${ALLOCATOR_BENCH_CPUS:-0.5}
+WORKERS=${ALLOCATOR_BENCH_WORKERS:-1}
 MEMORY_LIMIT=${ALLOCATOR_BENCH_MEMORY:-1g}
 CERT_GID=${ALLOCATOR_BENCH_CERT_GID:-$(id -g)}
 MIN_FREE_BYTES=${ALLOCATOR_BENCH_MIN_FREE_BYTES:-1073741824}
@@ -79,6 +80,10 @@ if [[ ! "${CERT_GID}" =~ ^[0-9]+$ ]]; then
   echo "ALLOCATOR_BENCH_CERT_GID must be a numeric group ID" >&2
   exit 2
 fi
+if [[ ! "${WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ALLOCATOR_BENCH_WORKERS must be a positive integer" >&2
+  exit 2
+fi
 
 mkdir -p "${OUTPUT}/raw"
 chmod 0755 "${OUTPUT}" "${OUTPUT}/raw"
@@ -102,6 +107,7 @@ tcmalloc_image=${TCMALLOC_IMAGE}
 jemalloc_expected_allocator=${JEMALLOC_EXPECTED_ALLOCATOR}
 tcmalloc_expected_allocator=${TCMALLOC_EXPECTED_ALLOCATOR}
 cpu_limit=${CPU_LIMIT}
+workers=${WORKERS}
 cpu_nano=${CPU_NANO}
 memory_limit=${MEMORY_LIMIT}
 memory_bytes=${MEMORY_BYTES}
@@ -149,7 +155,7 @@ server:
   certificate: /work/cert.pem
   private_key: /work/key.pem
   health_socket: /tmp/pingora/health.sock
-  threads: 1
+  threads: ${WORKERS}
   upstream_keepalive_pool_size: 128
   max_retries: 0
   access_log: false
