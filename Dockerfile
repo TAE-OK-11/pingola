@@ -10,14 +10,12 @@ ARG TLS_PROVIDER=aws-lc
 ARG PGO_MODE=off
 ARG PGO_TRAIN_TARGET_CPU=x86-64-v2
 # Rebalanced from standard-port Oracle A/B results. Keep steady-state H2 at
-# roughly 60% of the merged profile while raising H1 coverage to 30.3% after
-# the standard-port candidate remained 2.4% behind NGINX. H1 and H2 scenarios
-# already contain TLS, streaming, and error traffic, so the dedicated profiles
-# remain supplemental rather than being removed.
-ARG PGO_WEIGHT_H1=100
-ARG PGO_WEIGHT_H2=200
-ARG PGO_WEIGHT_TLS=10
-ARG PGO_WEIGHT_TAIL=20
+# roughly 60% of the merged profile while raising H1 coverage from 17.5% to
+# 22.6%; H1 already includes a TLS workload, so this does not remove TLS paths.
+ARG PGO_WEIGHT_H1=60
+ARG PGO_WEIGHT_H2=160
+ARG PGO_WEIGHT_TLS=15
+ARG PGO_WEIGHT_TAIL=30
 ARG PGO_TRAIN_ROUNDS=2
 ARG PGO_ECDSA_CURVE=prime256v1
 ARG DEBIAN_SUITE=trixie
