@@ -12,8 +12,8 @@ CERT_GID=${BENCH_CERT_GID:-$(id -g)}
 MIN_FREE_BYTES=${BENCH_MIN_FREE_BYTES:-1073741824}
 BACKEND_PORT=${BACKEND_PORT:-18700}
 BACKEND_SOURCE=${BENCH_BACKEND_SOURCE:-${ROOT}/bench/backend.rs}
-HTTP_PORT=${HTTP_PORT:-18780}
-HTTPS_PORT=${HTTPS_PORT:-18743}
+HTTP_PORT=${HTTP_PORT:-80}
+HTTPS_PORT=${HTTPS_PORT:-443}
 DURATION=${BENCH_DURATION:-3s}
 WARMUP=${BENCH_WARMUP:-1s}
 STABILITY_REQUESTS=${BENCH_STABILITY_REQUESTS:-480}
@@ -126,6 +126,9 @@ stability_requests=${STABILITY_REQUESTS}
 backend=rust-std-http1
 backend_source=${BACKEND_SOURCE}
 backend_binary_sha256=$(sha256sum "${BACKEND_BIN}" | cut -d' ' -f1)
+http_port=${HTTP_PORT}
+https_port=${HTTPS_PORT}
+backend_port=${BACKEND_PORT}
 note=load generator and backend share this host; each proxy container has identical CPU and memory limits
 EOF
 rustc -vV | sed 's/^/backend_rustc_/' >>"${OUTPUT}/environment.txt"

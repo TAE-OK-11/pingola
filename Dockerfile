@@ -9,11 +9,11 @@ ARG RUST_CODEGEN_UNITS=1
 ARG TLS_PROVIDER=aws-lc
 ARG PGO_MODE=off
 ARG PGO_TRAIN_TARGET_CPU=x86-64-v2
-# Rebalanced from low-noise Oracle A/B results: favor steady-state H2,
-# keep enough H1 coverage, reduce duplicated standalone TLS influence,
-# and retain explicit tail-path training.
-ARG PGO_WEIGHT_H1=35
-ARG PGO_WEIGHT_H2=120
+# Rebalanced from standard-port Oracle A/B results. Keep steady-state H2 at
+# roughly 60% of the merged profile while raising H1 coverage from 17.5% to
+# 22.6%; H1 already includes a TLS workload, so this does not remove TLS paths.
+ARG PGO_WEIGHT_H1=60
+ARG PGO_WEIGHT_H2=160
 ARG PGO_WEIGHT_TLS=15
 ARG PGO_WEIGHT_TAIL=30
 ARG PGO_TRAIN_ROUNDS=2

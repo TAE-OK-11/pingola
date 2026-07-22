@@ -100,16 +100,16 @@ assert_container_hardening() {
   fi
 }
 
-write_config "${RUNTIME}/http.yaml" '["127.0.0.1:18570"]' '[]'
+write_config "${RUNTIME}/http.yaml" '["127.0.0.1:80"]' '[]'
 start_container pingora-test-http "${RUNTIME}/http.yaml"
 assert_container_hardening pingora-test-http
 curl --noproxy '*' -fsS -H 'host: health.invalid' \
-  http://127.0.0.1:18570/pingora-health -o /dev/null
+  http://127.0.0.1:80/pingora-health -o /dev/null
 [[ $(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
-  -H 'host: health.invalid' http://127.0.0.1:18570/nginx-health) == 404 ]]
+  -H 'host: health.invalid' http://127.0.0.1:80/nginx-health) == 404 ]]
 docker rm -f pingora-test-http >/dev/null
 
-write_config "${RUNTIME}/ipv6.yaml" '[]' '["[::1]:18571"]' true
+write_config "${RUNTIME}/ipv6.yaml" '[]' '["[::1]:443"]' true
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj '/CN=health.test' -addext 'subjectAltName=DNS:health.test' \
   -keyout "${RUNTIME}/cert/key.pem" -out "${RUNTIME}/cert/cert.pem" >/dev/null 2>&1
@@ -127,8 +127,8 @@ fi
 start_container pingora-test-https-ipv6 "${RUNTIME}/ipv6.yaml" \
   --volume "${RUNTIME}/cert:/etc/pingora/cert:ro"
 assert_container_hardening pingora-test-https-ipv6
-curl --noproxy '*' -gkfsS --http2 --resolve health.test:18571:[::1] \
-  https://health.test:18571/pingora-ready -o /dev/null
+curl --noproxy '*' -gkfsS --http2 --resolve health.test:443:[::1] \
+  https://health.test:443/pingora-ready -o /dev/null
 
 docker exec pingora-test-https-ipv6 /usr/local/bin/pingora \
   --config /etc/pingora/pingora.yaml --check >/dev/null

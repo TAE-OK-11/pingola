@@ -47,9 +47,9 @@ run_curl_case() {
     method_args=(--head)
   fi
   curl --noproxy '*' -ksS "${http_version}" "${method_args[@]}" \
-    --resolve matrix.test:18444:127.0.0.1 \
+    --resolve matrix.test:443:127.0.0.1 \
     --dump-header "${headers}" --output "${body}" \
-    "https://matrix.test:18444${path}" 2>"${errors}" || rc=$?
+    "https://matrix.test:443${path}" 2>"${errors}" || rc=$?
 
   local sha=-
   [[ -f "${body}" ]] && sha=$(sha256sum "${body}" | awk '{print $1}')
@@ -80,8 +80,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 
 cat >"${RUNTIME}/pingora.yaml" <<EOF
 server:
-  http_listen: ["127.0.0.1:18081"]
-  https_listen: ["127.0.0.1:18444"]
+  http_listen: ["127.0.0.1:80"]
+  https_listen: ["127.0.0.1:443"]
   certificate: ${RUNTIME}/cert.pem
   private_key: ${RUNTIME}/key.pem
   threads: 1
@@ -121,7 +121,7 @@ GATEWAY_PID=$!
 ready=0
 for _ in {1..100}; do
   if curl --noproxy '*' -fsS -H 'host: matrix.test' \
-    http://127.0.0.1:18081/pingora-health -o /dev/null 2>/dev/null; then
+    http://127.0.0.1:80/pingora-health -o /dev/null 2>/dev/null; then
     ready=1
     break
   fi
@@ -167,9 +167,9 @@ done <"${RESULTS}"
 
 # One TLS 1.3 connection carrying repeated and concurrent HTTP/2 streams.
 nghttp --no-verify-peer -v -H ':authority: matrix.test' \
-  https://127.0.0.1:18444/fixed/64 \
-  https://127.0.0.1:18444/fixed/4096 \
-  https://127.0.0.1:18444/chunked/4096 \
+  https://127.0.0.1:443/fixed/64 \
+  https://127.0.0.1:443/fixed/4096 \
+  https://127.0.0.1:443/chunked/4096 \
   >"${RUNTIME}/nghttp.stdout" 2>"${RUNTIME}/nghttp.stderr"
 nghttp_rc=$?
 [[ "${nghttp_rc}" -eq 0 ]] || FAILURES=$((FAILURES + 1))
@@ -181,7 +181,7 @@ for concurrency in 1 8 32; do
   # behavior is a separate benchmark dimension and must not multiply this
   # value by h2load's connection count.
   h2load -n $((concurrency * 20)) -c 1 -m "${concurrency}" \
-    -H 'host: matrix.test' "https://127.0.0.1:18444/fixed/64" \
+    -H 'host: matrix.test' "https://127.0.0.1:443/fixed/64" \
     >"${RUNTIME}/h2load-c${concurrency}.stdout" \
     2>"${RUNTIME}/h2load-c${concurrency}.stderr"
   rc=$?
@@ -197,7 +197,7 @@ for concurrency in 1 8 32; do
     "raw=h2load-c${concurrency}.stdout"
 done
 
-openssl s_client -connect 127.0.0.1:18444 -servername matrix.test -tls1_3 -alpn h2 \
+openssl s_client -connect 127.0.0.1:443 -servername matrix.test -tls1_3 -alpn h2 \
   </dev/null >"${RUNTIME}/openssl.stdout" 2>"${RUNTIME}/openssl.stderr"
 openssl_rc=$?
 if [[ "${openssl_rc}" -ne 0 ]] || ! grep -q 'ALPN protocol: h2' "${RUNTIME}/openssl.stdout"; then

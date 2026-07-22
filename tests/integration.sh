@@ -38,7 +38,7 @@ GATEWAY_PID=$!
 
 for _ in {1..50}; do
   if curl --noproxy '*' -fsS -H 'host: health.invalid' \
-    http://127.0.0.1:18080/pingora-health -o /dev/null 2>/dev/null; then
+    http://127.0.0.1:80/pingora-health -o /dev/null 2>/dev/null; then
     break
   fi
   sleep 0.1
@@ -47,61 +47,61 @@ kill -0 "${GATEWAY_PID}"
 "${ROOT}/target/debug/pingora" --config "${ROOT}/tests/fixtures/integration.yaml" --healthcheck
 
 status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
-  -H 'host: unknown.test' http://127.0.0.1:18080/)
+  -H 'host: unknown.test' http://127.0.0.1:80/)
 [[ "${status}" == "421" ]]
 
 location=$(curl --noproxy '*' -sSI -H 'host: app.test' \
-  'http://127.0.0.1:18080/hello?x=1' | awk -F': ' \
+  'http://127.0.0.1:80/hello?x=1' | awk -F': ' \
   'tolower($1) == "location" {gsub("\r", "", $2); print $2}')
 [[ "${location}" == "https://app.test/hello?x=1" ]]
 
 static_body=$(curl --noproxy '*' --compressed -fsS -H 'host: static.test' \
-  -H 'accept-encoding: gzip' http://127.0.0.1:18080/)
+  -H 'accept-encoding: gzip' http://127.0.0.1:80/)
 grep -q 'pingora-static-response' <<<"${static_body}"
 
 curl --noproxy '*' -sSI -H 'host: static.test' -H 'accept-encoding: zstd' \
-  http://127.0.0.1:18080/ | grep -qi '^content-encoding: zstd'
+  http://127.0.0.1:80/ | grep -qi '^content-encoding: zstd'
 
 curl --noproxy '*' -fsS -H 'host: static.test' \
-  http://127.0.0.1:18080/large.bin -o "${RUNTIME}/large-response.bin"
+  http://127.0.0.1:80/large.bin -o "${RUNTIME}/large-response.bin"
 [[ "$(stat -c '%s' "${RUNTIME}/large-response.bin")" == "8388609" ]]
 
 http_version=$(curl --noproxy '*' -ksS --http2 \
-  --resolve static.test:18443:127.0.0.1 -o /dev/null -w '%{http_version}' \
-  https://static.test:18443/)
+  --resolve static.test:443:127.0.0.1 -o /dev/null -w '%{http_version}' \
+  https://static.test:443/)
 [[ "${http_version}" == "2" ]]
 
-curl --noproxy '*' -ksSI --http2 --resolve static.test:18443:127.0.0.1 \
-  https://static.test:18443/ | \
+curl --noproxy '*' -ksSI --http2 --resolve static.test:443:127.0.0.1 \
+  https://static.test:443/ | \
   grep -qi '^strict-transport-security: max-age=63072000; includeSubDomains; preload'
 
-openssl s_client -connect 127.0.0.1:18443 -servername static.test \
+openssl s_client -connect 127.0.0.1:443 -servername static.test \
   -alpn h2 -tls1_3 </dev/null 2>&1 | tr -d '\000' >"${RUNTIME}/tls13.log"
 grep -q 'New, TLSv1.3' "${RUNTIME}/tls13.log"
 grep -q 'ALPN protocol: h2' "${RUNTIME}/tls13.log"
-if openssl s_client -connect 127.0.0.1:18443 -servername static.test \
+if openssl s_client -connect 127.0.0.1:443 -servername static.test \
   -tls1_2 </dev/null 2>&1 | grep -q 'New, TLSv1.2'; then
   echo 'TLS 1.2 was unexpectedly accepted' >&2
   exit 1
 fi
 
 proxy_response=$(curl --noproxy '*' -ksS --http2 \
-  --resolve app.test:18443:127.0.0.1 \
+  --resolve app.test:443:127.0.0.1 \
   -H 'x-forwarded-for: 198.51.100.50, 10.0.0.2' \
-  https://app.test:18443/hello)
+  https://app.test:443/hello)
 jq -e '.headers["x-forwarded-for"] == "198.51.100.50"' \
   <<<"${proxy_response}" >/dev/null
 jq -e '.headers["x-forwarded-proto"] == "https"' \
   <<<"${proxy_response}" >/dev/null
-jq -e '.headers["x-forwarded-port"] == "18443"' \
+jq -e '.headers["x-forwarded-port"] == "443"' \
   <<<"${proxy_response}" >/dev/null
 
 hop_response=$(curl --noproxy '*' -ksS --http1.1 \
-  --resolve app.test:18443:127.0.0.1 \
+  --resolve app.test:443:127.0.0.1 \
   -H 'connection: keep-alive, x-private' \
   -H 'x-private: must-not-reach-upstream' \
   -H 'proxy-authorization: Basic must-not-reach-upstream' \
-  https://app.test:18443/headers)
+  https://app.test:443/headers)
 jq -e '.headers["x-private"] == null' <<<"${hop_response}" >/dev/null
 jq -e '.headers["proxy-authorization"] == null' <<<"${hop_response}" >/dev/null
 jq -e '.headers.connection == null' <<<"${hop_response}" >/dev/null
@@ -119,7 +119,7 @@ context = ssl.create_default_context()
 context.check_hostname = False
 context.verify_mode = ssl.CERT_NONE
 context.set_alpn_protocols(["http/1.1"])
-raw = socket.create_connection(("127.0.0.1", 18443), timeout=5)
+raw = socket.create_connection(("127.0.0.1", 443), timeout=5)
 connection = context.wrap_socket(raw, server_hostname="app.test")
 connection.settimeout(5)
 spill_headers = b"".join(
@@ -186,7 +186,7 @@ context = ssl.create_default_context()
 context.check_hostname = False
 context.verify_mode = ssl.CERT_NONE
 context.set_alpn_protocols(["http/1.1"])
-raw = socket.create_connection(("127.0.0.1", 18443), timeout=5)
+raw = socket.create_connection(("127.0.0.1", 443), timeout=5)
 connection = context.wrap_socket(raw, server_hostname="vault.test")
 connection.settimeout(5)
 buffer = b""
@@ -234,29 +234,29 @@ if completed != expected:
 PY
 
 status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \
-  --resolve app.test:18443:127.0.0.1 \
-  --data 'this-body-is-over-sixteen-bytes' https://app.test:18443/upload)
+  --resolve app.test:443:127.0.0.1 \
+  --data 'this-body-is-over-sixteen-bytes' https://app.test:443/upload)
 [[ "${status}" == "413" ]]
 
 for _ in {1..4}; do
   status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \
-    --resolve vault.test:18443:127.0.0.1 \
-    https://vault.test:18443/api/accounts/login)
+    --resolve vault.test:443:127.0.0.1 \
+    https://vault.test:443/api/accounts/login)
   [[ "${status}" == "200" ]]
 done
 status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \
-  --resolve vault.test:18443:127.0.0.1 \
-  https://vault.test:18443/api/accounts/login)
+  --resolve vault.test:443:127.0.0.1 \
+  https://vault.test:443/api/accounts/login)
 [[ "${status}" == "429" ]]
 
-if curl --noproxy '*' -ksSI --http2 --resolve app.test:18443:127.0.0.1 \
-  https://app.test:18443/hello | grep -qi '^server:'; then
+if curl --noproxy '*' -ksSI --http2 --resolve app.test:443:127.0.0.1 \
+  https://app.test:443/hello | grep -qi '^server:'; then
   echo 'upstream Server header leaked' >&2
   exit 1
 fi
 
 status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
-  -H 'host: health.invalid' http://127.0.0.1:18080/nginx-health)
+  -H 'host: health.invalid' http://127.0.0.1:80/nginx-health)
 [[ "${status}" == "404" ]]
 
 echo 'Pingora integration checks passed'

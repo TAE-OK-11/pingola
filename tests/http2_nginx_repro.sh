@@ -71,8 +71,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -keyout "${RUNTIME}/key.pem" -out "${RUNTIME}/cert.pem" >/dev/null 2>&1
 cat >"${RUNTIME}/pingora.yaml" <<EOF
 server:
-  http_listen: ["127.0.0.1:18082"]
-  https_listen: ["127.0.0.1:18445"]
+  http_listen: ["127.0.0.1:80"]
+  https_listen: ["127.0.0.1:443"]
   certificate: ${RUNTIME}/cert.pem
   private_key: ${RUNTIME}/key.pem
   threads: 1
@@ -99,7 +99,7 @@ RUST_LOG=debug "${ROOT}/target/debug/pingora" --config "${RUNTIME}/pingora.yaml"
 GATEWAY_PID=$!
 for _ in {1..100}; do
   if curl --noproxy '*' -fsS -H 'host: matrix.test' \
-    http://127.0.0.1:18082/pingora-health -o /dev/null 2>/dev/null; then
+    http://127.0.0.1:80/pingora-health -o /dev/null 2>/dev/null; then
     break
   fi
   sleep 0.1
@@ -119,8 +119,8 @@ for protocol in h1 h2; do
     error=${RUNTIME}/${protocol}-${iteration}.stderr
     rc=0
     curl --noproxy '*' -ksS "${option}" \
-      --resolve matrix.test:18445:127.0.0.1 \
-      https://matrix.test:18445/fixed/64 -o "${body}" 2>"${error}" || rc=$?
+      --resolve matrix.test:443:127.0.0.1 \
+      https://matrix.test:443/fixed/64 -o "${body}" 2>"${error}" || rc=$?
     size=$(stat -c '%s' "${body}" 2>/dev/null || echo 0)
     digest=$(sha256sum "${body}" 2>/dev/null | awk '{print $1}')
     status=pass
@@ -135,12 +135,12 @@ for protocol in h1 h2; do
 done
 
 nghttp --no-verify-peer -v -H ':authority: matrix.test' \
-  https://127.0.0.1:18445/fixed/64 \
-  https://127.0.0.1:18445/fixed/64 \
+  https://127.0.0.1:443/fixed/64 \
+  https://127.0.0.1:443/fixed/64 \
   >"${RUNTIME}/nghttp.stdout" 2>"${RUNTIME}/nghttp.stderr" || \
   FAILURES=$((FAILURES + 1))
 h2load -n 3200 -c 1 -m 32 -H 'host: matrix.test' \
-  https://127.0.0.1:18445/fixed/64 \
+  https://127.0.0.1:443/fixed/64 \
   >"${RUNTIME}/h2load.stdout" 2>"${RUNTIME}/h2load.stderr" || \
   FAILURES=$((FAILURES + 1))
 if grep -Eq '([1-9][0-9]* failed|[1-9][0-9]* errored|[1-9][0-9]* timeout)' \

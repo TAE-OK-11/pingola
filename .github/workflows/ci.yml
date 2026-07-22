@@ -42,7 +42,7 @@ jobs:
       - name: Install build and test tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cmake ninja-build jq nghttp2-client
+          sudo apt-get install --yes cmake libcap2-bin ninja-build jq nghttp2-client
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
           rustup show active-toolchain
       - name: PGO trainer preflight
@@ -52,7 +52,7 @@ jobs:
           rustc --edition=2021 -D warnings bench/backend.rs -o /tmp/pgo-backend
           rustc --edition=2021 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
           /tmp/pgo-client \
-            --port 19080 \
+            --port 80 \
             --threads 0 \
             --requests-per-thread 1 \
             --requests-per-connection 500 \
@@ -72,7 +72,11 @@ jobs:
       - name: Unit tests
         run: cargo test --all-targets --locked
       - name: Build integration-test binary
-        run: cargo build --locked
+        run: |
+          cargo build --locked
+          # Functional listener tests intentionally exercise production ports
+          # 80/443 while the runner itself remains unprivileged.
+          sudo setcap cap_net_bind_service=+ep target/debug/pingora
       - name: Lints
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: System allocator baseline still builds

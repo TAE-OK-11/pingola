@@ -22,7 +22,7 @@ mkdir -p "${RUNTIME}/www"
 truncate -s 67108864 "${RUNTIME}/www/large.bin"
 cat >"${RUNTIME}/pingora.yaml" <<EOF
 server:
-  http_listen: ["127.0.0.1:18545"]
+  http_listen: ["127.0.0.1:80"]
   https_listen: []
   global_active_requests: 1
   graceful_shutdown_timeout_seconds: 1
@@ -53,7 +53,7 @@ import socket
 import time
 
 runtime = os.environ["RUNTIME"]
-connection = socket.create_connection(("127.0.0.1", 18545), timeout=5)
+connection = socket.create_connection(("127.0.0.1", 80), timeout=5)
 connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
 connection.sendall(
     b"GET /large.bin HTTP/1.1\r\n"
@@ -81,14 +81,14 @@ done
 sleep 0.1
 
 status=$(curl --noproxy '*' -sS -I -o /dev/null -w '%{http_code}' \
-  -H 'host: static-limit.test' http://127.0.0.1:18545/large.bin)
+  -H 'host: static-limit.test' http://127.0.0.1:80/large.bin)
 [[ "${status}" == 429 ]]
 
 wait "${HOLDER_PID}"
 HOLDER_PID=
 for _ in {1..100}; do
   status=$(curl --noproxy '*' -sS -I -o /dev/null -w '%{http_code}' \
-    -H 'host: static-limit.test' http://127.0.0.1:18545/large.bin)
+    -H 'host: static-limit.test' http://127.0.0.1:80/large.bin)
   [[ "${status}" == 200 ]] && break
   sleep 0.02
 done

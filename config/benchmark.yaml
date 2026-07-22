@@ -2,8 +2,8 @@
 # certificate under /tmp/pingora-bench before use. Every application limiter is
 # disabled so 429 responses cannot be mistaken for benchmark throughput.
 server:
-  http_listen: ["127.0.0.1:18090"]
-  https_listen: ["127.0.0.1:18490"]
+  http_listen: ["127.0.0.1:80"]
+  https_listen: ["127.0.0.1:443"]
   certificate: /tmp/pingora-bench/cert.pem
   private_key: /tmp/pingora-bench/key.pem
   health_socket: /tmp/pingora-bench/health.sock

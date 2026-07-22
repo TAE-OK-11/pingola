@@ -22,7 +22,7 @@ rm -rf "${RUNTIME}"
 mkdir -p "${RUNTIME}"
 cat >"${RUNTIME}/pingora.yaml" <<EOF
 server:
-  http_listen: ["127.0.0.1:18540"]
+  http_listen: ["127.0.0.1:80"]
   https_listen: []
   graceful_shutdown_timeout_seconds: 1
   health_socket: ${RUNTIME}/health.sock
@@ -62,7 +62,7 @@ for _ in {1..100}; do
 done
 
 curl --noproxy '*' -sS -o /dev/null -H 'host: nav.test' \
-  http://127.0.0.1:18540/stream &
+  http://127.0.0.1:80/stream &
 STREAM_PID=$!
 for _ in {1..100}; do
   [[ -f "${RUNTIME}/stream-active" ]] && break
@@ -71,9 +71,9 @@ done
 [[ -f "${RUNTIME}/stream-active" ]]
 
 same_service=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
-  -H 'host: nav.test' http://127.0.0.1:18540/stream)
+  -H 'host: nav.test' http://127.0.0.1:80/stream)
 other_service=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
-  -H 'host: vault.test' http://127.0.0.1:18540/api)
+  -H 'host: vault.test' http://127.0.0.1:80/api)
 [[ "${same_service}" == 429 ]]
 [[ "${other_service}" == 200 ]]
 

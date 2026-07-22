@@ -1,8 +1,8 @@
 server:
   http_listen:
-    - "127.0.0.1:18080"
+    - "127.0.0.1:80"
   https_listen:
-    - "127.0.0.1:18443"
+    - "127.0.0.1:443"
   certificate: /tmp/pingora-integration/cert.pem
   private_key: /tmp/pingora-integration/key.pem
   threads: 1

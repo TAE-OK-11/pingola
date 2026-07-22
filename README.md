@@ -424,9 +424,12 @@ body SHA-256과 raw curl/nghttp/h2load log를 `/tmp/pingora-h2-matrix`에 남깁
 
 ## Profiling, H2 tuning, NGINX 비교
 
-비교 도구는 운영 container를 중지하거나 이름을 재사용하지 않고 18700번대 고포트와
-고유 container 이름만 사용합니다. 종료와 Ctrl+C 때 자신이 만든 container와
-backend만 정리합니다. 한 case가 실패해도 다음 case를 계속하고 실패를 0 RPS로
+비교 도구와 PGO 학습은 실제 listener 분기까지 동일하게 측정하도록 프런트에 표준
+HTTP 80/HTTPS 443만 사용하며, 동시에 실행되는 localhost synthetic backend만 별도
+고포트를 사용합니다. 따라서 실행 전에 호스트의 80/443이 비어 있어야 합니다. 도구는
+운영 container를 중지하거나 이름을 재사용하지 않고 고유 container 이름을 사용하며,
+종료와 Ctrl+C 때 자신이 만든 container와 backend만 정리합니다. 한 case가 실패해도
+다음 case를 계속하고 실패를 0 RPS로
 바꾸지 않습니다. raw curl/wrk/h2load, container log, CPU/RSS sample, image inspect,
 `nginx -V`, `ldd`, 실제 `nginx -T`를 결과 directory에 보존합니다. 두 프록시에는
 동일한 forwarded/security header, downstream request keepalive 상한,

@@ -62,39 +62,39 @@ stop() {
 rm -rf "${RUNTIME}"
 mkdir -p "${RUNTIME}"
 
-write_http_config ipv4 '["127.0.0.1:18520"]'
+write_http_config ipv4 '["127.0.0.1:80"]'
 "${BIN}" --config "${RUNTIME}/ipv4.yaml" --check-bind >/dev/null
 start ipv4
 curl --noproxy '*' -fsS -H 'host: health.invalid' \
-  http://127.0.0.1:18520/pingora-health -D "${RUNTIME}/ipv4.headers" -o /dev/null
+  http://127.0.0.1:80/pingora-health -D "${RUNTIME}/ipv4.headers" -o /dev/null
 grep -qi '^x-proxy-product: Pingora' "${RUNTIME}/ipv4.headers"
 stop
 
-write_http_config ipv6 '["[::1]:18521"]'
+write_http_config ipv6 '["[::1]:80"]'
 "${BIN}" --config "${RUNTIME}/ipv6.yaml" --check-bind >/dev/null
 start ipv6
 curl --noproxy '*' -gfsS -H 'host: health.invalid' \
-  'http://[::1]:18521/pingora-health' -o /dev/null
+  'http://[::1]:80/pingora-health' -o /dev/null
 stop
 
-write_http_config dual '["0.0.0.0:18522", "[::]:18522"]'
+write_http_config dual '["0.0.0.0:80", "[::]:80"]'
 "${BIN}" --config "${RUNTIME}/dual.yaml" --check-bind \
   >"${RUNTIME}/dual-check.log" 2>&1
 grep -q 'IPV6_V6ONLY=true' "${RUNTIME}/dual-check.log"
 start dual
 curl --noproxy '*' -fsS -H 'host: health.invalid' \
-  http://127.0.0.1:18522/pingora-ready -o /dev/null
+  http://127.0.0.1:80/pingora-ready -o /dev/null
 curl --noproxy '*' -gfsS -H 'host: health.invalid' \
-  'http://[::1]:18522/pingora-live' -o /dev/null
+  'http://[::1]:80/pingora-live' -o /dev/null
 for _ in 1 2; do
   curl --noproxy '*' -fsS -H 'host: health.invalid' \
-    http://127.0.0.1:18522/pingola-health -o /dev/null
+    http://127.0.0.1:80/pingola-health -o /dev/null
 done
 status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
-  -H 'host: health.invalid' http://127.0.0.1:18522/nginx-health)
+  -H 'host: health.invalid' http://127.0.0.1:80/nginx-health)
 [[ "${status}" == 404 ]]
 details_status=$(curl --noproxy '*' -sS -o "${RUNTIME}/details.json" -w '%{http_code}' \
-  -H 'host: health.invalid' 'http://127.0.0.1:18522/pingora-health/details?upstreams=1')
+  -H 'host: health.invalid' 'http://127.0.0.1:80/pingora-health/details?upstreams=1')
 [[ "${details_status}" == 503 ]]
 jq -e '.product == "Pingora" and .readiness == false and .upstreams.unavailable == false' \
   "${RUNTIME}/details.json" >/dev/null
@@ -107,7 +107,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 cat >"${RUNTIME}/https-only.yaml" <<EOF
 server:
   http_listen: []
-  https_listen: ["[::1]:18523"]
+  https_listen: ["[::1]:443"]
   certificate: ${RUNTIME}/cert.pem
   private_key: ${RUNTIME}/key.pem
   health_socket: ${RUNTIME}/https-only.sock
@@ -125,8 +125,8 @@ EOF
 "${BIN}" --config "${RUNTIME}/https-only.yaml" --check-bind >/dev/null
 start https-only
 "${BIN}" --config "${RUNTIME}/https-only.yaml" --healthcheck
-curl --noproxy '*' -gkfsS --http2 --resolve health.test:18523:[::1] \
-  https://health.test:18523/pingora-health -o /dev/null
+curl --noproxy '*' -gkfsS --http2 --resolve health.test:443:[::1] \
+  https://health.test:443/pingora-health -o /dev/null
 stop
 
 echo "IPv4, IPv6, dual-stack, HTTP-only, and HTTPS-only health tests passed"

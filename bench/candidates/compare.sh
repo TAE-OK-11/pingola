@@ -5,8 +5,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 ARTIFACTS=${1:?usage: compare.sh ARTIFACT_DIR [OUTPUT_DIR]}
 OUTPUT=${2:-${ROOT}/bench/results/candidate-compare-$(date -u +%Y%m%dT%H%M%SZ)}
 BACKEND_PORT=${BACKEND_PORT:-18700}
-HTTP_PORT=${HTTP_PORT:-18780}
-HTTPS_PORT=${HTTPS_PORT:-18743}
+HTTP_PORT=${HTTP_PORT:-80}
+HTTPS_PORT=${HTTPS_PORT:-443}
 WORKERS=${BENCH_WORKERS:-$(nproc)}
 DURATION=${BENCH_DURATION:-3s}
 WARMUP=${BENCH_WARMUP:-1s}
@@ -87,6 +87,9 @@ chmod 0600 "${OUTPUT}/key.pem"
   echo "rounds=${ROUNDS}"
   echo "duration=${DURATION}"
   echo "warmup=${WARMUP}"
+  echo "http_port=${HTTP_PORT}"
+  echo "https_port=${HTTPS_PORT}"
+  echo "backend_port=${BACKEND_PORT}"
   echo "backend=Actions-built dependency-free Rust HTTP/1.1"
   echo "note=load generator, backend, and candidate share all host CPUs; no cgroup CPU or RAM limit"
   lscpu

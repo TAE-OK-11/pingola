@@ -14,7 +14,7 @@ HANDLER=${OVERHEAD_HANDLER:-vaultwarden}
 PATH_UNDER_TEST=${OVERHEAD_PATH:-/bytes/64}
 ACTIVE_LIMIT=${OVERHEAD_ACTIVE_LIMIT:-0}
 BACKEND_PORT=${OVERHEAD_BACKEND_PORT:-18900}
-PROXY_PORT=${OVERHEAD_PROXY_PORT:-18980}
+PROXY_PORT=${OVERHEAD_PROXY_PORT:-80}
 NAME=pingora-overhead-$$
 BACKEND_PID=
 
@@ -164,6 +164,8 @@ memory=${MEMORY}
 workers=${WORKERS}
 active_limit=${ACTIVE_LIMIT}
 body_sha256=${DIRECT_SHA}
+proxy_port=${PROXY_PORT}
+backend_port=${BACKEND_PORT}
 note=direct backend and proxied requests alternate on the same host; load generator shares host CPUs
 EOF
 docker image inspect "${IMAGE}" >"${OUTPUT}/image-inspect.json"

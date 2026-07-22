@@ -15,8 +15,8 @@ DURATION=${ALLOCATOR_BENCH_DURATION:-3s}
 WARMUP=${ALLOCATOR_BENCH_WARMUP:-1s}
 PROFILE=${ALLOCATOR_BENCH_PROFILE:-standard}
 BACKEND_PORT=${ALLOCATOR_BACKEND_PORT:-18900}
-HTTP_PORT=${ALLOCATOR_HTTP_PORT:-18980}
-HTTPS_PORT=${ALLOCATOR_HTTPS_PORT:-18943}
+HTTP_PORT=${ALLOCATOR_HTTP_PORT:-80}
+HTTPS_PORT=${ALLOCATOR_HTTPS_PORT:-443}
 OUTPUT=${ALLOCATOR_BENCH_OUTPUT:-${ROOT}/bench/results/allocator-images-$(date -u +%Y%m%dT%H%M%SZ)}
 if [[ "${OUTPUT}" != /* ]]; then
   OUTPUT=${ROOT}/${OUTPUT}
@@ -108,6 +108,9 @@ duration=${DURATION}
 warmup=${WARMUP}
 note=load generator and synthetic backend are unbounded host processes; only each proxy container is limited
 backend_image=${BACKEND_IMAGE}
+http_port=${HTTP_PORT}
+https_port=${HTTPS_PORT}
+backend_port=${BACKEND_PORT}
 EOF
 lscpu >>"${OUTPUT}/environment.txt" 2>&1
 docker version >>"${OUTPUT}/environment.txt" 2>&1

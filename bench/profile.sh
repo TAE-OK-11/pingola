@@ -11,8 +11,8 @@ BACKEND_PORT=${PROFILE_BACKEND_PORT:-18800}
 BACKEND_SOURCE=${PROFILE_BACKEND_SOURCE:-${ROOT}/bench/backend.rs}
 PREBUILT_BACKEND=${PROFILE_BACKEND_BIN:-}
 PERF_BIN=${PROFILE_PERF_BIN:-perf}
-HTTP_PORT=${PROFILE_HTTP_PORT:-18880}
-HTTPS_PORT=${PROFILE_HTTPS_PORT:-18843}
+HTTP_PORT=${PROFILE_HTTP_PORT:-80}
+HTTPS_PORT=${PROFILE_HTTPS_PORT:-443}
 DURATION=${PROFILE_DURATION_SECONDS:-5}
 CPUS=${PROFILE_CPUS:-}
 MEMORY=${PROFILE_MEMORY:-}
@@ -165,6 +165,9 @@ backend=rust-std-http1
 backend_source=${BACKEND_SOURCE}
 backend_prebuilt=${PREBUILT_BACKEND:-false}
 backend_binary_sha256=$(sha256sum "${BACKEND_BIN}" | cut -d' ' -f1)
+http_port=${HTTP_PORT}
+https_port=${HTTPS_PORT}
+backend_port=${BACKEND_PORT}
 perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo unknown)
 EOF
 if [[ -z "${PREBUILT_BACKEND}" ]]; then

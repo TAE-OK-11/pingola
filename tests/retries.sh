@@ -79,7 +79,7 @@ rm -rf "${RUNTIME}"
 mkdir -p "${RUNTIME}"
 
 for retries in 0 1 2; do
-  port=$((18530 + retries))
+  port=80
   name=max-${retries}
   write_config "${name}" "${retries}" "${port}" "127.0.0.1:19999"
   start "${name}"
@@ -92,10 +92,10 @@ for retries in 0 1 2; do
 done
 
 # Non-idempotent and body-bearing requests are never replayed.
-write_config unsafe-body 2 18533 "127.0.0.1:19999"
+write_config unsafe-body 2 80 "127.0.0.1:19999"
 start unsafe-body
-request POST 18533 --data-binary 'streaming-body-must-not-repeat'
-request PUT 18533 --data-binary 'streaming-body-must-not-repeat'
+request POST 80 --data-binary 'streaming-body-must-not-repeat'
+request PUT 80 --data-binary 'streaming-body-must-not-repeat'
 stop
 [[ $(grep -c 'upstream connect failure.*method=POST' "${RUNTIME}/unsafe-body.stderr") -eq 1 ]]
 [[ $(grep -c 'upstream connect failure.*method=PUT' "${RUNTIME}/unsafe-body.stderr") -eq 1 ]]
@@ -115,10 +115,10 @@ for _ in {1..50}; do
   sleep 0.1
 done
 : >"${RUNTIME}/backend-count.log"
-write_config status-503 2 18534 "127.0.0.1:19998"
+write_config status-503 2 80 "127.0.0.1:19998"
 start status-503
 status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
-  -H 'host: retry.test' http://127.0.0.1:18534/retry)
+  -H 'host: retry.test' http://127.0.0.1:80/retry)
 [[ "${status}" == 503 ]]
 stop
 [[ $(wc -l <"${RUNTIME}/backend-count.log") -eq 1 ]]

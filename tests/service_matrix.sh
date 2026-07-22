@@ -21,8 +21,8 @@ trap cleanup EXIT INT TERM
 proxy_sha() {
   local host=$1
   local path=$2
-  curl --noproxy '*' -ksS --http2 --resolve "${host}:18550:127.0.0.1" \
-    "https://${host}:18550${path}" | sha256sum | awk '{print $1}'
+  curl --noproxy '*' -ksS --http2 --resolve "${host}:443:127.0.0.1" \
+    "https://${host}:443${path}" | sha256sum | awk '{print $1}'
 }
 
 direct_sha() {
@@ -39,8 +39,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 
 cat >"${RUNTIME}/pingora.yaml" <<EOF
 server:
-  http_listen: ["127.0.0.1:18549"]
-  https_listen: ["127.0.0.1:18550"]
+  http_listen: ["127.0.0.1:80"]
+  https_listen: ["127.0.0.1:443"]
   certificate: ${RUNTIME}/cert.pem
   private_key: ${RUNTIME}/key.pem
   health_socket: ${RUNTIME}/health.sock
@@ -105,16 +105,16 @@ kill -0 "${GATEWAY_PID}"
 
 # Text/API routes may negotiate upstream compression. Audio streams,
 # Vaultwarden auth/WebSocket and binary DoH routes must not.
-api_headers=$(curl --noproxy '*' -ksS --http2 --resolve nav.test:18550:127.0.0.1 \
-  -H 'accept-encoding: gzip' https://nav.test:18550/headers)
-stream_headers=$(curl --noproxy '*' -ksS --http2 --resolve nav.test:18550:127.0.0.1 \
-  -H 'accept-encoding: gzip' https://nav.test:18550/stream/headers)
+api_headers=$(curl --noproxy '*' -ksS --http2 --resolve nav.test:443:127.0.0.1 \
+  -H 'accept-encoding: gzip' https://nav.test:443/headers)
+stream_headers=$(curl --noproxy '*' -ksS --http2 --resolve nav.test:443:127.0.0.1 \
+  -H 'accept-encoding: gzip' https://nav.test:443/stream/headers)
 vault_headers=$(curl --noproxy '*' --compressed -ksS --http2 \
-  --resolve vault.test:18550:127.0.0.1 -D "${RUNTIME}/vault-compression.headers" \
-  -H 'accept-encoding: gzip' https://vault.test:18550/headers)
+  --resolve vault.test:443:127.0.0.1 -D "${RUNTIME}/vault-compression.headers" \
+  -H 'accept-encoding: gzip' https://vault.test:443/headers)
 couch_headers=$(curl --noproxy '*' --compressed -ksS --http2 \
-  --resolve couch.test:18550:127.0.0.1 -D "${RUNTIME}/couch-compression.headers" \
-  -H 'accept-encoding: gzip' https://couch.test:18550/headers)
+  --resolve couch.test:443:127.0.0.1 -D "${RUNTIME}/couch-compression.headers" \
+  -H 'accept-encoding: gzip' https://couch.test:443/headers)
 jq -e '.accept_encoding == "gzip"' <<<"${api_headers}" >/dev/null
 jq -e '.accept_encoding == null' <<<"${stream_headers}" >/dev/null
 jq -e '.accept_encoding == null' <<<"${vault_headers}" >/dev/null
@@ -125,37 +125,37 @@ grep -qi '^content-encoding: gzip' "${RUNTIME}/couch-compression.headers"
 # Keep the HTTP/1 bodyless proxy fast path covered: it must still run the
 # downstream response compressor and preserve the decoded response body.
 vault_h1_headers=$(curl --noproxy '*' --compressed -ksS --http1.1 \
-  --resolve vault.test:18550:127.0.0.1 -D "${RUNTIME}/vault-h1-compression.headers" \
-  -H 'accept-encoding: gzip' https://vault.test:18550/headers)
+  --resolve vault.test:443:127.0.0.1 -D "${RUNTIME}/vault-h1-compression.headers" \
+  -H 'accept-encoding: gzip' https://vault.test:443/headers)
 couch_h1_headers=$(curl --noproxy '*' --compressed -ksS --http1.1 \
-  --resolve couch.test:18550:127.0.0.1 -D "${RUNTIME}/couch-h1-compression.headers" \
-  -H 'accept-encoding: gzip' https://couch.test:18550/headers)
+  --resolve couch.test:443:127.0.0.1 -D "${RUNTIME}/couch-h1-compression.headers" \
+  -H 'accept-encoding: gzip' https://couch.test:443/headers)
 jq -e '.accept_encoding == null' <<<"${vault_h1_headers}" >/dev/null
 jq -e '.accept_encoding == null' <<<"${couch_h1_headers}" >/dev/null
 grep -qi '^content-encoding: gzip' "${RUNTIME}/vault-h1-compression.headers"
 grep -qi '^content-encoding: gzip' "${RUNTIME}/couch-h1-compression.headers"
 
-curl --noproxy '*' -ksS --http2 --resolve vault.test:18550:127.0.0.1 \
+curl --noproxy '*' -ksS --http2 --resolve vault.test:443:127.0.0.1 \
   -H 'accept-encoding: gzip;q=0' -D "${RUNTIME}/vault-q0.headers" \
-  https://vault.test:18550/headers -o "${RUNTIME}/vault-q0.body"
+  https://vault.test:443/headers -o "${RUNTIME}/vault-q0.body"
 ! grep -qi '^content-encoding:' "${RUNTIME}/vault-q0.headers"
 jq -e '.padding | length == 2048' "${RUNTIME}/vault-q0.body" >/dev/null
 status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \
-  --resolve vault.test:18550:127.0.0.1 \
+  --resolve vault.test:443:127.0.0.1 \
   -H 'accept-encoding: identity;q=0, *;q=0' \
-  https://vault.test:18550/headers)
+  https://vault.test:443/headers)
 [[ "${status}" == 406 ]]
 
-curl --noproxy '*' -ksS --http2 --resolve couch.test:18550:127.0.0.1 \
+curl --noproxy '*' -ksS --http2 --resolve couch.test:443:127.0.0.1 \
   -H 'accept-encoding: gzip' -D "${RUNTIME}/couch-no-transform.headers" \
-  https://couch.test:18550/headers-no-transform \
+  https://couch.test:443/headers-no-transform \
   -o "${RUNTIME}/couch-no-transform.body"
 ! grep -qi '^content-encoding:' "${RUNTIME}/couch-no-transform.headers"
 jq -e '.padding | length == 2048' "${RUNTIME}/couch-no-transform.body" >/dev/null
 
-curl --noproxy '*' -ksS --http2 --resolve vault.test:18550:127.0.0.1 \
+curl --noproxy '*' -ksS --http2 --resolve vault.test:443:127.0.0.1 \
   -H 'accept-encoding: gzip' -D "${RUNTIME}/vault-binary.headers" \
-  https://vault.test:18550/attachment/1048576 \
+  https://vault.test:443/attachment/1048576 \
   -o "${RUNTIME}/vault-binary.body"
 ! grep -qi '^content-encoding:' "${RUNTIME}/vault-binary.headers"
 [[ $(sha256sum "${RUNTIME}/vault-binary.body" | awk '{print $1}') == \
@@ -169,9 +169,9 @@ expect_identity_rejected() {
   shift 2
   local status
   status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \
-    --resolve "${host}:18550:127.0.0.1" \
+    --resolve "${host}:443:127.0.0.1" \
     -H 'accept-encoding: gzip, identity;q=0' "$@" \
-    "https://${host}:18550${path}")
+    "https://${host}:443${path}")
   [[ "${status}" == 406 ]]
 }
 expect_identity_rejected vault.test /attachment/100
@@ -181,15 +181,15 @@ expect_identity_rejected couch.test /replication/4096 -H 'range: bytes=0-2047'
 for endpoint in empty/204 not-modified/304; do
   expected=${endpoint##*/}
   status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \
-    --resolve "vault.test:18550:127.0.0.1" \
+    --resolve "vault.test:443:127.0.0.1" \
     -H 'accept-encoding: gzip, identity;q=0' \
-    "https://vault.test:18550/${endpoint}")
+    "https://vault.test:443/${endpoint}")
   [[ "${status}" == "${expected}" ]]
 done
 status=$(curl --noproxy '*' -ksS --http2 --head -o /dev/null -w '%{http_code}' \
-  --resolve "vault.test:18550:127.0.0.1" \
+  --resolve "vault.test:443:127.0.0.1" \
   -H 'accept-encoding: gzip, identity;q=0' \
-  https://vault.test:18550/stream/100)
+  https://vault.test:443/stream/100)
 [[ "${status}" == 406 ]]
 
 for size in 1048576 10485760 104857600; do
@@ -207,20 +207,20 @@ done
 # Range/seek headers and body are preserved.
 curl --noproxy '*' -sS -H 'range: bytes=65536-131071' \
   http://127.0.0.1:19996/stream/1048576 -o "${RUNTIME}/range-direct"
-curl --noproxy '*' -ksS --http2 --resolve nav.test:18550:127.0.0.1 \
+curl --noproxy '*' -ksS --http2 --resolve nav.test:443:127.0.0.1 \
   -H 'range: bytes=65536-131071' -D "${RUNTIME}/range.headers" \
-  https://nav.test:18550/stream/1048576 -o "${RUNTIME}/range-proxy"
+  https://nav.test:443/stream/1048576 -o "${RUNTIME}/range-proxy"
 cmp "${RUNTIME}/range-direct" "${RUNTIME}/range-proxy"
 grep -q '^HTTP/2 206' "${RUNTIME}/range.headers"
 grep -qi '^content-range: bytes 65536-131071/1048576' "${RUNTIME}/range.headers"
 grep -qi '^accept-ranges: bytes' "${RUNTIME}/range.headers"
 
-curl --noproxy '*' -ksSI --http2 --resolve nav.test:18550:127.0.0.1 \
-  https://nav.test:18550/stream/1048576 >"${RUNTIME}/head.headers"
+curl --noproxy '*' -ksSI --http2 --resolve nav.test:443:127.0.0.1 \
+  https://nav.test:443/stream/1048576 >"${RUNTIME}/head.headers"
 grep -qi '^content-length: 1048576' "${RUNTIME}/head.headers"
 status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \
-  --resolve nav.test:18550:127.0.0.1 -H 'if-none-match: "synthetic-1048576"' \
-  https://nav.test:18550/stream/1048576)
+  --resolve nav.test:443:127.0.0.1 -H 'if-none-match: "synthetic-1048576"' \
+  https://nav.test:443/stream/1048576)
 [[ "${status}" == 304 ]]
 
 # Vaultwarden attachment and CouchDB chunked replication remain byte-exact.
@@ -228,31 +228,31 @@ status=$(curl --noproxy '*' -ksS --http2 -o /dev/null -w '%{http_code}' \
 [[ $(proxy_sha couch.test /replication/1048576) == $(direct_sha /replication/1048576) ]]
 
 # DoH GET/POST stays binary, uncompressed and no-store over H2.
-curl --noproxy '*' -ksS --http2 --resolve dns.test:18550:127.0.0.1 \
-  -D "${RUNTIME}/doh-get.headers" https://dns.test:18550/dns-query \
+curl --noproxy '*' -ksS --http2 --resolve dns.test:443:127.0.0.1 \
+  -D "${RUNTIME}/doh-get.headers" https://dns.test:443/dns-query \
   -o "${RUNTIME}/doh-get.body"
 grep -qi '^cache-control: no-store' "${RUNTIME}/doh-get.headers"
 printf '\x00\x01query' >"${RUNTIME}/doh-query"
-curl --noproxy '*' -ksS --http2 --resolve dns.test:18550:127.0.0.1 \
+curl --noproxy '*' -ksS --http2 --resolve dns.test:443:127.0.0.1 \
   -H 'content-type: application/dns-message' --data-binary @"${RUNTIME}/doh-query" \
-  https://dns.test:18550/dns-query -o "${RUNTIME}/doh-post.body"
+  https://dns.test:443/dns-query -o "${RUNTIME}/doh-post.body"
 cmp "${RUNTIME}/doh-query" "${RUNTIME}/doh-post.body"
 h2load -n 200 -c 2 -m 32 -H 'host: dns.test' \
-  https://127.0.0.1:18550/dns-query >"${RUNTIME}/doh-h2load.log" 2>&1
+  https://127.0.0.1:443/dns-query >"${RUNTIME}/doh-h2load.log" 2>&1
 ! grep -Eq '([1-9][0-9]* failed|[1-9][0-9]* errored|[1-9][0-9]* timeout)' \
   "${RUNTIME}/doh-h2load.log"
 
 # Early upstream EOF must be surfaced, not silently accepted as a valid body.
 reset_rc=0
-curl --noproxy '*' -ksS --http2 --resolve nav.test:18550:127.0.0.1 \
-  https://nav.test:18550/stream-reset/1048576 -o /dev/null \
+curl --noproxy '*' -ksS --http2 --resolve nav.test:443:127.0.0.1 \
+  https://nav.test:443/stream-reset/1048576 -o /dev/null \
   2>"${RUNTIME}/reset.stderr" || reset_rc=$?
 [[ "${reset_rc}" -ne 0 ]]
 
 # A slow client disconnect should reach the upstream promptly.
 set +o pipefail
-curl --noproxy '*' -ksS --http2 --resolve nav.test:18550:127.0.0.1 \
-  https://nav.test:18550/stream-slow/104857600 2>"${RUNTIME}/disconnect.stderr" | \
+curl --noproxy '*' -ksS --http2 --resolve nav.test:443:127.0.0.1 \
+  https://nav.test:443/stream-slow/104857600 2>"${RUNTIME}/disconnect.stderr" | \
   head -c 65536 >/dev/null
 set -o pipefail
 for _ in {1..100}; do
