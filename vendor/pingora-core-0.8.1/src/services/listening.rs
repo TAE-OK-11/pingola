@@ -39,6 +39,7 @@ use pingora_timeout::timeout;
 use std::fs::Permissions;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 /// The type of service that is associated with a list of listening endpoints and a particular application
 pub struct Service<A> {
@@ -47,6 +48,7 @@ pub struct Service<A> {
     app_logic: Option<A>,
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
+    connection_limit: Option<Arc<Semaphore>>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Arc<dyn ConnectionFilter>,
 }
@@ -59,6 +61,7 @@ impl<A> Service<A> {
             listeners: Listeners::new(),
             app_logic: Some(app_logic),
             threads: None,
+            connection_limit: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
         }
@@ -72,6 +75,7 @@ impl<A> Service<A> {
             listeners,
             app_logic: Some(app_logic),
             threads: None,
+            connection_limit: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
         }
@@ -114,6 +118,11 @@ impl<A> Service<A> {
     /// Get the [`Listeners`], mostly to add more endpoints.
     pub fn endpoints(&mut self) -> &mut Listeners {
         &mut self.listeners
+    }
+
+    /// Bound the number of accepted connections being processed by this service.
+    pub fn set_connection_limit(&mut self, maximum: usize) {
+        self.connection_limit = Some(Arc::new(Semaphore::new(maximum)));
     }
 
     // the follow add* function has no effect if the server is already started
@@ -185,6 +194,7 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
         app_logic: Arc<A>,
         mut stack: TransportStack,
         mut shutdown: ShutdownWatch,
+        connection_limit: Option<Arc<Semaphore>>,
     ) {
         // the accept loop, until the system is shutting down
         loop {
@@ -209,9 +219,20 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
             };
             match new_io {
                 Ok(io) => {
+                    let connection_permit = match connection_limit.as_ref() {
+                        Some(limit) => match limit.clone().try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                debug!("downstream connection limit reached");
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
                     let app = app_logic.clone();
                     let shutdown = shutdown.clone();
                     current_handle().spawn(async move {
+                        let _connection_permit = connection_permit;
                         let peer_addr = io.peer_addr();
                         match timeout(Duration::from_secs(60), io.handshake()).await {
                             Ok(handshake) => {
@@ -287,9 +308,10 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
                 let shutdown = shutdown.clone();
                 let my_app_logic = app_logic.clone();
                 let endpoint = endpoint.clone();
+                let connection_limit = self.connection_limit.clone();
 
                 let jh = runtime.spawn(async move {
-                    Self::run_endpoint(my_app_logic, endpoint, shutdown).await;
+                    Self::run_endpoint(my_app_logic, endpoint, shutdown, connection_limit).await;
                 });
 
                 handlers.push(jh);

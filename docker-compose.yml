@@ -1,7 +1,7 @@
 services:
   pingora:
     container_name: pingora
-    image: ${PINGORA_IMAGE:-ghcr.io/tae-ok-11/pingora:latest}
+    image: ${PINGORA_IMAGE:-pingora:local}
     build:
       context: .
       args:

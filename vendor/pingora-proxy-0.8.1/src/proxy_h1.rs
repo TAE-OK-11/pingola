@@ -94,7 +94,7 @@ where
 
         session.upstream_compression.request_filter(&req);
 
-        debug!("Sending header to upstream {:?}", req);
+        debug!("sending HTTP/1 request header upstream");
 
         match client_session.write_request_header(Box::new(req)).await {
             Ok(_) => { /* Continue */ }
@@ -568,7 +568,7 @@ where
                 },
 
                 task = rx.recv(), if !response_state.upstream_done() => {
-                    debug!("upstream event: {:?}", task);
+                    debug!("HTTP/1 upstream event received");
                     if let Some(t) = task {
                         if serve_from_cache.should_discard_upstream() {
                             // just drain, do we need to do anything else?
@@ -579,7 +579,7 @@ where
                         tasks.push(t);
                         // tokio::task::unconstrained because now_or_never may yield None when the future is ready
                         while let Some(maybe_task) = tokio::task::unconstrained(rx.recv()).now_or_never() {
-                            debug!("upstream event now: {:?}", maybe_task);
+                            debug!("additional HTTP/1 upstream event received");
                             if let Some(t) = maybe_task {
                                 tasks.push(t);
                             } else {
@@ -643,7 +643,7 @@ where
                     let task = self.h1_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
                         &mut range_body_filter, true).await?;
-                    debug!("serve_from_cache task {task:?}");
+                    debug!("HTTP/1 cache task received");
 
                     match session.write_response_tasks(vec![task]).await {
                         Ok(b) => response_state.maybe_set_cache_done(b),

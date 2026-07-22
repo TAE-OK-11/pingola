@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.25
+# syntax=docker/dockerfile:1.25@sha256:0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12
 # check=error=true
 
 ARG RUST_VERSION=1.97.1
@@ -20,7 +20,7 @@ ARG PGO_TRAIN_ROUNDS=2
 ARG PGO_ECDSA_CURVE=prime256v1
 ARG DEBIAN_SUITE=trixie
 
-FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS builder
+FROM rust:1.97.1-slim-trixie@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c AS builder
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -189,7 +189,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       install -Dm644 /src/pgo-data/profile-summary.txt /out/pgo-profile-summary.txt; \
     fi
 
-FROM debian:${DEBIAN_SUITE}-slim AS runtime
+FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS runtime
 
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=unknown

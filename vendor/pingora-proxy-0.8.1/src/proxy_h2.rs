@@ -143,7 +143,7 @@ where
             }
         }
 
-        debug!("Request to h2: {req:?}");
+        debug!("sending HTTP/2 request header upstream");
 
         // send END_STREAM on HEADERS
         let send_header_eos = send_end_stream && body_empty;
@@ -387,7 +387,7 @@ where
 
                 task = rx.recv(), if !response_state.upstream_done() => {
                     if let Some(t) = task {
-                        debug!("upstream event: {:?}", t);
+                        debug!("HTTP/2 upstream event received");
                         if serve_from_cache.should_discard_upstream() {
                             // just drain, do we need to do anything else?
                            continue;
@@ -453,7 +453,7 @@ where
                     let task = self.h2_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
                         &mut range_body_filter, true).await?;
-                    debug!("serve_from_cache task {task:?}");
+                    debug!("HTTP/2 cache task received");
 
                     match session.write_response_tasks(vec![task]).await {
                         Ok(b) => response_state.maybe_set_cache_done(b),
