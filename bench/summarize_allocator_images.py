@@ -69,10 +69,14 @@ with summary_path.open("w", newline="") as target:
         p99_ratio = tp99 / jp99 if jp99 else 0.0
         eff_ratio = teff / jeff if jeff else 0.0
         rss_ratio = trss / jrss if jrss else 0.0
-        ratios["rps"].append(rps_ratio)
-        ratios["p99"].append(p99_ratio)
-        ratios["efficiency"].append(eff_ratio)
-        ratios["rss"].append(rss_ratio)
+        if rps_ratio > 0:
+            ratios["rps"].append(rps_ratio)
+        if p99_ratio > 0:
+            ratios["p99"].append(p99_ratio)
+        if eff_ratio > 0:
+            ratios["efficiency"].append(eff_ratio)
+        if rss_ratio > 0:
+            ratios["rss"].append(rss_ratio)
         writer.writerow(
             {
                 "protocol": key[0],
@@ -88,25 +92,37 @@ with summary_path.open("w", newline="") as target:
                 "tcmalloc_cpu_pct": f"{tcpu:.2f}",
                 "jemalloc_rps_per_cpu_pct": f"{jeff:.2f}",
                 "tcmalloc_rps_per_cpu_pct": f"{teff:.2f}",
-                "cpu_efficiency_delta_pct": f"{(eff_ratio - 1) * 100:.2f}",
+                "cpu_efficiency_delta_pct": (
+                    f"{(eff_ratio - 1) * 100:.2f}" if eff_ratio else "NA"
+                ),
                 "jemalloc_peak_rss_kib": f"{jrss:.0f}",
                 "tcmalloc_peak_rss_kib": f"{trss:.0f}",
-                "peak_rss_delta_pct": f"{(rss_ratio - 1) * 100:.2f}",
+                "peak_rss_delta_pct": (
+                    f"{(rss_ratio - 1) * 100:.2f}" if rss_ratio else "NA"
+                ),
             }
         )
 
 
 def geometric_mean(values: list[float]) -> float:
-    positive = [value for value in values if value > 0]
-    return math.exp(sum(math.log(value) for value in positive) / len(positive))
+    return math.exp(sum(math.log(value) for value in values) / len(values))
 
 
 print(f"paired_cases={len(ratios['rps'])} failed_rows={len(failures)}")
 if ratios["rps"]:
     print(f"tcmalloc_rps_geomean_delta_pct={(geometric_mean(ratios['rps']) - 1) * 100:.2f}")
     print(f"tcmalloc_p99_median_delta_pct={(statistics.median(ratios['p99']) - 1) * 100:.2f}")
-    print(
-        "tcmalloc_cpu_efficiency_geomean_delta_pct="
-        f"{(geometric_mean(ratios['efficiency']) - 1) * 100:.2f}"
-    )
-    print(f"tcmalloc_peak_rss_median_delta_pct={(statistics.median(ratios['rss']) - 1) * 100:.2f}")
+    if ratios["efficiency"]:
+        print(
+            "tcmalloc_cpu_efficiency_geomean_delta_pct="
+            f"{(geometric_mean(ratios['efficiency']) - 1) * 100:.2f}"
+        )
+    else:
+        print("tcmalloc_cpu_efficiency_geomean_delta_pct=NA")
+    if ratios["rss"]:
+        print(
+            "tcmalloc_peak_rss_median_delta_pct="
+            f"{(statistics.median(ratios['rss']) - 1) * 100:.2f}"
+        )
+    else:
+        print("tcmalloc_peak_rss_median_delta_pct=NA")

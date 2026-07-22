@@ -66,16 +66,15 @@ thread_local! {
 }
 const NO_PLAN: usize = usize::MAX;
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+#[cfg(test)]
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
+#[cfg(test)]
 const PROXY_AUTHENTICATE: HeaderName = HeaderName::from_static("proxy-authenticate");
+#[cfg(test)]
 const PROXY_AUTHORIZATION: HeaderName = HeaderName::from_static("proxy-authorization");
-const TE: HeaderName = HeaderName::from_static("te");
-const TRAILER: HeaderName = HeaderName::from_static("trailer");
-const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
+#[cfg(test)]
 const STRICT_TRANSPORT_SECURITY: HeaderName = HeaderName::from_static("strict-transport-security");
-const X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
-const REFERRER_POLICY: HeaderName = HeaderName::from_static("referrer-policy");
 const DIRECT_DOH_HOST: HeaderValue = HeaderValue::from_static("direct.tae00217.cloud");
 const PORT_443: HeaderValue = HeaderValue::from_static("443");
 const PORT_80: HeaderValue = HeaderValue::from_static("80");
@@ -91,16 +90,6 @@ const HSTS_VALUE: HeaderValue =
 const SAMEORIGIN: HeaderValue = HeaderValue::from_static("SAMEORIGIN");
 const REFERRER_POLICY_VALUE: HeaderValue =
     HeaderValue::from_static("strict-origin-when-cross-origin");
-const STRIPPED_RESPONSE_HEADERS: [HeaderName; 7] = [
-    HeaderName::from_static("server"),
-    HeaderName::from_static("x-powered-by"),
-    HeaderName::from_static("alt-svc"),
-    STRICT_TRANSPORT_SECURITY,
-    X_CONTENT_TYPE_OPTIONS,
-    X_FRAME_OPTIONS,
-    REFERRER_POLICY,
-];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 enum RouteClass {
@@ -756,7 +745,6 @@ impl ProxyHttp for Gateway {
             && session.req_header().version == Version::HTTP_11
             && session.is_upgrade_req();
         strip_response_hop_headers(response, forwards_upgrade)?;
-        strip_upstream_headers(response);
         insert_security_headers(response, plan.handler, ctx.tls)?;
         if ctx.compression_selected && response_status_is_interim(response.status.as_u16()) {
             // 100/103 are interim headers. Do not permanently disable the
@@ -1115,17 +1103,16 @@ fn strip_request_hop_headers(
             }
         }
     }
-    for name in [
-        &CONNECTION,
-        &KEEP_ALIVE,
-        &PROXY_CONNECTION,
-        &PROXY_AUTHENTICATE,
-        &PROXY_AUTHORIZATION,
-        &TE,
-        &TRAILER,
-        &UPGRADE,
-    ] {
-        upstream.remove_header(name);
+    // A small normal request usually has fewer headers than this fixed list.
+    // One linear scan avoids eight absent-key hash lookups on every request.
+    let fixed: arrayvec::ArrayVec<HeaderName, 8> = upstream
+        .headers
+        .keys()
+        .filter(|name| is_fixed_request_hop_header(name))
+        .cloned()
+        .collect();
+    for name in fixed {
+        upstream.remove_header(&name);
     }
     Ok(())
 }
@@ -1134,20 +1121,21 @@ fn strip_response_hop_headers(response: &mut ResponseHeader, forwards_upgrade: b
     let upgrade = forwards_upgrade
         .then(|| response.headers.get(UPGRADE).cloned())
         .flatten();
-    for name in connection_option_names(&response.headers, 502)? {
+    let connection_options = connection_option_names(&response.headers, 502)?;
+    // Hop-by-hop fields and upstream identity/security fields are both absent
+    // from the downstream response. Filter them in one pass instead of doing
+    // fifteen independent HeaderMap hash removals for every response.
+    let fixed: arrayvec::ArrayVec<HeaderName, 15> = response
+        .headers
+        .keys()
+        .filter(|name| is_fixed_response_removed_header(name))
+        .cloned()
+        .collect();
+    for name in connection_options {
         response.remove_header(&name);
     }
-    for name in [
-        &CONNECTION,
-        &KEEP_ALIVE,
-        &PROXY_CONNECTION,
-        &PROXY_AUTHENTICATE,
-        &PROXY_AUTHORIZATION,
-        &TE,
-        &TRAILER,
-        &UPGRADE,
-    ] {
-        response.remove_header(name);
+    for name in fixed {
+        response.remove_header(&name);
     }
     if forwards_upgrade {
         let upgrade = upgrade.ok_or_else(|| {
@@ -1160,6 +1148,34 @@ fn strip_response_hop_headers(response: &mut ResponseHeader, forwards_upgrade: b
         response.insert_header(CONNECTION, UPGRADE_VALUE)?;
     }
     Ok(())
+}
+
+fn is_fixed_request_hop_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "upgrade"
+    )
+}
+
+fn is_fixed_response_removed_header(name: &HeaderName) -> bool {
+    is_fixed_request_hop_header(name)
+        || matches!(
+            name.as_str(),
+            "server"
+                | "x-powered-by"
+                | "alt-svc"
+                | "strict-transport-security"
+                | "x-content-type-options"
+                | "x-frame-options"
+                | "referrer-policy"
+        )
 }
 
 fn request_authority(request: &RequestHeader) -> Option<&str> {
@@ -1462,12 +1478,6 @@ pub fn resolve_client_ip(
     selected
 }
 
-fn strip_upstream_headers(response: &mut ResponseHeader) {
-    for name in &STRIPPED_RESPONSE_HEADERS {
-        response.remove_header(name);
-    }
-}
-
 fn insert_security_headers(
     response: &mut ResponseHeader,
     handler: HandlerKind,
@@ -1754,12 +1764,20 @@ hosts:
         response
             .insert_header(PROXY_AUTHENTICATE, "Basic realm=proxy")
             .unwrap();
+        response.insert_header("server", "upstream").unwrap();
+        response.insert_header("x-powered-by", "framework").unwrap();
+        response
+            .insert_header(STRICT_TRANSPORT_SECURITY, "upstream-policy")
+            .unwrap();
         strip_response_hop_headers(&mut response, false).unwrap();
         for name in [
             &CONNECTION,
             &KEEP_ALIVE,
             &PROXY_AUTHENTICATE,
             &HeaderName::from_static("x-private"),
+            &HeaderName::from_static("server"),
+            &HeaderName::from_static("x-powered-by"),
+            &STRICT_TRANSPORT_SECURITY,
         ] {
             assert!(!response.headers.contains_key(name));
         }

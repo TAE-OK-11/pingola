@@ -282,7 +282,10 @@ start_proxy() {
 sample_resources() {
   local pid=$1 output=$2 cg
   cg=/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' "/proc/${pid}/cgroup")
-  while kill -0 "${pid}" 2>/dev/null; do
+  # A non-root benchmark user gets EPERM from kill(2) for the UID-10001
+  # container process. Its proc directory is visible for the exact lifetime
+  # that resource sampling needs to cover.
+  while [[ -d "/proc/${pid}" ]]; do
     local timestamp usage rss=0 member value
     timestamp=$(date +%s%N)
     timestamp=${timestamp::-3}
