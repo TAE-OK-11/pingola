@@ -83,12 +83,10 @@ fn main() -> Result<()> {
     }
 
     install_aws_lc_tls13_provider().context("TLS provider initialization failed")?;
-    let runtime = Arc::new(RuntimeConfig::load(&config_path).with_context(|| {
-        format!(
-            "configuration validation failed: {}",
-            config_path.display()
-        )
-    })?);
+    let runtime =
+        Arc::new(RuntimeConfig::load(&config_path).with_context(|| {
+            format!("configuration validation failed: {}", config_path.display())
+        })?);
 
     if cli.check || cli.check_bind {
         println!(
