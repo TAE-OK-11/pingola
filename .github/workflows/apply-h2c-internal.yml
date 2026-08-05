@@ -1,0 +1,135 @@
+name: apply-internal-h2c-bridge
+
+on:
+  push:
+    branches: [agent/quiche-http3]
+    paths: [.github/workflows/apply-h2c-internal.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: agent/quiche-http3
+          fetch-depth: 0
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake jq libcap2-bin nghttp2-client ninja-build openssl perl
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          rustup default 1.97.1
+      - name: Apply h2c-only internal bridge
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cargo = Path('Cargo.toml')
+          text = cargo.read_text()
+          text = text.replace(
+              'hyper = { version = "1.11.0", features = ["client", "http1"] }',
+              'hyper = { version = "1.11.0", features = ["client", "http2"] }',
+          )
+          text = text.replace(
+              'hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "tokio"] }',
+              'hyper-util = { version = "0.1.20", features = ["client-legacy", "http2", "tokio"] }',
+          )
+          cargo.write_text(text)
+
+          main = Path('src/main.rs')
+          text = main.read_text()
+          needle = '''    http_options.keepalive_request_limit = Some(
+        server_config
+            .downstream_keepalive_requests
+            .checked_sub(1)
+            .ok_or_else(|| anyhow!("server.downstream_keepalive_requests must be positive"))?,
+    );
+'''
+          replacement = needle + '''    // Accept cleartext HTTP/2 prior knowledge on plaintext listeners. The
+    // dedicated loopback listener uses this path for the H3 -> Pingora bridge,
+    // while Pingora 0.8.1 still detects ordinary HTTP/1.1 on public HTTP ports.
+    http_options.h2c = true;
+'''
+          if text.count(needle) != 1:
+              raise SystemExit('main.rs h2c insertion point not found')
+          main.write_text(text.replace(needle, replacement))
+
+          h3 = Path('src/http3.rs')
+          text = h3.read_text()
+          old = '''    let client: ProxyClient = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(server.http3_max_concurrent_streams as usize)
+        .build(connector);
+'''
+          new = '''    // Use one multiplexed h2c connection per internal authority. There is no
+    // HTTP/1 fallback: a protocol regression fails requests and the H3 CI test.
+    let client: ProxyClient = Client::builder(TokioExecutor::new())
+        .http2_only(true)
+        .pool_max_idle_per_host(1)
+        .build(connector);
+'''
+          if text.count(old) != 1:
+              raise SystemExit('http3.rs client builder pattern not found')
+          text = text.replace(old, new)
+          text = text.replace('.version(Version::HTTP_11)', '.version(Version::HTTP_2)', 1)
+          old_copy = 'let frame = Frame::data(Bytes::copy_from_slice(data.as_ref()));'
+          new_copy = 'let frame = Frame::data(data.freeze());'
+          if text.count(old_copy) != 1:
+              raise SystemExit('HTTP/3 body copy pattern not found')
+          text = text.replace(old_copy, new_copy)
+          old_log = '"HTTP/3 frontend started: udp={:?} internal=http://{} quiche={} early_data=false migration=false pmtud=true max_udp_payload={} send_capacity_factor={}",'
+          new_log = '"HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} early_data=false migration=false pmtud=true max_udp_payload={} send_capacity_factor={}",'
+          if text.count(old_log) != 1:
+              raise SystemExit('HTTP/3 startup log pattern not found')
+          h3.write_text(text.replace(old_log, new_log))
+
+          test = Path('tests/http3.sh')
+          text = test.read_text()
+          needle = '''kill -0 "${GATEWAY_PID}"
+
+app_response=$('''
+          insert = '''kill -0 "${GATEWAY_PID}"
+
+# The private handoff listener must accept HTTP/2 prior knowledge. This request
+# intentionally lacks the random internal token, so a successful h2c exchange
+# returns the normal HTTPS redirect rather than entering the trusted H3 path.
+h2c_probe=$(nghttp --no-dep -nv -H ':authority: app.test' \\
+  http://127.0.0.1:18080/headers 2>&1)
+grep -q ':status: 308' <<<"${h2c_probe}"
+
+app_response=$('''
+          if text.count(needle) != 1:
+              raise SystemExit('http3.sh insertion point not found')
+          text = text.replace(needle, insert)
+          text = text.replace(
+              'grep -q \'HTTP/3 frontend started\' "${GATEWAY_LOG}"',
+              'grep -q \'HTTP/3 frontend started:.*internal=h2c://\' "${GATEWAY_LOG}"',
+          )
+          text = text.replace(
+              'echo "HTTP/3 QUIC proxy, static response, Alt-Svc, forwarding, and private-header isolation tests passed"',
+              'echo "HTTP/3 QUIC proxy, h2c internal multiplexing, static response, Alt-Svc, forwarding, and private-header isolation tests passed"',
+          )
+          test.write_text(text)
+          PY
+          cargo fmt --all
+      - name: Validate h2c bridge
+        run: |
+          set -euxo pipefail
+          cargo fmt --all --check
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo build --locked
+          sudo setcap cap_net_bind_service=+ep target/debug/pingora
+          tests/http3.sh
+      - name: Commit verified source changes
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.toml Cargo.lock src/main.rs src/http3.rs tests/http3.sh
+          git diff --cached --check
+          git commit -m 'perf(http3): multiplex internal bridge over h2c'
+          git push origin HEAD:agent/quiche-http3
