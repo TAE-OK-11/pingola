@@ -52,7 +52,11 @@ async fn explicit_h2c_upstream_is_used_and_reused() {
             let requests = Arc::clone(&requests_task);
             tokio::spawn(async move {
                 let mut connection = h2::server::handshake(stream).await.unwrap();
-                while let Some(result) = connection.accept().await {
+                loop {
+                    let next = connection.accept().await;
+                    let Some(result) = next else {
+                        break;
+                    };
                     let (request, mut respond) = result.unwrap();
                     assert_eq!(request.version(), http::Version::HTTP_2);
                     requests.fetch_add(1, Ordering::Relaxed);

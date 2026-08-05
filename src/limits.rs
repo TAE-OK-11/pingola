@@ -201,7 +201,8 @@ impl ActiveRequestLimiter {
 
         let mut retried_after_cleanup = false;
         let counter = loop {
-            match self.counters.entry(key.clone()) {
+            let entry = self.counters.entry(key.clone());
+            match entry {
                 Entry::Occupied(entry) => {
                     let counter = entry.get().clone();
                     counter

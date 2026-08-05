@@ -312,7 +312,8 @@ fn check_listener_binds(runtime: &RuntimeConfig, report: &mut CheckReport) {
                 .map(|address| ("HTTPS", address)),
         )
     {
-        match bind_listener(address) {
+        let bind_result = bind_listener(address);
+        match bind_result {
             Ok(socket) => {
                 report.ok(
                     format!("listener bind {protocol} {address}"),

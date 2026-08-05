@@ -1,0 +1,76 @@
+name: Benchmark tool builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - bench/backend.rs
+      - bench/pgo_client.rs
+      - .github/workflows/bench-tools-build.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: znver1 benchmark tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+      - name: Build dependency-free benchmark tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d "$RUNNER_TEMP/artifact"
+          for source in backend pgo_client; do
+            rustc \
+              --edition=2024 \
+              -C opt-level=3 \
+              -C target-cpu=znver1 \
+              -C lto=fat \
+              -C codegen-units=1 \
+              -C panic=abort \
+              -C strip=symbols \
+              "bench/${source}.rs" \
+              -o "$RUNNER_TEMP/artifact/${source}"
+          done
+          (
+            cd "$RUNNER_TEMP/artifact"
+            sha256sum backend pgo_client > sha256.txt
+          )
+          {
+            echo "revision=$GITHUB_SHA"
+            echo "rustc=$(rustc --version)"
+            echo "target_cpu=znver1"
+            echo "lto=fat"
+            echo "codegen_units=1"
+          } > "$RUNNER_TEMP/artifact/build-manifest.txt"
+      - name: Smoke test tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/artifact/backend" --help
+          set +e
+          output=$("$RUNNER_TEMP/artifact/pgo_client" \
+            --port 1 \
+            --threads 0 \
+            --requests-per-thread 1 \
+            --requests-per-connection 1 \
+            2>&1)
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -F "threads must be 1..=64" <<<"$output"
+      - name: Upload benchmark tools and provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: benchmark-tools-znver1-fat
+          path: ${{ runner.temp }}/artifact/
+          if-no-files-found: error
+          retention-days: 14
