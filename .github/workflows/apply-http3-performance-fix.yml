@@ -32,43 +32,36 @@ jobs:
           path = Path('src/http3.rs')
           text = path.read_text()
 
-          old = '''    quic.discover_path_mtu = true;
-              quic.send_capacity_factor = HTTP3_SEND_CAPACITY_FACTOR;
-          '''
-          new = '''    quic.discover_path_mtu = true;
-              // QuicSettings defaults this wrapper-level switch to false and
-              // then applies it over quiche's native default. Keep packet
-              // pacing enabled so CUBIC sends are smoothed instead of bursty.
-              quic.enable_pacing = true;
-              quic.send_capacity_factor = HTTP3_SEND_CAPACITY_FACTOR;
-          '''
-          if text.count(old) != 1:
+          pacing_anchor = "    quic.discover_path_mtu = true;\n"
+          pacing_insert = (
+              pacing_anchor
+              + "    // Keep QUIC packet sends paced instead of bursty.\n"
+              + "    quic.enable_pacing = true;\n"
+          )
+          if text.count(pacing_anchor) != 1:
               raise SystemExit('QUIC pacing insertion point did not match')
-          text = text.replace(old, new, 1)
+          text = text.replace(pacing_anchor, pacing_insert, 1)
 
-          old = '''    let client: ProxyClient = Client::builder(TokioExecutor::new())
-              .http2_only(true)
-              .pool_max_idle_per_host(1)
-              .build(connector);
-          '''
-          new = '''    let client: ProxyClient = Client::builder(TokioExecutor::new())
-              .http2_only(true)
-              // Large and concurrent audio responses should grow the loopback
-              // H2 flow-control windows instead of repeatedly stalling on the
-              // conservative static defaults.
-              .http2_adaptive_window(true)
-              .pool_max_idle_per_host(1)
-              .build(connector);
-          '''
-          if text.count(old) != 1:
+          h2_anchor = "        .http2_only(true)\n"
+          h2_insert = (
+              h2_anchor
+              + "        // Grow loopback H2 flow-control windows for large and\n"
+              + "        // concurrent audio responses instead of stalling on\n"
+              + "        // conservative static defaults.\n"
+              + "        .http2_adaptive_window(true)\n"
+          )
+          if text.count(h2_anchor) != 1:
               raise SystemExit('h2c client builder insertion point did not match')
-          text = text.replace(old, new, 1)
+          text = text.replace(h2_anchor, h2_insert, 1)
 
-          old = '''pmtud=true max_udp_payload={} send_capacity_factor={}'''
-          new = '''pmtud=true pacing=true max_udp_payload={} send_capacity_factor={}'''
-          if text.count(old) != 1:
+          log_anchor = "pmtud=true max_udp_payload={} send_capacity_factor={}"
+          if text.count(log_anchor) != 1:
               raise SystemExit('HTTP/3 startup log insertion point did not match')
-          text = text.replace(old, new, 1)
+          text = text.replace(
+              log_anchor,
+              "pmtud=true pacing=true max_udp_payload={} send_capacity_factor={}",
+              1,
+          )
 
           path.write_text(text)
           PY
