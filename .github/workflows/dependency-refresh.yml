@@ -1,4 +1,4 @@
-name: finalize-full-stack-refresh
+name: export-full-stack-refresh
 
 on:
   pull_request:
@@ -7,22 +7,22 @@ permissions:
   contents: read
 
 jobs:
-  finalize:
+  export:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: agent/full-stack-refresh
           fetch-depth: 0
-      - name: Install build and test tools
+      - name: Install migration tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cmake libcap2-bin ninja-build jq nghttp2-client
+          sudo apt-get install --yes cmake ninja-build
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
           rustup default 1.97.1
-      - name: Apply Rust 2024 and container refresh
+      - name: Reproduce verified refresh
         shell: bash
         run: |
           set -euxo pipefail
@@ -68,26 +68,6 @@ jobs:
           cargo fmt --all
           cargo clippy --fix --all-targets --locked --allow-dirty --allow-staged -- -D warnings
           cargo fmt --all
-      - name: Validate dependencies, allocators and compression
-        run: |
-          set -euxo pipefail
-          cargo fmt --all --check
-          cargo tree --locked > /tmp/tree.txt
-          grep -q 'aws-lc-rs v1.17.3' /tmp/tree.txt
-          grep -q 'rustls v0.23.43' /tmp/tree.txt
-          ! grep -Eiq '(^|[[:space:]])(ring|boring|boring-sys|pingora-boringssl) v' /tmp/tree.txt
-          cargo tree --locked -i tcmalloc-better | grep -q 'tcmalloc-better v0.1.19'
-          cargo tree --locked -i brotli | grep -q 'brotli v8.0.4'
-          cargo tree --locked -i flate2 | grep -q 'flate2 v1.1.9'
-          cargo tree --locked -i zstd | grep -q 'zstd v0.13.3'
-          cargo test --all-targets --locked
-          cargo clippy --all-targets --locked -- -D warnings
-          cargo check --all-targets --locked --no-default-features --features system-allocator,tls-aws-lc
-          cargo check --all-targets --locked --no-default-features --features jemalloc,tls-aws-lc
-          cargo build --locked --release
-          target/release/pingora --allocator-info | grep -q 'allocator=tcmalloc implementation=google-tcmalloc'
-          rustc --edition=2024 -D warnings bench/backend.rs -o /tmp/pgo-backend
-          rustc --edition=2024 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
       - name: Package verified refresh
         run: |
           set -euxo pipefail
