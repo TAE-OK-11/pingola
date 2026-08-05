@@ -211,7 +211,7 @@ backend_port=${BACKEND_PORT}
 backend_connections=${upstream_connections}
 fresh_handshakes=64
 concurrent_connections=8
-persistent_requests=7376
+persistent_requests=7368
 EOF_WORKLOAD
 
 kill -TERM "${PINGORA_PID}"
