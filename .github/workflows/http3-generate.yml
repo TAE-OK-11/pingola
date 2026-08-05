@@ -1,4 +1,4 @@
-name: http3-generate
+name: http3-harden
 
 on:
   pull_request:
@@ -7,7 +7,7 @@ permissions:
   contents: write
 
 jobs:
-  generate:
+  harden:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -22,22 +22,20 @@ jobs:
           sudo apt-get install --yes clang cmake ninja-build perl
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
           rustup default 1.97.1
-      - name: Generate HTTP/3 integration
+      - name: Apply HTTP/3 hardening
         run: |
-          python3 tools/http3_generate.py
-          python3 tools/http3_fixups.py
-          cargo update --verbose
+          python3 tools/http3_harden.py
           cargo fmt --all
       - name: Compile and test
         run: |
           cargo check --all-targets --locked
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --all-targets --locked
-      - name: Commit validated HTTP/3 integration
+      - name: Commit validated HTTP/3 hardening
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add Cargo.lock src config/pingora.yaml
+          git add src/http3.rs
           git diff --cached --check
-          git commit -m 'feat(http3): connect quiche frontend to Pingora'
+          git commit -m 'refactor(http3): bound connections and preserve public port'
           git push origin HEAD:agent/quiche-http3
