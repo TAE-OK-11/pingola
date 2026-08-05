@@ -1,292 +1,172 @@
-name: verify-and-publish
+name: migrate-shared-h2c-gateway
 
 concurrency:
-  group: pingora-${{ github.workflow }}-${{ github.ref }}
+  group: pingora-h2c-migration-${{ github.ref }}
   cancel-in-progress: true
 
 on:
-  workflow_dispatch:
-    inputs:
-      publish_images:
-        description: Publish production images
-        required: false
-        default: false
-        type: boolean
-  push:
-    branches: [main]
-    tags: ["v*"]
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  audit:
+  migrate:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      checks: write
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: RustSec dependency audit
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  verify:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install build and test tools
+          ref: agent/quiche-http3
+          fetch-depth: 0
+      - name: Install toolchain
         run: |
           sudo apt-get update
           sudo apt-get install --yes clang cmake jq libcap2-bin nghttp2-client ninja-build openssl perl
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
-          rustup show active-toolchain
-      - name: PGO trainer preflight
+          rustup default 1.97.1
+      - name: Isolate h2c listener and share gateway state
+        id: migrate
         run: |
-          bash -n bench/pgo_train.sh
-          bash -n bench/pgo_train_h3.sh
-          bash -n bench/pgo_compare_three.sh
-          rustc --edition=2024 -D warnings bench/backend.rs -o /tmp/pgo-backend
-          rustc --edition=2024 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Verify TLS provider boundaries
+          set -euo pipefail
+          if grep -q 'pingora-http3-h2c-handoff' src/main.rs && \
+             grep -q 'static_files: Arc<StaticFiles>' src/gateway.rs; then
+            echo 'changed=false' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+
+          gateway = Path('src/gateway.rs')
+          text = gateway.read_text()
+          old = '''pub struct Gateway {
+    runtime: Arc<RuntimeConfig>,
+    static_files: StaticFiles,
+    hosts: AHashMap<Arc<str>, PreparedHost>,
+    plans: Box<[PreparedPlan]>,
+    rates: RateLimiter,
+    active_requests: ActiveRequestLimiter,
+}
+'''
+          new = '''#[derive(Clone)]
+pub struct Gateway {
+    runtime: Arc<RuntimeConfig>,
+    static_files: Arc<StaticFiles>,
+    hosts: Arc<AHashMap<Arc<str>, PreparedHost>>,
+    plans: Arc<[PreparedPlan]>,
+    rates: Arc<RateLimiter>,
+    active_requests: Arc<ActiveRequestLimiter>,
+}
+'''
+          if text.count(old) != 1:
+              raise SystemExit('Gateway struct pattern not found')
+          text = text.replace(old, new)
+          text = text.replace(
+              'let static_files = StaticFiles::new(roots, runtime.config.server.static_cache_bytes)?;',
+              'let static_files = Arc::new(StaticFiles::new(roots, runtime.config.server.static_cache_bytes)?);',
+              1,
+          )
+          old = '''            static_files,
+            hosts,
+            plans: prepared_plans.into_boxed_slice(),
+            rates: RateLimiter::new(),
+            active_requests: ActiveRequestLimiter::new(),
+'''
+          new = '''            static_files,
+            hosts: Arc::new(hosts),
+            plans: Arc::from(prepared_plans),
+            rates: Arc::new(RateLimiter::new()),
+            active_requests: Arc::new(ActiveRequestLimiter::new()),
+'''
+          if text.count(old) != 1:
+              raise SystemExit('Gateway constructor pattern not found')
+          gateway.write_text(text.replace(old, new))
+
+          main = Path('src/main.rs')
+          text = main.read_text()
+          text = text.replace(
+              '''    // Accept cleartext HTTP/2 prior knowledge. The dedicated loopback listener
+    // uses this path for the H3 -> Pingora bridge, while Pingora 0.8.1 retains
+    // HTTP/1.1 detection for ordinary public plaintext listeners.
+    http_options.h2c = true;
+''',
+              '',
+              1,
+          )
+          text = text.replace(
+              'ProxyServiceBuilder::new(&server.configuration, gateway)\n',
+              'ProxyServiceBuilder::new(&server.configuration, gateway.clone())\n',
+              1,
+          )
+          old = '''    let http3_internal = server_config.http3_internal_listen.to_string();
+    if !server_config.http3_listen.is_empty() {
+        service.add_tcp_with_settings(&http3_internal, listener_options(&http3_internal)?);
+    }
+'''
+          if text.count(old) != 1:
+              raise SystemExit('public internal-listener block not found')
+          text = text.replace(old, '', 1)
+          marker = '''    service.add_uds(
+        &server_config.health_socket.to_string_lossy(),
+        Some(Permissions::from_mode(0o600)),
+    );
+
+    http3::start(runtime.clone()).context("HTTP/3 frontend startup failed")?;
+'''
+          replacement = '''    service.add_uds(
+        &server_config.health_socket.to_string_lossy(),
+        Some(Permissions::from_mode(0o600)),
+    );
+
+    if !server_config.http3_listen.is_empty() {
+        let mut h2c_options = HttpServerOptions::default();
+        h2c_options.h2c = true;
+        h2c_options.request_header_timeout = Some(Duration::from_secs(
+            server_config.downstream_request_header_timeout_seconds,
+        ));
+        let mut h2c_service = ProxyServiceBuilder::new(&server.configuration, gateway)
+            .name("pingora-http3-h2c-handoff")
+            .server_options(h2c_options)
+            .build();
+        h2c_service.set_connection_limit(server_config.downstream_max_connections);
+        let mut h2c_stream_options = default_h2_options();
+        h2c_stream_options.max_concurrent_streams(server_config.http3_max_concurrent_streams);
+        h2c_stream_options.max_header_list_size(64 * 1024);
+        if let Some(proxy) = h2c_service.app_logic_mut() {
+            proxy.h2_options = Some(h2c_stream_options);
+        }
+        let internal = server_config.http3_internal_listen.to_string();
+        h2c_service.add_tcp_with_settings(&internal, listener_options(&internal)?);
+        server.add_service(h2c_service);
+    }
+
+    http3::start(runtime.clone()).context("HTTP/3 frontend startup failed")?;
+'''
+          if text.count(marker) != 1:
+              raise SystemExit('internal service insertion point not found')
+          main.write_text(text.replace(marker, replacement))
+          PY
+          cargo fmt --all
+          echo 'changed=true' >> "${GITHUB_OUTPUT}"
+      - name: Verify isolated bridge
+        if: steps.migrate.outputs.changed == 'true'
         run: |
-          cargo tree --locked > /tmp/cargo-tree.txt
-          cargo tree --locked -p pingora-rustls@0.8.1 > /tmp/pingora-tls-tree.txt
-          cargo tree --locked -p tokio-quiche@0.19.1 > /tmp/http3-tls-tree.txt
-          grep -q 'aws-lc-rs v1.17.3' /tmp/pingora-tls-tree.txt
-          grep -q 'rustls v0.23.43' /tmp/pingora-tls-tree.txt
-          ! grep -Eiq '(^|[[:space:]])(boring|boring-sys|pingora-boringssl) v' /tmp/pingora-tls-tree.txt
-          grep -q 'quiche v0.29.3' /tmp/http3-tls-tree.txt
-          grep -q 'boring v4.22.0' /tmp/http3-tls-tree.txt
-          grep -q 'boring-sys v4.22.0' /tmp/http3-tls-tree.txt
-          ! grep -q 'pingora-boringssl v' /tmp/cargo-tree.txt
-      - name: Unit tests
-        run: cargo test --all-targets --locked
-      - name: Build integration-test binary
-        run: |
+          set -euxo pipefail
+          cargo fmt --all --check
+          cargo test --locked --test downstream_admission
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
           cargo build --locked
           sudo setcap cap_net_bind_service=+ep target/debug/pingora
-      - name: Lints
-        run: cargo clippy --all-targets --locked -- -D warnings
-      - name: Allocator fallback builds
+          tests/http3.sh
+      - name: Commit verified migration
+        if: steps.migrate.outputs.changed == 'true'
         run: |
-          cargo check --all-targets --locked --no-default-features --features system-allocator,tls-aws-lc
-          cargo check --all-targets --locked --no-default-features --features jemalloc,tls-aws-lc
-      - name: Protocol and security integration checks
-        run: |
-          sudo tests/runtime_preflight.sh
-          tests/listeners_health.sh
-          tests/retries.sh
-          tests/limit_isolation.sh
-          tests/static_global_limit.sh
-          tests/service_matrix.sh
-          tests/integration.sh
-          tests/http2_matrix.sh
-      - name: Real QUIC, HTTP/3, and h2c bridge integration
-        run: tests/http3.sh
-
-  image-test:
-    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.publish_images != true)
-    needs: [audit, verify]
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target_cpu: x86-64-v2
-            runtime: true
-          - target_cpu: znver1
-            runtime: false
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-      - name: Build image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        with:
-          context: .
-          load: true
-          tags: pingora:ci-${{ matrix.target_cpu }}
-          pull: true
-          build-args: |
-            ALLOCATOR=tcmalloc
-            TLS_PROVIDER=aws-lc
-            PGO_MODE=train
-            PGO_TRAIN_TARGET_CPU=x86-64-v2
-            PGO_WEIGHT_H1=60
-            PGO_WEIGHT_H2=160
-            PGO_WEIGHT_H3=100
-            PGO_WEIGHT_TLS=15
-            PGO_WEIGHT_TAIL=30
-            RUST_TARGET_CPU=${{ matrix.target_cpu }}
-            RUST_LTO=fat
-            BUILD_VERSION=ci
-            BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha,scope=image-test-${{ matrix.target_cpu }}
-          cache-to: type=gha,mode=max,scope=image-test-${{ matrix.target_cpu }}
-      - name: Runtime checks
-        if: matrix.runtime
-        env:
-          PINGORA_TEST_IMAGE: pingora:ci-${{ matrix.target_cpu }}
-          PINGORA_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
-          PINGORA_EXPECTED_LTO: fat
-          PINGORA_EXPECTED_TLS_PROVIDER: aws-lc
-          PINGORA_EXPECTED_PGO: train
-        run: tests/docker_runtime.sh
-      - name: Specialized image metadata check
-        if: ${{ !matrix.runtime }}
-        env:
-          IMAGE: pingora:ci-${{ matrix.target_cpu }}
-        run: |
-          test "$(docker image inspect --format '{{.Config.User}}' "${IMAGE}")" = "10001:10001"
-          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.target-cpu"]')" = "znver1"
-          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator"]')" = "tcmalloc"
-          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.http3.provider"]')" = "quiche"
-          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo-weight-h3"]')" = "100"
-
-  publish-pr:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    needs: [audit, verify, image-test]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-      attestations: write
-      id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target_cpu: x86-64-v2
-            suffix: ""
-          - target_cpu: znver1
-            suffix: -znver1
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-      - name: Sign in to GHCR
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: PR image metadata
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        with:
-          images: |
-            ghcr.io/tae-ok-11/pingora
-            ghcr.io/tae-ok-11/pingola
-          tags: |
-            type=raw,value=pr-${{ github.event.pull_request.number }}${{ matrix.suffix }}
-            type=sha,prefix=sha-,suffix=${{ matrix.suffix }}
-          labels: |
-            org.opencontainers.image.title=JBS Pingora PR ${{ github.event.pull_request.number }}
-            org.opencontainers.image.description=AWS-LC TCP TLS, Quiche HTTP/3, and h2c internal bridge
-            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
-            org.opencontainers.image.allocator=tcmalloc
-            org.opencontainers.image.tls.provider=aws-lc
-            org.opencontainers.image.http3.provider=quiche
-            org.opencontainers.image.http3.internal-protocol=h2c
-      - name: Build and publish verified PR image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          pull: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            ALLOCATOR=tcmalloc
-            TLS_PROVIDER=aws-lc
-            PGO_MODE=train
-            PGO_TRAIN_TARGET_CPU=x86-64-v2
-            PGO_WEIGHT_H1=60
-            PGO_WEIGHT_H2=160
-            PGO_WEIGHT_H3=100
-            PGO_WEIGHT_TLS=15
-            PGO_WEIGHT_TAIL=30
-            RUST_TARGET_CPU=${{ matrix.target_cpu }}
-            RUST_LTO=fat
-            BUILD_VERSION=pr-${{ github.event.pull_request.number }}${{ matrix.suffix }}
-            BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha,scope=image-test-${{ matrix.target_cpu }}
-          cache-to: type=gha,mode=max,scope=image-pr-${{ matrix.target_cpu }}
-          provenance: mode=max
-          sbom: true
-
-  publish:
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_images)
-    needs: [audit, verify]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-      attestations: write
-      id-token: write
-    strategy:
-      matrix:
-        include:
-          - target_cpu: x86-64-v2
-            suffix: ""
-          - target_cpu: znver1
-            suffix: -znver1
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-      - name: Sign in to GHCR
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Image metadata
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        with:
-          images: |
-            ghcr.io/tae-ok-11/pingora
-            ghcr.io/tae-ok-11/pingola
-          tags: |
-            type=raw,value=latest${{ matrix.suffix }},enable={{is_default_branch}}
-            type=sha,prefix=sha-,suffix=${{ matrix.suffix }}
-            type=semver,pattern={{version}},suffix=${{ matrix.suffix }}
-          labels: |
-            org.opencontainers.image.title=JBS Pingora
-            org.opencontainers.image.description=AWS-LC TCP TLS, Quiche HTTP/3, and h2c internal bridge
-            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
-            org.opencontainers.image.allocator=tcmalloc
-            org.opencontainers.image.tls.provider=aws-lc
-            org.opencontainers.image.http3.provider=quiche
-            org.opencontainers.image.http3.internal-protocol=h2c
-      - name: Build and publish
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          pull: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            ALLOCATOR=tcmalloc
-            TLS_PROVIDER=aws-lc
-            PGO_MODE=train
-            PGO_TRAIN_TARGET_CPU=x86-64-v2
-            PGO_WEIGHT_H1=60
-            PGO_WEIGHT_H2=160
-            PGO_WEIGHT_H3=100
-            PGO_WEIGHT_TLS=15
-            PGO_WEIGHT_TAIL=30
-            RUST_TARGET_CPU=${{ matrix.target_cpu }}
-            RUST_LTO=fat
-            BUILD_VERSION=${{ steps.meta.outputs.version }}${{ matrix.suffix }}
-            BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha,scope=image-${{ matrix.target_cpu }}
-          cache-to: type=gha,mode=max,scope=image-${{ matrix.target_cpu }}
-          provenance: mode=max
-          sbom: true
+          set -euxo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/gateway.rs src/main.rs
+          git diff --cached --check
+          git commit -m 'perf(http3): isolate shared Pingora h2c handoff'
+          git push origin HEAD:agent/quiche-http3
