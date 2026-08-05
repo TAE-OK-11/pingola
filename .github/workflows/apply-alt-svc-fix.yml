@@ -1,0 +1,131 @@
+name: apply-alt-svc-fix
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: agent/quiche-http3
+          fetch-depth: 0
+      - name: Install verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake jq libcap2-bin nghttp2-client ninja-build openssl perl
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          rustup default 1.97.1
+      - name: Advertise HTTP/3 on direct H1 and H2 responses
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          gateway = Path('src/gateway.rs')
+          text = gateway.read_text()
+          definition = 'async fn send_empty(\n'
+          if text.count(definition) != 1:
+              raise SystemExit('unexpected send_empty definition count')
+          before, after = text.split(definition, 1)
+          call_count = before.count('send_empty(')
+          if call_count < 10:
+              raise SystemExit(f'unexpected send_empty call count: {call_count}')
+          before = before.replace('send_empty(', 'send_empty(&self.runtime, ')
+          text = before + definition + after
+
+          old = '''async fn send_empty(
+              session: &mut Session,
+              status: u16,
+              handler: Option<HandlerKind>,
+              tls: bool,
+              headers: &[(&'static str, &str)],
+          ) -> Result<bool> {
+          '''
+          new = '''async fn send_empty(
+              runtime: &RuntimeConfig,
+              session: &mut Session,
+              status: u16,
+              handler: Option<HandlerKind>,
+              tls: bool,
+              headers: &[(&'static str, &str)],
+          ) -> Result<bool> {
+          '''
+          if old not in text:
+              raise SystemExit('send_empty signature did not match')
+          text = text.replace(old, new, 1)
+
+          old = '''    if let Some(handler) = handler {
+              insert_security_headers(&mut response, handler, tls)?;
+          }
+              session
+          '''
+          new = '''    if let Some(handler) = handler {
+              insert_security_headers(&mut response, handler, tls)?;
+          }
+              if tls
+                  && let Some(alt_svc) = runtime.http3_alt_svc_header()
+              {
+                  response.insert_header("alt-svc", alt_svc)?;
+              }
+              session
+          '''
+          if old not in text:
+              raise SystemExit('send_empty response block did not match')
+          gateway.write_text(text.replace(old, new, 1))
+
+          fixture = Path('tests/fixtures/http3.yaml')
+          text = fixture.read_text()
+          old = '  https_listen: []\n'
+          new = '  https_listen:\n    - "127.0.0.1:18444"\n'
+          if text.count(old) != 1:
+              raise SystemExit('HTTP/3 fixture HTTPS listener did not match')
+          fixture.write_text(text.replace(old, new, 1))
+
+          test = Path('tests/http3.sh')
+          text = test.read_text()
+          anchor = '''kill -0 "${GATEWAY_PID}"
+
+          # The private handoff listener must accept HTTP/2 prior knowledge.'''
+          addition = '''kill -0 "${GATEWAY_PID}"
+
+          # Browsers normally discover HTTP/3 from an initial H1 or H2 TLS
+          # response. Direct redirects must advertise the configured UDP port
+          # even though they bypass Pingora's upstream response filter.
+          for protocol in --http1.1 --http2; do
+            headers=$(curl --noproxy '*' -gksSI "${protocol}" \
+              --resolve app.test:18444:127.0.0.1 https://app.test:18444/)
+            grep -q '^HTTP/' <<<"${headers}"
+            grep -qi '^alt-svc: h3=":18443"; ma=86400' <<<"${headers}"
+            grep -qi '^location: https://app.test/app/' <<<"${headers}"
+          done
+
+          # The private handoff listener must accept HTTP/2 prior knowledge.'''
+          if text.count(anchor) != 1:
+              raise SystemExit('HTTP/3 integration-test insertion point did not match')
+          test.write_text(text.replace(anchor, addition, 1))
+          PY
+          cargo fmt --all
+      - name: Verify Alt-Svc behavior
+        run: |
+          set -euxo pipefail
+          cargo fmt --all --check
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo build --locked
+          sudo setcap cap_net_bind_service=+ep target/debug/pingora
+          tests/http3.sh
+      - name: Commit verified fix
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/gateway.rs tests/fixtures/http3.yaml tests/http3.sh
+          git diff --cached --check
+          git commit -m 'fix(http3): advertise Alt-Svc on direct H1 and H2 responses'
+          git push origin HEAD:agent/quiche-http3
