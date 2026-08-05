@@ -29,6 +29,7 @@ RUN apt-get update \
         clang \
         cmake \
         curl \
+        git \
         lld \
         nghttp2-client \
         ninja-build \
@@ -36,6 +37,7 @@ RUN apt-get update \
         perl \
         pkg-config \
     && rm -rf /var/lib/apt/lists/* \
+    && git --version \
     && rustc --version \
     && cargo --version
 
