@@ -1,0 +1,143 @@
+name: http3-bootstrap
+
+on:
+  push:
+    branches:
+      - agent/quiche-http3
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: agent/quiche-http3
+          fetch-depth: 0
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake ninja-build perl
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          rustup default 1.97.1
+      - name: Connect HTTP/3 frontend to Pingora
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new, count=1):
+              p = Path(path)
+              text = p.read_text()
+              actual = text.count(old)
+              if actual != count:
+                  raise SystemExit(f'{path}: expected {count} matches, found {actual}: {old!r}')
+              p.write_text(text.replace(old, new))
+
+          # Configuration schema, defaults and validation.
+          replace('src/config.rs',
+              'use anyhow::{Context, Result, bail};\nuse ipnet::IpNet;',
+              'use anyhow::{Context, Result, bail};\nuse http::HeaderValue;\nuse ipnet::IpNet;')
+          replace('src/config.rs',
+              'fn default_http2_max_concurrent_streams() -> u32 {\n    32\n}\n',
+              '''fn default_http2_max_concurrent_streams() -> u32 {\n    32\n}\n\nfn default_http3_internal_listen() -> String {\n    "127.0.0.1:18080".to_string()\n}\n\nfn default_http3_max_idle_timeout() -> u64 {\n    60\n}\n\nfn default_http3_max_concurrent_streams() -> u32 {\n    64\n}\n''')
+          replace('src/config.rs',
+              '    pub https_listen: Vec<String>,\n    #[serde(default)]\n    pub certificate: Option<PathBuf>,',
+              '''    pub https_listen: Vec<String>,\n    #[serde(default)]\n    pub http3_listen: Vec<String>,\n    #[serde(default = "default_http3_internal_listen")]\n    pub http3_internal_listen: String,\n    #[serde(default = "default_http3_max_idle_timeout")]\n    pub http3_max_idle_timeout_seconds: u64,\n    #[serde(default = "default_http3_max_concurrent_streams")]\n    pub http3_max_concurrent_streams: u32,\n    #[serde(default)]\n    pub certificate: Option<PathBuf>,''')
+          replace('src/config.rs',
+              '    pub fn is_trusted_proxy(&self, ip: std::net::IpAddr) -> bool {',
+              '''    pub fn http3_internal_addr(&self) -> Option<SocketAddr> {\n        (!self.config.server.http3_listen.is_empty())\n            .then(|| self.config.server.http3_internal_listen.parse().ok())\n            .flatten()\n    }\n\n    pub fn http3_public_port(&self) -> Option<u16> {\n        self.config\n            .server\n            .http3_listen\n            .first()\n            .and_then(|address| address.parse::<SocketAddr>().ok())\n            .map(|address| address.port())\n    }\n\n    pub fn http3_alt_svc_header(&self) -> Option<HeaderValue> {\n        let port = self.http3_public_port()?;\n        HeaderValue::from_str(&format!(r#"h3=\":{port}\"; ma=86400"#)).ok()\n    }\n\n    pub fn is_trusted_proxy(&self, ip: std::net::IpAddr) -> bool {''')
+          replace('src/config.rs',
+              '    if config.server.http_listen.is_empty() && config.server.https_listen.is_empty() {\n        bail!("at least one HTTP or HTTPS listen address is required");\n    }',
+              '''    if config.server.http_listen.is_empty()\n        && config.server.https_listen.is_empty()\n        && config.server.http3_listen.is_empty()\n    {\n        bail!("at least one HTTP, HTTPS, or HTTP/3 listen address is required");\n    }''')
+          replace('src/config.rs',
+              '    if !(1..=1024).contains(&config.server.http2_max_concurrent_streams) {\n        bail!("server.http2_max_concurrent_streams must be between 1 and 1024");\n    }',
+              '''    if !(1..=1024).contains(&config.server.http2_max_concurrent_streams) {\n        bail!("server.http2_max_concurrent_streams must be between 1 and 1024");\n    }\n    if !(1..=1024).contains(&config.server.http3_max_concurrent_streams) {\n        bail!("server.http3_max_concurrent_streams must be between 1 and 1024");\n    }\n    if !(1..=600).contains(&config.server.http3_max_idle_timeout_seconds) {\n        bail!("server.http3_max_idle_timeout_seconds must be between 1 and 600");\n    }''')
+          replace('src/config.rs',
+              '    for (kind, addresses) in [\n        ("HTTP", &config.server.http_listen),\n        ("HTTPS", &config.server.https_listen),\n    ] {',
+              '''    for (kind, addresses) in [\n        ("HTTP", &config.server.http_listen),\n        ("HTTPS", &config.server.https_listen),\n        ("HTTP/3 UDP", &config.server.http3_listen),\n    ] {''')
+          replace('src/config.rs',
+              '    if !config.server.https_listen.is_empty()\n        && (config',
+              '    if (!config.server.https_listen.is_empty() || !config.server.http3_listen.is_empty())\n        && (config')
+          replace('src/config.rs',
+              '        bail!("certificate and private_key are required for HTTPS listeners");\n    }',
+              '''        bail!("certificate and private_key are required for HTTPS or HTTP/3 listeners");\n    }\n    if !config.server.http3_listen.is_empty() {\n        let internal = config\n            .server\n            .http3_internal_listen\n            .parse::<SocketAddr>()\n            .with_context(|| {\n                format!(\n                    "server HTTP/3 internal listener has invalid socket address {}",\n                    config.server.http3_internal_listen\n                )\n            })?;\n        if !internal.ip().is_loopback() {\n            bail!("server.http3_internal_listen must use a loopback address");\n        }\n        let mut public_port = None;\n        for address in &config.server.http3_listen {\n            let address = address.parse::<SocketAddr>()?;\n            if address.port() == 0 {\n                bail!("server HTTP/3 listeners cannot use port zero");\n            }\n            match public_port {\n                Some(port) if port != address.port() => {\n                    bail!("all server HTTP/3 listeners must use the same UDP port")\n                }\n                None => public_port = Some(address.port()),\n                _ => {}\n            }\n        }\n        if config\n            .server\n            .http_listen\n            .iter()\n            .chain(&config.server.https_listen)\n            .filter_map(|address| address.parse::<SocketAddr>().ok())\n            .any(|address| address == internal)\n        {\n            bail!("server.http3_internal_listen conflicts with a public TCP listener");\n        }\n    }''')
+
+          # Main server wiring.
+          replace('src/main.rs', 'mod gateway;\n', 'mod gateway;\nmod http3;\n')
+          replace('src/main.rs',
+              '            runtime.config.server.http_listen.len() + runtime.config.server.https_listen.len()\n',
+              '''            runtime.config.server.http_listen.len()\n                + runtime.config.server.https_listen.len()\n                + runtime.config.server.http3_listen.len()\n                + usize::from(!runtime.config.server.http3_listen.is_empty())\n''')
+          replace('src/main.rs',
+              '    for address in &server_config.https_listen {',
+              '''    if !server_config.http3_listen.is_empty() {\n        service.add_tcp_with_settings(\n            &server_config.http3_internal_listen,\n            listener_options(&server_config.http3_internal_listen)?,\n        );\n    }\n    for address in &server_config.https_listen {''')
+          replace('src/main.rs',
+              '    info!(\n        "starting Pingora with {} TLS 1.3: http={:?} https={:?} health_socket={} threads={}",',
+              '''    http3::start(runtime.clone()).context("HTTP/3 frontend startup failed")?;\n\n    info!(\n        "starting Pingora with {} TLS 1.3: http={:?} https={:?} http3_udp={:?} http3_internal={} health_socket={} threads={}",''')
+          replace('src/main.rs',
+              '        server_config.https_listen,\n        server_config.health_socket.display(),',
+              '''        server_config.https_listen,\n        server_config.http3_listen,\n        server_config.http3_internal_listen,\n        server_config.health_socket.display(),''')
+
+          # Gateway trust boundary and Alt-Svc advertisement.
+          replace('src/gateway.rs',
+              'const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");',
+              '''const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");\nconst HTTP3_INTERNAL: HeaderName = HeaderName::from_static("x-jbs-http3-internal");\nconst HTTP3_PORT: HeaderName = HeaderName::from_static("x-jbs-http3-port");''')
+          replace('src/gateway.rs',
+              '    tls: bool,\n    body_bytes: usize,',
+              '    tls: bool,\n    http3: bool,\n    forwarded_port: Option<u16>,\n    body_bytes: usize,')
+          replace('src/gateway.rs',
+              '            tls: false,\n            body_bytes: 0,',
+              '            tls: false,\n            http3: false,\n            forwarded_port: None,\n            body_bytes: 0,')
+          replace('src/gateway.rs',
+              '        let tls = is_tls(session);\n        let path = session.req_header().uri.path();',
+              '''        let http3 = is_internal_http3(&self.runtime, session);\n        let tls = is_tls(session) || http3;\n        ctx.http3 = http3;\n        ctx.forwarded_port = http3.then(|| {\n            session\n                .req_header()\n                .headers\n                .get(&HTTP3_PORT)\n                .and_then(|value| value.to_str().ok())\n                .and_then(|value| value.parse::<u16>().ok())\n                .or_else(|| self.runtime.http3_public_port())\n        }).flatten();\n        let path = session.req_header().uri.path();''')
+          replace('src/gateway.rs',
+              '        upstream_request.remove_header(&FORWARDED);\n        upstream_request.remove_header(&X_FORWARDED_FOR);',
+              '''        upstream_request.remove_header(&FORWARDED);\n        upstream_request.remove_header(&X_FORWARDED_FOR);\n        upstream_request.remove_header(&HTTP3_INTERNAL);\n        upstream_request.remove_header(&HTTP3_PORT);''')
+          replace('src/gateway.rs',
+              '        let listener_port = session\n            .server_addr()',
+              '''        let listener_port = ctx.forwarded_port.or_else(|| session\n            .server_addr()''')
+          replace('src/gateway.rs',
+              '            .map(|address| address.port());\n        upstream_request.insert_header(',
+              '            .map(|address| address.port()));\n        upstream_request.insert_header(', 1)
+          replace('src/gateway.rs',
+              '        insert_security_headers(response, plan.handler, ctx.tls)?;',
+              '''        insert_security_headers(response, plan.handler, ctx.tls)?;\n        if ctx.tls\n            && let Some(alt_svc) = self.runtime.http3_alt_svc_header()\n        {\n            response.insert_header("alt-svc", alt_svc)?;\n        }''')
+          replace('src/gateway.rs',
+              '''fn is_tls(session: &Session) -> bool {\n    session\n        .digest()\n        .and_then(|digest| digest.ssl_digest.as_ref())\n        .is_some()\n}\n''',
+              '''fn is_tls(session: &Session) -> bool {\n    session\n        .digest()\n        .and_then(|digest| digest.ssl_digest.as_ref())\n        .is_some()\n}\n\nfn is_internal_http3(runtime: &RuntimeConfig, session: &Session) -> bool {\n    let Some(expected) = runtime.http3_internal_addr() else {\n        return false;\n    };\n    let server_matches = session\n        .server_addr()\n        .and_then(|address| address.as_inet())\n        .is_some_and(|address| address == expected);\n    let peer_is_loopback = session\n        .client_addr()\n        .and_then(|address| address.as_inet())\n        .is_some_and(|address| address.ip().is_loopback());\n    let marker_matches = session\n        .req_header()\n        .headers\n        .get(&HTTP3_INTERNAL)\n        .is_some_and(|value| value == "1");\n    server_matches && peer_is_loopback && marker_matches\n}\n''')
+
+          # Preflight validates TCP and UDP binds simultaneously.
+          replace('src/preflight.rs',
+              '    if server.https_listen.is_empty() {',
+              '    if server.https_listen.is_empty() && server.http3_listen.is_empty() {')
+          replace('src/preflight.rs',
+              '        let count = server.http_listen.len() + server.https_listen.len();',
+              '''        let count = server.http_listen.len()\n            + server.https_listen.len()\n            + server.http3_listen.len()\n            + usize::from(!server.http3_listen.is_empty());''')
+          replace('src/preflight.rs',
+              '    drop(sockets);\n}\n\nfn bind_listener(address: &str) -> Result<Socket> {',
+              '''    if !runtime.config.server.http3_listen.is_empty() {\n        let address = &runtime.config.server.http3_internal_listen;\n        match bind_listener(address) {\n            Ok(socket) => {\n                report.ok(format!("listener bind HTTP/3 internal {address}"), "bound loopback TCP");\n                sockets.push(socket);\n            }\n            Err(error) => report.error(\n                format!("listener bind HTTP/3 internal {address}"),\n                format!("failed to bind internal TCP address {address}: {error:#}"),\n            ),\n        }\n    }\n    let mut udp_sockets = Vec::new();\n    for address in &runtime.config.server.http3_listen {\n        match bind_udp_listener(address) {\n            Ok(socket) => {\n                report.ok(\n                    format!("listener bind HTTP/3 UDP {address}"),\n                    if address.starts_with('[') {\n                        "bound with IPV6_V6ONLY=true".to_string()\n                    } else {\n                        "bound".to_string()\n                    },\n                );\n                udp_sockets.push(socket);\n            }\n            Err(error) => report.error(\n                format!("listener bind HTTP/3 UDP {address}"),\n                format!("failed to bind UDP address {address}: {error:#}"),\n            ),\n        }\n    }\n    drop(udp_sockets);\n    drop(sockets);\n}\n\nfn bind_udp_listener(address: &str) -> Result<Socket> {\n    let address = address\n        .parse::<SocketAddr>()\n        .with_context(|| format!("invalid UDP listener address {address}"))?;\n    let domain = if address.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };\n    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))\n        .with_context(|| format!("failed to create UDP socket for {address}"))?;\n    socket.set_reuse_address(true)?;\n    if address.is_ipv6() {\n        socket.set_only_v6(true)?;\n    }\n    socket.bind(&address.into())\n        .with_context(|| format!("UDP bind failed for {address}"))?;\n    Ok(socket)\n}\n\nfn bind_listener(address: &str) -> Result<Socket> {''')
+
+          # Checked-in production configuration enables UDP 443 on both families.
+          replace('config/pingora.yaml',
+              '  https_listen:\n    - "0.0.0.0:443"\n    - "[::]:443"\n',
+              '''  https_listen:\n    - "0.0.0.0:443"\n    - "[::]:443"\n  http3_listen:\n    - "0.0.0.0:443"\n    - "[::]:443"\n  http3_internal_listen: "127.0.0.1:18080"\n  http3_max_idle_timeout_seconds: 60\n  http3_max_concurrent_streams: 64\n''')
+          PY
+          cargo update --verbose
+          cargo fmt --all
+      - name: Compile and lint HTTP/3 integration
+        run: |
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+      - name: Commit generated integration
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.lock src config/pingora.yaml
+          git diff --cached --check
+          git commit -m 'feat(http3): connect quiche frontend to Pingora'
+          git push origin HEAD:agent/quiche-http3
