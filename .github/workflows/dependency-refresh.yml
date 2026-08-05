@@ -30,11 +30,6 @@ jobs:
           cp Cargo.lock refresh-report/Cargo.lock.updated
           cargo tree --locked --depth 1 > refresh-report/cargo-tree-root.txt
           cargo tree --locked -e features > refresh-report/cargo-tree-features.txt
-      - name: Report incompatible direct dependency updates
-        run: |
-          set -euxo pipefail
-          cargo install cargo-outdated --locked
-          cargo outdated --root-deps-only --exit-code 0 | tee refresh-report/cargo-outdated.txt
       - name: Verify refreshed Rust graph
         run: |
           set -euxo pipefail
