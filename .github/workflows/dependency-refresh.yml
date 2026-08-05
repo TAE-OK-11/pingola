@@ -4,7 +4,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   finalize:
@@ -61,8 +61,6 @@ jobs:
           ci.write_text(text.replace(old, new))
           PY
 
-          # Run Cargo's edition migration lints from the previous edition, then
-          # restore Rust 2024 and apply machine-safe Clippy modernization fixes.
           sed -i 's/edition = "2024"/edition = "2021"/' Cargo.toml
           cargo update --verbose
           cargo fix --edition --all-targets --allow-dirty
@@ -90,12 +88,23 @@ jobs:
           target/release/pingora --allocator-info | grep -q 'allocator=tcmalloc implementation=google-tcmalloc'
           rustc --edition=2024 -D warnings bench/backend.rs -o /tmp/pgo-backend
           rustc --edition=2024 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
-      - name: Commit verified refresh
+      - name: Package verified refresh
         run: |
           set -euxo pipefail
           rm -f .github/workflows/apply-full-refresh.yml .github/workflows/dependency-refresh.yml
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -A
-          git commit -m 'build: refresh Rust, dependencies and Debian 13 runtime'
-          git push origin HEAD:agent/full-stack-refresh
+          mkdir -p refresh-output/files
+          git diff --name-status > refresh-output/name-status.txt
+          git diff --binary > refresh-output/full-refresh.patch
+          git diff --name-only -z | while IFS= read -r -d '' file; do
+            if [ -f "$file" ]; then
+              mkdir -p "refresh-output/files/$(dirname "$file")"
+              cp "$file" "refresh-output/files/$file"
+            fi
+          done
+      - name: Upload verified refresh
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: full-stack-refresh-output
+          path: refresh-output/
+          if-no-files-found: error
+          retention-days: 3
