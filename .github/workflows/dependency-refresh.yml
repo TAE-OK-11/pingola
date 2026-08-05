@@ -1,4 +1,4 @@
-name: commit-full-stack-refresh
+name: finalize-rust-2024-and-workflows
 
 on:
   pull_request:
@@ -7,58 +7,86 @@ permissions:
   contents: write
 
 jobs:
-  commit:
+  finalize:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: agent/full-stack-refresh
           fetch-depth: 0
-      - name: Install migration tools
+      - name: Install verification tools
         run: |
           sudo apt-get update
           sudo apt-get install --yes cmake ninja-build
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
           rustup default 1.97.1
-      - name: Reproduce verified non-workflow refresh
+      - name: Make Rust 2024 drop order explicit and stage workflow content
         shell: bash
         run: |
           set -euxo pipefail
           python3 - <<'PY'
           from pathlib import Path
 
-          dockerfile = Path('Dockerfile')
-          text = dockerfile.read_text()
           replacements = {
-              'ARG DEBIAN_SUITE=trixie': 'ARG DEBIAN_SUITE=13',
-              'FROM rust:1.97.1-slim-trixie@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c AS builder':
-                  'FROM rust:1.97.1-slim-trixie@sha256:69153971349358535be9821190190f026a761f690c6b58c68a914d14ab2d610a AS builder',
-              'FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS runtime':
-                  'FROM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS runtime',
-              '--edition=2021': '--edition=2024',
+              Path('src/limits.rs'): [(
+                  '        let counter = loop {\n            match self.counters.entry(key.clone()) {',
+                  '        let counter = loop {\n            let entry = self.counters.entry(key.clone());\n            match entry {'
+              )],
+              Path('src/preflight.rs'): [(
+                  '    {\n        match bind_listener(address) {\n            Ok(socket) => {',
+                  '    {\n        let bind_result = bind_listener(address);\n        match bind_result {\n            Ok(socket) => {'
+              )],
+              Path('tests/upstream_http2.rs'): [(
+                  '                while let Some(result) = connection.accept().await {',
+                  '                loop {\n                    let next = connection.accept().await;\n                    let Some(result) = next else {\n                        break;\n                    };'
+              )],
           }
-          for old, new in replacements.items():
-              if old not in text:
-                  raise SystemExit(f'expected Dockerfile text not found: {old}')
-              text = text.replace(old, new)
-          dockerfile.write_text(text)
-          PY
+          for path, pairs in replacements.items():
+              text = path.read_text()
+              for old, new in pairs:
+                  if text.count(old) != 1:
+                      raise SystemExit(f'expected exactly one Rust 2024 migration site in {path}: {old!r}')
+                  text = text.replace(old, new)
+              path.write_text(text)
 
-          sed -i 's/edition = "2024"/edition = "2021"/' Cargo.toml
-          cargo update --verbose
-          cargo fix --edition --all-targets --allow-dirty
-          sed -i 's/edition = "2021"/edition = "2024"/' Cargo.toml
+          generated = Path('generated-workflows')
+          generated.mkdir(exist_ok=True)
+
+          ci = Path('.github/workflows/ci.yml').read_text()
+          old_login = 'docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4'
+          new_login = 'docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1'
+          if ci.count(old_login) != 2:
+              raise SystemExit('expected exactly two docker/login-action 4.4.0 references')
+          if ci.count('--edition=2021') != 2:
+              raise SystemExit('expected exactly two Rust 2021 bench-tool flags in ci.yml')
+          ci = ci.replace(old_login, new_login).replace('--edition=2021', '--edition=2024')
+          (generated / 'ci.yml').write_text(ci)
+
+          bench = Path('.github/workflows/bench-tools-build.yml').read_text()
+          if bench.count('--edition=2021') != 1:
+              raise SystemExit('expected exactly one Rust 2021 flag in bench-tools-build.yml')
+          (generated / 'bench-tools-build.yml').write_text(
+              bench.replace('--edition=2021', '--edition=2024')
+          )
+          PY
           cargo fmt --all
-          cargo clippy --fix --all-targets --locked --allow-dirty --allow-staged -- -D warnings
-          cargo fmt --all
-      - name: Commit generated files
+      - name: Verify explicit lifetimes and staged workflows
+        run: |
+          set -euxo pipefail
+          cargo fmt --all --check
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          grep -q -- '--edition=2024' generated-workflows/ci.yml
+          grep -q -- '--edition=2024' generated-workflows/bench-tools-build.yml
+          grep -q 'docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1' generated-workflows/ci.yml
+      - name: Commit finalized source and staged workflows
         run: |
           set -euxo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add Cargo.lock Dockerfile src tests
+          git add src/limits.rs src/preflight.rs tests/upstream_http2.rs generated-workflows
           git diff --cached --check
-          git commit -m 'build: refresh Rust dependencies and Debian 13 runtime'
+          git commit -m 'refactor: make Rust 2024 temporary lifetimes explicit'
           git push origin HEAD:agent/full-stack-refresh
