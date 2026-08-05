@@ -138,8 +138,13 @@ async fn run(
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
     connector.set_connect_timeout(Some(Duration::from_secs(2)));
+    // A single cleartext HTTP/2 connection multiplexes all concurrent H3
+    // streams for this internal authority. There is intentionally no H1
+    // fallback, so a protocol regression fails fast instead of becoming a
+    // silent performance regression.
     let client: ProxyClient = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(server.http3_max_concurrent_streams as usize)
+        .http2_only(true)
+        .pool_max_idle_per_host(1)
         .build(connector);
     let internal = server.http3_internal_listen;
     let public_port = runtime
@@ -197,7 +202,7 @@ async fn run(
     }
 
     info!(
-        "HTTP/3 frontend started: udp={:?} internal=http://{} quiche={} early_data=false migration=false pmtud=true max_udp_payload={} send_capacity_factor={}",
+        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} early_data=false migration=false pmtud=true max_udp_payload={} send_capacity_factor={}",
         server.http3_listen,
         internal,
         tokio_quiche::quiche::PROTOCOL_VERSION,
@@ -325,15 +330,15 @@ async fn proxy_request_inner(
     let mut request = Request::builder()
         .method(decoded.method)
         .uri(decoded.uri)
-        .version(Version::HTTP_11)
+        .version(Version::HTTP_2)
         .body(body)
         .context("failed to build internal HTTP/3 proxy request")?;
     *request.headers_mut() = decoded.headers;
 
     let response = tokio::time::timeout(Duration::from_secs(3600), client.request(request))
         .await
-        .map_err(|_| anyhow!("internal Pingora request timed out"))?
-        .context("internal Pingora request failed")?;
+        .map_err(|_| anyhow!("internal Pingora h2c request timed out"))?
+        .context("internal Pingora h2c request failed")?;
     forward_response(response, &mut send, alt_svc).await
 }
 
@@ -453,7 +458,9 @@ fn request_body(
         loop {
             match recv.recv().await {
                 Some(InboundFrame::Body(data, fin)) => {
-                    let frame = Frame::data(Bytes::copy_from_slice(data.as_ref()));
+                    // InboundFrame owns the BytesMut allocation. Freeze it into
+                    // Bytes and transfer ownership into Hyper without copying.
+                    let frame = Frame::data(data.freeze());
                     return Some((Ok::<_, BoxError>(frame), (recv, fin)));
                 }
                 Some(InboundFrame::Datagram(_)) => continue,
