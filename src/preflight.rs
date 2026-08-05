@@ -73,7 +73,7 @@ pub fn check_runtime(runtime: &RuntimeConfig, check_bind: bool) -> CheckReport {
     let mut report = CheckReport::default();
     let server = &runtime.config.server;
 
-    if server.https_listen.is_empty() {
+    if server.https_listen.is_empty() && server.http3_listen.is_empty() {
         report.ok("TLS files", "not required (no HTTPS listeners)");
     } else {
         check_tls(runtime, &mut report);
@@ -139,7 +139,10 @@ pub fn check_runtime(runtime: &RuntimeConfig, check_bind: bool) -> CheckReport {
     if check_bind {
         check_listener_binds(runtime, &mut report);
     } else {
-        let count = server.http_listen.len() + server.https_listen.len();
+        let count = server.http_listen.len()
+            + server.https_listen.len()
+            + server.http3_listen.len()
+            + usize::from(!server.http3_listen.is_empty());
         report.ok(
             "listener syntax",
             format!("{count} numeric socket addresses parsed; bind skipped"),
@@ -331,7 +334,69 @@ fn check_listener_binds(runtime: &RuntimeConfig, report: &mut CheckReport) {
             ),
         }
     }
+    if !runtime.config.server.http3_listen.is_empty() {
+        let address = runtime.config.server.http3_internal_listen;
+        match bind_listener(&address.to_string()) {
+            Ok(socket) => {
+                report.ok(
+                    format!("listener bind HTTP/3 internal {address}"),
+                    "bound loopback TCP",
+                );
+                sockets.push(socket);
+            }
+            Err(error) => report.error(
+                format!("listener bind HTTP/3 internal {address}"),
+                format!("failed to bind internal TCP address {address}: {error:#}"),
+            ),
+        }
+    }
+    let mut udp_sockets = Vec::new();
+    for address in &runtime.config.server.http3_listen {
+        match bind_udp_listener(address) {
+            Ok(socket) => {
+                report.ok(
+                    format!("listener bind HTTP/3 UDP {address}"),
+                    if address.starts_with('[') {
+                        "bound with IPV6_V6ONLY=true".to_string()
+                    } else {
+                        "bound".to_string()
+                    },
+                );
+                udp_sockets.push(socket);
+            }
+            Err(error) => report.error(
+                format!("listener bind HTTP/3 UDP {address}"),
+                format!("failed to bind UDP address {address}: {error:#}"),
+            ),
+        }
+    }
+    drop(udp_sockets);
     drop(sockets);
+}
+
+fn bind_udp_listener(address: &str) -> Result<Socket> {
+    let address = address
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid UDP listener address {address}"))?;
+    let domain = if address.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .with_context(|| format!("failed to create UDP socket for {address}"))?;
+    socket
+        .set_reuse_address(true)
+        .with_context(|| format!("failed to set SO_REUSEADDR for UDP {address}"))?;
+    if address.is_ipv6() {
+        socket
+            .set_only_v6(true)
+            .with_context(|| format!("failed to set IPV6_V6ONLY for UDP {address}"))?;
+    }
+    socket
+        .bind(&address.into())
+        .with_context(|| format!("UDP bind failed for {address}"))?;
+    Ok(socket)
 }
 
 fn bind_listener(address: &str) -> Result<Socket> {

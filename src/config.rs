@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use http::HeaderValue;
 use ipnet::IpNet;
 use serde::Deserialize;
 
@@ -27,6 +28,20 @@ fn default_max_retries() -> usize {
 
 fn default_http2_max_concurrent_streams() -> u32 {
     32
+}
+
+fn default_http3_internal_listen() -> SocketAddr {
+    "127.0.0.1:18080"
+        .parse()
+        .expect("the default HTTP/3 internal listener is valid")
+}
+
+fn default_http3_max_idle_timeout() -> u64 {
+    60
+}
+
+fn default_http3_max_concurrent_streams() -> u32 {
+    64
 }
 
 fn default_downstream_max_connections() -> usize {
@@ -89,6 +104,14 @@ pub struct Config {
 pub struct ServerConfig {
     pub http_listen: Vec<String>,
     pub https_listen: Vec<String>,
+    #[serde(default)]
+    pub http3_listen: Vec<String>,
+    #[serde(default = "default_http3_internal_listen")]
+    pub http3_internal_listen: SocketAddr,
+    #[serde(default = "default_http3_max_idle_timeout")]
+    pub http3_max_idle_timeout_seconds: u64,
+    #[serde(default = "default_http3_max_concurrent_streams")]
+    pub http3_max_concurrent_streams: u32,
     #[serde(default)]
     pub certificate: Option<PathBuf>,
     #[serde(default)]
@@ -230,6 +253,25 @@ impl RuntimeConfig {
         })
     }
 
+    pub fn http3_internal_addr(&self) -> Option<SocketAddr> {
+        (!self.config.server.http3_listen.is_empty())
+            .then_some(self.config.server.http3_internal_listen)
+    }
+
+    pub fn http3_public_port(&self) -> Option<u16> {
+        self.config
+            .server
+            .http3_listen
+            .first()
+            .and_then(|address| address.parse::<SocketAddr>().ok())
+            .map(|address| address.port())
+    }
+
+    pub fn http3_alt_svc_header(&self) -> Option<HeaderValue> {
+        let port = self.http3_public_port()?;
+        HeaderValue::from_str(&format!(r#"h3=":{port}"; ma=86400"#)).ok()
+    }
+
     pub fn is_trusted_proxy(&self, ip: std::net::IpAddr) -> bool {
         self.config
             .trusted_proxies
@@ -260,8 +302,11 @@ pub(crate) fn normalized_host(authority: &str) -> Cow<'_, str> {
 }
 
 fn validate(config: &Config) -> Result<()> {
-    if config.server.http_listen.is_empty() && config.server.https_listen.is_empty() {
-        bail!("at least one HTTP or HTTPS listen address is required");
+    if config.server.http_listen.is_empty()
+        && config.server.https_listen.is_empty()
+        && config.server.http3_listen.is_empty()
+    {
+        bail!("at least one HTTP, HTTPS, or HTTP/3 listen address is required");
     }
     if config.server.threads == 0 {
         bail!("server.threads must be greater than zero");
@@ -277,6 +322,12 @@ fn validate(config: &Config) -> Result<()> {
     }
     if !(1..=1024).contains(&config.server.http2_max_concurrent_streams) {
         bail!("server.http2_max_concurrent_streams must be between 1 and 1024");
+    }
+    if !(1..=1024).contains(&config.server.http3_max_concurrent_streams) {
+        bail!("server.http3_max_concurrent_streams must be between 1 and 1024");
+    }
+    if !(1..=600).contains(&config.server.http3_max_idle_timeout_seconds) {
+        bail!("server.http3_max_idle_timeout_seconds must be between 1 and 600");
     }
     if !(1..=1_000_000).contains(&config.server.downstream_max_connections) {
         bail!("server.downstream_max_connections must be between 1 and 1000000");
@@ -295,6 +346,7 @@ fn validate(config: &Config) -> Result<()> {
     for (kind, addresses) in [
         ("HTTP", &config.server.http_listen),
         ("HTTPS", &config.server.https_listen),
+        ("HTTP/3 UDP", &config.server.http3_listen),
     ] {
         for address in addresses {
             address.parse::<SocketAddr>().with_context(|| {
@@ -302,7 +354,7 @@ fn validate(config: &Config) -> Result<()> {
             })?;
         }
     }
-    if !config.server.https_listen.is_empty()
+    if (!config.server.https_listen.is_empty() || !config.server.http3_listen.is_empty())
         && (config
             .server
             .certificate
@@ -314,7 +366,37 @@ fn validate(config: &Config) -> Result<()> {
                 .as_ref()
                 .is_none_or(|path| path.as_os_str().is_empty()))
     {
-        bail!("certificate and private_key are required for HTTPS listeners");
+        bail!("certificate and private_key are required for HTTPS or HTTP/3 listeners");
+    }
+    if !config.server.http3_listen.is_empty() {
+        let internal = config.server.http3_internal_listen;
+        if !internal.ip().is_loopback() {
+            bail!("server.http3_internal_listen must use a loopback address");
+        }
+        let mut public_port = None;
+        for address in &config.server.http3_listen {
+            let address = address.parse::<SocketAddr>()?;
+            if address.port() == 0 {
+                bail!("server HTTP/3 listeners cannot use port zero");
+            }
+            match public_port {
+                Some(port) if port != address.port() => {
+                    bail!("all server HTTP/3 listeners must use the same UDP port")
+                }
+                None => public_port = Some(address.port()),
+                _ => {}
+            }
+        }
+        if config
+            .server
+            .http_listen
+            .iter()
+            .chain(&config.server.https_listen)
+            .filter_map(|address| address.parse::<SocketAddr>().ok())
+            .any(|address| address == internal)
+        {
+            bail!("server.http3_internal_listen conflicts with a public TCP listener");
+        }
     }
     if config.hosts.is_empty() {
         bail!("at least one host is required");

@@ -66,6 +66,8 @@ thread_local! {
 }
 const NO_PLAN: usize = usize::MAX;
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+const HTTP3_INTERNAL: HeaderName = HeaderName::from_static("x-jbs-http3-internal");
+const HTTP3_PORT: HeaderName = HeaderName::from_static("x-jbs-http3-port");
 #[cfg(test)]
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
@@ -250,6 +252,8 @@ pub struct RequestContext {
     plan_index: usize,
     client_ip: IpAddr,
     tls: bool,
+    http3: bool,
+    forwarded_port: Option<u16>,
     body_bytes: usize,
     retries: usize,
     identity_acceptable: bool,
@@ -265,6 +269,8 @@ impl Default for RequestContext {
             plan_index: NO_PLAN,
             client_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             tls: false,
+            http3: false,
+            forwarded_port: None,
             body_bytes: 0,
             retries: 0,
             identity_acceptable: true,
@@ -436,7 +442,20 @@ impl ProxyHttp for Gateway {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        let tls = is_tls(session);
+        let http3 = is_internal_http3(&self.runtime, session);
+        let tls = is_tls(session) || http3;
+        ctx.http3 = http3;
+        ctx.forwarded_port = http3
+            .then(|| {
+                session
+                    .req_header()
+                    .headers
+                    .get(&HTTP3_PORT)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .or_else(|| self.runtime.http3_public_port())
+            })
+            .flatten();
         let path = session.req_header().uri.path();
 
         if path == "/pingora-health" || path == "/pingora-live" || path == "/pingora-ready" {
@@ -640,14 +659,18 @@ impl ProxyHttp for Gateway {
 
         upstream_request.remove_header(&FORWARDED);
         upstream_request.remove_header(&X_FORWARDED_FOR);
+        upstream_request.remove_header(&HTTP3_INTERNAL);
+        upstream_request.remove_header(&HTTP3_PORT);
         upstream_request.insert_header(HOST, upstream_host)?;
         upstream_request.insert_header("x-real-ip", client_ip.clone())?;
         upstream_request.insert_header("x-forwarded-for", client_ip)?;
         upstream_request.insert_header("x-forwarded-host", plan.domain.clone())?;
-        let listener_port = session
-            .server_addr()
-            .and_then(|address| address.as_inet())
-            .map(|address| address.port());
+        let listener_port = ctx.forwarded_port.or_else(|| {
+            session
+                .server_addr()
+                .and_then(|address| address.as_inet())
+                .map(|address| address.port())
+        });
         upstream_request.insert_header(
             "x-forwarded-port",
             forwarded_port_value(listener_port, ctx.tls)?,
@@ -754,6 +777,11 @@ impl ProxyHttp for Gateway {
             && session.is_upgrade_req();
         strip_response_hop_headers(response, forwards_upgrade)?;
         insert_security_headers(response, plan.handler, ctx.tls)?;
+        if ctx.tls
+            && let Some(alt_svc) = self.runtime.http3_alt_svc_header()
+        {
+            response.insert_header("alt-svc", alt_svc)?;
+        }
         if ctx.compression_selected && response_status_is_interim(response.status.as_u16()) {
             // 100/103 are interim headers. Do not permanently disable the
             // compressor before the final response arrives.
@@ -1218,6 +1246,26 @@ fn is_tls(session: &Session) -> bool {
         .digest()
         .and_then(|digest| digest.ssl_digest.as_ref())
         .is_some()
+}
+
+fn is_internal_http3(runtime: &RuntimeConfig, session: &Session) -> bool {
+    let Some(expected) = runtime.http3_internal_addr() else {
+        return false;
+    };
+    let server_matches = session
+        .server_addr()
+        .and_then(|address| address.as_inet())
+        .is_some_and(|address| *address == expected);
+    let peer_is_loopback = session
+        .client_addr()
+        .and_then(|address| address.as_inet())
+        .is_some_and(|address| address.ip().is_loopback());
+    let marker_matches = session
+        .req_header()
+        .headers
+        .get(&HTTP3_INTERNAL)
+        .is_some_and(|value| value == "1");
+    server_matches && peer_is_loopback && marker_matches
 }
 
 fn session_client_ip(runtime: &RuntimeConfig, session: &Session) -> IpAddr {

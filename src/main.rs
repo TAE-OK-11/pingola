@@ -2,6 +2,7 @@ mod allocator;
 mod config;
 mod content_encoding;
 mod gateway;
+mod http3;
 mod limits;
 mod preflight;
 mod static_files;
@@ -93,7 +94,10 @@ fn main() -> Result<()> {
             config_path.display(),
             runtime.config.hosts.len(),
             runtime.config.upstreams.len(),
-            runtime.config.server.http_listen.len() + runtime.config.server.https_listen.len()
+            runtime.config.server.http_listen.len()
+                + runtime.config.server.https_listen.len()
+                + runtime.config.server.http3_listen.len()
+                + usize::from(!runtime.config.server.http3_listen.is_empty())
         );
         let report = check_runtime(&runtime, cli.check_bind);
         report.print();
@@ -304,6 +308,10 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     for address in &server_config.http_listen {
         service.add_tcp_with_settings(address, listener_options(address)?);
     }
+    let http3_internal = server_config.http3_internal_listen.to_string();
+    if !server_config.http3_listen.is_empty() {
+        service.add_tcp_with_settings(&http3_internal, listener_options(&http3_internal)?);
+    }
     for address in &server_config.https_listen {
         let certificate = server_config.certificate.as_deref().ok_or_else(|| {
             anyhow!(
@@ -334,11 +342,15 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         Some(Permissions::from_mode(0o600)),
     );
 
+    http3::start(runtime.clone()).context("HTTP/3 frontend startup failed")?;
+
     info!(
-        "starting Pingora with {} TLS 1.3: http={:?} https={:?} health_socket={} threads={}",
+        "starting Pingora with {} TLS 1.3: http={:?} https={:?} http3_udp={:?} http3_internal={} health_socket={} threads={}",
         tls_provider_name(),
         server_config.http_listen,
         server_config.https_listen,
+        server_config.http3_listen,
+        server_config.http3_internal_listen,
         server_config.health_socket.display(),
         server_config.threads
     );

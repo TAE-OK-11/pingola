@@ -8,14 +8,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use futures::{StreamExt, stream};
+use futures::{SinkExt, StreamExt, stream};
 use http::header::{CONNECTION, HOST, TE, TRAILER, TRANSFER_ENCODING, UPGRADE};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, StreamBody};
 use hyper::body::Frame;
+use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::{Client, ResponseFuture};
 use hyper_util::rt::TokioExecutor;
 use log::{error, info, warn};
 use tokio::net::UdpSocket;
@@ -25,7 +25,6 @@ use tokio_quiche::http3::driver::{
 };
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::metrics::DefaultMetrics;
-use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::quiche::h3::{self, NameValue};
 use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
 use tokio_quiche::{ConnectionParams, ServerH3Driver, listen};
@@ -75,7 +74,10 @@ pub fn start(runtime: Arc<RuntimeConfig>) -> Result<()> {
         .map_err(anyhow::Error::msg)
 }
 
-async fn run(runtime: Arc<RuntimeConfig>, ready: mpsc::SyncSender<Result<(), String>>) -> Result<()> {
+async fn run(
+    runtime: Arc<RuntimeConfig>,
+    ready: mpsc::SyncSender<Result<(), String>>,
+) -> Result<()> {
     let server = &runtime.config.server;
     let certificate = server
         .certificate
@@ -101,9 +103,8 @@ async fn run(runtime: Arc<RuntimeConfig>, ready: mpsc::SyncSender<Result<(), Str
     }
 
     let mut quic = QuicSettings::default();
-    quic.max_idle_timeout = Some(Duration::from_secs(
-        server.http3_max_idle_timeout_seconds,
-    ));
+    quic.enable_dgram = false;
+    quic.max_idle_timeout = Some(Duration::from_secs(server.http3_max_idle_timeout_seconds));
     quic.handshake_timeout = Some(Duration::from_secs(10));
     quic.listen_backlog = server.downstream_max_connections.min(16_384);
     quic.initial_max_streams_bidi = u64::from(server.http3_max_concurrent_streams);
@@ -120,13 +121,8 @@ async fn run(runtime: Arc<RuntimeConfig>, ready: mpsc::SyncSender<Result<(), Str
         },
         Hooks::default(),
     );
-    let listeners = listen(
-        sockets,
-        params,
-        SimpleConnectionIdGenerator,
-        DefaultMetrics,
-    )
-    .context("failed to create quiche HTTP/3 listeners")?;
+    let listeners = listen(sockets, params, DefaultMetrics)
+        .context("failed to create quiche HTTP/3 listeners")?;
 
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
@@ -139,15 +135,13 @@ async fn run(runtime: Arc<RuntimeConfig>, ready: mpsc::SyncSender<Result<(), Str
 
     for mut listener in listeners {
         let client = client.clone();
-        let internal = internal;
         let alt_svc = alt_svc.clone();
         tokio::spawn(async move {
             while let Some(connection) = listener.next().await {
                 match connection {
                     Ok(connection) => {
                         let peer = connection.peer_addr();
-                        let (driver, controller) =
-                            ServerH3Driver::new(Http3Settings::default());
+                        let (driver, controller) = ServerH3Driver::new(Http3Settings::default());
                         connection.start(driver);
                         tokio::spawn(handle_connection(
                             controller,
@@ -345,7 +339,8 @@ fn decode_request_headers(
     output.insert("x-forwarded-proto", HeaderValue::from_static("https"));
     output.insert(
         "x-forwarded-port",
-        HeaderValue::from_str(&internal.port().to_string()).context("invalid HTTP/3 port header")?,
+        HeaderValue::from_str(&internal.port().to_string())
+            .context("invalid HTTP/3 port header")?,
     );
     output.insert(INTERNAL_MARKER, HeaderValue::from_static("1"));
     output.insert(
@@ -420,9 +415,7 @@ async fn forward_response(
         has_alt_svc |= name.as_str() == "alt-svc";
         headers.push(h3::Header::new(name.as_str().as_bytes(), value.as_bytes()));
     }
-    if !has_alt_svc
-        && let Some(value) = alt_svc.as_ref()
-    {
+    if !has_alt_svc && let Some(value) = alt_svc.as_ref() {
         headers.push(h3::Header::new(b"alt-svc", value.as_bytes()));
     }
     send.send(OutboundFrame::Headers(headers, None))
@@ -492,12 +485,14 @@ mod tests {
             h3::Header::new(b":path", b"/rest/ping"),
             h3::Header::new(b"connection", b"close"),
         ];
-        assert!(decode_request_headers(
-            &headers,
-            "127.0.0.1:12345".parse().unwrap(),
-            "127.0.0.1:18080".parse().unwrap(),
-        )
-        .is_err());
+        assert!(
+            decode_request_headers(
+                &headers,
+                "127.0.0.1:12345".parse().unwrap(),
+                "127.0.0.1:18080".parse().unwrap(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -516,7 +511,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request.method, Method::GET);
-        assert_eq!(request.uri.path_and_query().unwrap().as_str(), "/rest/ping?x=1");
+        assert_eq!(
+            request.uri.path_and_query().unwrap().as_str(),
+            "/rest/ping?x=1"
+        );
         assert_eq!(request.headers[HOST], "music.example");
         assert_eq!(request.headers[INTERNAL_MARKER], "1");
         assert_eq!(request.headers["x-forwarded-for"], "192.0.2.10");

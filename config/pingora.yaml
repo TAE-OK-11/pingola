@@ -5,6 +5,12 @@ server:
   https_listen:
     - "0.0.0.0:443"
     - "[::]:443"
+  http3_listen:
+    - "0.0.0.0:443"
+    - "[::]:443"
+  http3_internal_listen: "127.0.0.1:18080"
+  http3_max_idle_timeout_seconds: 60
+  http3_max_concurrent_streams: 64
   certificate: /etc/pingora/cert/live/tae00217.cloud/fullchain.pem
   private_key: /etc/pingora/cert/live/tae00217.cloud/privkey.pem
   threads: 1
