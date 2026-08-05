@@ -1,0 +1,65 @@
+name: dependency-refresh-report
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install build and inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake jq libcap2-bin ninja-build nghttp2-client
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          rustup default 1.97.1
+          rustc --version
+          cargo --version
+      - name: Refresh compatible dependency graph
+        run: |
+          set -euxo pipefail
+          mkdir -p refresh-report
+          cp Cargo.lock refresh-report/Cargo.lock.before
+          cargo update --verbose 2>&1 | tee refresh-report/cargo-update.txt
+          cp Cargo.lock refresh-report/Cargo.lock.updated
+          cargo tree --locked --depth 1 > refresh-report/cargo-tree-root.txt
+          cargo tree --locked -e features > refresh-report/cargo-tree-features.txt
+      - name: Report incompatible direct dependency updates
+        run: |
+          set -euxo pipefail
+          cargo install cargo-outdated --locked
+          cargo outdated --root-deps-only --exit-code 0 | tee refresh-report/cargo-outdated.txt
+      - name: Verify refreshed Rust graph
+        run: |
+          set -euxo pipefail
+          cargo fmt --check
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo check --all-targets --locked --no-default-features --features system-allocator,tls-aws-lc
+          cargo check --all-targets --locked --no-default-features --features jemalloc,tls-aws-lc
+          cargo build --locked --release
+          target/release/pingora --allocator-info | tee refresh-report/allocator-info.txt
+          cargo tree --locked -i tcmalloc-better > refresh-report/tcmalloc-tree.txt
+          cargo tree --locked -i brotli > refresh-report/brotli-tree.txt
+          cargo tree --locked -i flate2 > refresh-report/flate2-tree.txt
+          cargo tree --locked -i zstd > refresh-report/zstd-tree.txt
+      - name: Inspect current official container bases
+        run: |
+          set -euxo pipefail
+          docker buildx imagetools inspect docker.io/library/debian:13-slim > refresh-report/debian-13-slim.txt
+          docker buildx imagetools inspect docker.io/library/rust:1.97.1-slim-trixie > refresh-report/rust-1.97.1-slim-trixie.txt
+          docker buildx imagetools inspect docker.io/docker/dockerfile:1.25 > refresh-report/dockerfile-1.25.txt
+          docker run --rm docker.io/library/debian:13-slim sh -c 'cat /etc/debian_version; cat /etc/os-release' > refresh-report/debian-runtime-version.txt
+      - name: Upload refresh report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dependency-refresh-report
+          path: refresh-report/
+          if-no-files-found: error
+          retention-days: 3
