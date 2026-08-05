@@ -35,6 +35,9 @@ use crate::config::RuntimeConfig;
 const INTERNAL_MARKER: &str = "x-jbs-http3-internal";
 const INTERNAL_PORT: &str = "x-jbs-http3-port";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const HTTP3_MAX_UDP_PAYLOAD_SIZE: usize = 1452;
+const HTTP3_CONTROL_STREAM_LIMIT: u64 = 8;
+const HTTP3_SEND_CAPACITY_FACTOR: f64 = 2.0;
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -105,10 +108,17 @@ async fn run(
 
     let mut quic = QuicSettings::default();
     quic.enable_dgram = false;
+    quic.dgram_recv_max_queue_len = 0;
+    quic.dgram_send_max_queue_len = 0;
     quic.max_idle_timeout = Some(Duration::from_secs(server.http3_max_idle_timeout_seconds));
     quic.handshake_timeout = Some(Duration::from_secs(10));
     quic.listen_backlog = server.downstream_max_connections.min(16_384);
     quic.initial_max_streams_bidi = u64::from(server.http3_max_concurrent_streams);
+    quic.initial_max_streams_uni = HTTP3_CONTROL_STREAM_LIMIT;
+    quic.max_recv_udp_payload_size = HTTP3_MAX_UDP_PAYLOAD_SIZE;
+    quic.max_send_udp_payload_size = HTTP3_MAX_UDP_PAYLOAD_SIZE;
+    quic.discover_path_mtu = true;
+    quic.send_capacity_factor = HTTP3_SEND_CAPACITY_FACTOR;
     quic.enable_early_data = false;
     quic.disable_active_migration = true;
     quic.disable_client_ip_validation = false;
@@ -187,10 +197,12 @@ async fn run(
     }
 
     info!(
-        "HTTP/3 frontend started: udp={:?} internal=http://{} quiche={} early_data=false migration=false",
+        "HTTP/3 frontend started: udp={:?} internal=http://{} quiche={} early_data=false migration=false pmtud=true max_udp_payload={} send_capacity_factor={}",
         server.http3_listen,
         internal,
         tokio_quiche::quiche::PROTOCOL_VERSION,
+        HTTP3_MAX_UDP_PAYLOAD_SIZE,
+        HTTP3_SEND_CAPACITY_FACTOR,
     );
     let _ = ready.send(Ok(()));
     std::future::pending::<()>().await;
