@@ -1,48 +1,98 @@
-name: dependency-refresh-report
+name: finalize-full-stack-refresh
 
 on:
   pull_request:
-  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  refresh:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install inspection tools
-        run: |
-          rustup toolchain install 1.97.1 --profile minimal
-          rustup default 1.97.1
-          rustc --version
-          cargo --version
-      - name: Refresh compatible dependency graph
-        run: |
-          set -euxo pipefail
-          mkdir -p refresh-report
-          cp Cargo.lock refresh-report/Cargo.lock.before
-          cargo update --verbose 2>&1 | tee refresh-report/cargo-update.txt
-          cp Cargo.lock refresh-report/Cargo.lock.updated
-          cargo tree --locked --depth 1 > refresh-report/cargo-tree-root.txt
-          cargo tree --locked -e features > refresh-report/cargo-tree-features.txt
-          cargo tree --locked -i tcmalloc-better > refresh-report/tcmalloc-tree.txt
-          cargo tree --locked -i brotli > refresh-report/brotli-tree.txt
-          cargo tree --locked -i flate2 > refresh-report/flate2-tree.txt
-          cargo tree --locked -i zstd > refresh-report/zstd-tree.txt
-      - name: Inspect current official container bases
-        run: |
-          set -euxo pipefail
-          docker buildx imagetools inspect docker.io/library/debian:13-slim > refresh-report/debian-13-slim.txt
-          docker buildx imagetools inspect docker.io/library/rust:1.97.1-slim-trixie > refresh-report/rust-1.97.1-slim-trixie.txt
-          docker buildx imagetools inspect docker.io/docker/dockerfile:1.25 > refresh-report/dockerfile-1.25.txt
-          docker run --rm docker.io/library/debian:13-slim sh -c 'cat /etc/debian_version; cat /etc/os-release' > refresh-report/debian-runtime-version.txt
-      - name: Upload refresh report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: dependency-refresh-report
-          path: refresh-report/
-          if-no-files-found: error
-          retention-days: 3
+          ref: agent/full-stack-refresh
+          fetch-depth: 0
+      - name: Install build and test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake libcap2-bin ninja-build jq nghttp2-client
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          rustup default 1.97.1
+      - name: Apply Rust 2024 and container refresh
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          dockerfile = Path('Dockerfile')
+          text = dockerfile.read_text()
+          replacements = {
+              'ARG DEBIAN_SUITE=trixie': 'ARG DEBIAN_SUITE=13',
+              'FROM rust:1.97.1-slim-trixie@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c AS builder':
+                  'FROM rust:1.97.1-slim-trixie@sha256:69153971349358535be9821190190f026a761f690c6b58c68a914d14ab2d610a AS builder',
+              'FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS runtime':
+                  'FROM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS runtime',
+              '--edition=2021': '--edition=2024',
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'expected Dockerfile text not found: {old}')
+              text = text.replace(old, new)
+          dockerfile.write_text(text)
+
+          for name in ['.github/workflows/ci.yml', '.github/workflows/bench-tools-build.yml']:
+              path = Path(name)
+              text = path.read_text()
+              if '--edition=2021' not in text:
+                  raise SystemExit(f'expected Rust 2021 flag not found in {name}')
+              path.write_text(text.replace('--edition=2021', '--edition=2024'))
+
+          ci = Path('.github/workflows/ci.yml')
+          text = ci.read_text()
+          old = 'docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4'
+          new = 'docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1'
+          if text.count(old) != 2:
+              raise SystemExit('expected two pinned login-action references')
+          ci.write_text(text.replace(old, new))
+          PY
+
+          # Run Cargo's edition migration lints from the previous edition, then
+          # restore the declared Rust 2024 edition for the committed manifest.
+          sed -i 's/edition = "2024"/edition = "2021"/' Cargo.toml
+          cargo update --verbose
+          cargo fix --edition --all-targets --allow-dirty
+          sed -i 's/edition = "2021"/edition = "2024"/' Cargo.toml
+      - name: Validate dependencies, allocators and compression
+        run: |
+          set -euxo pipefail
+          cargo fmt --check
+          cargo tree --locked > /tmp/tree.txt
+          grep -q 'aws-lc-rs v1.17.3' /tmp/tree.txt
+          grep -q 'rustls v0.23.43' /tmp/tree.txt
+          ! grep -Eiq '(^|[[:space:]])(ring|boring|boring-sys|pingora-boringssl) v' /tmp/tree.txt
+          cargo tree --locked -i tcmalloc-better | grep -q 'tcmalloc-better v0.1.19'
+          cargo tree --locked -i brotli | grep -q 'brotli v8.0.4'
+          cargo tree --locked -i flate2 | grep -q 'flate2 v1.1.9'
+          cargo tree --locked -i zstd | grep -q 'zstd v0.13.3'
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo check --all-targets --locked --no-default-features --features system-allocator,tls-aws-lc
+          cargo check --all-targets --locked --no-default-features --features jemalloc,tls-aws-lc
+          cargo build --locked --release
+          target/release/pingora --allocator-info | grep -q 'allocator=tcmalloc implementation=google-tcmalloc'
+          rustc --edition=2024 -D warnings bench/backend.rs -o /tmp/pgo-backend
+          rustc --edition=2024 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
+      - name: Commit verified refresh
+        run: |
+          set -euxo pipefail
+          rm -f .github/workflows/apply-full-refresh.yml .github/workflows/dependency-refresh.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'build: refresh Rust, dependencies and Debian 13 runtime'
+          git push origin HEAD:agent/full-stack-refresh
