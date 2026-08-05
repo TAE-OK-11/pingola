@@ -13,11 +13,11 @@ name = "pingora_rustls"
 path = "src/lib.rs"
 
 [dependencies]
-aws-lc-rs = "1.17.3"
+aws-lc-rs = "=1.17.3"
 log = "0.4.33"
 no_debug = "3.1.0"
 pingora-error = "0.8.1"
-rustls = { version = "0.23.42", default-features = false, features = ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"] }
+rustls = { version = "=0.23.42", default-features = false, features = ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"] }
 rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.15.0"
