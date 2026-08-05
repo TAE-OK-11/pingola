@@ -9,11 +9,11 @@ ARG RUST_CODEGEN_UNITS=1
 ARG TLS_PROVIDER=aws-lc
 ARG PGO_MODE=off
 ARG PGO_TRAIN_TARGET_CPU=x86-64-v2
-# Rebalanced from standard-port Oracle A/B results. Keep steady-state H2 at
-# roughly 60% of the merged profile while raising H1 coverage from 17.5% to
-# 22.6%; H1 already includes a TLS workload, so this does not remove TLS paths.
+# Production mix: H2 remains the largest workload, while H3 receives a
+# dedicated profile large enough to train QUIC, QPACK, and response streaming.
 ARG PGO_WEIGHT_H1=60
 ARG PGO_WEIGHT_H2=160
+ARG PGO_WEIGHT_H3=100
 ARG PGO_WEIGHT_TLS=15
 ARG PGO_WEIGHT_TAIL=30
 ARG PGO_TRAIN_ROUNDS=2
@@ -46,7 +46,8 @@ WORKDIR /src
 COPY --link Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY --link vendor ./vendor
 COPY --link src ./src
-COPY --link bench/backend.rs bench/pgo_client.rs bench/pgo_train.sh ./bench/
+COPY --link examples/http3_probe.rs ./examples/
+COPY --link bench/backend.rs bench/pgo_client.rs bench/pgo_train.sh bench/pgo_train_h3.sh ./bench/
 
 ARG RUST_TARGET_TRIPLE
 ARG RUST_TARGET_CPU
@@ -58,6 +59,7 @@ ARG PGO_MODE
 ARG PGO_TRAIN_TARGET_CPU
 ARG PGO_WEIGHT_H1
 ARG PGO_WEIGHT_H2
+ARG PGO_WEIGHT_H3
 ARG PGO_WEIGHT_TLS
 ARG PGO_WEIGHT_TAIL
 ARG PGO_ECDSA_CURVE
@@ -114,11 +116,11 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       prime256v1|secp384r1) ;; \
       *) echo "unsupported ECDSA curve: ${PGO_ECDSA_CURVE}" >&2; exit 2 ;; \
     esac; \
-    for value in "${PGO_WEIGHT_H1}" "${PGO_WEIGHT_H2}" "${PGO_WEIGHT_TLS}" "${PGO_WEIGHT_TAIL}" "${PGO_TRAIN_ROUNDS}"; do \
+    for value in "${PGO_WEIGHT_H1}" "${PGO_WEIGHT_H2}" "${PGO_WEIGHT_H3}" "${PGO_WEIGHT_TLS}" "${PGO_WEIGHT_TAIL}" "${PGO_TRAIN_ROUNDS}"; do \
       case "${value}" in ''|*[!0-9]*) echo "PGO weights/rounds must be positive integers" >&2; exit 2 ;; esac; \
       test "${value}" -gt 0; \
     done; \
-    chmod 755 bench/pgo_train.sh; \
+    chmod 755 bench/pgo_train.sh bench/pgo_train_h3.sh; \
     if [ "${PGO_MODE}" = off ]; then \
       CARGO_TARGET_DIR=/src/target/release \
       CFLAGS="${TARGET_NATIVE_FLAGS}" \
@@ -135,8 +137,17 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       rustc --edition=2024 -D warnings -C opt-level=3 -C codegen-units=1 \
         -C panic=abort -C target-cpu="${PGO_TRAIN_TARGET_CPU}" -C strip=symbols \
         bench/pgo_client.rs -o /tmp/pgo-client; \
+      CARGO_TARGET_DIR=/src/target/pgo-tools \
+      CFLAGS="${TRAIN_NATIVE_FLAGS}" \
+      CXXFLAGS="${TRAIN_NATIVE_FLAGS}" \
+      RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${PGO_TRAIN_TARGET_CPU}" \
+        cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
+          --example http3_probe --no-default-features \
+          --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
+      H3_PROBE="/src/target/pgo-tools/${RUST_TARGET_TRIPLE}/release/examples/http3_probe"; \
+      test -x "${H3_PROBE}"; \
       rm -rf /src/pgo-data; \
-      install -d /src/pgo-data/raw/h1 /src/pgo-data/raw/h2 /src/pgo-data/raw/tls /src/pgo-data/raw/tail; \
+      install -d /src/pgo-data/raw/h1 /src/pgo-data/raw/h2 /src/pgo-data/raw/h3 /src/pgo-data/raw/tls /src/pgo-data/raw/tail; \
       CARGO_TARGET_DIR=/src/target/pgo-generate \
       CFLAGS="${TRAIN_NATIVE_FLAGS}" \
       CXXFLAGS="${TRAIN_NATIVE_FLAGS}" \
@@ -152,29 +163,36 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
             bench/pgo_train.sh "${PGO_BIN}" /tmp/pgo-backend /tmp/pgo-client \
               "/src/pgo-data/raw/${scenario}" "${scenario}"; \
         done; \
+        echo "PGO training scenario=h3 round=${round}/${PGO_TRAIN_ROUNDS}"; \
+        PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" PGO_TRAIN_ROUND="${round}" \
+          bench/pgo_train_h3.sh "${PGO_BIN}" /tmp/pgo-backend "${H3_PROBE}" \
+            /src/pgo-data/raw/h3; \
       done; \
       LLVM_PROFDATA="$(rustc --print target-libdir)/../bin/llvm-profdata"; \
       test -x "${LLVM_PROFDATA}"; \
-      for scenario in h1 h2 tls tail; do \
+      for scenario in h1 h2 h3 tls tail; do \
         "${LLVM_PROFDATA}" merge --failure-mode=any \
           -o "/src/pgo-data/${scenario}.profdata" "/src/pgo-data/raw/${scenario}"/*.profraw; \
       done; \
       "${LLVM_PROFDATA}" merge \
         --weighted-input="${PGO_WEIGHT_H1},/src/pgo-data/h1.profdata" \
         --weighted-input="${PGO_WEIGHT_H2},/src/pgo-data/h2.profdata" \
+        --weighted-input="${PGO_WEIGHT_H3},/src/pgo-data/h3.profdata" \
         --weighted-input="${PGO_WEIGHT_TLS},/src/pgo-data/tls.profdata" \
         --weighted-input="${PGO_WEIGHT_TAIL},/src/pgo-data/tail.profdata" \
         -o /src/pgo-data/merged.profdata; \
       test -s /src/pgo-data/merged.profdata; \
       { \
-        echo "weights h1=${PGO_WEIGHT_H1} h2=${PGO_WEIGHT_H2} tls=${PGO_WEIGHT_TLS} tail=${PGO_WEIGHT_TAIL} rounds=${PGO_TRAIN_ROUNDS}"; \
+        echo "weights h1=${PGO_WEIGHT_H1} h2=${PGO_WEIGHT_H2} h3=${PGO_WEIGHT_H3} tls=${PGO_WEIGHT_TLS} tail=${PGO_WEIGHT_TAIL} rounds=${PGO_TRAIN_ROUNDS}"; \
         "${LLVM_PROFDATA}" show --counts --covered --topn=100 /src/pgo-data/merged.profdata; \
         echo; echo "=== h1 vs h2 overlap ==="; \
         "${LLVM_PROFDATA}" overlap /src/pgo-data/h1.profdata /src/pgo-data/h2.profdata || true; \
-        echo; echo "=== h2 vs tls overlap ==="; \
-        "${LLVM_PROFDATA}" overlap /src/pgo-data/h2.profdata /src/pgo-data/tls.profdata || true; \
-        echo; echo "=== h2 vs tail overlap ==="; \
-        "${LLVM_PROFDATA}" overlap /src/pgo-data/h2.profdata /src/pgo-data/tail.profdata || true; \
+        echo; echo "=== h2 vs h3 overlap ==="; \
+        "${LLVM_PROFDATA}" overlap /src/pgo-data/h2.profdata /src/pgo-data/h3.profdata || true; \
+        echo; echo "=== h3 vs tls overlap ==="; \
+        "${LLVM_PROFDATA}" overlap /src/pgo-data/h3.profdata /src/pgo-data/tls.profdata || true; \
+        echo; echo "=== h3 vs tail overlap ==="; \
+        "${LLVM_PROFDATA}" overlap /src/pgo-data/h3.profdata /src/pgo-data/tail.profdata || true; \
       } > /src/pgo-data/profile-summary.txt; \
       PROFILE_SHA="$(sha256sum /src/pgo-data/merged.profdata | cut -d ' ' -f 1)"; \
       PROFILE_PATH="/src/pgo-data/merged-${PROFILE_SHA}.profdata"; \
@@ -201,6 +219,7 @@ ARG PGO_MODE
 ARG PGO_TRAIN_TARGET_CPU
 ARG PGO_WEIGHT_H1
 ARG PGO_WEIGHT_H2
+ARG PGO_WEIGHT_H3
 ARG PGO_WEIGHT_TLS
 ARG PGO_WEIGHT_TAIL
 ARG PGO_ECDSA_CURVE
@@ -225,6 +244,7 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.rust.pgo-train-target-cpu="${PGO_TRAIN_TARGET_CPU}" \
       org.opencontainers.image.rust.pgo-weight-h1="${PGO_WEIGHT_H1}" \
       org.opencontainers.image.rust.pgo-weight-h2="${PGO_WEIGHT_H2}" \
+      org.opencontainers.image.rust.pgo-weight-h3="${PGO_WEIGHT_H3}" \
       org.opencontainers.image.rust.pgo-weight-tls="${PGO_WEIGHT_TLS}" \
       org.opencontainers.image.rust.pgo-weight-tail="${PGO_WEIGHT_TAIL}" \
       org.opencontainers.image.rust.pgo-ecdsa-curve="${PGO_ECDSA_CURVE}" \
