@@ -86,7 +86,7 @@ jobs:
           tests/service_matrix.sh
           tests/integration.sh
           tests/http2_matrix.sh
-      - name: Real QUIC and HTTP/3 integration
+      - name: Real QUIC, HTTP/3, and h2c bridge integration
         run: tests/http3.sh
 
   image-test:
@@ -147,6 +147,78 @@ jobs:
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.http3.provider"]')" = "quiche"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo-weight-h3"]')" = "100"
 
+  publish-pr:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [audit, verify, image-test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_cpu: x86-64-v2
+            suffix: ""
+          - target_cpu: znver1
+            suffix: -znver1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Sign in to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: PR image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: |
+            ghcr.io/tae-ok-11/pingora
+            ghcr.io/tae-ok-11/pingola
+          tags: |
+            type=raw,value=pr-${{ github.event.pull_request.number }}${{ matrix.suffix }}
+            type=sha,prefix=sha-,suffix=${{ matrix.suffix }}
+          labels: |
+            org.opencontainers.image.title=JBS Pingora PR ${{ github.event.pull_request.number }}
+            org.opencontainers.image.description=AWS-LC TCP TLS, Quiche HTTP/3, and h2c internal bridge
+            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
+            org.opencontainers.image.allocator=tcmalloc
+            org.opencontainers.image.tls.provider=aws-lc
+            org.opencontainers.image.http3.provider=quiche
+            org.opencontainers.image.http3.internal-protocol=h2c
+      - name: Build and publish verified PR image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ALLOCATOR=tcmalloc
+            TLS_PROVIDER=aws-lc
+            PGO_MODE=train
+            PGO_TRAIN_TARGET_CPU=x86-64-v2
+            PGO_WEIGHT_H1=60
+            PGO_WEIGHT_H2=160
+            PGO_WEIGHT_H3=100
+            PGO_WEIGHT_TLS=15
+            PGO_WEIGHT_TAIL=30
+            RUST_TARGET_CPU=${{ matrix.target_cpu }}
+            RUST_LTO=fat
+            BUILD_VERSION=pr-${{ github.event.pull_request.number }}${{ matrix.suffix }}
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=image-test-${{ matrix.target_cpu }}
+          cache-to: type=gha,mode=max,scope=image-pr-${{ matrix.target_cpu }}
+          provenance: mode=max
+          sbom: true
+
   publish:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_images)
     needs: [audit, verify]
@@ -185,11 +257,12 @@ jobs:
             type=semver,pattern={{version}},suffix=${{ matrix.suffix }}
           labels: |
             org.opencontainers.image.title=JBS Pingora
-            org.opencontainers.image.description=AWS-LC TCP TLS and Quiche HTTP/3 reverse proxy
+            org.opencontainers.image.description=AWS-LC TCP TLS, Quiche HTTP/3, and h2c internal bridge
             org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
             org.opencontainers.image.allocator=tcmalloc
             org.opencontainers.image.tls.provider=aws-lc
             org.opencontainers.image.http3.provider=quiche
+            org.opencontainers.image.http3.internal-protocol=h2c
       - name: Build and publish
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
