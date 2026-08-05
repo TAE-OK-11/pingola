@@ -118,6 +118,8 @@ async fn run(
     quic.max_recv_udp_payload_size = HTTP3_MAX_UDP_PAYLOAD_SIZE;
     quic.max_send_udp_payload_size = HTTP3_MAX_UDP_PAYLOAD_SIZE;
     quic.discover_path_mtu = true;
+    // Keep QUIC packet sends paced instead of bursty.
+    quic.enable_pacing = true;
     quic.send_capacity_factor = HTTP3_SEND_CAPACITY_FACTOR;
     quic.enable_early_data = false;
     quic.disable_active_migration = true;
@@ -144,6 +146,10 @@ async fn run(
     // silent performance regression.
     let client: ProxyClient = Client::builder(TokioExecutor::new())
         .http2_only(true)
+        // Grow loopback H2 flow-control windows for large and
+        // concurrent audio responses instead of stalling on
+        // conservative static defaults.
+        .http2_adaptive_window(true)
         .pool_max_idle_per_host(1)
         .build(connector);
     let internal = server.http3_internal_listen;
@@ -202,7 +208,7 @@ async fn run(
     }
 
     info!(
-        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} early_data=false migration=false pmtud=true max_udp_payload={} send_capacity_factor={}",
+        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} early_data=false migration=false pmtud=true pacing=true max_udp_payload={} send_capacity_factor={}",
         server.http3_listen,
         internal,
         tokio_quiche::quiche::PROTOCOL_VERSION,
