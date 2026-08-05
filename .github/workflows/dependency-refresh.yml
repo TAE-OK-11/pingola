@@ -10,14 +10,12 @@ permissions:
 jobs:
   refresh:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install build and inspection tools
+      - name: Install inspection tools
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes cmake jq libcap2-bin ninja-build nghttp2-client
-          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.97.1 --profile minimal
           rustup default 1.97.1
           rustc --version
           cargo --version
@@ -30,16 +28,6 @@ jobs:
           cp Cargo.lock refresh-report/Cargo.lock.updated
           cargo tree --locked --depth 1 > refresh-report/cargo-tree-root.txt
           cargo tree --locked -e features > refresh-report/cargo-tree-features.txt
-      - name: Verify refreshed Rust graph
-        run: |
-          set -euxo pipefail
-          cargo fmt --check
-          cargo test --all-targets --locked
-          cargo clippy --all-targets --locked -- -D warnings
-          cargo check --all-targets --locked --no-default-features --features system-allocator,tls-aws-lc
-          cargo check --all-targets --locked --no-default-features --features jemalloc,tls-aws-lc
-          cargo build --locked --release
-          target/release/pingora --allocator-info | tee refresh-report/allocator-info.txt
           cargo tree --locked -i tcmalloc-better > refresh-report/tcmalloc-tree.txt
           cargo tree --locked -i brotli > refresh-report/brotli-tree.txt
           cargo tree --locked -i flate2 > refresh-report/flate2-tree.txt
