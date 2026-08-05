@@ -27,10 +27,17 @@ write_config() {
   local http=$2
   local https=$3
   local tls=${4:-false}
+  local http3=${5:-'[]'}
   {
     printf 'server:\n'
     printf '  http_listen: %s\n' "${http}"
     printf '  https_listen: %s\n' "${https}"
+    printf '  http3_listen: %s\n' "${http3}"
+    if [[ "${http3}" != '[]' ]]; then
+      printf '  http3_internal_listen: "127.0.0.1:18080"\n'
+      printf '  http3_max_idle_timeout_seconds: 15\n'
+      printf '  http3_max_concurrent_streams: 16\n'
+    fi
     if [[ "${tls}" == true ]]; then
       printf '  certificate: /etc/pingora/cert/cert.pem\n'
       printf '  private_key: /etc/pingora/cert/key.pem\n'
@@ -92,6 +99,9 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.target-cpu"}}' "${name}") == "${EXPECTED_TARGET_CPU}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.lto"}}' "${name}") == "${EXPECTED_LTO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.tls.provider"}}' "${name}") == "${EXPECTED_TLS_PROVIDER}" ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.http3.provider"}}' "${name}") == quiche ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.quic.tls.provider"}}' "${name}") == boringssl ]]
+  docker image inspect "${IMAGE}" | jq -e '.[0].Config.ExposedPorts["443/udp"] != null' >/dev/null
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.pgo"}}' "${name}") == "${EXPECTED_PGO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.linker"}}' "${name}") == lld ]]
   if docker exec "${name}" sh -c 'command -v setcap >/dev/null || dpkg-query -W libcap2-bin >/dev/null 2>&1'; then
@@ -109,7 +119,7 @@ curl --noproxy '*' -fsS -H 'host: health.invalid' \
   -H 'host: health.invalid' http://127.0.0.1:80/nginx-health) == 404 ]]
 docker rm -f pingora-test-http >/dev/null
 
-write_config "${RUNTIME}/ipv6.yaml" '[]' '["[::1]:443"]' true
+write_config "${RUNTIME}/ipv6.yaml" '[]' '["[::1]:443"]' true '["[::1]:8443"]'
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj '/CN=health.test' -addext 'subjectAltName=DNS:health.test' \
   -keyout "${RUNTIME}/cert/key.pem" -out "${RUNTIME}/cert/cert.pem" >/dev/null 2>&1
@@ -129,8 +139,9 @@ start_container pingora-test-https-ipv6 "${RUNTIME}/ipv6.yaml" \
 assert_container_hardening pingora-test-https-ipv6
 curl --noproxy '*' -gkfsS --http2 --resolve health.test:443:[::1] \
   https://health.test:443/pingora-ready -o /dev/null
+docker logs pingora-test-https-ipv6 2>&1   | grep -q 'HTTP/3 frontend started: udp=\["\[::1\]:8443"\]'
 
 docker exec pingora-test-https-ipv6 /usr/local/bin/pingora \
   --config /etc/pingora/pingora.yaml --check >/dev/null
 
-echo "Docker UID 10001, read-only filesystem, HTTP-only, HTTPS-only, IPv6-only, healthcheck, ${EXPECTED_ALLOCATOR}, ${EXPECTED_TLS_PROVIDER}, and pgo=${EXPECTED_PGO} tests passed"
+echo "Docker UID 10001, read-only filesystem, HTTP-only, HTTPS/HTTP3 IPv6-only, UDP exposure, healthcheck, ${EXPECTED_ALLOCATOR}, ${EXPECTED_TLS_PROVIDER}, and pgo=${EXPECTED_PGO} tests passed"

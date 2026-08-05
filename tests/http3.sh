@@ -78,6 +78,11 @@ location=$(curl --noproxy '*' -sSI -H 'host: app.test' \
   'tolower($1) == "location" {gsub("\r", "", $2); print $2}')
 [[ "${location}" == "https://app.test/headers" ]]
 
+# A loopback caller cannot forge the private H3 handoff with the old static
+# marker. The request must still be treated as plaintext and redirected.
+spoof_location=$(curl --noproxy '*' -sSI -H 'host: app.test'   -H 'x-jbs-http3-internal: 1' -H 'x-jbs-http3-port: 18443'   http://127.0.0.1:18080/headers | awk -F': '   'tolower($1) == "location" {gsub("\r", "", $2); print $2}')
+[[ "${spoof_location}" == "https://app.test/headers" ]]
+
 grep -q 'HTTP/3 frontend started' "${GATEWAY_LOG}"
 grep -q 'http3_udp=\["127.0.0.1:18443"\]' "${GATEWAY_LOG}"
 

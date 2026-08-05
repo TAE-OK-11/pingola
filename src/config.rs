@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use http::HeaderValue;
 use ipnet::IpNet;
 use serde::Deserialize;
@@ -231,9 +232,19 @@ pub struct RouteLimitConfig {
     pub active_requests: Option<usize>,
 }
 
+#[derive(Clone)]
+struct Http3InternalToken(HeaderValue);
+
+impl fmt::Debug for Http3InternalToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Http3InternalToken([redacted])")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub config: Arc<Config>,
+    http3_internal_token: Option<Http3InternalToken>,
 }
 
 impl RuntimeConfig {
@@ -247,10 +258,25 @@ impl RuntimeConfig {
 
     pub fn new(config: Config) -> Result<Self> {
         validate(&config)?;
+        let http3_internal_token = if config.server.http3_listen.is_empty() {
+            None
+        } else {
+            let mut token = [0_u8; 32];
+            getrandom::fill(&mut token)
+                .map_err(|error| anyhow!("failed to generate HTTP/3 internal token: {error}"))?;
+            let token = HeaderValue::from_str(&hex::encode(token))
+                .context("generated HTTP/3 internal token is not a valid header value")?;
+            Some(Http3InternalToken(token))
+        };
 
         Ok(Self {
             config: Arc::new(config),
+            http3_internal_token,
         })
+    }
+
+    pub fn http3_internal_token(&self) -> Option<&HeaderValue> {
+        self.http3_internal_token.as_ref().map(|token| &token.0)
     }
 
     pub fn http3_internal_addr(&self) -> Option<SocketAddr> {

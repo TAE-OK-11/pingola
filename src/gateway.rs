@@ -1260,11 +1260,13 @@ fn is_internal_http3(runtime: &RuntimeConfig, session: &Session) -> bool {
         .client_addr()
         .and_then(|address| address.as_inet())
         .is_some_and(|address| address.ip().is_loopback());
-    let marker_matches = session
-        .req_header()
-        .headers
-        .get(&HTTP3_INTERNAL)
-        .is_some_and(|value| value == "1");
+    let marker_matches = runtime.http3_internal_token().is_some_and(|expected| {
+        session
+            .req_header()
+            .headers
+            .get(&HTTP3_INTERNAL)
+            .is_some_and(|value| value == expected)
+    });
     server_matches && peer_is_loopback && marker_matches
 }
 

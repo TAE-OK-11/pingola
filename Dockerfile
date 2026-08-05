@@ -217,6 +217,8 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.revision="${BUILD_REVISION}" \
       org.opencontainers.image.allocator="${ALLOCATOR}" \
       org.opencontainers.image.tls.provider="${TLS_PROVIDER}" \
+      org.opencontainers.image.http3.provider="quiche" \
+      org.opencontainers.image.quic.tls.provider="boringssl" \
       org.opencontainers.image.rust.pgo="${PGO_MODE}" \
       org.opencontainers.image.rust.pgo-train-target-cpu="${PGO_TRAIN_TARGET_CPU}" \
       org.opencontainers.image.rust.pgo-weight-h1="${PGO_WEIGHT_H1}" \
@@ -253,7 +255,7 @@ COPY --link --chown=10001:10001 config/pingora.yaml /etc/pingora/pingora.yaml
 USER 10001:10001
 WORKDIR /tmp/pingora
 
-EXPOSE 80/tcp 443/tcp
+EXPOSE 80/tcp 443/tcp 443/udp
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD ["/usr/local/bin/pingora", "--healthcheck"]

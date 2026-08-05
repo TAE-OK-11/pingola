@@ -135,12 +135,17 @@ async fn run(
     let public_port = runtime
         .http3_public_port()
         .ok_or_else(|| anyhow!("HTTP/3 public port was not configured"))?;
+    let internal_token = runtime
+        .http3_internal_token()
+        .cloned()
+        .ok_or_else(|| anyhow!("HTTP/3 internal token was not initialized"))?;
     let alt_svc = runtime.http3_alt_svc_header();
     let connection_limit = Arc::new(Semaphore::new(server.downstream_max_connections));
 
     for mut listener in listeners {
         let client = client.clone();
         let alt_svc = alt_svc.clone();
+        let internal_token = internal_token.clone();
         let connection_limit = connection_limit.clone();
         tokio::spawn(async move {
             while let Some(connection) = listener.next().await {
@@ -164,11 +169,14 @@ async fn run(
                         connection.start(driver);
                         tokio::spawn(handle_connection(
                             controller,
-                            peer,
-                            internal,
-                            public_port,
-                            client.clone(),
-                            alt_svc.clone(),
+                            Http3ConnectionContext {
+                                peer,
+                                internal,
+                                public_port,
+                                internal_token: internal_token.clone(),
+                                client: client.clone(),
+                                alt_svc: alt_svc.clone(),
+                            },
                             permit,
                         ));
                     }
@@ -189,44 +197,62 @@ async fn run(
     Ok(())
 }
 
-async fn handle_connection(
-    mut controller: ServerH3Controller,
+#[derive(Clone)]
+struct Http3ConnectionContext {
     peer: SocketAddr,
     internal: SocketAddr,
     public_port: u16,
+    internal_token: HeaderValue,
     client: ProxyClient,
     alt_svc: Option<HeaderValue>,
+}
+
+async fn handle_connection(
+    mut controller: ServerH3Controller,
+    context: Http3ConnectionContext,
     _connection_permit: OwnedSemaphorePermit,
 ) {
+    let peer = context.peer;
     while let Some(event) = controller.event_receiver_mut().recv().await {
         match event {
-            ServerH3Event::Core(H3Event::IncomingHeaders(incoming)) => {
-                tokio::spawn(proxy_request(
-                    incoming,
-                    peer,
-                    internal,
-                    public_port,
-                    client.clone(),
-                    alt_svc.clone(),
-                ));
+            ServerH3Event::Headers {
+                incoming_headers,
+                is_in_early_data,
+                ..
+            } => {
+                if *is_in_early_data {
+                    warn!("HTTP/3 early-data request rejected peer={peer}");
+                    let IncomingH3Headers { mut send, .. } = incoming_headers;
+                    if let Err(error) = send_error(
+                        &mut send,
+                        StatusCode::TOO_EARLY,
+                        "HTTP/3 early data is not accepted",
+                    )
+                    .await
+                    {
+                        warn!("failed to reject HTTP/3 early-data request peer={peer}: {error:#}");
+                    }
+                    continue;
+                }
+                tokio::spawn(proxy_request(incoming_headers, context.clone()));
             }
             ServerH3Event::Core(H3Event::BodyBytesReceived { .. }) => {}
             ServerH3Event::Core(event) => {
                 log::debug!("HTTP/3 connection event peer={peer}: {event:?}");
             }
-            event => log::debug!("HTTP/3 server event peer={peer}: {event:?}"),
         }
     }
 }
 
-async fn proxy_request(
-    incoming: IncomingH3Headers,
-    peer: SocketAddr,
-    internal: SocketAddr,
-    public_port: u16,
-    client: ProxyClient,
-    alt_svc: Option<HeaderValue>,
-) {
+async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionContext) {
+    let Http3ConnectionContext {
+        peer,
+        internal,
+        public_port,
+        internal_token,
+        client,
+        alt_svc,
+    } = context;
     let IncomingH3Headers {
         headers,
         send,
@@ -242,6 +268,7 @@ async fn proxy_request(
         peer,
         internal,
         public_port,
+        internal_token,
         client,
         alt_svc,
     )
@@ -260,16 +287,18 @@ async fn proxy_request_inner(
     peer: SocketAddr,
     internal: SocketAddr,
     public_port: u16,
+    internal_token: HeaderValue,
     client: ProxyClient,
     alt_svc: Option<HeaderValue>,
 ) -> Result<()> {
-    let decoded = match decode_request_headers(&headers, peer, internal, public_port) {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            send_error(&mut send, StatusCode::BAD_REQUEST, "invalid HTTP/3 request").await?;
-            return Err(error);
-        }
-    };
+    let decoded =
+        match decode_request_headers(&headers, peer, internal, public_port, internal_token) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                send_error(&mut send, StatusCode::BAD_REQUEST, "invalid HTTP/3 request").await?;
+                return Err(error);
+            }
+        };
     if decoded.method == Method::CONNECT {
         send_error(
             &mut send,
@@ -307,6 +336,7 @@ fn decode_request_headers(
     peer: SocketAddr,
     internal: SocketAddr,
     public_port: u16,
+    internal_token: HeaderValue,
 ) -> Result<DecodedRequest> {
     let mut method = None;
     let mut scheme = None;
@@ -375,7 +405,7 @@ fn decode_request_headers(
     let public_port = HeaderValue::from_str(&public_port.to_string())
         .context("invalid HTTP/3 public port header")?;
     output.insert("x-forwarded-port", public_port.clone());
-    output.insert(INTERNAL_MARKER, HeaderValue::from_static("1"));
+    output.insert(INTERNAL_MARKER, internal_token);
     output.insert(INTERNAL_PORT, public_port);
 
     Ok(DecodedRequest {
@@ -521,6 +551,7 @@ mod tests {
                 "127.0.0.1:12345".parse().unwrap(),
                 "127.0.0.1:18080".parse().unwrap(),
                 443,
+                HeaderValue::from_static("unit-test-token"),
             )
             .is_err()
         );
@@ -540,6 +571,7 @@ mod tests {
             "192.0.2.10:12345".parse().unwrap(),
             "127.0.0.1:18080".parse().unwrap(),
             8443,
+            HeaderValue::from_static("unit-test-token"),
         )
         .unwrap();
         assert_eq!(request.method, Method::GET);
@@ -548,7 +580,7 @@ mod tests {
             "/rest/ping?x=1"
         );
         assert_eq!(request.headers[HOST], "music.example");
-        assert_eq!(request.headers[INTERNAL_MARKER], "1");
+        assert_eq!(request.headers[INTERNAL_MARKER], "unit-test-token");
         assert_eq!(request.headers["x-forwarded-for"], "192.0.2.10");
         assert_eq!(request.headers["x-forwarded-port"], "8443");
         assert_eq!(request.headers[INTERNAL_PORT], "8443");
