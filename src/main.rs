@@ -292,7 +292,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
             .checked_sub(1)
             .ok_or_else(|| anyhow!("server.downstream_keepalive_requests must be positive"))?,
     );
-    let mut service = ProxyServiceBuilder::new(&server.configuration, gateway.clone())
+    let mut service = ProxyServiceBuilder::new(&server.configuration, gateway)
         .name("pingora-gateway")
         .server_options(http_options)
         .build();
@@ -339,12 +339,14 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     );
 
     if !server_config.http3_listen.is_empty() {
+        let h2c_gateway =
+            Gateway::new(runtime.clone()).context("HTTP/3 h2c service bootstrap failed")?;
         let mut h2c_options = HttpServerOptions::default();
         h2c_options.h2c = true;
         h2c_options.request_header_timeout = Some(Duration::from_secs(
             server_config.downstream_request_header_timeout_seconds,
         ));
-        let mut h2c_service = ProxyServiceBuilder::new(&server.configuration, gateway)
+        let mut h2c_service = ProxyServiceBuilder::new(&server.configuration, h2c_gateway)
             .name("pingora-http3-h2c-handoff")
             .server_options(h2c_options)
             .build();
