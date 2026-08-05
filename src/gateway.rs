@@ -459,7 +459,15 @@ impl ProxyHttp for Gateway {
         let path = session.req_header().uri.path();
 
         if path == "/pingora-health" || path == "/pingora-live" || path == "/pingora-ready" {
-            return send_empty(session, 204, None, tls, &[("x-proxy-product", "Pingora")]).await;
+            return send_empty(
+                &self.runtime,
+                session,
+                204,
+                None,
+                tls,
+                &[("x-proxy-product", "Pingora")],
+            )
+            .await;
         }
         if path == "/pingola-health" {
             if self.runtime.config.server.legacy_pingola_health {
@@ -469,6 +477,7 @@ impl ProxyHttp for Gateway {
                     );
                 });
                 return send_empty(
+                    &self.runtime,
                     session,
                     204,
                     None,
@@ -477,10 +486,26 @@ impl ProxyHttp for Gateway {
                 )
                 .await;
             }
-            return send_empty(session, 404, None, tls, &[("x-proxy-product", "Pingora")]).await;
+            return send_empty(
+                &self.runtime,
+                session,
+                404,
+                None,
+                tls,
+                &[("x-proxy-product", "Pingora")],
+            )
+            .await;
         }
         if path == "/nginx-health" {
-            return send_empty(session, 404, None, tls, &[("x-proxy-product", "Pingora")]).await;
+            return send_empty(
+                &self.runtime,
+                session,
+                404,
+                None,
+                tls,
+                &[("x-proxy-product", "Pingora")],
+            )
+            .await;
         }
         if path == "/pingora-health/details" {
             let unix_socket = session
@@ -488,18 +513,25 @@ impl ProxyHttp for Gateway {
                 .and_then(|address| address.as_inet())
                 .is_none();
             if !self.runtime.config.server.health_details || !unix_socket {
-                return send_empty(session, 404, None, tls, &[("x-proxy-product", "Pingora")])
-                    .await;
+                return send_empty(
+                    &self.runtime,
+                    session,
+                    404,
+                    None,
+                    tls,
+                    &[("x-proxy-product", "Pingora")],
+                )
+                .await;
             }
             return send_health_details(session, &self.runtime).await;
         }
 
         let Some(authority) = request_authority(session.req_header()) else {
-            return send_empty(session, 400, None, tls, &[]).await;
+            return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
         };
         let Some(host) = self.host(authority) else {
             session.set_keepalive(None);
-            return send_empty(session, 421, None, tls, &[]).await;
+            return send_empty(&self.runtime, session, 421, None, tls, &[]).await;
         };
 
         if !tls && host.redirect_http {
@@ -510,6 +542,7 @@ impl ProxyHttp for Gateway {
                 .map_or("/", |value| value.as_str());
             let location = format!("https://{}{path_and_query}", host.domain.as_ref());
             return send_empty(
+                &self.runtime,
                 session,
                 308,
                 Some(host.handler),
@@ -529,6 +562,7 @@ impl ProxyHttp for Gateway {
             }
             if !self.acquire_global_request(ctx) {
                 return send_empty(
+                    &self.runtime,
                     session,
                     429,
                     Some(host.handler),
@@ -546,6 +580,7 @@ impl ProxyHttp for Gateway {
         if host.handler == HandlerKind::NavidromeMain && path == "/" {
             let location = format!("https://{}/app/", host.domain.as_ref());
             return send_empty(
+                &self.runtime,
                 session,
                 308,
                 Some(host.handler),
@@ -556,25 +591,26 @@ impl ProxyHttp for Gateway {
         }
 
         let Some(plan_index) = host.plan(path) else {
-            return send_empty(session, 500, Some(host.handler), tls, &[]).await;
+            return send_empty(&self.runtime, session, 500, Some(host.handler), tls, &[]).await;
         };
         let plan = &self.plans[plan_index];
         let encoding = configure_downstream_compression(session, plan.route)?;
         if encoding.preferred == ContentCoding::NotAcceptable {
-            return send_empty(session, 406, Some(plan.handler), tls, &[]).await;
+            return send_empty(&self.runtime, session, 406, Some(plan.handler), tls, &[]).await;
         }
         ctx.identity_acceptable = encoding.identity_acceptable;
         ctx.compression_selected = encoding.preferred.as_str().is_some();
         ctx.tls = tls;
 
         if content_length(session.req_header()).is_some_and(|length| length > plan.max_body_bytes) {
-            return send_empty(session, 413, Some(plan.handler), tls, &[]).await;
+            return send_empty(&self.runtime, session, 413, Some(plan.handler), tls, &[]).await;
         }
 
         if let Some((rate, burst)) = plan.rate_limit
             && !self.rates.allow(plan.route.name(), client_ip, rate, burst)
         {
             return send_empty(
+                &self.runtime,
                 session,
                 429,
                 Some(plan.handler),
@@ -586,6 +622,7 @@ impl ProxyHttp for Gateway {
 
         if !self.acquire_global_request(ctx) {
             return send_empty(
+                &self.runtime,
                 session,
                 429,
                 Some(plan.handler),
@@ -602,6 +639,7 @@ impl ProxyHttp for Gateway {
                 plan.active_request_limit,
             ) else {
                 return send_empty(
+                    &self.runtime,
                     session,
                     429,
                     Some(plan.handler),
@@ -1556,6 +1594,7 @@ fn insert_security_headers(
 }
 
 async fn send_empty(
+    runtime: &RuntimeConfig,
     session: &mut Session,
     status: u16,
     handler: Option<HandlerKind>,
@@ -1569,6 +1608,9 @@ async fn send_empty(
     }
     if let Some(handler) = handler {
         insert_security_headers(&mut response, handler, tls)?;
+    }
+    if tls && let Some(alt_svc) = runtime.http3_alt_svc_header() {
+        response.insert_header("alt-svc", alt_svc)?;
     }
     session
         .write_response_header(Box::new(response), true)

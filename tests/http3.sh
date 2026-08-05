@@ -51,6 +51,16 @@ for _ in {1..100}; do
 done
 kill -0 "${GATEWAY_PID}"
 
+# Browsers normally discover HTTP/3 from an initial H1 or H2 TLS
+# response. Direct redirects must advertise the configured UDP port
+# even though they bypass Pingora's upstream response filter.
+for protocol in --http1.1 --http2; do
+  headers=$(curl --noproxy '*' -gksSI "${protocol}"     --resolve app.test:18444:127.0.0.1 https://app.test:18444/)
+  grep -q '^HTTP/' <<<"${headers}"
+  grep -qi '^alt-svc: h3=":18443"; ma=86400' <<<"${headers}"
+  grep -qi '^location: https://app.test/app/' <<<"${headers}"
+done
+
 # The private handoff listener must accept HTTP/2 prior knowledge. This request
 # intentionally lacks the random internal token, so a successful h2c exchange
 # returns the normal HTTPS redirect rather than entering the trusted H3 path.

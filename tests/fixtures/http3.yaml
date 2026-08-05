@@ -1,7 +1,8 @@
 server:
   http_listen:
     - "127.0.0.1:18081"
-  https_listen: []
+  https_listen:
+    - "127.0.0.1:18444"
   http3_listen:
     - "127.0.0.1:18443"
   http3_internal_listen: "127.0.0.1:18080"
