@@ -15,16 +15,13 @@ default = ["tcmalloc", "tls-aws-lc"]
 jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemallocator"]
 tcmalloc = ["dep:tcmalloc-better"]
 system-allocator = []
-tls-aws-lc = ["cloudflare-pingora/rustls", "dep:aws-lc-rs"]
+tls-aws-lc = ["cloudflare-pingora/rustls"]
 
 [dependencies]
 anyhow = "1.0"
 ahash = "0.8"
 arrayvec = "0.7"
 async-trait = "0.1"
-# Keep the process-wide rustls provider on the audited AWS-LC release selected
-# by the vendored Pingora adapter instead of relying only on transitive resolution.
-aws-lc-rs = { version = "=1.17.3", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 brotli = "8.0"
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive", "env"] }
