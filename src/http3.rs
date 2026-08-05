@@ -19,6 +19,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use log::{error, info, warn};
 use tokio::net::UdpSocket;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_quiche::http3::driver::{
     H3Event, InboundFrame, IncomingH3Headers, OutboundFrame, OutboundFrameSender,
     ServerH3Controller, ServerH3Event,
@@ -131,24 +132,44 @@ async fn run(
         .pool_max_idle_per_host(server.http3_max_concurrent_streams as usize)
         .build(connector);
     let internal = server.http3_internal_listen;
+    let public_port = runtime
+        .http3_public_port()
+        .ok_or_else(|| anyhow!("HTTP/3 public port was not configured"))?;
     let alt_svc = runtime.http3_alt_svc_header();
+    let connection_limit = Arc::new(Semaphore::new(server.downstream_max_connections));
 
     for mut listener in listeners {
         let client = client.clone();
         let alt_svc = alt_svc.clone();
+        let connection_limit = connection_limit.clone();
         tokio::spawn(async move {
             while let Some(connection) = listener.next().await {
                 match connection {
                     Ok(connection) => {
+                        let permit = match connection_limit.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                warn!(
+                                    "HTTP/3 connection rejected: downstream connection limit reached"
+                                );
+                                continue;
+                            }
+                        };
                         let peer = connection.peer_addr();
-                        let (driver, controller) = ServerH3Driver::new(Http3Settings::default());
+                        let settings = Http3Settings {
+                            max_header_list_size: Some(64 * 1024),
+                            ..Http3Settings::default()
+                        };
+                        let (driver, controller) = ServerH3Driver::new(settings);
                         connection.start(driver);
                         tokio::spawn(handle_connection(
                             controller,
                             peer,
                             internal,
+                            public_port,
                             client.clone(),
                             alt_svc.clone(),
+                            permit,
                         ));
                     }
                     Err(error) => warn!("HTTP/3 accept failed: {error}"),
@@ -172,8 +193,10 @@ async fn handle_connection(
     mut controller: ServerH3Controller,
     peer: SocketAddr,
     internal: SocketAddr,
+    public_port: u16,
     client: ProxyClient,
     alt_svc: Option<HeaderValue>,
+    _connection_permit: OwnedSemaphorePermit,
 ) {
     while let Some(event) = controller.event_receiver_mut().recv().await {
         match event {
@@ -182,6 +205,7 @@ async fn handle_connection(
                     incoming,
                     peer,
                     internal,
+                    public_port,
                     client.clone(),
                     alt_svc.clone(),
                 ));
@@ -199,6 +223,7 @@ async fn proxy_request(
     incoming: IncomingH3Headers,
     peer: SocketAddr,
     internal: SocketAddr,
+    public_port: u16,
     client: ProxyClient,
     alt_svc: Option<HeaderValue>,
 ) {
@@ -210,7 +235,15 @@ async fn proxy_request(
         ..
     } = incoming;
     if let Err(error) = proxy_request_inner(
-        headers, send, recv, read_fin, peer, internal, client, alt_svc,
+        headers,
+        send,
+        recv,
+        read_fin,
+        peer,
+        internal,
+        public_port,
+        client,
+        alt_svc,
     )
     .await
     {
@@ -226,10 +259,11 @@ async fn proxy_request_inner(
     read_fin: bool,
     peer: SocketAddr,
     internal: SocketAddr,
+    public_port: u16,
     client: ProxyClient,
     alt_svc: Option<HeaderValue>,
 ) -> Result<()> {
-    let decoded = match decode_request_headers(&headers, peer, internal) {
+    let decoded = match decode_request_headers(&headers, peer, internal, public_port) {
         Ok(decoded) => decoded,
         Err(error) => {
             send_error(&mut send, StatusCode::BAD_REQUEST, "invalid HTTP/3 request").await?;
@@ -272,6 +306,7 @@ fn decode_request_headers(
     headers: &[h3::Header],
     peer: SocketAddr,
     internal: SocketAddr,
+    public_port: u16,
 ) -> Result<DecodedRequest> {
     let mut method = None;
     let mut scheme = None;
@@ -337,16 +372,11 @@ fn decode_request_headers(
         HeaderValue::from_str(&peer.ip().to_string()).context("invalid client IP header")?,
     );
     output.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-    output.insert(
-        "x-forwarded-port",
-        HeaderValue::from_str(&internal.port().to_string())
-            .context("invalid HTTP/3 port header")?,
-    );
+    let public_port = HeaderValue::from_str(&public_port.to_string())
+        .context("invalid HTTP/3 public port header")?;
+    output.insert("x-forwarded-port", public_port.clone());
     output.insert(INTERNAL_MARKER, HeaderValue::from_static("1"));
-    output.insert(
-        INTERNAL_PORT,
-        HeaderValue::from_str("443").expect("static HTTP/3 port is valid"),
-    );
+    output.insert(INTERNAL_PORT, public_port);
 
     Ok(DecodedRequest {
         method,
@@ -490,6 +520,7 @@ mod tests {
                 &headers,
                 "127.0.0.1:12345".parse().unwrap(),
                 "127.0.0.1:18080".parse().unwrap(),
+                443,
             )
             .is_err()
         );
@@ -508,6 +539,7 @@ mod tests {
             &headers,
             "192.0.2.10:12345".parse().unwrap(),
             "127.0.0.1:18080".parse().unwrap(),
+            8443,
         )
         .unwrap();
         assert_eq!(request.method, Method::GET);
@@ -518,5 +550,7 @@ mod tests {
         assert_eq!(request.headers[HOST], "music.example");
         assert_eq!(request.headers[INTERNAL_MARKER], "1");
         assert_eq!(request.headers["x-forwarded-for"], "192.0.2.10");
+        assert_eq!(request.headers["x-forwarded-port"], "8443");
+        assert_eq!(request.headers[INTERNAL_PORT], "8443");
     }
 }
