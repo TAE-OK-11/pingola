@@ -26,6 +26,7 @@ jobs:
         run: |
           python3 tools/http3_event_fix.py
           python3 tools/http3_token_harden.py
+          python3 tools/http3_context_refactor.py
           python3 tools/http3_ci_finalize.py
           cargo update --verbose
           cargo fmt --all
