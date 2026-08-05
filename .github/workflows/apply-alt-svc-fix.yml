@@ -63,14 +63,14 @@ jobs:
           start = text.index('async fn send_empty(')
           end = text.index('\nasync fn send_health_details', start)
           function = text[start:end]
-          anchor = '''    session
-              .write_response_header'''
-          insertion = '''    if tls
-              && let Some(alt_svc) = runtime.http3_alt_svc_header()
-          {
-              response.insert_header("alt-svc", alt_svc)?;
-          }
-          '''
+          anchor = "    session\n        .write_response_header"
+          insertion = (
+              "    if tls\n"
+              "        && let Some(alt_svc) = runtime.http3_alt_svc_header()\n"
+              "    {\n"
+              "        response.insert_header(\"alt-svc\", alt_svc)?;\n"
+              "    }\n"
+          )
           if function.count(anchor) != 1:
               raise SystemExit('send_empty write-response point did not match')
           function = function.replace(anchor, insertion + anchor, 1)
