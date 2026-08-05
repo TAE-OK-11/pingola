@@ -1,11 +1,11 @@
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use parking_lot::Mutex;
 
 const MAX_RATE_BUCKETS: usize = 262_144;
@@ -201,7 +201,8 @@ impl ActiveRequestLimiter {
 
         let mut retried_after_cleanup = false;
         let counter = loop {
-            match self.counters.entry(key.clone()) {
+            let entry = self.counters.entry(key.clone());
+            match entry {
                 Entry::Occupied(entry) => {
                     let counter = entry.get().clone();
                     counter
@@ -249,8 +250,8 @@ impl Drop for ActiveRequestPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Barrier;
+    use std::sync::atomic::AtomicBool;
     use std::thread;
     use std::time::Duration;
 
@@ -293,9 +294,11 @@ mod tests {
                 .acquire("api", "192.0.2.40".parse().unwrap(), 1)
                 .unwrap(),
         );
-        assert!(limiter
-            .acquire("api", "192.0.2.41".parse().unwrap(), 1)
-            .is_some());
+        assert!(
+            limiter
+                .acquire("api", "192.0.2.41".parse().unwrap(), 1)
+                .is_some()
+        );
         assert_eq!(limiter.counter_count.load(Ordering::Acquire), 1);
     }
 
@@ -354,15 +357,18 @@ mod tests {
             workers.push(thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..ITERATIONS {
-                    if let Some(permit) = limiter.acquire("api", ip, 1) {
-                        if granted.fetch_add(1, Ordering::AcqRel) != 0 {
-                            violated.store(true, Ordering::Release);
+                    match limiter.acquire("api", ip, 1) {
+                        Some(permit) => {
+                            if granted.fetch_add(1, Ordering::AcqRel) != 0 {
+                                violated.store(true, Ordering::Release);
+                            }
+                            thread::yield_now();
+                            granted.fetch_sub(1, Ordering::AcqRel);
+                            drop(permit);
                         }
-                        thread::yield_now();
-                        granted.fetch_sub(1, Ordering::AcqRel);
-                        drop(permit);
-                    } else {
-                        thread::yield_now();
+                        _ => {
+                            thread::yield_now();
+                        }
                     }
                 }
             }));

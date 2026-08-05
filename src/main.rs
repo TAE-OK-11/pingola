@@ -15,16 +15,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use cloudflare_pingora::apps::HttpServerOptions;
-use cloudflare_pingora::listeners::tls::TlsSettings;
 use cloudflare_pingora::listeners::TcpSocketOptions;
-use cloudflare_pingora::protocols::http::v2::server::default_h2_options;
+use cloudflare_pingora::listeners::tls::TlsSettings;
 use cloudflare_pingora::protocols::TcpKeepalive;
+use cloudflare_pingora::protocols::http::v2::server::default_h2_options;
 use cloudflare_pingora::proxy::ProxyServiceBuilder;
-use cloudflare_pingora::server::configuration::ServerConf;
 use cloudflare_pingora::server::Server;
+use cloudflare_pingora::server::configuration::ServerConf;
 use log::info;
 
 use crate::config::RuntimeConfig;

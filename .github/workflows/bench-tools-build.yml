@@ -30,7 +30,7 @@ jobs:
           install -d "$RUNNER_TEMP/artifact"
           for source in backend pgo_client; do
             rustc \
-              --edition=2021 \
+              --edition=2024 \
               -C opt-level=3 \
               -C target-cpu=znver1 \
               -C lto=fat \

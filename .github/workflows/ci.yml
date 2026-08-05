@@ -49,8 +49,8 @@ jobs:
         run: |
           bash -n bench/pgo_train.sh
           bash -n bench/pgo_compare_three.sh
-          rustc --edition=2021 -D warnings bench/backend.rs -o /tmp/pgo-backend
-          rustc --edition=2021 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
+          rustc --edition=2024 -D warnings bench/backend.rs -o /tmp/pgo-backend
+          rustc --edition=2024 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
           /tmp/pgo-client \
             --port 80 \
             --threads 0 \
@@ -177,7 +177,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - name: Sign in to GitHub Container Registry
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -251,7 +251,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - name: Sign in to GitHub Container Registry
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

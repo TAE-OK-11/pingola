@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use serde::Deserialize;
 
@@ -351,13 +351,13 @@ fn validate(config: &Config) -> Result<()> {
             HandlerKind::AdguardKorea => Some("adguard_korea_doh"),
             _ => None,
         };
-        if let Some(required) = required_doh_upstream {
-            if !config.upstreams.contains_key(required) {
-                bail!(
-                    "host {name} handler {:?} requires DoH upstream {required}",
-                    host.handler
-                );
-            }
+        if let Some(required) = required_doh_upstream
+            && !config.upstreams.contains_key(required)
+        {
+            bail!(
+                "host {name} handler {:?} requires DoH upstream {required}",
+                host.handler
+            );
         }
 
         for domain in &host.domains {
@@ -404,12 +404,10 @@ fn validate(config: &Config) -> Result<()> {
         if !ROUTES.contains(&name.as_str()) {
             bail!("route_limits contains unknown route {name}");
         }
-        if let Some(rate) = limit.rate_per_second {
-            if !rate.is_finite() || !(0.0..=1_000_000.0).contains(&rate) {
-                bail!(
-                    "route_limits.{name}.rate_per_second must be finite and between 0 and 1000000"
-                );
-            }
+        if let Some(rate) = limit.rate_per_second
+            && (!rate.is_finite() || !(0.0..=1_000_000.0).contains(&rate))
+        {
+            bail!("route_limits.{name}.rate_per_second must be finite and between 0 and 1000000");
         }
         if limit.burst.is_some_and(|burst| burst > 1_000_000) {
             bail!("route_limits.{name}.burst must not exceed 1000000");

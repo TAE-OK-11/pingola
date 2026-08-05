@@ -4,7 +4,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rustix::process::{getegid, geteuid};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -312,7 +312,8 @@ fn check_listener_binds(runtime: &RuntimeConfig, report: &mut CheckReport) {
                 .map(|address| ("HTTPS", address)),
         )
     {
-        match bind_listener(address) {
+        let bind_result = bind_listener(address);
+        match bind_result {
             Ok(socket) => {
                 report.ok(
                     format!("listener bind {protocol} {address}"),
@@ -485,10 +486,11 @@ hosts:
             .find(|item| item.name == "upstream address broken")
             .unwrap();
         assert!(item.result.is_err());
-        assert!(item
-            .result
-            .as_ref()
-            .unwrap_err()
-            .contains("127.0.0.1:not-a-port"));
+        assert!(
+            item.result
+                .as_ref()
+                .unwrap_err()
+                .contains("127.0.0.1:not-a-port")
+        );
     }
 }

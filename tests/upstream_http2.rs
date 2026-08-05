@@ -1,8 +1,8 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -52,7 +52,11 @@ async fn explicit_h2c_upstream_is_used_and_reused() {
             let requests = Arc::clone(&requests_task);
             tokio::spawn(async move {
                 let mut connection = h2::server::handshake(stream).await.unwrap();
-                while let Some(result) = connection.accept().await {
+                loop {
+                    let next = connection.accept().await;
+                    let Some(result) = next else {
+                        break;
+                    };
                     let (request, mut respond) = result.unwrap();
                     assert_eq!(request.version(), http::Version::HTTP_2);
                     requests.fetch_add(1, Ordering::Relaxed);
@@ -124,9 +128,11 @@ route_limits:
     for _ in 0..3 {
         let response = proxy_get(proxy_address);
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(response
-            .to_ascii_lowercase()
-            .contains("x-upstream-protocol: h2"));
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("x-upstream-protocol: h2")
+        );
         assert!(response.ends_with("h2-upstream"));
     }
 
