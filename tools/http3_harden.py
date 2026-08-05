@@ -59,8 +59,10 @@ replace(
                             }
                         };
                         let peer = connection.peer_addr();
-                        let mut settings = Http3Settings::default();
-                        settings.max_header_list_size = Some(64 * 1024);
+                        let settings = Http3Settings {
+                            max_header_list_size: Some(64 * 1024),
+                            ..Http3Settings::default()
+                        };
                         let (driver, controller) = ServerH3Driver::new(settings);
                         connection.start(driver);
                         tokio::spawn(handle_connection(
