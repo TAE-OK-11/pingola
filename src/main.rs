@@ -83,10 +83,12 @@ fn main() -> Result<()> {
     }
 
     install_aws_lc_tls13_provider().context("TLS provider initialization failed")?;
-    let runtime =
-        Arc::new(RuntimeConfig::load(&config_path).with_context(|| {
-            format!("configuration validation failed: {}", config_path.display())
-        })?);
+    let runtime = Arc::new(RuntimeConfig::load(&config_path).with_context(|| {
+        format!(
+            "configuration validation failed: {}",
+            config_path.display()
+        )
+    })?);
 
     if cli.check || cli.check_bind {
         println!(
@@ -292,6 +294,10 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
             .checked_sub(1)
             .ok_or_else(|| anyhow!("server.downstream_keepalive_requests must be positive"))?,
     );
+    // Accept cleartext HTTP/2 prior knowledge. The dedicated loopback listener
+    // uses this path for the H3 -> Pingora bridge, while Pingora 0.8.1 retains
+    // HTTP/1.1 detection for ordinary public plaintext listeners.
+    http_options.h2c = true;
     let mut service = ProxyServiceBuilder::new(&server.configuration, gateway)
         .name("pingora-gateway")
         .server_options(http_options)
@@ -345,7 +351,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     http3::start(runtime.clone()).context("HTTP/3 frontend startup failed")?;
 
     info!(
-        "starting Pingora with {} TLS 1.3: http={:?} https={:?} http3_udp={:?} http3_internal={} health_socket={} threads={}",
+        "starting Pingora with {} TLS 1.3: http={:?} https={:?} http3_udp={:?} http3_internal_h2c={} health_socket={} threads={}",
         tls_provider_name(),
         server_config.http_listen,
         server_config.https_listen,
