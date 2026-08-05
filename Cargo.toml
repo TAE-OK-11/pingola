@@ -35,8 +35,8 @@ hex = "0.4.3"
 http = "1.5.0"
 http-body-util = "0.1.4"
 httpdate = "1.0.3"
-hyper = { version = "1.11.0", features = ["client", "http1"] }
-hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "tokio"] }
+hyper = { version = "1.11.0", features = ["client", "http2"] }
+hyper-util = { version = "0.1.20", features = ["client-legacy", "http2", "tokio"] }
 ipnet = { version = "2.12.1", features = ["serde"] }
 log = { version = "0.4.33", features = ["release_max_level_info"] }
 lru = "0.18.2"
