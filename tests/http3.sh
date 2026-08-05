@@ -30,7 +30,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 chmod 0600 "${RUNTIME}/key.pem"
 chmod 0644 "${RUNTIME}/cert.pem"
 
-cargo build --manifest-path "${ROOT}/Cargo.toml" --example http3_probe
+cargo build --manifest-path "${ROOT}/Cargo.toml" --locked \
+  --bin pingora --example http3_probe
 python3 "${ROOT}/tests/backend.py" >"${BACKEND_LOG}" 2>&1 &
 BACKEND_PID=$!
 RUST_LOG=info "${ROOT}/target/debug/pingora" \
