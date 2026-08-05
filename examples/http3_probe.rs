@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
             ],
             body_writer: None,
         })
-        .context("failed to queue HTTP/3 request")?;
+        .map_err(|_| anyhow!("failed to queue HTTP/3 request: controller is closed"))?;
 
     let response = tokio::time::timeout(REQUEST_TIMEOUT, receive_response(&mut controller))
         .await
