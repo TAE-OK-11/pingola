@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
 
     let (_, mut controller) = tokio_quiche::quic::connect(socket, Some(&authority))
         .await
-        .context("HTTP/3 QUIC handshake failed")?;
+        .map_err(|error| anyhow!("HTTP/3 QUIC handshake failed: {error}"))?;
     controller
         .request_sender()
         .send(NewClientRequest {
