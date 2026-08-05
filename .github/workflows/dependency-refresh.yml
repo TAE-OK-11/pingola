@@ -62,15 +62,16 @@ jobs:
           PY
 
           # Run Cargo's edition migration lints from the previous edition, then
-          # restore the declared Rust 2024 edition for the committed manifest.
+          # restore the declared Rust 2024 edition and normalize the generated edits.
           sed -i 's/edition = "2024"/edition = "2021"/' Cargo.toml
           cargo update --verbose
           cargo fix --edition --all-targets --allow-dirty
           sed -i 's/edition = "2021"/edition = "2024"/' Cargo.toml
+          cargo fmt --all
       - name: Validate dependencies, allocators and compression
         run: |
           set -euxo pipefail
-          cargo fmt --check
+          cargo fmt --all --check
           cargo tree --locked > /tmp/tree.txt
           grep -q 'aws-lc-rs v1.17.3' /tmp/tree.txt
           grep -q 'rustls v0.23.43' /tmp/tree.txt
