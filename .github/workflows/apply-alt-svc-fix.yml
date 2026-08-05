@@ -60,24 +60,22 @@ jobs:
               raise SystemExit('send_empty signature did not match')
           text = text.replace(old, new, 1)
 
-          old = '''    if let Some(handler) = handler {
-              insert_security_headers(&mut response, handler, tls)?;
+          start = text.index('async fn send_empty(')
+          end = text.index('\nasync fn send_health_details', start)
+          function = text[start:end]
+          anchor = '''    session
+              .write_response_header'''
+          insertion = '''    if tls
+              && let Some(alt_svc) = runtime.http3_alt_svc_header()
+          {
+              response.insert_header("alt-svc", alt_svc)?;
           }
-              session
           '''
-          new = '''    if let Some(handler) = handler {
-              insert_security_headers(&mut response, handler, tls)?;
-          }
-              if tls
-                  && let Some(alt_svc) = runtime.http3_alt_svc_header()
-              {
-                  response.insert_header("alt-svc", alt_svc)?;
-              }
-              session
-          '''
-          if old not in text:
-              raise SystemExit('send_empty response block did not match')
-          gateway.write_text(text.replace(old, new, 1))
+          if function.count(anchor) != 1:
+              raise SystemExit('send_empty write-response point did not match')
+          function = function.replace(anchor, insertion + anchor, 1)
+          text = text[:start] + function + text[end:]
+          gateway.write_text(text)
 
           fixture = Path('tests/fixtures/http3.yaml')
           text = fixture.read_text()
