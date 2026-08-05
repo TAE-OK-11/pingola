@@ -46,6 +46,7 @@ jobs:
       - name: PGO trainer preflight
         run: |
           bash -n bench/pgo_train.sh
+          bash -n bench/pgo_train_h3.sh
           bash -n bench/pgo_compare_three.sh
           rustc --edition=2024 -D warnings bench/backend.rs -o /tmp/pgo-backend
           rustc --edition=2024 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
@@ -115,6 +116,11 @@ jobs:
             TLS_PROVIDER=aws-lc
             PGO_MODE=train
             PGO_TRAIN_TARGET_CPU=x86-64-v2
+            PGO_WEIGHT_H1=60
+            PGO_WEIGHT_H2=160
+            PGO_WEIGHT_H3=100
+            PGO_WEIGHT_TLS=15
+            PGO_WEIGHT_TAIL=30
             RUST_TARGET_CPU=${{ matrix.target_cpu }}
             RUST_LTO=fat
             BUILD_VERSION=ci
@@ -139,6 +145,7 @@ jobs:
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.target-cpu"]')" = "znver1"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator"]')" = "tcmalloc"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.http3.provider"]')" = "quiche"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo-weight-h3"]')" = "100"
 
   publish:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_images)
@@ -197,6 +204,11 @@ jobs:
             TLS_PROVIDER=aws-lc
             PGO_MODE=train
             PGO_TRAIN_TARGET_CPU=x86-64-v2
+            PGO_WEIGHT_H1=60
+            PGO_WEIGHT_H2=160
+            PGO_WEIGHT_H3=100
+            PGO_WEIGHT_TLS=15
+            PGO_WEIGHT_TAIL=30
             RUST_TARGET_CPU=${{ matrix.target_cpu }}
             RUST_LTO=fat
             BUILD_VERSION=${{ steps.meta.outputs.version }}${{ matrix.suffix }}
