@@ -76,19 +76,22 @@ replace(
 )
 replace(
     "src/http3.rs",
-    '''    peer: SocketAddr,
+    '''async fn handle_connection(
+    mut controller: ServerH3Controller,
+    peer: SocketAddr,
     internal: SocketAddr,
     client: ProxyClient,
     alt_svc: Option<HeaderValue>,
 ) {''',
-    '''    peer: SocketAddr,
+    '''async fn handle_connection(
+    mut controller: ServerH3Controller,
+    peer: SocketAddr,
     internal: SocketAddr,
     public_port: u16,
     client: ProxyClient,
     alt_svc: Option<HeaderValue>,
     _connection_permit: OwnedSemaphorePermit,
 ) {''',
-    1,
 )
 replace(
     "src/http3.rs",
@@ -99,23 +102,24 @@ replace(
                     internal,
                     public_port,
                     client.clone(),''',
-    1,
 )
 replace(
     "src/http3.rs",
-    '''    peer: SocketAddr,
+    '''async fn proxy_request(
+    incoming: IncomingH3Headers,
+    peer: SocketAddr,
     internal: SocketAddr,
     client: ProxyClient,
     alt_svc: Option<HeaderValue>,
-) {
-    let IncomingH3Headers {''',
-    '''    peer: SocketAddr,
+) {''',
+    '''async fn proxy_request(
+    incoming: IncomingH3Headers,
+    peer: SocketAddr,
     internal: SocketAddr,
     public_port: u16,
     client: ProxyClient,
     alt_svc: Option<HeaderValue>,
-) {
-    let IncomingH3Headers {''',
+) {''',
 )
 replace(
     "src/http3.rs",
@@ -183,7 +187,6 @@ replace(
     '''                "127.0.0.1:18080".parse().unwrap(),
                 443,
             )''',
-    1,
 )
 replace(
     "src/http3.rs",
@@ -192,7 +195,6 @@ replace(
     '''            "127.0.0.1:18080".parse().unwrap(),
             8443,
         )''',
-    1,
 )
 replace(
     "src/http3.rs",
