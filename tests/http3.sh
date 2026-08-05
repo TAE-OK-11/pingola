@@ -51,6 +51,13 @@ for _ in {1..100}; do
 done
 kill -0 "${GATEWAY_PID}"
 
+# The private handoff listener must accept HTTP/2 prior knowledge. This request
+# intentionally lacks the random internal token, so a successful h2c exchange
+# returns the normal HTTPS redirect rather than entering the trusted H3 path.
+h2c_probe=$(nghttp --no-dep -nv -H ':authority: app.test' \
+  http://127.0.0.1:18080/headers 2>&1)
+grep -q ':status: 308' <<<"${h2c_probe}"
+
 app_response=$("${ROOT}/target/debug/examples/http3_probe" \
   127.0.0.1:18443 app.test /headers)
 jq -e '.method == "GET"' <<<"${app_response}" >/dev/null
@@ -80,10 +87,13 @@ location=$(curl --noproxy '*' -sSI -H 'host: app.test' \
 
 # A loopback caller cannot forge the private H3 handoff with the old static
 # marker. The request must still be treated as plaintext and redirected.
-spoof_location=$(curl --noproxy '*' -sSI -H 'host: app.test'   -H 'x-jbs-http3-internal: 1' -H 'x-jbs-http3-port: 18443'   http://127.0.0.1:18080/headers | awk -F': '   'tolower($1) == "location" {gsub("\r", "", $2); print $2}')
+spoof_location=$(curl --noproxy '*' -sSI -H 'host: app.test' \
+  -H 'x-jbs-http3-internal: 1' -H 'x-jbs-http3-port: 18443' \
+  http://127.0.0.1:18080/headers | awk -F': ' \
+  'tolower($1) == "location" {gsub("\r", "", $2); print $2}')
 [[ "${spoof_location}" == "https://app.test/headers" ]]
 
-grep -q 'HTTP/3 frontend started' "${GATEWAY_LOG}"
+grep -q 'HTTP/3 frontend started:.*internal=h2c://' "${GATEWAY_LOG}"
 grep -q 'http3_udp=\["127.0.0.1:18443"\]' "${GATEWAY_LOG}"
 
-echo "HTTP/3 QUIC proxy, static response, Alt-Svc, forwarding, and private-header isolation tests passed"
+echo "HTTP/3 QUIC proxy, h2c internal multiplexing, static response, Alt-Svc, forwarding, and private-header isolation tests passed"
