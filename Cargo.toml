@@ -37,7 +37,7 @@ mime_guess = "2.0"
 parking_lot = "0.12"
 percent-encoding = "2.3"
 cloudflare-pingora = { package = "pingora", version = "0.8.1", default-features = false, features = ["proxy"] }
-rustls = { version = "0.23.42", default-features = false, features = ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"] }
+rustls = { version = "=0.23.42", default-features = false, features = ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"] }
 rustls-pemfile = "2.2"
 rustix = { version = "1.1", features = ["process"] }
 serde = { version = "1.0", features = ["derive"] }
