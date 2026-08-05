@@ -44,6 +44,11 @@ replace(
         .context("failed to create quiche HTTP/3 listeners")?;''',
 )
 replace(
+    "src/http3.rs",
+    "        let internal = internal;\n",
+    "",
+)
+replace(
     "src/gateway.rs",
     ".is_some_and(|address| address == expected);",
     ".is_some_and(|address| *address == expected);",
