@@ -1,0 +1,42 @@
+server:
+  http_listen:
+    - "127.0.0.1:18081"
+  https_listen: []
+  http3_listen:
+    - "127.0.0.1:18443"
+  http3_internal_listen: "127.0.0.1:18080"
+  http3_max_idle_timeout_seconds: 15
+  http3_max_concurrent_streams: 16
+  downstream_max_connections: 64
+  certificate: /tmp/pingora-http3/cert.pem
+  private_key: /tmp/pingora-http3/key.pem
+  threads: 1
+  upstream_keepalive_pool_size: 8
+  downstream_keepalive_requests: 32
+  max_retries: 1
+  graceful_shutdown_timeout_seconds: 2
+  static_cache_bytes: 4194304
+  access_log: true
+  health_socket: /tmp/pingora-http3/health.sock
+
+trusted_proxies:
+  - "127.0.0.0/8"
+  - "::1/128"
+
+upstreams:
+  backend:
+    address: "127.0.0.1:19090"
+
+hosts:
+  static:
+    domains:
+      - static.test
+    handler: static
+    static_root: /tmp/pingora-http3/www
+  app:
+    domains:
+      - app.test
+    handler: navidrome-main
+    upstream: backend
+    redirect_http: true
+    max_body_bytes: 1048576
