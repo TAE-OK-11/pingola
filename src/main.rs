@@ -292,11 +292,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
             .checked_sub(1)
             .ok_or_else(|| anyhow!("server.downstream_keepalive_requests must be positive"))?,
     );
-    // Accept cleartext HTTP/2 prior knowledge. The dedicated loopback listener
-    // uses this path for the H3 -> Pingora bridge, while Pingora 0.8.1 retains
-    // HTTP/1.1 detection for ordinary public plaintext listeners.
-    http_options.h2c = true;
-    let mut service = ProxyServiceBuilder::new(&server.configuration, gateway)
+    let mut service = ProxyServiceBuilder::new(&server.configuration, gateway.clone())
         .name("pingora-gateway")
         .server_options(http_options)
         .build();
@@ -311,10 +307,6 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
 
     for address in &server_config.http_listen {
         service.add_tcp_with_settings(address, listener_options(address)?);
-    }
-    let http3_internal = server_config.http3_internal_listen.to_string();
-    if !server_config.http3_listen.is_empty() {
-        service.add_tcp_with_settings(&http3_internal, listener_options(&http3_internal)?);
     }
     for address in &server_config.https_listen {
         let certificate = server_config.certificate.as_deref().ok_or_else(|| {
@@ -346,10 +338,32 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         Some(Permissions::from_mode(0o600)),
     );
 
+    if !server_config.http3_listen.is_empty() {
+        let mut h2c_options = HttpServerOptions::default();
+        h2c_options.h2c = true;
+        h2c_options.request_header_timeout = Some(Duration::from_secs(
+            server_config.downstream_request_header_timeout_seconds,
+        ));
+        let mut h2c_service = ProxyServiceBuilder::new(&server.configuration, gateway)
+            .name("pingora-http3-h2c-handoff")
+            .server_options(h2c_options)
+            .build();
+        h2c_service.set_connection_limit(server_config.downstream_max_connections);
+        let mut h2c_stream_options = default_h2_options();
+        h2c_stream_options.max_concurrent_streams(server_config.http3_max_concurrent_streams);
+        h2c_stream_options.max_header_list_size(64 * 1024);
+        if let Some(proxy) = h2c_service.app_logic_mut() {
+            proxy.h2_options = Some(h2c_stream_options);
+        }
+        let internal = server_config.http3_internal_listen.to_string();
+        h2c_service.add_tcp_with_settings(&internal, listener_options(&internal)?);
+        server.add_service(h2c_service);
+    }
+
     http3::start(runtime.clone()).context("HTTP/3 frontend startup failed")?;
 
     info!(
-        "starting Pingora with {} TLS 1.3: http={:?} https={:?} http3_udp={:?} http3_internal_h2c={} health_socket={} threads={}",
+        "starting Pingora with {} TLS 1.3: http={:?} https={:?} http3_udp={:?} http3_internal={} health_socket={} threads={}",
         tls_provider_name(),
         server_config.http_listen,
         server_config.https_listen,
