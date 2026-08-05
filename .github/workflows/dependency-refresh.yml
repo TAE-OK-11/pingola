@@ -1,13 +1,13 @@
-name: export-full-stack-refresh
+name: commit-full-stack-refresh
 
 on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  export:
+  commit:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -22,7 +22,7 @@ jobs:
           sudo apt-get install --yes cmake ninja-build
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
           rustup default 1.97.1
-      - name: Reproduce verified refresh
+      - name: Reproduce verified non-workflow refresh
         shell: bash
         run: |
           set -euxo pipefail
@@ -44,21 +44,6 @@ jobs:
                   raise SystemExit(f'expected Dockerfile text not found: {old}')
               text = text.replace(old, new)
           dockerfile.write_text(text)
-
-          for name in ['.github/workflows/ci.yml', '.github/workflows/bench-tools-build.yml']:
-              path = Path(name)
-              text = path.read_text()
-              if '--edition=2021' not in text:
-                  raise SystemExit(f'expected Rust 2021 flag not found in {name}')
-              path.write_text(text.replace('--edition=2021', '--edition=2024'))
-
-          ci = Path('.github/workflows/ci.yml')
-          text = ci.read_text()
-          old = 'docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4'
-          new = 'docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1'
-          if text.count(old) != 2:
-              raise SystemExit('expected two pinned login-action references')
-          ci.write_text(text.replace(old, new))
           PY
 
           sed -i 's/edition = "2024"/edition = "2021"/' Cargo.toml
@@ -68,23 +53,12 @@ jobs:
           cargo fmt --all
           cargo clippy --fix --all-targets --locked --allow-dirty --allow-staged -- -D warnings
           cargo fmt --all
-      - name: Package verified refresh
+      - name: Commit generated files
         run: |
           set -euxo pipefail
-          rm -f .github/workflows/apply-full-refresh.yml .github/workflows/dependency-refresh.yml
-          mkdir -p refresh-output/files
-          git diff --name-status > refresh-output/name-status.txt
-          git diff --binary > refresh-output/full-refresh.patch
-          git diff --name-only -z | while IFS= read -r -d '' file; do
-            if [ -f "$file" ]; then
-              mkdir -p "refresh-output/files/$(dirname "$file")"
-              cp "$file" "refresh-output/files/$file"
-            fi
-          done
-      - name: Upload verified refresh
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: full-stack-refresh-output
-          path: refresh-output/
-          if-no-files-found: error
-          retention-days: 3
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.lock Dockerfile src tests
+          git diff --cached --check
+          git commit -m 'build: refresh Rust dependencies and Debian 13 runtime'
+          git push origin HEAD:agent/full-stack-refresh
