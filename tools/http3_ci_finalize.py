@@ -62,17 +62,24 @@ replace(
 ''',
 )
 
-replace(
-    "Dockerfile",
-    '''      org.opencontainers.image.tls.provider="${TLS_PROVIDER}" \
-      org.opencontainers.image.rust.pgo="${PGO_MODE}" \
-''',
-    '''      org.opencontainers.image.tls.provider="${TLS_PROVIDER}" \
-      org.opencontainers.image.http3.provider="quiche" \
-      org.opencontainers.image.quic.tls.provider="boringssl" \
-      org.opencontainers.image.rust.pgo="${PGO_MODE}" \
-''',
+dockerfile = Path("Dockerfile")
+docker_lines = dockerfile.read_text().splitlines()
+label_index = next(
+    (
+        index
+        for index, line in enumerate(docker_lines)
+        if 'org.opencontainers.image.tls.provider="${TLS_PROVIDER}"' in line
+    ),
+    None,
 )
+if label_index is None:
+    raise SystemExit("Dockerfile: TLS provider label was not found")
+slash = chr(92)
+docker_lines[label_index + 1 : label_index + 1] = [
+    f'      org.opencontainers.image.http3.provider="quiche" {slash}',
+    f'      org.opencontainers.image.quic.tls.provider="boringssl" {slash}',
+]
+dockerfile.write_text("\n".join(docker_lines) + "\n")
 replace(
     "Dockerfile",
     "EXPOSE 80/tcp 443/tcp",
@@ -125,13 +132,11 @@ replace(
 )
 replace(
     "tests/docker_runtime.sh",
-    '''curl --noproxy '*' -gkfsS --http2 --resolve health.test:443:[::1] \
-  https://health.test:443/pingora-ready -o /dev/null
+    '''  https://health.test:443/pingora-ready -o /dev/null
 
 docker exec pingora-test-https-ipv6 /usr/local/bin/pingora \
 ''',
-    '''curl --noproxy '*' -gkfsS --http2 --resolve health.test:443:[::1] \
-  https://health.test:443/pingora-ready -o /dev/null
+    '''  https://health.test:443/pingora-ready -o /dev/null
 docker logs pingora-test-https-ipv6 2>&1 \
   | grep -q 'HTTP/3 frontend started: udp=\\["\\[::1\\]:8443"\\]'
 
