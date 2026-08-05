@@ -84,7 +84,10 @@ async fn main() -> Result<()> {
         );
     }
 
-    print!("{}", String::from_utf8(response.body).context("HTTP/3 body is not UTF-8")?);
+    print!(
+        "{}",
+        String::from_utf8(response.body).context("HTTP/3 body is not UTF-8")?
+    );
     Ok(())
 }
 
