@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
     if response.status != 200 {
         bail!("HTTP/3 server returned status {}", response.status);
     }
-    let expected_alt_svc = format!(r#"h3=\":{}\""#, peer.port());
+    let expected_alt_svc = format!("h3=\":{}\"", peer.port());
     if !response
         .alt_svc
         .as_deref()
