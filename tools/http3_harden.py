@@ -166,7 +166,8 @@ replace(
     "src/http3.rs",
     '''    output.insert(
         "x-forwarded-port",
-        HeaderValue::from_str(&internal.port().to_string()).context("invalid HTTP/3 port header")?,
+        HeaderValue::from_str(&internal.port().to_string())
+            .context("invalid HTTP/3 port header")?,
     );''',
     '''    let public_port = HeaderValue::from_str(&public_port.to_string())
         .context("invalid HTTP/3 public port header")?;
