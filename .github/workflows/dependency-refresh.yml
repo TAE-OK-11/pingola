@@ -62,11 +62,13 @@ jobs:
           PY
 
           # Run Cargo's edition migration lints from the previous edition, then
-          # restore the declared Rust 2024 edition and normalize the generated edits.
+          # restore Rust 2024 and apply machine-safe Clippy modernization fixes.
           sed -i 's/edition = "2024"/edition = "2021"/' Cargo.toml
           cargo update --verbose
           cargo fix --edition --all-targets --allow-dirty
           sed -i 's/edition = "2021"/edition = "2024"/' Cargo.toml
+          cargo fmt --all
+          cargo clippy --fix --all-targets --locked --allow-dirty --allow-staged -- -D warnings
           cargo fmt --all
       - name: Validate dependencies, allocators and compression
         run: |
