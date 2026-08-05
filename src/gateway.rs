@@ -6,27 +6,27 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use arrayvec::ArrayString;
 use bytes::Bytes;
-use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
-use cloudflare_pingora::modules::http::compression::{
-    ResponseCompression, ResponseCompressionBuilder,
-};
-use cloudflare_pingora::modules::http::HttpModules;
-use cloudflare_pingora::prelude::HttpPeer;
-use cloudflare_pingora::protocols::{Digest, TcpKeepalive, ALPN};
-use cloudflare_pingora::proxy::{
-    default_fail_to_proxy, CacheMeta, FailToProxy, ForcedFreshness, HitHandler, ProxyHttp,
-    RawSocketHandle, Session,
-};
 use cloudflare_pingora::Error;
 use cloudflare_pingora::ErrorType;
 use cloudflare_pingora::ErrorType::HTTPStatus;
 use cloudflare_pingora::Result;
+use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
+use cloudflare_pingora::modules::http::HttpModules;
+use cloudflare_pingora::modules::http::compression::{
+    ResponseCompression, ResponseCompressionBuilder,
+};
+use cloudflare_pingora::prelude::HttpPeer;
+use cloudflare_pingora::protocols::{ALPN, Digest, TcpKeepalive};
+use cloudflare_pingora::proxy::{
+    CacheMeta, FailToProxy, ForcedFreshness, HitHandler, ProxyHttp, RawSocketHandle, Session,
+    default_fail_to_proxy,
+};
 use http::header::{
-    HeaderName, HeaderValue, ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING,
-    CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, EXPIRES, FORWARDED, HOST, LAST_MODIFIED, PRAGMA,
+    ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
+    CONTENT_TYPE, EXPIRES, FORWARDED, HOST, HeaderName, HeaderValue, LAST_MODIFIED, PRAGMA,
     TRANSFER_ENCODING, UPGRADE,
 };
 use http::{Method, Version};
@@ -34,8 +34,8 @@ use log::{info, warn};
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::config::{normalized_host, HandlerKind, RuntimeConfig, UpstreamProtocol};
-use crate::content_encoding::{negotiate, ContentCoding, EncodingNegotiation};
+use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_host};
+use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
 use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, RateLimiter};
 use crate::static_files::StaticFiles;
 
@@ -552,17 +552,17 @@ impl ProxyHttp for Gateway {
             return send_empty(session, 413, Some(plan.handler), tls, &[]).await;
         }
 
-        if let Some((rate, burst)) = plan.rate_limit {
-            if !self.rates.allow(plan.route.name(), client_ip, rate, burst) {
-                return send_empty(
-                    session,
-                    429,
-                    Some(plan.handler),
-                    tls,
-                    &[("retry-after", "1")],
-                )
-                .await;
-            }
+        if let Some((rate, burst)) = plan.rate_limit
+            && !self.rates.allow(plan.route.name(), client_ip, rate, burst)
+        {
+            return send_empty(
+                session,
+                429,
+                Some(plan.handler),
+                tls,
+                &[("retry-after", "1")],
+            )
+            .await;
         }
 
         if !self.acquire_global_request(ctx) {
@@ -997,15 +997,14 @@ fn response_allows_compression(response: &ResponseHeader) -> bool {
     }) {
         return false;
     }
-    if let Some(length) = response.headers.get(CONTENT_LENGTH) {
-        if length
+    if let Some(length) = response.headers.get(CONTENT_LENGTH)
+        && length
             .to_str()
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .is_none_or(|length| length < 1024)
-        {
-            return false;
-        }
+    {
+        return false;
     }
 
     response

@@ -18,9 +18,9 @@ ARG PGO_WEIGHT_TLS=15
 ARG PGO_WEIGHT_TAIL=30
 ARG PGO_TRAIN_ROUNDS=2
 ARG PGO_ECDSA_CURVE=prime256v1
-ARG DEBIAN_SUITE=trixie
+ARG DEBIAN_SUITE=13
 
-FROM rust:1.97.1-slim-trixie@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c AS builder
+FROM rust:1.97.1-slim-trixie@sha256:69153971349358535be9821190190f026a761f690c6b58c68a914d14ab2d610a AS builder
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -127,10 +127,10 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       install -Dm755 "/src/target/release/${RUST_TARGET_TRIPLE}/release/pingora" /out/pingora; \
     else \
       rustup component add llvm-tools-preview; \
-      rustc --edition=2021 -D warnings -C opt-level=3 -C codegen-units=1 \
+      rustc --edition=2024 -D warnings -C opt-level=3 -C codegen-units=1 \
         -C panic=abort -C target-cpu="${PGO_TRAIN_TARGET_CPU}" -C strip=symbols \
         bench/backend.rs -o /tmp/pgo-backend; \
-      rustc --edition=2021 -D warnings -C opt-level=3 -C codegen-units=1 \
+      rustc --edition=2024 -D warnings -C opt-level=3 -C codegen-units=1 \
         -C panic=abort -C target-cpu="${PGO_TRAIN_TARGET_CPU}" -C strip=symbols \
         bench/pgo_client.rs -o /tmp/pgo-client; \
       rm -rf /src/pgo-data; \
@@ -189,7 +189,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       install -Dm644 /src/pgo-data/profile-summary.txt /out/pgo-profile-summary.txt; \
     fi
 
-FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS runtime
+FROM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS runtime
 
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=unknown

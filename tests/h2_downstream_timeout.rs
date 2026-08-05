@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cloudflare_pingora::protocols::http::v2::server::{handshake, HttpSession};
-use cloudflare_pingora::protocols::Digest;
 use cloudflare_pingora::ErrorType;
+use cloudflare_pingora::protocols::Digest;
+use cloudflare_pingora::protocols::http::v2::server::{HttpSession, handshake};
 use http::{Method, Request};
 use tokio::io::duplex;
 

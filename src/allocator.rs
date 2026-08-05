@@ -1,8 +1,8 @@
-#[cfg(feature = "tcmalloc")]
-use anyhow::bail;
 #[cfg(feature = "jemalloc")]
 use anyhow::Context;
 use anyhow::Result;
+#[cfg(feature = "tcmalloc")]
+use anyhow::bail;
 #[cfg(feature = "jemalloc")]
 use tikv_jemalloc_ctl::{epoch, stats, version as jemalloc_version};
 
@@ -167,7 +167,7 @@ fn tcmalloc_numeric_property(name: &'static str) -> Result<usize> {
 }
 
 #[cfg(feature = "tcmalloc")]
-extern "C" {
+unsafe extern "C" {
     #[link_name = "MallocExtension_Internal_GetNumericProperty"]
     fn tcmalloc_get_numeric_property(
         name: *const std::ffi::c_char,

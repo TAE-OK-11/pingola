@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
+use cloudflare_pingora::Result;
 use cloudflare_pingora::http::ResponseHeader;
 use cloudflare_pingora::protocols::http::conditional_filter::weak_validate_etag;
 use cloudflare_pingora::proxy::Session;
-use cloudflare_pingora::Result;
 use http::header::{
     ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
     IF_NONE_MATCH, LAST_MODIFIED, VARY,
@@ -22,7 +22,7 @@ use percent_encoding::percent_decode_str;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 
-use crate::content_encoding::{negotiate, ContentCoding};
+use crate::content_encoding::{ContentCoding, negotiate};
 
 const MAX_BUFFERED_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
@@ -225,30 +225,31 @@ impl StaticFiles {
 
                 // Another cold request can populate the representation while
                 // this request waits for the bounded compressor.
-                if let Some(asset) = self.cache.get(&key) {
-                    asset
-                } else {
-                    let body = self
-                        .read_representation(root, &path, requested_encoding)
-                        .await;
-                    let (body, actual_encoding) = match body {
-                        Ok(value) => value,
-                        Err(_) => return send_empty(session, 500, &[], tls).await,
-                    };
-                    let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), modified_nanos);
-                    let asset = Arc::new(CachedAsset {
-                        content_type: cached_header_value(&content_type(&path))?,
-                        content_length: cached_header_value(&body.len().to_string())?,
-                        body,
-                        etag: cached_header_value(&etag)?,
-                        last_modified: cached_header_value(&httpdate::fmt_http_date(modified))?,
-                    });
-                    let actual_key = CacheKey {
-                        encoding: actual_encoding,
-                        ..key
-                    };
-                    self.cache.insert(actual_key, asset.clone());
-                    asset
+                match self.cache.get(&key) {
+                    Some(asset) => asset,
+                    _ => {
+                        let body = self
+                            .read_representation(root, &path, requested_encoding)
+                            .await;
+                        let (body, actual_encoding) = match body {
+                            Ok(value) => value,
+                            Err(_) => return send_empty(session, 500, &[], tls).await,
+                        };
+                        let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), modified_nanos);
+                        let asset = Arc::new(CachedAsset {
+                            content_type: cached_header_value(&content_type(&path))?,
+                            content_length: cached_header_value(&body.len().to_string())?,
+                            body,
+                            etag: cached_header_value(&etag)?,
+                            last_modified: cached_header_value(&httpdate::fmt_http_date(modified))?,
+                        });
+                        let actual_key = CacheKey {
+                            encoding: actual_encoding,
+                            ..key
+                        };
+                        self.cache.insert(actual_key, asset.clone());
+                        asset
+                    }
                 }
             }
         };
@@ -374,24 +375,21 @@ async fn resolve_path(root: &Path, uri_path: &str) -> Option<(PathBuf, bool)> {
         relative.push("index.html");
     }
 
-    if let Ok(candidate) = tokio::fs::canonicalize(root.join(&relative)).await {
-        if candidate.starts_with(root) {
-            if let Ok(metadata) = tokio::fs::metadata(&candidate).await {
-                if metadata.is_file() {
-                    return Some((candidate, false));
-                }
-                if metadata.is_dir() {
-                    if let Ok(index) = tokio::fs::canonicalize(candidate.join("index.html")).await {
-                        if index.starts_with(root)
-                            && tokio::fs::metadata(&index)
-                                .await
-                                .is_ok_and(|metadata| metadata.is_file())
-                        {
-                            return Some((index, false));
-                        }
-                    }
-                }
-            }
+    if let Ok(candidate) = tokio::fs::canonicalize(root.join(&relative)).await
+        && candidate.starts_with(root)
+        && let Ok(metadata) = tokio::fs::metadata(&candidate).await
+    {
+        if metadata.is_file() {
+            return Some((candidate, false));
+        }
+        if metadata.is_dir()
+            && let Ok(index) = tokio::fs::canonicalize(candidate.join("index.html")).await
+            && index.starts_with(root)
+            && tokio::fs::metadata(&index)
+                .await
+                .is_ok_and(|metadata| metadata.is_file())
+        {
+            return Some((index, false));
         }
     }
 

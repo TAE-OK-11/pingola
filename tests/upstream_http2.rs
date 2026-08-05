@@ -1,8 +1,8 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -124,9 +124,11 @@ route_limits:
     for _ in 0..3 {
         let response = proxy_get(proxy_address);
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(response
-            .to_ascii_lowercase()
-            .contains("x-upstream-protocol: h2"));
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("x-upstream-protocol: h2")
+        );
         assert!(response.ends_with("h2-upstream"));
     }
 
