@@ -3,6 +3,9 @@ from pathlib import Path
 import re
 
 source = Path(".github/workflows/ci.yml").read_text()
+source = source.replace("tls-aws-lc", "tls-boringssl")
+source = source.replace("aws-lc", "boringssl")
+source = source.replace("AWS-LC TCP TLS", "Cloudflare BoringSSL TLS")
 replacement = """      - name: Verify unified Cloudflare BoringSSL provider
         run: |
           cargo tree --locked > /tmp/cargo-tree.txt
@@ -29,7 +32,4 @@ source, count = re.subn(
 )
 if count != 1:
     raise SystemExit(f"expected one TLS boundary block, found {count}")
-source = source.replace("tls-aws-lc", "tls-boringssl")
-source = source.replace("aws-lc", "boringssl")
-source = source.replace("AWS-LC TCP TLS", "Cloudflare BoringSSL TLS")
 Path("ci-boringssl.yml").write_text(source)
