@@ -25,7 +25,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes clang cmake libcap2-bin libclang-dev ninja-build openssl perl pkg-config
+          sudo apt-get install --yes clang cmake jq libcap2-bin libclang-dev nghttp2-client ninja-build openssl perl pkg-config
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
 
       - name: Apply security exceptions
