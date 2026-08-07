@@ -26,6 +26,8 @@ trusted_proxies:
 upstreams:
   backend:
     address: "127.0.0.1:19090"
+  adguard_dns_doh:
+    address: "127.0.0.1:19090"
 
 hosts:
   static:
@@ -44,5 +46,17 @@ hosts:
     domains:
       - vault.test
     handler: vaultwarden
+    upstream: backend
+    redirect_http: true
+  couch:
+    domains:
+      - couch.test
+    handler: couchdb
+    upstream: backend
+    redirect_http: true
+  adguard:
+    domains:
+      - dns.test
+    handler: adguard-dns
     upstream: backend
     redirect_http: true

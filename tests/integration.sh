@@ -26,7 +26,7 @@ cp "${ROOT}/tests/fixtures/www/index.html" "${RUNTIME}/www/index.html"
 truncate -s 8388609 "${RUNTIME}/www/large.bin"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj "/CN=static.test" \
-  -addext "subjectAltName=DNS:static.test,DNS:app.test,DNS:vault.test" \
+  -addext "subjectAltName=DNS:static.test,DNS:app.test,DNS:vault.test,DNS:couch.test,DNS:dns.test" \
   -keyout "${RUNTIME}/key.pem" -out "${RUNTIME}/cert.pem" >/dev/null 2>&1
 
 cargo build --manifest-path "${ROOT}/Cargo.toml"
@@ -118,6 +118,43 @@ jq -e '.headers["x-forwarded-proto"] == "https"' \
   <<<"${proxy_response}" >/dev/null
 jq -e '.headers["x-forwarded-port"] == "443"' \
   <<<"${proxy_response}" >/dev/null
+
+# Modern downstream compression prefers zstd, then Brotli, then gzip for
+# eligible non-Navidrome proxy responses. The backend always emits identity so
+# these assertions prove the gateway itself performed the transformation.
+curl --noproxy '*' -ksS --http2 --raw -D "${RUNTIME}/vault-zstd.headers" \
+  --resolve vault.test:443:127.0.0.1 \
+  -H 'accept-encoding: gzip, br, zstd' \
+  https://vault.test:443/compress-large -o "${RUNTIME}/vault-zstd.body"
+grep -qi '^content-encoding: zstd' "${RUNTIME}/vault-zstd.headers"
+grep -qi '^vary:.*accept-encoding' "${RUNTIME}/vault-zstd.headers"
+[[ -s "${RUNTIME}/vault-zstd.body" ]]
+
+curl --noproxy '*' -ksS --http2 --raw -D "${RUNTIME}/couch-br.headers" \
+  --resolve couch.test:443:127.0.0.1 \
+  -H 'accept-encoding: gzip, br' \
+  https://couch.test:443/compress-large -o "${RUNTIME}/couch-br.body"
+grep -qi '^content-encoding: br' "${RUNTIME}/couch-br.headers"
+[[ -s "${RUNTIME}/couch-br.body" ]]
+
+curl --noproxy '*' -ksS --http2 --raw -D "${RUNTIME}/adguard-gzip.headers" \
+  --resolve dns.test:443:127.0.0.1 \
+  -H 'accept-encoding: gzip' \
+  https://dns.test:443/compress-large -o "${RUNTIME}/adguard-gzip.body"
+grep -qi '^content-encoding: gzip' "${RUNTIME}/adguard-gzip.headers"
+[[ -s "${RUNTIME}/adguard-gzip.body" ]]
+
+# Navidrome remains outside the gateway compression module. Its API/cover path
+# may still forward Accept-Encoding to the origin, but the proxy itself must not
+# add a Content-Encoding when the origin returned identity.
+curl --noproxy '*' -ksS --http2 --raw -D "${RUNTIME}/navidrome.headers" \
+  --resolve app.test:443:127.0.0.1 \
+  -H 'accept-encoding: gzip, br, zstd' \
+  https://app.test:443/compress-large -o "${RUNTIME}/navidrome.body"
+if grep -qi '^content-encoding:' "${RUNTIME}/navidrome.headers"; then
+  echo 'Navidrome response was unexpectedly compressed by the gateway' >&2
+  exit 1
+fi
 
 hop_response=$(curl --noproxy '*' -ksS --http1.1 \
   --resolve app.test:443:127.0.0.1 \

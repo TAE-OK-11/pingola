@@ -28,10 +28,12 @@ HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항�
 
 Pingora 0.8.1은 다운스트림 HTTP/3/QUIC server를 제공하지 않으므로 HTTP/3와
 `Alt-Svc`는 지원하지 않습니다. gzip/Brotli/Zstd 동적 압축은 PiKKY 정적 파일에만
-직접 적용합니다. Navidrome API/cover는 client의 `Accept-Encoding`을 origin에
-전달하고, Vaultwarden 일반 API와 CouchDB의 압축 가능한 응답은 Pingora가 level 1
-gzip으로 streaming 압축합니다. Audio stream, Vaultwarden 인증·notifications hub 및
-DoH는 압축하지 않습니다.
+직접 적용합니다. Navidrome API/cover는 client의 `Accept-Encoding`을 origin에 전달하고 gateway
+압축은 적용하지 않습니다. 그 외 압축 가능한 프록시 응답(Vaultwarden, CouchDB,
+AdGuard UI)은 client의 `Accept-Encoding`을 정확히 협상해 같은 q-value에서는
+`zstd` → `br` → `gzip` 순으로 선택하고 level 1 streaming 압축을 적용합니다.
+Range/206, 이미 인코딩된 응답, `no-transform`, 1 KiB 미만, WebSocket/본문 없는 응답과
+DoH `application/dns-message` 같은 비압축 MIME은 identity를 유지합니다.
 
 ## 새 이름과 한 릴리스 호환성
 
