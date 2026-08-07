@@ -17,6 +17,8 @@ HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항�
 
 - Cloudflare BoringSSL를 사용하는 rustls와 다운스트림 TLS 1.3 전용 정책
 - HTTP/1.1 및 HTTP/2, 기본 최대 32개 동시 H2 stream(설정으로 1~1024 override)
+- upstream HTTP/3/QUIC (`http3`/`http3-preferred`) + connection reuse + replay-safe 0-RTT session resumption
+- QUIC Stateless Retry defaults ON; only a trusted private H3 origin should set `server.http3_stateless_retry: false` when accepted 0-RTT is required
 - IPv4/IPv6 listener와 IPv6 socket의 명시적 `IPV6_V6ONLY=true`
 - Host allowlist, trusted proxy 기반 `X-Forwarded-For`, body 크기 제한
 - 서비스·route별 rate limit 및 active request/H2 stream limit
