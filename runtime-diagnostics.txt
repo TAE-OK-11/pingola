@@ -1,0 +1,389 @@
+RUNTIME_TEST_FAILED
+===== TEST TRACE TAIL =====
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ for _ in {1..100}
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ sleep 0.1
++ grep -q 'upstream HTTP/3 early-data request sent stream=' /tmp/pingora-upstream-http3/front.log
++ grep -q 'HTTP/3 early-data request accepted' /tmp/pingora-upstream-http3/origin.log
++ cleanup
++ for pid in "${FALLBACK_PID}" "${FRONT_PID}" "${ORIGIN_PID}" "${BACKEND_PID}"
++ [[ -n 11480 ]]
++ kill 11480
++ wait 11480
++ for pid in "${FALLBACK_PID}" "${FRONT_PID}" "${ORIGIN_PID}" "${BACKEND_PID}"
++ [[ -n 11479 ]]
++ kill 11479
++ wait 11479
++ for pid in "${FALLBACK_PID}" "${FRONT_PID}" "${ORIGIN_PID}" "${BACKEND_PID}"
++ [[ -n 11467 ]]
++ kill 11467
++ wait 11467
++ for pid in "${FALLBACK_PID}" "${FRONT_PID}" "${ORIGIN_PID}" "${BACKEND_PID}"
++ [[ -n 11466 ]]
++ kill 11466
++ wait 11466
++ true
+===== origin.log FILTERED =====
+[2026-08-07T12:41:30Z INFO  pingora::http3] HTTP/3 UDP offload capabilities: address=127.0.0.1:28443 capabilities=SocketCapabilities { has_gso: true, check_udp_drop: true, has_txtime: true, has_rxtime: false, has_gro: true, has_ippktinfo: false, has_iprecvorigdstaddr: false, has_ipv6pktinfo: false, has_ipv6recvorigdstaddr: false, has_ip_mtu_discover_probe: true, has_ipv6_mtu_discover_probe: false, has_mark: true }
+[2026-08-07T12:41:30Z INFO  pingora::http3] HTTP/3 frontend started: udp=["127.0.0.1:28443"] internal=h2c://127.0.0.1:28080 quiche=1 hybrid_pq=X25519MLKEM768:X25519:P-256 stateless_retry=true max_amplification=3 early_data=true migration=false pmtud=true pacing=true socket_offload=auto[gso,gro,so_txtime,rxq_ovfl,pmtu_probe] max_udp_payload=1452 send_capacity_factor=2 admission_rate=64/s burst=128 max_connections_per_ip=128 handshake_timeout=5s
+[2026-08-07T12:41:30Z WARN  pingora_proxy::proxy_h1] Upstream body is already finished. Nothing to write
+===== origin.log TAIL =====
+[2026-08-07T12:41:30Z INFO  pingora] startup preflight passed (12 checks)
+[2026-08-07T12:41:30Z INFO  pingora] allocator=tcmalloc implementation=google-tcmalloc logical_page_size=8192 background_actions_needed=false
+[2026-08-07T12:41:30Z INFO  pingora_core::server::bootstrap_services] Bootstrap starting
+[2026-08-07T12:41:30Z INFO  pingora_core::server::bootstrap_services] Bootstrap done
+[2026-08-07T12:41:30Z INFO  pingora::http3] HTTP/3 UDP offload capabilities: address=127.0.0.1:28443 capabilities=SocketCapabilities { has_gso: true, check_udp_drop: true, has_txtime: true, has_rxtime: false, has_gro: true, has_ippktinfo: false, has_iprecvorigdstaddr: false, has_ipv6pktinfo: false, has_ipv6recvorigdstaddr: false, has_ip_mtu_discover_probe: true, has_ipv6_mtu_discover_probe: false, has_mark: true }
+[2026-08-07T12:41:30Z INFO  pingora::http3] HTTP/3 frontend started: udp=["127.0.0.1:28443"] internal=h2c://127.0.0.1:28080 quiche=1 hybrid_pq=X25519MLKEM768:X25519:P-256 stateless_retry=true max_amplification=3 early_data=true migration=false pmtud=true pacing=true socket_offload=auto[gso,gro,so_txtime,rxq_ovfl,pmtu_probe] max_udp_payload=1452 send_capacity_factor=2 admission_rate=64/s burst=128 max_connections_per_ip=128 handshake_timeout=5s
+[2026-08-07T12:41:30Z INFO  pingora] starting Pingora with Cloudflare BoringSSL TLS 1.3 hybrid_pq=X25519MLKEM768:X25519:P-256: http=["127.0.0.1:28081"] https=["127.0.0.1:28443", "127.0.0.1:28453"] http3_udp=["127.0.0.1:28443"] http3_internal=127.0.0.1:28080 health_socket=/tmp/pingora-upstream-http3/origin-health.sock threads=1
+[2026-08-07T12:41:30Z INFO  pingora_core::server] Server starting
+[2026-08-07T12:41:30Z INFO  pingora_core::server] Starting services in dependency order: ["pingora-gateway", "pingora-http3-h2c-handoff"]
+[2026-08-07T12:41:30Z INFO  pingora_core::server] Starting service: pingora-gateway
+[2026-08-07T12:41:30Z INFO  pingora_core::server] Starting service: pingora-http3-h2c-handoff
+[2026-08-07T12:41:30Z INFO  pingora::gateway] client=0.0.0.0 method=GET uri=/pingora-ready status=204 elapsed_ms=0
+[2026-08-07T12:41:30Z INFO  pingora::gateway] client=127.0.0.1 method=GET uri=/headers status=200 elapsed_ms=1
+[2026-08-07T12:41:30Z WARN  pingora_proxy::proxy_h1] Upstream body is already finished. Nothing to write
+[2026-08-07T12:41:30Z INFO  pingora::gateway] client=127.0.0.1 method=POST uri=/post status=200 elapsed_ms=40
+[2026-08-07T12:41:30Z INFO  pingora::gateway] client=127.0.0.1 method=GET uri=/reuse status=200 elapsed_ms=41
+[2026-08-07T12:41:32Z INFO  pingora::gateway] client=127.0.0.1 method=GET uri=/zero-rtt status=200 elapsed_ms=0
+[2026-08-07T12:41:47Z INFO  pingora_core::server] SIGTERM received, gracefully exiting
+[2026-08-07T12:41:47Z INFO  pingora_core::server] Broadcasting graceful shutdown
+[2026-08-07T12:41:47Z INFO  pingora_core::server] Graceful shutdown started!
+[2026-08-07T12:41:47Z INFO  pingora_core::server] Broadcast graceful shutdown complete
+[2026-08-07T12:41:47Z INFO  pingora_core::services::listening] Shutting down 127.0.0.1:28080
+[2026-08-07T12:41:47Z INFO  pingora_core::services::listening] Shutting down /tmp/pingora-upstream-http3/origin-health.sock
+[2026-08-07T12:41:47Z INFO  pingora_core::server] Graceful shutdown: grace period 0s starts
+[2026-08-07T12:41:47Z INFO  pingora_core::server] Graceful shutdown: grace period ends
+[2026-08-07T12:41:47Z INFO  pingora_core::server] service 'pingora-http3-h2c-handoff' exited.
+[2026-08-07T12:41:47Z INFO  pingora_core::services::listening] Shutting down 127.0.0.1:28081
+[2026-08-07T12:41:47Z INFO  pingora_core::server] Waiting for runtimes to exit!
+[2026-08-07T12:41:47Z INFO  pingora_core::services::listening] Shutting down 127.0.0.1:28443
+[2026-08-07T12:41:47Z INFO  pingora_core::server] Waiting for runtimes to exit!
+[2026-08-07T12:41:47Z INFO  pingora_core::services::listening] Shutting down 127.0.0.1:28453
+[2026-08-07T12:41:47Z INFO  pingora_core::server] Waiting for service runtime pingora-gateway to exit
+[2026-08-07T12:41:47Z INFO  pingora_core::server] service 'pingora-gateway' exited.
+[2026-08-07T12:41:49Z INFO  pingora_core::server] Waiting for service runtime pingora-http3-h2c-handoff to exit
+[2026-08-07T12:41:49Z INFO  pingora_core::server] All runtimes exited, exiting now
+===== front.log FILTERED =====
+[2026-08-07T12:41:30Z INFO  pingora::upstream_h3] upstream HTTP/3 bridge started: upstream=origin h2c=127.0.0.1:43971 forced=true hybrid_pq=X25519MLKEM768:X25519:P-256 early_data=replay-safe-only
+[2026-08-07T12:41:30Z INFO  pingora::upstream_h3] upstream HTTP/3 established upstream=origin peer=127.0.0.1:28443 resumed=false early_data_enabled=true hybrid_pq=X25519MLKEM768:X25519:P-256
+[2026-08-07T12:41:30Z INFO  pingora::upstream_h3] upstream HTTP/3 session ticket cached upstream=origin
+[2026-08-07T12:41:31Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC connection closed
+[2026-08-07T12:41:32Z INFO  pingora::upstream_h3] upstream HTTP/3 early-data request sent stream=0 request_id=4
+[2026-08-07T12:41:32Z INFO  pingora::upstream_h3] upstream HTTP/3 established upstream=origin peer=127.0.0.1:28443 resumed=true early_data_enabled=true hybrid_pq=X25519MLKEM768:X25519:P-256
+[2026-08-07T12:41:32Z INFO  pingora::upstream_h3] upstream HTTP/3 session ticket cached upstream=origin
+[2026-08-07T12:41:33Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC connection closed
+===== front.log TAIL =====
+[2026-08-07T12:41:30Z INFO  pingora] startup preflight passed (4 checks)
+[2026-08-07T12:41:30Z INFO  pingora] allocator=tcmalloc implementation=google-tcmalloc logical_page_size=8192 background_actions_needed=false
+[2026-08-07T12:41:30Z INFO  pingora_core::server::bootstrap_services] Bootstrap starting
+[2026-08-07T12:41:30Z INFO  pingora_core::server::bootstrap_services] Bootstrap done
+[2026-08-07T12:41:30Z INFO  pingora::upstream_h3] upstream HTTP/3 bridge started: upstream=origin h2c=127.0.0.1:43971 forced=true hybrid_pq=X25519MLKEM768:X25519:P-256 early_data=replay-safe-only
+[2026-08-07T12:41:30Z INFO  pingora::upstream_h3] upstream HTTP/3 established upstream=origin peer=127.0.0.1:28443 resumed=false early_data_enabled=true hybrid_pq=X25519MLKEM768:X25519:P-256
+[2026-08-07T12:41:30Z INFO  pingora::upstream_h3] upstream HTTP/3 session ticket cached upstream=origin
+[2026-08-07T12:41:30Z INFO  pingora] starting Pingora with Cloudflare BoringSSL TLS 1.3 hybrid_pq=X25519MLKEM768:X25519:P-256: http=["127.0.0.1:38081"] https=[] http3_udp=[] http3_internal=127.0.0.1:18080 health_socket=/tmp/pingora-upstream-http3/front-health.sock threads=1
+[2026-08-07T12:41:30Z INFO  pingora_core::server] Server starting
+[2026-08-07T12:41:30Z INFO  pingora_core::server] Starting services in dependency order: ["pingora-gateway"]
+[2026-08-07T12:41:30Z INFO  pingora_core::server] Starting service: pingora-gateway
+[2026-08-07T12:41:30Z INFO  pingora::gateway] client=0.0.0.0 method=GET uri=/pingora-ready status=204 elapsed_ms=0
+[2026-08-07T12:41:30Z INFO  pingora::gateway] client=127.0.0.1 method=GET uri=/headers status=200 elapsed_ms=42
+[2026-08-07T12:41:30Z INFO  pingora::gateway] client=127.0.0.1 method=POST uri=/post status=200 elapsed_ms=53
+[2026-08-07T12:41:30Z INFO  pingora::gateway] client=127.0.0.1 method=GET uri=/reuse status=200 elapsed_ms=44
+[2026-08-07T12:41:31Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC connection closed
+[2026-08-07T12:41:32Z INFO  pingora::upstream_h3] upstream HTTP/3 early-data request sent stream=0 request_id=4
+[2026-08-07T12:41:32Z INFO  pingora::upstream_h3] upstream HTTP/3 established upstream=origin peer=127.0.0.1:28443 resumed=true early_data_enabled=true hybrid_pq=X25519MLKEM768:X25519:P-256
+[2026-08-07T12:41:32Z INFO  pingora::upstream_h3] upstream HTTP/3 session ticket cached upstream=origin
+[2026-08-07T12:41:32Z INFO  pingora::gateway] client=127.0.0.1 method=GET uri=/zero-rtt status=200 elapsed_ms=42
+[2026-08-07T12:41:33Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC connection closed
+[2026-08-07T12:41:45Z INFO  pingora_core::server] SIGTERM received, gracefully exiting
+[2026-08-07T12:41:45Z INFO  pingora_core::server] Broadcasting graceful shutdown
+[2026-08-07T12:41:45Z INFO  pingora_core::server] Graceful shutdown started!
+[2026-08-07T12:41:45Z INFO  pingora_core::server] Broadcast graceful shutdown complete
+[2026-08-07T12:41:45Z INFO  pingora_core::services::listening] Shutting down /tmp/pingora-upstream-http3/front-health.sock
+[2026-08-07T12:41:45Z INFO  pingora_core::server] Graceful shutdown: grace period 0s starts
+[2026-08-07T12:41:45Z INFO  pingora_core::server] Graceful shutdown: grace period ends
+[2026-08-07T12:41:45Z INFO  pingora_core::server] Waiting for runtimes to exit!
+[2026-08-07T12:41:45Z INFO  pingora_core::services::listening] Shutting down 127.0.0.1:38081
+[2026-08-07T12:41:45Z INFO  pingora_core::server] Waiting for service runtime pingora-gateway to exit
+[2026-08-07T12:41:45Z INFO  pingora_core::server] service 'pingora-gateway' exited.
+[2026-08-07T12:41:47Z INFO  pingora_core::server] All runtimes exited, exiting now
+===== fallback.log FILTERED =====
+[2026-08-07T12:41:32Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:33Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:33Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:33Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:33Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:33Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:33Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:33Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:33Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:33Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:33Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:34Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:34Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:34Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:34Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:34Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:34Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:34Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:34Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:34Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:34Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:35Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:35Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:35Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:35Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:35Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:35Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:35Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:35Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:35Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:36Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:36Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:36Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:36Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:36Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:36Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:36Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:36Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:36Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:36Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:37Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:37Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:37Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:37Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:37Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:37Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:37Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:37Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:37Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:37Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:38Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:38Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:38Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:38Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:38Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:38Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:38Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:38Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:38Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:38Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:39Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:39Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:39Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:39Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:39Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:39Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:39Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:39Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:39Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z INFO  pingora_core::services::listening] Shutting down /tmp/pingora-upstream-http3/fallback-health.sock
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:45Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+===== fallback.log TAIL =====
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:40Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:41Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:42Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z INFO  pingora_core::server] SIGTERM received, gracefully exiting
+[2026-08-07T12:41:43Z INFO  pingora_core::server] Broadcasting graceful shutdown
+[2026-08-07T12:41:43Z INFO  pingora_core::server] Graceful shutdown started!
+[2026-08-07T12:41:43Z INFO  pingora_core::server] Broadcast graceful shutdown complete
+[2026-08-07T12:41:43Z INFO  pingora_core::services::listening] Shutting down 127.0.0.1:38082
+[2026-08-07T12:41:43Z INFO  pingora_core::server] Graceful shutdown: grace period 0s starts
+[2026-08-07T12:41:43Z INFO  pingora_core::server] Graceful shutdown: grace period ends
+[2026-08-07T12:41:43Z INFO  pingora_core::server] Waiting for runtimes to exit!
+[2026-08-07T12:41:43Z INFO  pingora_core::services::listening] Shutting down /tmp/pingora-upstream-http3/fallback-health.sock
+[2026-08-07T12:41:43Z INFO  pingora_core::server] Waiting for service runtime pingora-gateway to exit
+[2026-08-07T12:41:43Z INFO  pingora_core::server] service 'pingora-gateway' exited.
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:43Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:44Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:45Z WARN  pingora::upstream_h3] upstream HTTP/3 connection stopped upstream=origin: upstream QUIC UDP send failed: Connection refused (os error 111)
+[2026-08-07T12:41:45Z INFO  pingora_core::server] All runtimes exited, exiting now
+===== backend.log FILTERED =====
+===== backend.log TAIL =====
