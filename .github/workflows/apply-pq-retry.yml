@@ -31,6 +31,7 @@ jobs:
       - name: Apply hybrid PQ and QUIC hardening
         run: |
           python3 scripts/implement_pq_retry.py
+          python3 scripts/fix_pq_retry_validation.py
           cargo fmt --all
           git diff --check
 
@@ -46,7 +47,7 @@ jobs:
         run: |
           set -euxo pipefail
           git checkout HEAD -- .github/workflows/apply-pq-retry.yml
-          git rm scripts/implement_pq_retry.py
+          git rm scripts/implement_pq_retry.py scripts/fix_pq_retry_validation.py
           git diff --check
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
