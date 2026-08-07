@@ -31,6 +31,7 @@ jobs:
       - name: Apply QUIC socket offload and fast shutdown
         run: |
           python3 scripts/apply_quic_offload_shutdown.py
+          cargo update -p tokio-quiche --precise 0.19.1
           cargo fmt --all
           git diff --check
 
@@ -43,6 +44,8 @@ jobs:
           grep -F 'STOPSIGNAL SIGTERM' Dockerfile
           grep -F 'apply_max_capabilities();' src/http3.rs
           grep -F 'listen_with_capabilities' src/http3.rs
+          cargo tree -p tokio-quiche --depth 0 | grep -F 'tokio-quiche v0.19.1'
+          cargo tree -p quiche --depth 0 | grep -F 'quiche v0.29.3'
           docker compose config --quiet
 
       - name: Verify Rust and protocol behavior
