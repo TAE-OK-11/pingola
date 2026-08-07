@@ -1,0 +1,62 @@
+name: diagnose-upstream-http3
+
+on:
+  pull_request:
+    branches: [agent/quiche-http3]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: diagnose-upstream-http3-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    if: github.event.pull_request.head.ref == 'agent/upstream-http3' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: agent/upstream-http3
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes -qq clang cmake jq libcap2-bin libclang-dev ninja-build openssl perl pkg-config >/dev/null
+          rustup toolchain install 1.97.1 --profile minimal >/dev/null 2>&1
+
+      - name: Run compact runtime diagnostic
+        shell: bash
+        run: |
+          set -uo pipefail
+          python3 scripts/apply_upstream_h3_zero_rtt.py
+          cargo fmt --all
+          if ! cargo build --quiet --locked; then
+            echo 'BUILD_FAILED' > runtime-diagnostics.txt
+          else
+            sudo setcap cap_net_bind_service=+ep target/debug/pingora
+            if bash -x tests/upstream_http3.sh >/tmp/upstream-http3-test.out 2>&1; then
+              echo 'RUNTIME_TEST_PASSED' > runtime-diagnostics.txt
+            else
+              {
+                echo 'RUNTIME_TEST_FAILED'
+                echo '===== TEST TRACE TAIL ====='
+                tail -n 120 /tmp/upstream-http3-test.out || true
+                for file in origin front fallback backend; do
+                  echo "===== ${file}.log FILTERED ====="
+                  grep -Ei 'HTTP/3|early|session|resum|error|warn|failed|fallback|proxy error|connection stopped|established|bridge' "/tmp/pingora-upstream-http3/${file}.log" | tail -n 120 || true
+                  echo "===== ${file}.log TAIL ====="
+                  tail -n 60 "/tmp/pingora-upstream-http3/${file}.log" || true
+                done
+              } > runtime-diagnostics.txt
+            fi
+          fi
+          git checkout HEAD -- src/upstream_h3.rs
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add runtime-diagnostics.txt
+          git commit -m 'ci: capture upstream HTTP3 runtime diagnostics'
+          git push origin HEAD:agent/upstream-http3
