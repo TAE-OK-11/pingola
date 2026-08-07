@@ -162,6 +162,7 @@ async fn run(
 ) -> Result<()> {
     let server = &runtime.config.server;
     let allow_early_data = server.http3_enable_early_data;
+    let stateless_retry = server.http3_stateless_retry;
     let certificate = server
         .certificate
         .as_deref()
@@ -232,8 +233,10 @@ async fn run(
     quic.max_path_challenge_recv_queue_len = 1;
     quic.grease = true;
     // Stateless Retry proves source-address ownership before the server allocates
-    // a full QUIC connection and starts expensive TLS work.
-    quic.disable_client_ip_validation = false;
+    // a full QUIC connection and starts expensive TLS work. Keep it enabled by
+    // default for public listeners; trusted private origins may explicitly turn
+    // it off to permit true accepted 0-RTT without a Retry round trip.
+    quic.disable_client_ip_validation = !stateless_retry;
     quic.max_amplification_factor = HTTP3_MAX_AMPLIFICATION_FACTOR;
 
     let params = ConnectionParams::new_server(
@@ -344,11 +347,12 @@ async fn run(
     }
 
     info!(
-        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} hybrid_pq={} stateless_retry=true max_amplification={} early_data={} migration=false pmtud=true pacing=true socket_offload=auto[gso,gro,so_txtime,rxq_ovfl,pmtu_probe] max_udp_payload={} send_capacity_factor={} admission_rate={}/s burst={} max_connections_per_ip={} handshake_timeout={}s",
+        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} hybrid_pq={} stateless_retry={} max_amplification={} early_data={} migration=false pmtud=true pacing=true socket_offload=auto[gso,gro,so_txtime,rxq_ovfl,pmtu_probe] max_udp_payload={} send_capacity_factor={} admission_rate={}/s burst={} max_connections_per_ip={} handshake_timeout={}s",
         server.http3_listen,
         internal,
         tokio_quiche::quiche::PROTOCOL_VERSION,
         HYBRID_PQ_GROUPS,
+        stateless_retry,
         HTTP3_MAX_AMPLIFICATION_FACTOR,
         allow_early_data,
         HTTP3_MAX_UDP_PAYLOAD_SIZE,

@@ -139,6 +139,8 @@ pub struct ServerConfig {
     pub http3_handshake_timeout_seconds: u64,
     #[serde(default)]
     pub http3_enable_early_data: bool,
+    #[serde(default = "default_true")]
+    pub http3_stateless_retry: bool,
     #[serde(default = "default_http3_connection_rate_per_second")]
     pub http3_connection_rate_per_second: f64,
     #[serde(default = "default_http3_connection_burst")]

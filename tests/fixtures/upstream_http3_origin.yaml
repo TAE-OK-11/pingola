@@ -10,6 +10,9 @@ server:
   http3_max_idle_timeout_seconds: 1
   http3_max_concurrent_streams: 32
   http3_enable_early_data: true
+  # This fixture models a trusted private origin. Public listeners keep the
+  # default Retry protection enabled; private origin 0-RTT explicitly opts out.
+  http3_stateless_retry: false
   downstream_max_connections: 128
   certificate: /tmp/pingora-upstream-http3/cert.pem
   private_key: /tmp/pingora-upstream-http3/key.pem

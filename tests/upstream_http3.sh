@@ -116,23 +116,23 @@ zero_rtt_get=$(curl --noproxy '*' -fsS -H 'host: front.test' \
 jq -e '.method == "GET" and .path == "/zero-rtt"' <<<"${zero_rtt_get}" >/dev/null
 
 for _ in {1..100}; do
-  if grep -q 'upstream HTTP/3 early-data request sent upstream=origin' "${FRONT_LOG}" \
+  if grep -q 'upstream HTTP/3 early-data request sent stream=' "${FRONT_LOG}" \
     && grep -q 'HTTP/3 early-data request accepted' "${ORIGIN_LOG}"; then
     break
   fi
   sleep 0.1
 done
-grep -q 'upstream HTTP/3 early-data request sent upstream=origin' "${FRONT_LOG}"
+grep -q 'upstream HTTP/3 early-data request sent stream=' "${FRONT_LOG}"
 grep -q 'HTTP/3 early-data request accepted' "${ORIGIN_LOG}"
 grep -q 'upstream HTTP/3 established upstream=origin peer=127.0.0.1:28443 resumed=true' "${FRONT_LOG}"
 
-early_before=$(grep -c 'upstream HTTP/3 early-data request sent upstream=origin' "${FRONT_LOG}" || true)
+early_before=$(grep -c 'upstream HTTP/3 early-data request sent stream=' "${FRONT_LOG}" || true)
 sleep 2
 safe_post=$(curl --noproxy '*' -fsS -H 'host: front.test' \
   --data-binary 'must-wait-for-1rtt' \
   http://127.0.0.1:38081/not-early)
 jq -e '.method == "POST" and .body_length > 0' <<<"${safe_post}" >/dev/null
-early_after=$(grep -c 'upstream HTTP/3 early-data request sent upstream=origin' "${FRONT_LOG}" || true)
+early_after=$(grep -c 'upstream HTTP/3 early-data request sent stream=' "${FRONT_LOG}" || true)
 [[ "${early_after}" -eq "${early_before}" ]]
 
 # Preferred mode points at a TCP/TLS listener where no UDP listener exists.

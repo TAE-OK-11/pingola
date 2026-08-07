@@ -12,6 +12,7 @@ server:
   http3_max_idle_timeout_seconds: 60
   http3_max_concurrent_streams: 64
   http3_enable_early_data: false
+  http3_stateless_retry: true
   certificate: /etc/pingora/cert/live/tae00217.cloud/fullchain.pem
   private_key: /etc/pingora/cert/live/tae00217.cloud/privkey.pem
   threads: 1

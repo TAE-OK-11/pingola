@@ -353,14 +353,33 @@ async fn pool_manager(
     available: Arc<AtomicBool>,
 ) {
     let session = Arc::new(Mutex::new(None::<Vec<u8>>));
+    let mut connected_once = false;
     loop {
-        let resumed = session.lock().is_some();
-        if resumed && settings.enable_early_data {
-            // A request entering the local bridge now can be queued and emitted
-            // as soon as BoringSSL enters early-data state, before 1-RTT completes.
+        // After a session ticket exists, do not burn the 0-RTT opportunity by
+        // reconnecting before there is application data to send. Mark the
+        // bridge selectable and wait for one request; run_connection queues it
+        // before the first QUIC flight so a replay-safe GET/HEAD can ride 0-RTT.
+        let can_resume_early =
+            connected_once && settings.enable_early_data && session.lock().is_some();
+        let initial_command = if can_resume_early {
             available.store(true, Ordering::Release);
-        }
-        let result = run_connection(&settings, &session, &mut commands, available.clone()).await;
+            match commands.recv().await {
+                Some(command) => Some(command),
+                None => return,
+            }
+        } else {
+            None
+        };
+
+        let result = run_connection(
+            &settings,
+            &session,
+            &mut commands,
+            available.clone(),
+            initial_command,
+        )
+        .await;
+        connected_once = true;
         available.store(false, Ordering::Release);
         if commands.is_closed() {
             return;
@@ -380,6 +399,7 @@ async fn run_connection(
     session: &Arc<Mutex<Option<Vec<u8>>>>,
     commands: &mut mpsc::Receiver<Command>,
     available: Arc<AtomicBool>,
+    initial_command: Option<Command>,
 ) -> Result<()> {
     let bind = if settings.origin.is_ipv4() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
@@ -458,6 +478,18 @@ async fn run_connection(
     let mut send_buf = vec![0_u8; 64 * 1024];
     let handshake_deadline = Instant::now() + settings.connect_timeout;
     let mut established_logged = false;
+    let mut session_logged = false;
+
+    if let Some(command) = initial_command {
+        handle_command(
+            command,
+            h3_conn.as_mut(),
+            &mut conn,
+            &mut requests,
+            &mut stream_to_request,
+            &mut waiting,
+        )?;
+    }
 
     loop {
         if conn.is_closed() {
@@ -494,6 +526,13 @@ async fn run_connection(
                 let mut cache = session.lock();
                 if cache.as_deref() != Some(new_session) {
                     *cache = Some(new_session.to_vec());
+                    if !session_logged {
+                        info!(
+                            "upstream HTTP/3 session ticket cached upstream={}",
+                            settings.name
+                        );
+                        session_logged = true;
+                    }
                 }
             }
         }
@@ -643,6 +682,12 @@ fn dispatch_waiting(
             Ok(stream_id) => {
                 request.stream_id = Some(stream_id);
                 request.sent_in_early_data = in_early_data;
+                if in_early_data {
+                    info!(
+                        "upstream HTTP/3 early-data request sent stream={} request_id={}",
+                        stream_id, id
+                    );
+                }
                 stream_to_request.insert(stream_id, id);
                 if let Some(opened) = request.opened.take() {
                     let _ = opened.send(Ok(()));
