@@ -44,8 +44,8 @@ jobs:
           cargo clippy --all-targets --locked -- -D warnings
           cargo build --locked
           sudo setcap cap_net_bind_service=+ep target/debug/pingora
-          tests/upstream_http3.sh
-          tests/http3.sh
+          bash tests/upstream_http3.sh
+          bash tests/http3.sh
 
       - name: Commit verified runtime changes
         run: |
