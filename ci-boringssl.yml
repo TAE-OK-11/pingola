@@ -1,0 +1,296 @@
+name: verify-and-publish
+
+concurrency:
+  group: pingora-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_images:
+        description: Publish production images
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: RustSec dependency audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install build and test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake jq libcap2-bin nghttp2-client ninja-build openssl perl
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          rustup show active-toolchain
+      - name: PGO trainer preflight
+        run: |
+          bash -n bench/pgo_train.sh
+          bash -n bench/pgo_train_h3.sh
+          bash -n bench/pgo_compare_three.sh
+          rustc --edition=2024 -D warnings bench/backend.rs -o /tmp/pgo-backend
+          rustc --edition=2024 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Verify unified Cloudflare BoringSSL provider
+        run: |
+          cargo tree --locked > /tmp/cargo-tree.txt
+          cargo tree --locked -p pingora-boringssl@0.8.1 > /tmp/pingora-tls-tree.txt
+          cargo tree --locked -p tokio-quiche@0.19.1 > /tmp/http3-tls-tree.txt
+          cargo tree --locked -i boring@4.22.0 > /tmp/boring-reverse-tree.txt
+          grep -q 'pingora-boringssl v0.8.1' /tmp/cargo-tree.txt
+          grep -q 'quiche v0.29.3' /tmp/http3-tls-tree.txt
+          grep -q 'boring v4.22.0' /tmp/pingora-tls-tree.txt
+          grep -q 'boring-sys v4.22.0' /tmp/pingora-tls-tree.txt
+          grep -q 'boring v4.22.0' /tmp/http3-tls-tree.txt
+          grep -q 'boring-sys v4.22.0' /tmp/http3-tls-tree.txt
+          grep -q 'pingora-boringssl v0.8.1' /tmp/boring-reverse-tree.txt
+          grep -Eq '(quiche v0.29.3|tokio-quiche v0.19.1)' /tmp/boring-reverse-tree.txt
+          ! grep -Eiq '(^|[[:space:]])(boringssl-rs|boringssl-sys|rustls) v' /tmp/cargo-tree.txt
+          ! cargo tree --locked -d | grep -E '^(boring|boring-sys) v'
+      - name: Unit tests
+        run: cargo test --all-targets --locked
+      - name: Build integration-test binary
+        run: |
+          cargo build --locked
+          sudo setcap cap_net_bind_service=+ep target/debug/pingora
+      - name: Lints
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Allocator fallback builds
+        run: |
+          cargo check --all-targets --locked --no-default-features --features system-allocator,tls-boringssl
+          cargo check --all-targets --locked --no-default-features --features jemalloc,tls-boringssl
+      - name: Protocol and security integration checks
+        run: |
+          sudo tests/runtime_preflight.sh
+          tests/listeners_health.sh
+          tests/retries.sh
+          tests/limit_isolation.sh
+          tests/static_global_limit.sh
+          tests/service_matrix.sh
+          tests/integration.sh
+          tests/http2_matrix.sh
+      - name: Real QUIC, HTTP/3, and h2c bridge integration
+        run: tests/http3.sh
+
+  image-test:
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.publish_images != true)
+    needs: [audit, verify]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_cpu: x86-64-v2
+            runtime: true
+          - target_cpu: znver1
+            runtime: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Build image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          load: true
+          tags: pingora:ci-${{ matrix.target_cpu }}
+          pull: true
+          build-args: |
+            ALLOCATOR=tcmalloc
+            TLS_PROVIDER=boringssl
+            PGO_MODE=train
+            PGO_TRAIN_TARGET_CPU=x86-64-v2
+            PGO_WEIGHT_H1=60
+            PGO_WEIGHT_H2=160
+            PGO_WEIGHT_H3=100
+            PGO_WEIGHT_TLS=15
+            PGO_WEIGHT_TAIL=30
+            RUST_TARGET_CPU=${{ matrix.target_cpu }}
+            RUST_LTO=fat
+            BUILD_VERSION=ci
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=image-test-${{ matrix.target_cpu }}
+          cache-to: type=gha,mode=max,scope=image-test-${{ matrix.target_cpu }}
+      - name: Runtime checks
+        if: matrix.runtime
+        env:
+          PINGORA_TEST_IMAGE: pingora:ci-${{ matrix.target_cpu }}
+          PINGORA_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
+          PINGORA_EXPECTED_LTO: fat
+          PINGORA_EXPECTED_TLS_PROVIDER: boringssl
+          PINGORA_EXPECTED_PGO: train
+        run: tests/docker_runtime.sh
+      - name: Specialized image metadata check
+        if: ${{ !matrix.runtime }}
+        env:
+          IMAGE: pingora:ci-${{ matrix.target_cpu }}
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' "${IMAGE}")" = "10001:10001"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.target-cpu"]')" = "znver1"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator"]')" = "tcmalloc"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.http3.provider"]')" = "quiche"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo-weight-h3"]')" = "100"
+
+  publish-pr:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [audit, verify, image-test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_cpu: x86-64-v2
+            suffix: ""
+          - target_cpu: znver1
+            suffix: -znver1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Sign in to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: PR image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: |
+            ghcr.io/tae-ok-11/pingora
+            ghcr.io/tae-ok-11/pingola
+          tags: |
+            type=raw,value=pr-${{ github.event.pull_request.number }}${{ matrix.suffix }}
+            type=sha,prefix=sha-,suffix=${{ matrix.suffix }}
+          labels: |
+            org.opencontainers.image.title=JBS Pingora PR ${{ github.event.pull_request.number }}
+            org.opencontainers.image.description=Cloudflare BoringSSL TLS, Quiche HTTP/3, and h2c internal bridge
+            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
+            org.opencontainers.image.allocator=tcmalloc
+            org.opencontainers.image.tls.provider=boringssl
+            org.opencontainers.image.http3.provider=quiche
+            org.opencontainers.image.http3.internal-protocol=h2c
+      - name: Build and publish verified PR image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ALLOCATOR=tcmalloc
+            TLS_PROVIDER=boringssl
+            PGO_MODE=train
+            PGO_TRAIN_TARGET_CPU=x86-64-v2
+            PGO_WEIGHT_H1=60
+            PGO_WEIGHT_H2=160
+            PGO_WEIGHT_H3=100
+            PGO_WEIGHT_TLS=15
+            PGO_WEIGHT_TAIL=30
+            RUST_TARGET_CPU=${{ matrix.target_cpu }}
+            RUST_LTO=fat
+            BUILD_VERSION=pr-${{ github.event.pull_request.number }}${{ matrix.suffix }}
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=image-test-${{ matrix.target_cpu }}
+          cache-to: type=gha,mode=max,scope=image-pr-${{ matrix.target_cpu }}
+          provenance: mode=max
+          sbom: true
+
+  publish:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_images)
+    needs: [audit, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    strategy:
+      matrix:
+        include:
+          - target_cpu: x86-64-v2
+            suffix: ""
+          - target_cpu: znver1
+            suffix: -znver1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Sign in to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: |
+            ghcr.io/tae-ok-11/pingora
+            ghcr.io/tae-ok-11/pingola
+          tags: |
+            type=raw,value=latest${{ matrix.suffix }},enable={{is_default_branch}}
+            type=sha,prefix=sha-,suffix=${{ matrix.suffix }}
+            type=semver,pattern={{version}},suffix=${{ matrix.suffix }}
+          labels: |
+            org.opencontainers.image.title=JBS Pingora
+            org.opencontainers.image.description=Cloudflare BoringSSL TLS, Quiche HTTP/3, and h2c internal bridge
+            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
+            org.opencontainers.image.allocator=tcmalloc
+            org.opencontainers.image.tls.provider=boringssl
+            org.opencontainers.image.http3.provider=quiche
+            org.opencontainers.image.http3.internal-protocol=h2c
+      - name: Build and publish
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ALLOCATOR=tcmalloc
+            TLS_PROVIDER=boringssl
+            PGO_MODE=train
+            PGO_TRAIN_TARGET_CPU=x86-64-v2
+            PGO_WEIGHT_H1=60
+            PGO_WEIGHT_H2=160
+            PGO_WEIGHT_H3=100
+            PGO_WEIGHT_TLS=15
+            PGO_WEIGHT_TAIL=30
+            RUST_TARGET_CPU=${{ matrix.target_cpu }}
+            RUST_LTO=fat
+            BUILD_VERSION=${{ steps.meta.outputs.version }}${{ matrix.suffix }}
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=image-${{ matrix.target_cpu }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.target_cpu }}
+          provenance: mode=max
+          sbom: true
