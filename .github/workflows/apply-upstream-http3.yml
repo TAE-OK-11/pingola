@@ -31,12 +31,14 @@ jobs:
       - name: Apply upstream HTTP3 integration
         run: |
           python3 scripts/apply_upstream_h3.py
+          cargo generate-lockfile
           cargo fmt --all
           git diff --check
-          git diff --exit-code -- Cargo.lock
           grep -F 'Http3Preferred' src/config.rs >/dev/null
           grep -F 'mod upstream_h3;' src/main.rs >/dev/null
           grep -F 'http3_enable_early_data' src/http3.rs >/dev/null
+          grep -F 'tokio-quiche' Cargo.lock >/dev/null
+          grep -F 'quiche' Cargo.lock >/dev/null
 
       - name: Verify Rust implementation
         run: |
