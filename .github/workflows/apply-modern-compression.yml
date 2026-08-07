@@ -65,6 +65,7 @@ jobs:
           cargo clippy --all-targets --locked -- -D warnings
           cargo check --all-targets --locked --no-default-features --features system-allocator,tls-boringssl
           cargo check --all-targets --locked --no-default-features --features jemalloc,tls-boringssl
+          cargo build --locked
           sudo setcap cap_net_bind_service=+ep target/debug/pingora
           tests/service_matrix.sh
           tests/integration.sh
