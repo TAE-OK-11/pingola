@@ -27,7 +27,8 @@ jobs:
           python3 scripts/materialize_boringssl_ci.py
           grep -q 'Verify unified Cloudflare BoringSSL provider' ci-boringssl.yml
           grep -q 'TLS_PROVIDER=boringssl' ci-boringssl.yml
-          ! grep -Eq 'AWS-LC|aws-lc|tls-aws-lc|pingora-rustls' ci-boringssl.yml
+          grep -q 'aws-lc-rs|aws-lc-sys|rustls' ci-boringssl.yml
+          ! grep -Eq 'TLS_PROVIDER=aws-lc|PINGORA_EXPECTED_TLS_PROVIDER: aws-lc|tls-aws-lc|pingora-rustls' ci-boringssl.yml
 
       - name: Commit materialized workflow
         run: |
