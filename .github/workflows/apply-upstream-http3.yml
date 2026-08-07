@@ -61,3 +61,5 @@ jobs:
           git add -A
           git commit -m 'feat(http3): add upstream QUIC and replay-safe 0-RTT'
           git push origin HEAD:agent/upstream-http3
+
+# Re-trigger only: replace a stalled hosted runner without touching product code.
