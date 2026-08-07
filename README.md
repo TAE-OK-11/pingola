@@ -89,10 +89,11 @@ docker compose ps
 ```
 
 기본 Compose는 기존 `10.77.0.1` 및 localhost upstream 접근을 위해 host network를
-사용합니다. 같은 호스트의 80/tcp와 443/tcp가 비어 있어야 합니다. Compose의
-`stop_grace_period: 65s`는 기본 60초 graceful drain보다 길게 잡혀 Docker가 재생 중인
-stream을 10초 기본 timeout으로 강제 종료하지 않게 하며, file descriptor limit은
-32,768, process/thread 수는 256으로 명시해 자원 증가를 bounded 상태로 유지합니다.
+사용합니다. 같은 호스트의 80/tcp와 443/tcp가 비어 있어야 합니다. Compose는 `SIGTERM`을 명시적으로 사용하고 `stop_grace_period: 8s`를 둡니다.
+Pingora는 새 연결을 즉시 받지 않은 뒤 기본 5초 동안만 in-flight 요청을 graceful drain하므로
+이미지 업데이트가 60초씩 지연되지 않습니다. 8초는 Pingora drain 뒤 정리할 여유를 주며,
+file descriptor limit은 32,768, process/thread 수는 256으로 명시해 자원 증가를 bounded
+상태로 유지합니다.
 
 Let's Encrypt의 `live/<domain>/*.pem`은 실제 파일이 아니라
 `archive/<domain>/*N.pem`을 가리키는 symlink입니다. `live` directory나 PEM

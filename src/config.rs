@@ -78,7 +78,9 @@ fn default_legacy_health_endpoint() -> bool {
 }
 
 fn default_graceful_shutdown() -> u64 {
-    60
+    // Container replacement should stop accepting new work immediately and only
+    // spend a short bounded interval draining in-flight requests.
+    5
 }
 
 fn default_body_limit() -> usize {
