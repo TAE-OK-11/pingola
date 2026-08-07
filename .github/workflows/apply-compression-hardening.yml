@@ -1,0 +1,61 @@
+name: apply-compression-hardening
+
+on:
+  pull_request:
+    branches: [agent/quiche-http3]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: compression-hardening-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  harden-and-verify:
+    if: github.event.pull_request.head.ref == 'agent/default-modern-compression' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: agent/default-modern-compression
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake libcap2-bin libclang-dev ninja-build openssl perl pkg-config
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+
+      - name: Apply security exceptions
+        run: |
+          python3 scripts/harden_compression_policy.py
+          cargo fmt --all
+          git diff --check
+          git diff --exit-code -- Cargo.lock
+          grep -F 'RouteClass::Vaultwarden | RouteClass::Couchdb | RouteClass::AdguardUi' src/gateway.rs
+          grep -F 'RouteClass::VaultwardenAuth' src/gateway.rs >/dev/null
+          grep -F 'notifications/WebSocket Hub' README.md >/dev/null
+
+      - name: Verify behavior
+        run: |
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo build --locked
+          sudo setcap cap_net_bind_service=+ep target/debug/pingora
+          tests/service_matrix.sh
+          tests/integration.sh
+          tests/http3.sh
+
+      - name: Commit verified hardening
+        run: |
+          set -euxo pipefail
+          git checkout HEAD -- .github/workflows/apply-compression-hardening.yml
+          git rm scripts/harden_compression_policy.py
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'security(compression): exclude sensitive Vaultwarden routes'
+          git push origin HEAD:agent/default-modern-compression
