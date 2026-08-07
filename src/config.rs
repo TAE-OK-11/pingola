@@ -45,6 +45,22 @@ fn default_http3_max_concurrent_streams() -> u32 {
     64
 }
 
+fn default_http3_handshake_timeout() -> u64 {
+    5
+}
+
+fn default_http3_connection_rate_per_second() -> f64 {
+    64.0
+}
+
+fn default_http3_connection_burst() -> u32 {
+    128
+}
+
+fn default_http3_max_connections_per_ip() -> usize {
+    128
+}
+
 fn default_downstream_max_connections() -> usize {
     4096
 }
@@ -113,6 +129,14 @@ pub struct ServerConfig {
     pub http3_max_idle_timeout_seconds: u64,
     #[serde(default = "default_http3_max_concurrent_streams")]
     pub http3_max_concurrent_streams: u32,
+    #[serde(default = "default_http3_handshake_timeout")]
+    pub http3_handshake_timeout_seconds: u64,
+    #[serde(default = "default_http3_connection_rate_per_second")]
+    pub http3_connection_rate_per_second: f64,
+    #[serde(default = "default_http3_connection_burst")]
+    pub http3_connection_burst: u32,
+    #[serde(default = "default_http3_max_connections_per_ip")]
+    pub http3_max_connections_per_ip: usize,
     #[serde(default)]
     pub certificate: Option<PathBuf>,
     #[serde(default)]
@@ -354,6 +378,20 @@ fn validate(config: &Config) -> Result<()> {
     }
     if !(1..=600).contains(&config.server.http3_max_idle_timeout_seconds) {
         bail!("server.http3_max_idle_timeout_seconds must be between 1 and 600");
+    }
+    if !(1..=30).contains(&config.server.http3_handshake_timeout_seconds) {
+        bail!("server.http3_handshake_timeout_seconds must be between 1 and 30");
+    }
+    if !config.server.http3_connection_rate_per_second.is_finite()
+        || !(0.1..=100_000.0).contains(&config.server.http3_connection_rate_per_second)
+    {
+        bail!("server.http3_connection_rate_per_second must be finite and between 0.1 and 100000");
+    }
+    if config.server.http3_connection_burst > 100_000 {
+        bail!("server.http3_connection_burst must not exceed 100000");
+    }
+    if !(1..=1_000_000).contains(&config.server.http3_max_connections_per_ip) {
+        bail!("server.http3_max_connections_per_ip must be between 1 and 1000000");
     }
     if !(1..=1_000_000).contains(&config.server.downstream_max_connections) {
         bail!("server.downstream_max_connections must be between 1 and 1000000");

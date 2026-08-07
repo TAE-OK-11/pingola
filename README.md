@@ -560,3 +560,8 @@ curl --fail http://127.0.0.1/nginx-health
 
 Apache-2.0. Vendored Pingora rustls adapter는 원본 Cloudflare 저작권과 라이선스를
 보존합니다.
+
+
+## Hybrid post-quantum TLS and QUIC admission hardening
+
+JBS Pingora prefers `X25519MLKEM768` for TLS 1.3 on both TCP and QUIC, with `X25519` and `P-256` retained as compatibility fallbacks. QUIC source-address validation is mandatory, so new clients complete a stateless Retry before a full connection is allocated. The server also enforces the QUIC 3x anti-amplification bound, disables 0-RTT and active migration, applies a bounded handshake timeout, and limits new/active QUIC connections per source IP. The defaults are 64 new connections/s with a burst of 128, at most 128 active QUIC connections per IP, and a 5-second QUIC handshake timeout.

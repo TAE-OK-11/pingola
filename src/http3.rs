@@ -7,6 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use boring::ssl::{SslContextBuilder, SslFiletype};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt, stream};
 use http::header::{CONNECTION, HOST, TE, TRAILER, TRANSFER_ENCODING, UPGRADE};
@@ -26,11 +27,14 @@ use tokio_quiche::http3::driver::{
 };
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::metrics::DefaultMetrics;
+use tokio_quiche::quic::ConnectionHook;
 use tokio_quiche::quiche::h3::{self, NameValue};
 use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
 use tokio_quiche::{ConnectionParams, ServerH3Driver, listen};
 
 use crate::config::RuntimeConfig;
+use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, RateLimiter};
+use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
 
 const INTERNAL_MARKER: &str = "x-jbs-http3-internal";
 const INTERNAL_PORT: &str = "x-jbs-http3-port";
@@ -38,10 +42,83 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP3_MAX_UDP_PAYLOAD_SIZE: usize = 1452;
 const HTTP3_CONTROL_STREAM_LIMIT: u64 = 8;
 const HTTP3_SEND_CAPACITY_FACTOR: f64 = 2.0;
+const HTTP3_MAX_AMPLIFICATION_FACTOR: usize = 3;
+const HTTP3_ADMISSION_ZONE: &str = "http3-connection";
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 type ProxyClient = Client<HttpConnector, ProxyBody>;
+
+#[derive(Debug)]
+struct HybridPqQuicTlsHook;
+
+impl ConnectionHook for HybridPqQuicTlsHook {
+    fn create_custom_ssl_context_builder(
+        &self,
+        settings: TlsCertificatePaths<'_>,
+    ) -> Option<SslContextBuilder> {
+        Some(
+            build_hybrid_pq_quic_context(settings.cert, settings.private_key).unwrap_or_else(
+                |error| panic!("validated HTTP/3 hybrid PQ TLS context became invalid: {error:#}"),
+            ),
+        )
+    }
+}
+
+fn build_hybrid_pq_quic_context(certificate: &str, private_key: &str) -> Result<SslContextBuilder> {
+    let mut builder = new_hybrid_pq_context()
+        .context("failed to create Cloudflare BoringSSL hybrid PQ context")?;
+    builder
+        .set_certificate_chain_file(certificate)
+        .with_context(|| format!("failed to load HTTP/3 certificate chain {certificate}"))?;
+    builder
+        .set_private_key_file(private_key, SslFiletype::PEM)
+        .with_context(|| format!("failed to load HTTP/3 private key {private_key}"))?;
+    builder
+        .check_private_key()
+        .context("HTTP/3 certificate and private key do not match")?;
+    Ok(builder)
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Http3AdmissionRejection {
+    RateLimited,
+    TooManyConnections,
+}
+
+struct Http3Admission {
+    rate: RateLimiter,
+    active: ActiveRequestLimiter,
+    rate_per_second: f64,
+    burst: u32,
+    max_active: usize,
+}
+
+impl Http3Admission {
+    fn new(rate_per_second: f64, burst: u32, max_active: usize) -> Self {
+        Self {
+            rate: RateLimiter::new(),
+            active: ActiveRequestLimiter::new(),
+            rate_per_second,
+            burst,
+            max_active,
+        }
+    }
+
+    fn admit(&self, peer: SocketAddr) -> Result<ActiveRequestPermit, Http3AdmissionRejection> {
+        if !self.rate.allow(
+            HTTP3_ADMISSION_ZONE,
+            peer.ip(),
+            self.rate_per_second,
+            self.burst,
+        ) {
+            return Err(Http3AdmissionRejection::RateLimited);
+        }
+        self.active
+            .acquire(HTTP3_ADMISSION_ZONE, peer.ip(), self.max_active)
+            .ok_or(Http3AdmissionRejection::TooManyConnections)
+    }
+}
 
 pub fn start(runtime: Arc<RuntimeConfig>) -> Result<()> {
     let server = &runtime.config.server;
@@ -98,6 +175,14 @@ async fn run(
         .to_str()
         .ok_or_else(|| anyhow!("HTTP/3 private key path is not valid UTF-8"))?;
 
+    // Build once before binding to guarantee the PQ group and certificate are
+    // accepted. The connection hook repeats the same construction per listener
+    // and fails closed if that invariant unexpectedly changes.
+    drop(
+        build_hybrid_pq_quic_context(certificate, private_key)
+            .context("HTTP/3 hybrid PQ TLS preflight failed")?,
+    );
+
     let mut sockets = Vec::with_capacity(server.http3_listen.len());
     for address in &server.http3_listen {
         let socket = UdpSocket::bind(address)
@@ -111,7 +196,7 @@ async fn run(
     quic.dgram_recv_max_queue_len = 0;
     quic.dgram_send_max_queue_len = 0;
     quic.max_idle_timeout = Some(Duration::from_secs(server.http3_max_idle_timeout_seconds));
-    quic.handshake_timeout = Some(Duration::from_secs(10));
+    quic.handshake_timeout = Some(Duration::from_secs(server.http3_handshake_timeout_seconds));
     quic.listen_backlog = server.downstream_max_connections.min(16_384);
     quic.initial_max_streams_bidi = u64::from(server.http3_max_concurrent_streams);
     quic.initial_max_streams_uni = HTTP3_CONTROL_STREAM_LIMIT;
@@ -123,7 +208,10 @@ async fn run(
     quic.send_capacity_factor = HTTP3_SEND_CAPACITY_FACTOR;
     quic.enable_early_data = false;
     quic.disable_active_migration = true;
+    // Stateless Retry proves source-address ownership before the server allocates
+    // a full QUIC connection and starts expensive TLS work.
     quic.disable_client_ip_validation = false;
+    quic.max_amplification_factor = HTTP3_MAX_AMPLIFICATION_FACTOR;
 
     let params = ConnectionParams::new_server(
         quic,
@@ -132,7 +220,9 @@ async fn run(
             private_key,
             kind: CertificateKind::X509,
         },
-        Hooks::default(),
+        Hooks {
+            connection_hook: Some(Arc::new(HybridPqQuicTlsHook)),
+        },
     );
     let listeners = listen(sockets, params, DefaultMetrics)
         .context("failed to create quiche HTTP/3 listeners")?;
@@ -162,12 +252,18 @@ async fn run(
         .ok_or_else(|| anyhow!("HTTP/3 internal token was not initialized"))?;
     let alt_svc = runtime.http3_alt_svc_header();
     let connection_limit = Arc::new(Semaphore::new(server.downstream_max_connections));
+    let admission = Arc::new(Http3Admission::new(
+        server.http3_connection_rate_per_second,
+        server.http3_connection_burst,
+        server.http3_max_connections_per_ip,
+    ));
 
     for mut listener in listeners {
         let client = client.clone();
         let alt_svc = alt_svc.clone();
         let internal_token = internal_token.clone();
         let connection_limit = connection_limit.clone();
+        let admission = admission.clone();
         tokio::spawn(async move {
             while let Some(connection) = listener.next().await {
                 match connection {
@@ -182,6 +278,21 @@ async fn run(
                             }
                         };
                         let peer = connection.peer_addr();
+                        let client_permit = match admission.admit(peer) {
+                            Ok(permit) => permit,
+                            Err(Http3AdmissionRejection::RateLimited) => {
+                                warn!(
+                                    "HTTP/3 connection rejected: per-IP admission rate exceeded peer={peer}"
+                                );
+                                continue;
+                            }
+                            Err(Http3AdmissionRejection::TooManyConnections) => {
+                                warn!(
+                                    "HTTP/3 connection rejected: per-IP active connection limit reached peer={peer}"
+                                );
+                                continue;
+                            }
+                        };
                         let settings = Http3Settings {
                             max_header_list_size: Some(64 * 1024),
                             ..Http3Settings::default()
@@ -199,6 +310,7 @@ async fn run(
                                 alt_svc: alt_svc.clone(),
                             },
                             permit,
+                            client_permit,
                         ));
                     }
                     Err(error) => warn!("HTTP/3 accept failed: {error}"),
@@ -208,12 +320,18 @@ async fn run(
     }
 
     info!(
-        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} early_data=false migration=false pmtud=true pacing=true max_udp_payload={} send_capacity_factor={}",
+        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} hybrid_pq={} stateless_retry=true max_amplification={} early_data=false migration=false pmtud=true pacing=true max_udp_payload={} send_capacity_factor={} admission_rate={}/s burst={} max_connections_per_ip={} handshake_timeout={}s",
         server.http3_listen,
         internal,
         tokio_quiche::quiche::PROTOCOL_VERSION,
+        HYBRID_PQ_GROUPS,
+        HTTP3_MAX_AMPLIFICATION_FACTOR,
         HTTP3_MAX_UDP_PAYLOAD_SIZE,
         HTTP3_SEND_CAPACITY_FACTOR,
+        server.http3_connection_rate_per_second,
+        server.http3_connection_burst,
+        server.http3_max_connections_per_ip,
+        server.http3_handshake_timeout_seconds,
     );
     let _ = ready.send(Ok(()));
     std::future::pending::<()>().await;
@@ -234,6 +352,7 @@ async fn handle_connection(
     mut controller: ServerH3Controller,
     context: Http3ConnectionContext,
     _connection_permit: OwnedSemaphorePermit,
+    _client_connection_permit: ActiveRequestPermit,
 ) {
     let peer = context.peer;
     while let Some(event) = controller.event_receiver_mut().recv().await {
@@ -560,6 +679,32 @@ async fn send_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hybrid_pq_context_accepts_cloudflare_group_policy() {
+        let mut builder = new_hybrid_pq_context().unwrap();
+        builder.set_curves_list(HYBRID_PQ_GROUPS).unwrap();
+    }
+
+    #[test]
+    fn http3_admission_limits_rate_and_active_connections() {
+        let peer: SocketAddr = "192.0.2.44:443".parse().unwrap();
+
+        let active = Http3Admission::new(10_000.0, 8, 1);
+        let permit = active.admit(peer).unwrap();
+        assert!(matches!(
+            active.admit(peer),
+            Err(Http3AdmissionRejection::TooManyConnections)
+        ));
+        drop(permit);
+
+        let rate = Http3Admission::new(0.1, 0, 8);
+        let _permit = rate.admit(peer).unwrap();
+        assert!(matches!(
+            rate.admit(peer),
+            Err(Http3AdmissionRejection::RateLimited)
+        ));
+    }
 
     #[test]
     fn request_header_decoder_rejects_connection_fields() {

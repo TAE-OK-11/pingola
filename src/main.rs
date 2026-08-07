@@ -6,6 +6,7 @@ mod http3;
 mod limits;
 mod preflight;
 mod static_files;
+mod tls_policy;
 
 use std::fs::{self, Permissions};
 use std::io::{Read, Write};
@@ -32,6 +33,7 @@ use log::info;
 use crate::config::RuntimeConfig;
 use crate::gateway::Gateway;
 use crate::preflight::check_runtime;
+use crate::tls_policy::HYBRID_PQ_GROUPS;
 
 #[cfg(not(feature = "tls-boringssl"))]
 compile_error!("the Cloudflare BoringSSL provider is required: enable tls-boringssl");
@@ -247,6 +249,8 @@ fn enforce_tls13(tls: &mut TlsSettings) -> Result<()> {
         .context("failed to set BoringSSL minimum protocol to TLS 1.3")?;
     tls.set_max_proto_version(Some(SslVersion::TLS1_3))
         .context("failed to set BoringSSL maximum protocol to TLS 1.3")?;
+    tls.set_curves_list(HYBRID_PQ_GROUPS)
+        .context("failed to configure X25519MLKEM768 hybrid post-quantum groups")?;
     Ok(())
 }
 
@@ -357,8 +361,9 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     http3::start(runtime.clone()).context("HTTP/3 frontend startup failed")?;
 
     info!(
-        "starting Pingora with {} TLS 1.3: http={:?} https={:?} http3_udp={:?} http3_internal={} health_socket={} threads={}",
+        "starting Pingora with {} TLS 1.3 hybrid_pq={}: http={:?} https={:?} http3_udp={:?} http3_internal={} health_socket={} threads={}",
         tls_provider_name(),
+        HYBRID_PQ_GROUPS,
         server_config.http_listen,
         server_config.https_listen,
         server_config.http3_listen,
