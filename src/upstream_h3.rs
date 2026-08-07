@@ -1,0 +1,1026 @@
+use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
+use std::error::Error as StdError;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc as std_mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow, bail};
+use bytes::Bytes;
+use futures::{StreamExt, stream};
+use http::header::{CONNECTION, HOST, TE, TRANSFER_ENCODING, UPGRADE};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Empty, StreamBody};
+use hyper::body::{Body as _, Frame, Incoming};
+use hyper::server::conn::http2;
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use log::{info, warn};
+use parking_lot::Mutex;
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::{mpsc, oneshot};
+use tokio_quiche::quiche;
+use tokio_quiche::quiche::h3::{self, NameValue};
+
+use crate::config::{RuntimeConfig, UpstreamConfig, UpstreamProtocol};
+use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
+
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const RECONNECT_DELAY: Duration = Duration::from_millis(100);
+const MAX_UDP_PAYLOAD: usize = 1452;
+const MAX_H3_HEADER_BYTES: u64 = 64 * 1024;
+const MAX_REQUEST_COMMANDS: usize = 256;
+const MAX_BODY_FRAMES: usize = 64;
+const INITIAL_MAX_DATA: u64 = 64 * 1024 * 1024;
+const INITIAL_STREAM_WINDOW: u64 = 16 * 1024 * 1024;
+const H3_CONTROL_STREAMS: u64 = 8;
+const SEND_CAPACITY_FACTOR: f64 = 2.0;
+
+type BoxError = Box<dyn StdError + Send + Sync>;
+type BridgeBody = UnsyncBoxBody<Bytes, BoxError>;
+
+#[derive(Clone)]
+pub struct BridgeRoute {
+    address: SocketAddr,
+    available: Arc<AtomicBool>,
+    forced: bool,
+}
+
+impl BridgeRoute {
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub fn should_use_h3(&self) -> bool {
+        self.forced || self.available.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Default)]
+pub struct UpstreamH3Registry {
+    routes: HashMap<String, BridgeRoute>,
+}
+
+impl UpstreamH3Registry {
+    pub fn route(&self, name: &str) -> Option<&BridgeRoute> {
+        self.routes.get(name)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+}
+
+#[derive(Clone)]
+struct BridgeSettings {
+    name: String,
+    origin: SocketAddr,
+    server_name: String,
+    verify_peer: bool,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+    max_streams: u64,
+    enable_early_data: bool,
+}
+
+struct BridgeSpec {
+    listener: StdTcpListener,
+    settings: BridgeSettings,
+    available: Arc<AtomicBool>,
+}
+
+pub fn start(runtime: Arc<RuntimeConfig>) -> Result<Arc<UpstreamH3Registry>> {
+    let mut routes = HashMap::new();
+    let mut specs = Vec::new();
+
+    for (name, upstream) in &runtime.config.upstreams {
+        if !upstream.protocol.uses_http3() {
+            continue;
+        }
+        if !upstream.tls {
+            bail!("HTTP/3 upstream {name} requires tls: true");
+        }
+
+        let origin = resolve_origin(name, upstream)?;
+        let server_name = upstream_server_name(name, upstream)?;
+        let listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .with_context(|| format!("failed to allocate HTTP/3 bridge listener for {name}"))?;
+        listener
+            .set_nonblocking(true)
+            .with_context(|| format!("failed to make HTTP/3 bridge listener nonblocking for {name}"))?;
+        let address = listener.local_addr()?;
+        let available = Arc::new(AtomicBool::new(false));
+        let forced = upstream.protocol == UpstreamProtocol::Http3;
+
+        routes.insert(
+            name.clone(),
+            BridgeRoute {
+                address,
+                available: available.clone(),
+                forced,
+            },
+        );
+        specs.push(BridgeSpec {
+            listener,
+            settings: BridgeSettings {
+                name: name.clone(),
+                origin,
+                server_name,
+                verify_peer: upstream.verify_certificate,
+                connect_timeout: Duration::from_secs(upstream.connect_timeout_seconds),
+                idle_timeout: Duration::from_secs(upstream.idle_timeout_seconds.max(1)),
+                max_streams: upstream.http3_max_concurrent_streams as u64,
+                enable_early_data: upstream.http3_early_data,
+            },
+            available,
+        });
+    }
+
+    let registry = Arc::new(UpstreamH3Registry { routes });
+    if specs.is_empty() {
+        return Ok(registry);
+    }
+
+    let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<(), String>>(1);
+    thread::Builder::new()
+        .name("jbs-upstream-h3".to_string())
+        .spawn(move || {
+            let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(runtime.config.server.threads.clamp(1, 8))
+                .thread_name("jbs-upstream-h3-worker")
+                .enable_all()
+                .build();
+            let tokio_runtime = match tokio_runtime {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "upstream HTTP/3 runtime creation failed: {error}"
+                    )));
+                    return;
+                }
+            };
+            tokio_runtime.block_on(async move {
+                for spec in specs {
+                    let listener = match TcpListener::from_std(spec.listener) {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(format!(
+                                "upstream HTTP/3 bridge listener conversion failed: {error}"
+                            )));
+                            return;
+                        }
+                    };
+                    let pool = H3Pool::new(spec.settings.clone(), spec.available.clone());
+                    tokio::spawn(serve_bridge(listener, pool));
+                }
+                let _ = ready_tx.send(Ok(()));
+                std::future::pending::<()>().await;
+            });
+        })
+        .context("failed to spawn upstream HTTP/3 runtime thread")?;
+
+    ready_rx
+        .recv_timeout(STARTUP_TIMEOUT)
+        .map_err(|error| anyhow!("upstream HTTP/3 startup did not complete: {error}"))?
+        .map_err(anyhow::Error::msg)?;
+
+    for (name, route) in &registry.routes {
+        info!(
+            "upstream HTTP/3 bridge started: upstream={} h2c={} forced={} hybrid_pq={} early_data=replay-safe-only",
+            name,
+            route.address,
+            route.forced,
+            HYBRID_PQ_GROUPS,
+        );
+    }
+    Ok(registry)
+}
+
+fn resolve_origin(name: &str, upstream: &UpstreamConfig) -> Result<SocketAddr> {
+    upstream
+        .address
+        .to_socket_addrs()
+        .with_context(|| {
+            format!(
+                "HTTP/3 upstream address resolution failed: name={name} address={}",
+                upstream.address
+            )
+        })?
+        .next()
+        .ok_or_else(|| anyhow!("HTTP/3 upstream {name} resolved to no addresses"))
+}
+
+fn upstream_server_name(name: &str, upstream: &UpstreamConfig) -> Result<String> {
+    if let Some(sni) = upstream.sni.as_ref().filter(|value| !value.is_empty()) {
+        return Ok(sni.clone());
+    }
+    let authority = upstream
+        .address
+        .rsplit_once(':')
+        .map_or(upstream.address.as_str(), |(host, _)| host)
+        .trim_matches(['[', ']']);
+    if authority.parse::<IpAddr>().is_ok() && upstream.verify_certificate {
+        bail!("HTTP/3 upstream {name} with certificate verification requires sni");
+    }
+    Ok(authority.to_string())
+}
+
+#[derive(Clone)]
+struct H3Pool {
+    commands: mpsc::Sender<Command>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl H3Pool {
+    fn new(settings: BridgeSettings, available: Arc<AtomicBool>) -> Arc<Self> {
+        let (commands, receiver) = mpsc::channel(MAX_REQUEST_COMMANDS);
+        let pool = Arc::new(Self {
+            commands,
+            next_id: Arc::new(AtomicU64::new(1)),
+        });
+        tokio::spawn(pool_manager(settings, receiver, available));
+        pool
+    }
+
+    async fn open(
+        &self,
+        headers: Vec<h3::Header>,
+        has_body: bool,
+        allow_early_data: bool,
+    ) -> Result<RequestHandle, BoxError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (opened_tx, opened_rx) = oneshot::channel();
+        let (response_tx, response_rx) = oneshot::channel();
+        self.commands
+            .send(Command::Open {
+                id,
+                headers,
+                has_body,
+                allow_early_data,
+                opened: opened_tx,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| boxed_error("upstream HTTP/3 worker is unavailable"))?;
+        Ok(RequestHandle {
+            id,
+            commands: self.commands.clone(),
+            opened: opened_rx,
+            response: response_rx,
+        })
+    }
+}
+
+struct RequestHandle {
+    id: u64,
+    commands: mpsc::Sender<Command>,
+    opened: oneshot::Receiver<Result<(), String>>,
+    response: oneshot::Receiver<Result<ResponseHead, String>>,
+}
+
+impl RequestHandle {
+    async fn wait_opened(&mut self) -> Result<(), BoxError> {
+        self.opened
+            .await
+            .map_err(|_| boxed_error("upstream HTTP/3 request open channel closed"))?
+            .map_err(boxed_error)
+    }
+
+    async fn send_body(&self, data: Bytes, fin: bool) -> Result<(), BoxError> {
+        self.commands
+            .send(Command::Body {
+                id: self.id,
+                data,
+                fin,
+            })
+            .await
+            .map_err(|_| boxed_error("upstream HTTP/3 body channel closed"))
+    }
+
+    async fn send_trailers(&self, headers: Vec<h3::Header>) -> Result<(), BoxError> {
+        self.commands
+            .send(Command::Trailers {
+                id: self.id,
+                headers,
+            })
+            .await
+            .map_err(|_| boxed_error("upstream HTTP/3 trailer channel closed"))
+    }
+
+    async fn response(self) -> Result<ResponseHead, BoxError> {
+        self.response
+            .await
+            .map_err(|_| boxed_error("upstream HTTP/3 response channel closed"))?
+            .map_err(boxed_error)
+    }
+}
+
+struct ResponseHead {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: mpsc::Receiver<Result<Frame<Bytes>, String>>,
+}
+
+enum Command {
+    Open {
+        id: u64,
+        headers: Vec<h3::Header>,
+        has_body: bool,
+        allow_early_data: bool,
+        opened: oneshot::Sender<Result<(), String>>,
+        response: oneshot::Sender<Result<ResponseHead, String>>,
+    },
+    Body {
+        id: u64,
+        data: Bytes,
+        fin: bool,
+    },
+    Trailers {
+        id: u64,
+        headers: Vec<h3::Header>,
+    },
+}
+
+struct PendingRequest {
+    id: u64,
+    headers: Vec<h3::Header>,
+    has_body: bool,
+    allow_early_data: bool,
+    opened: Option<oneshot::Sender<Result<(), String>>>,
+    response: Option<oneshot::Sender<Result<ResponseHead, String>>>,
+    body_tx: mpsc::Sender<Result<Frame<Bytes>, String>>,
+    body_rx: Option<mpsc::Receiver<Result<Frame<Bytes>, String>>>,
+    stream_id: Option<u64>,
+    response_started: bool,
+    sent_in_early_data: bool,
+}
+
+impl PendingRequest {
+    fn fail(mut self, message: &str) {
+        if let Some(opened) = self.opened.take() {
+            let _ = opened.send(Err(message.to_string()));
+        }
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(message.to_string()));
+        } else {
+            let _ = self.body_tx.try_send(Err(message.to_string()));
+        }
+    }
+}
+
+async fn pool_manager(
+    settings: BridgeSettings,
+    mut commands: mpsc::Receiver<Command>,
+    available: Arc<AtomicBool>,
+) {
+    let session = Arc::new(Mutex::new(None::<Vec<u8>>));
+    loop {
+        let resumed = session.lock().is_some();
+        if resumed && settings.enable_early_data {
+            // A request entering the local bridge now can be queued and emitted
+            // as soon as BoringSSL enters early-data state, before 1-RTT completes.
+            available.store(true, Ordering::Release);
+        }
+        let result = run_connection(
+            &settings,
+            &session,
+            &mut commands,
+            available.clone(),
+        )
+        .await;
+        available.store(false, Ordering::Release);
+        if commands.is_closed() {
+            return;
+        }
+        if let Err(error) = result {
+            warn!("upstream HTTP/3 connection stopped upstream={}: {error:#}", settings.name);
+        }
+        tokio::time::sleep(RECONNECT_DELAY).await;
+    }
+}
+
+async fn run_connection(
+    settings: &BridgeSettings,
+    session: &Arc<Mutex<Option<Vec<u8>>>>,
+    commands: &mut mpsc::Receiver<Command>,
+    available: Arc<AtomicBool>,
+) -> Result<()> {
+    let bind = if settings.origin.is_ipv4() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    };
+    let socket = UdpSocket::bind(bind)
+        .await
+        .with_context(|| format!("failed to bind UDP client for {}", settings.name))?;
+    socket
+        .connect(settings.origin)
+        .await
+        .with_context(|| format!("failed to connect UDP socket for {}", settings.name))?;
+    let local = socket.local_addr()?;
+
+    let mut tls = new_hybrid_pq_context()
+        .context("failed to create upstream HTTP/3 Cloudflare BoringSSL context")?;
+    if settings.verify_peer {
+        tls.set_default_verify_paths()
+            .context("failed to load default trust roots for HTTP/3 upstream")?;
+    }
+    let mut quic_config =
+        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls)
+            .context("failed to create upstream quiche configuration")?;
+    quic_config
+        .set_application_protos(h3::APPLICATION_PROTOCOL)
+        .context("failed to configure HTTP/3 ALPN")?;
+    quic_config.verify_peer(settings.verify_peer);
+    quic_config.set_max_idle_timeout(settings.idle_timeout.as_millis() as u64);
+    quic_config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD);
+    quic_config.set_max_send_udp_payload_size(MAX_UDP_PAYLOAD);
+    quic_config.set_initial_max_data(INITIAL_MAX_DATA);
+    quic_config.set_initial_max_stream_data_bidi_local(INITIAL_STREAM_WINDOW);
+    quic_config.set_initial_max_stream_data_bidi_remote(INITIAL_STREAM_WINDOW);
+    quic_config.set_initial_max_stream_data_uni(INITIAL_STREAM_WINDOW);
+    quic_config.set_initial_max_streams_bidi(settings.max_streams);
+    quic_config.set_initial_max_streams_uni(H3_CONTROL_STREAMS);
+    quic_config.set_disable_active_migration(true);
+    quic_config.set_active_connection_id_limit(2);
+    quic_config.discover_pmtu(true);
+    quic_config.set_pmtud_max_probes(3);
+    quic_config.enable_hystart(true);
+    quic_config.enable_pacing(true);
+    quic_config.grease(true);
+    quic_config.set_send_capacity_factor(SEND_CAPACITY_FACTOR);
+    if settings.enable_early_data {
+        quic_config.enable_early_data();
+    }
+
+    let mut scid_bytes = [0_u8; quiche::MAX_CONN_ID_LEN];
+    getrandom::fill(&mut scid_bytes)
+        .map_err(|error| anyhow!("failed to generate upstream QUIC connection ID: {error}"))?;
+    let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+    let mut conn = quiche::connect(
+        Some(&settings.server_name),
+        &scid,
+        local,
+        settings.origin,
+        &mut quic_config,
+    )
+    .with_context(|| format!("failed to create QUIC connection for {}", settings.name))?;
+
+    let cached_session = session.lock().clone();
+    if let Some(cached_session) = cached_session.as_deref() {
+        conn.set_session(cached_session)
+            .context("cached upstream QUIC session was rejected")?;
+    }
+
+    let mut h3_config = h3::Config::new().context("failed to create H3 config")?;
+    h3_config.set_max_field_section_size(MAX_H3_HEADER_BYTES);
+    let mut h3_conn = None;
+    let mut requests = HashMap::<u64, PendingRequest>::new();
+    let mut stream_to_request = HashMap::<u64, u64>::new();
+    let mut waiting = VecDeque::<u64>::new();
+    let mut recv_buf = vec![0_u8; 64 * 1024];
+    let mut send_buf = vec![0_u8; 64 * 1024];
+    let handshake_deadline = Instant::now() + settings.connect_timeout;
+    let mut established_logged = false;
+
+    loop {
+        if conn.is_closed() {
+            fail_all(&mut requests, "upstream QUIC connection closed");
+            bail!("upstream QUIC connection closed");
+        }
+        if !conn.is_established() && Instant::now() >= handshake_deadline {
+            conn.close(false, 0x1, b"handshake timeout").ok();
+            fail_all(&mut requests, "upstream QUIC handshake timed out");
+            bail!("upstream QUIC handshake timed out");
+        }
+
+        let app_ready = conn.is_established() || conn.is_in_early_data();
+        if app_ready && h3_conn.is_none() {
+            h3_conn = Some(
+                h3::Connection::with_transport(&mut conn, &h3_config)
+                    .context("failed to create upstream HTTP/3 connection")?,
+            );
+        }
+        if conn.is_established() {
+            available.store(true, Ordering::Release);
+            if !established_logged {
+                info!(
+                    "upstream HTTP/3 established upstream={} peer={} resumed={} early_data_enabled={} hybrid_pq={}",
+                    settings.name,
+                    settings.origin,
+                    conn.is_resumed(),
+                    settings.enable_early_data,
+                    HYBRID_PQ_GROUPS,
+                );
+                established_logged = true;
+            }
+            if let Some(new_session) = conn.session() {
+                let mut cache = session.lock();
+                if cache.as_deref() != Some(new_session) {
+                    *cache = Some(new_session.to_vec());
+                }
+            }
+        }
+
+        if let Some(h3_conn) = h3_conn.as_mut() {
+            dispatch_waiting(
+                h3_conn,
+                &mut conn,
+                &mut requests,
+                &mut stream_to_request,
+                &mut waiting,
+            )?;
+            process_h3_events(
+                h3_conn,
+                &mut conn,
+                &mut requests,
+                &mut stream_to_request,
+                &mut recv_buf,
+            )
+            .await?;
+        }
+        flush_quic(&socket, &mut conn, &mut send_buf).await?;
+
+        let timeout = conn.timeout().unwrap_or(Duration::from_secs(1));
+        tokio::select! {
+            recv = socket.recv_from(&mut recv_buf) => {
+                let (len, from) = recv.context("upstream QUIC UDP receive failed")?;
+                let info = quiche::RecvInfo { from, to: local };
+                match conn.recv(&mut recv_buf[..len], info) {
+                    Ok(_) | Err(quiche::Error::Done) => {}
+                    Err(error) => return Err(anyhow!("upstream QUIC packet processing failed: {error:?}")),
+                }
+            }
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    conn.close(true, 0, b"shutdown").ok();
+                    return Ok(());
+                };
+                handle_command(
+                    command,
+                    h3_conn.as_mut(),
+                    &mut conn,
+                    &mut requests,
+                    &mut stream_to_request,
+                    &mut waiting,
+                )?;
+            }
+            _ = tokio::time::sleep(timeout) => {
+                conn.on_timeout();
+            }
+        }
+    }
+}
+
+fn handle_command(
+    command: Command,
+    h3_conn: Option<&mut h3::Connection>,
+    conn: &mut quiche::Connection,
+    requests: &mut HashMap<u64, PendingRequest>,
+    stream_to_request: &mut HashMap<u64, u64>,
+    waiting: &mut VecDeque<u64>,
+) -> Result<()> {
+    match command {
+        Command::Open {
+            id,
+            headers,
+            has_body,
+            allow_early_data,
+            opened,
+            response,
+        } => {
+            let (body_tx, body_rx) = mpsc::channel(MAX_BODY_FRAMES);
+            requests.insert(
+                id,
+                PendingRequest {
+                    id,
+                    headers,
+                    has_body,
+                    allow_early_data,
+                    opened: Some(opened),
+                    response: Some(response),
+                    body_tx,
+                    body_rx: Some(body_rx),
+                    stream_id: None,
+                    response_started: false,
+                    sent_in_early_data: false,
+                },
+            );
+            waiting.push_back(id);
+            if let Some(h3_conn) = h3_conn {
+                dispatch_waiting(h3_conn, conn, requests, stream_to_request, waiting)?;
+            }
+        }
+        Command::Body { id, data, fin } => {
+            let request = requests
+                .get(&id)
+                .ok_or_else(|| anyhow!("HTTP/3 request disappeared before body write"))?;
+            let stream_id = request
+                .stream_id
+                .ok_or_else(|| anyhow!("HTTP/3 request body arrived before stream open"))?;
+            let h3_conn = h3_conn.ok_or_else(|| anyhow!("HTTP/3 connection is not ready"))?;
+            h3_conn
+                .send_body(conn, stream_id, &data, fin)
+                .map_err(|error| anyhow!("HTTP/3 request body send failed: {error:?}"))?;
+        }
+        Command::Trailers { id, headers } => {
+            let request = requests
+                .get(&id)
+                .ok_or_else(|| anyhow!("HTTP/3 request disappeared before trailers"))?;
+            let stream_id = request
+                .stream_id
+                .ok_or_else(|| anyhow!("HTTP/3 request trailers arrived before stream open"))?;
+            let h3_conn = h3_conn.ok_or_else(|| anyhow!("HTTP/3 connection is not ready"))?;
+            h3_conn
+                .send_additional_headers(conn, stream_id, &headers, true)
+                .map_err(|error| anyhow!("HTTP/3 request trailer send failed: {error:?}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_waiting(
+    h3_conn: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    requests: &mut HashMap<u64, PendingRequest>,
+    stream_to_request: &mut HashMap<u64, u64>,
+    waiting: &mut VecDeque<u64>,
+) -> Result<()> {
+    let count = waiting.len();
+    for _ in 0..count {
+        let Some(id) = waiting.pop_front() else { break };
+        let Some(request) = requests.get_mut(&id) else { continue };
+        if request.stream_id.is_some() {
+            continue;
+        }
+        let in_early_data = conn.is_in_early_data() && !conn.is_established();
+        if in_early_data && !request.allow_early_data {
+            waiting.push_back(id);
+            continue;
+        }
+        if !conn.is_established() && !in_early_data {
+            waiting.push_back(id);
+            continue;
+        }
+        match h3_conn.send_request(conn, &request.headers, !request.has_body) {
+            Ok(stream_id) => {
+                request.stream_id = Some(stream_id);
+                request.sent_in_early_data = in_early_data;
+                stream_to_request.insert(stream_id, id);
+                if let Some(opened) = request.opened.take() {
+                    let _ = opened.send(Ok(()));
+                }
+            }
+            Err(h3::Error::StreamBlocked)
+            | Err(h3::Error::TransportError(quiche::Error::StreamLimit)) => {
+                waiting.push_back(id);
+            }
+            Err(error) => {
+                let request = requests.remove(&id).expect("request still exists");
+                request.fail(&format!("HTTP/3 request open failed: {error:?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn process_h3_events(
+    h3_conn: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    requests: &mut HashMap<u64, PendingRequest>,
+    stream_to_request: &mut HashMap<u64, u64>,
+    body_buf: &mut [u8],
+) -> Result<()> {
+    loop {
+        let (stream_id, event) = match h3_conn.poll(conn) {
+            Ok(event) => event,
+            Err(h3::Error::Done) => break,
+            Err(error) => return Err(anyhow!("upstream HTTP/3 event processing failed: {error:?}")),
+        };
+        let Some(request_id) = stream_to_request.get(&stream_id).copied() else {
+            continue;
+        };
+        match event {
+            h3::Event::Headers { list, .. } => {
+                let request = requests
+                    .get_mut(&request_id)
+                    .ok_or_else(|| anyhow!("HTTP/3 response has no request state"))?;
+                if !request.response_started {
+                    let (status, headers) = decode_response_headers(&list)?;
+                    let body = request
+                        .body_rx
+                        .take()
+                        .ok_or_else(|| anyhow!("HTTP/3 response body receiver missing"))?;
+                    let response = request
+                        .response
+                        .take()
+                        .ok_or_else(|| anyhow!("HTTP/3 response sender missing"))?;
+                    request.response_started = true;
+                    let _ = response.send(Ok(ResponseHead { status, headers, body }));
+                } else {
+                    let trailers = decode_trailers(&list)?;
+                    request
+                        .body_tx
+                        .send(Ok(Frame::trailers(trailers)))
+                        .await
+                        .map_err(|_| anyhow!("downstream dropped HTTP/3 response trailers"))?;
+                }
+            }
+            h3::Event::Data => {
+                let request = requests
+                    .get_mut(&request_id)
+                    .ok_or_else(|| anyhow!("HTTP/3 data has no request state"))?;
+                loop {
+                    match h3_conn.recv_body(conn, stream_id, body_buf) {
+                        Ok(read) => {
+                            request
+                                .body_tx
+                                .send(Ok(Frame::data(Bytes::copy_from_slice(&body_buf[..read]))))
+                                .await
+                                .map_err(|_| anyhow!("downstream dropped HTTP/3 response body"))?;
+                        }
+                        Err(h3::Error::Done) => break,
+                        Err(error) => {
+                            return Err(anyhow!("HTTP/3 response body receive failed: {error:?}"));
+                        }
+                    }
+                }
+            }
+            h3::Event::Finished => {
+                stream_to_request.remove(&stream_id);
+                if let Some(mut request) = requests.remove(&request_id) {
+                    if !request.response_started {
+                        if let Some(response) = request.response.take() {
+                            let _ = response.send(Err("HTTP/3 response finished before headers".into()));
+                        }
+                    }
+                }
+            }
+            h3::Event::Reset(code) => {
+                stream_to_request.remove(&stream_id);
+                if let Some(mut request) = requests.remove(&request_id) {
+                    let message = format!("HTTP/3 stream reset by upstream code={code}");
+                    if let Some(response) = request.response.take() {
+                        let _ = response.send(Err(message));
+                    } else {
+                        let _ = request.body_tx.send(Err(message)).await;
+                    }
+                }
+            }
+            h3::Event::GoAway => {
+                return Err(anyhow!("upstream HTTP/3 peer sent GOAWAY id={stream_id}"));
+            }
+            h3::Event::PriorityUpdate => {}
+        }
+    }
+    Ok(())
+}
+
+async fn flush_quic(
+    socket: &UdpSocket,
+    conn: &mut quiche::Connection,
+    out: &mut [u8],
+) -> Result<()> {
+    loop {
+        let (write, send_info) = match conn.send(out) {
+            Ok(value) => value,
+            Err(quiche::Error::Done) => return Ok(()),
+            Err(error) => return Err(anyhow!("upstream QUIC send generation failed: {error:?}")),
+        };
+        let now = Instant::now();
+        if send_info.at > now {
+            tokio::time::sleep(send_info.at.duration_since(now)).await;
+        }
+        socket
+            .send(&out[..write])
+            .await
+            .context("upstream QUIC UDP send failed")?;
+    }
+}
+
+fn fail_all(requests: &mut HashMap<u64, PendingRequest>, message: &str) {
+    for (_, request) in requests.drain() {
+        request.fail(message);
+    }
+}
+
+async fn serve_bridge(listener: TcpListener, pool: Arc<H3Pool>) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(value) => value,
+            Err(error) => {
+                warn!("upstream HTTP/3 h2c bridge accept failed: {error}");
+                continue;
+            }
+        };
+        if !peer.ip().is_loopback() {
+            warn!("upstream HTTP/3 bridge rejected non-loopback peer={peer}");
+            continue;
+        }
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |request| proxy_bridge_request(request, pool.clone()));
+            if let Err(error) = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await
+            {
+                log::debug!("upstream HTTP/3 h2c bridge connection ended: {error}");
+            }
+        });
+    }
+}
+
+async fn proxy_bridge_request(
+    request: Request<Incoming>,
+    pool: Arc<H3Pool>,
+) -> Result<Response<BridgeBody>, BoxError> {
+    let (parts, mut body) = request.into_parts();
+    let has_body = !body.is_end_stream();
+    let allow_early_data = !has_body && matches!(parts.method, Method::GET | Method::HEAD);
+    let headers = encode_request_headers(&parts)?;
+    let mut handle = pool.open(headers, has_body, allow_early_data).await?;
+    handle.wait_opened().await?;
+
+    if has_body {
+        let id = handle.id;
+        let commands = handle.commands.clone();
+        tokio::spawn(async move {
+            let mut sent_fin = false;
+            while let Some(frame) = body.frame().await {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        warn!("h2c bridge request body read failed id={id}: {error}");
+                        return;
+                    }
+                };
+                if let Some(data) = frame.data_ref() {
+                    if commands
+                        .send(Command::Body {
+                            id,
+                            data: data.clone(),
+                            fin: false,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                if let Some(trailers) = frame.trailers_ref() {
+                    let trailers = encode_regular_headers(trailers);
+                    if commands.send(Command::Trailers { id, headers: trailers }).await.is_err() {
+                        return;
+                    }
+                    sent_fin = true;
+                }
+            }
+            if !sent_fin {
+                let _ = commands
+                    .send(Command::Body {
+                        id,
+                        data: Bytes::new(),
+                        fin: true,
+                    })
+                    .await;
+            }
+        });
+    }
+
+    let response = handle.response().await?;
+    let mut builder = Response::builder().status(response.status);
+    if let Some(headers) = builder.headers_mut() {
+        *headers = response.headers;
+    }
+    let stream = stream::unfold(response.body, |mut rx| async move {
+        rx.recv().await.map(|item| {
+            let item = item.map_err(|message| boxed_error(message));
+            (item, rx)
+        })
+    });
+    let body = StreamBody::new(stream).boxed_unsync();
+    builder.body(body).map_err(|error| error.into())
+}
+
+fn encode_request_headers(parts: &http::request::Parts) -> Result<Vec<h3::Header>, BoxError> {
+    let authority = parts
+        .headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| parts.uri.authority().map(|value| value.as_str()))
+        .ok_or_else(|| boxed_error("h2c bridge request is missing Host"))?;
+    let path = parts
+        .uri
+        .path_and_query()
+        .map_or("/", |value| value.as_str());
+    let mut output = Vec::with_capacity(parts.headers.len() + 4);
+    output.push(h3::Header::new(b":method", parts.method.as_str().as_bytes()));
+    output.push(h3::Header::new(b":scheme", b"https"));
+    output.push(h3::Header::new(b":authority", authority.as_bytes()));
+    output.push(h3::Header::new(b":path", path.as_bytes()));
+    output.extend(encode_regular_headers(&parts.headers));
+    Ok(output)
+}
+
+fn encode_regular_headers(headers: &HeaderMap) -> Vec<h3::Header> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            *name != HOST
+                && *name != CONNECTION
+                && *name != TRANSFER_ENCODING
+                && *name != UPGRADE
+                && name.as_str() != "keep-alive"
+                && name.as_str() != "proxy-connection"
+        })
+        .filter(|(name, value)| *name != TE || value.as_bytes().eq_ignore_ascii_case(b"trailers"))
+        .map(|(name, value)| h3::Header::new(name.as_str().as_bytes(), value.as_bytes()))
+        .collect()
+}
+
+fn decode_response_headers(list: &[h3::Header]) -> Result<(StatusCode, HeaderMap)> {
+    let mut status = None;
+    let mut regular_seen = false;
+    let mut headers = HeaderMap::with_capacity(list.len());
+    for header in list {
+        let name = header.name();
+        if name.starts_with(b":") {
+            if regular_seen || name != b":status" || status.is_some() {
+                bail!("invalid HTTP/3 response pseudo-header ordering");
+            }
+            let value = std::str::from_utf8(header.value()).context("invalid :status encoding")?;
+            let code = value.parse::<u16>().context("invalid :status value")?;
+            status = Some(StatusCode::from_u16(code).context("invalid HTTP status")?);
+            continue;
+        }
+        regular_seen = true;
+        append_h3_header(&mut headers, header)?;
+    }
+    Ok((status.ok_or_else(|| anyhow!("HTTP/3 response missing :status"))?, headers))
+}
+
+fn decode_trailers(list: &[h3::Header]) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::with_capacity(list.len());
+    for header in list {
+        if header.name().starts_with(b":") {
+            bail!("HTTP/3 trailer contains pseudo-header");
+        }
+        append_h3_header(&mut headers, header)?;
+    }
+    Ok(headers)
+}
+
+fn append_h3_header(headers: &mut HeaderMap, header: &h3::Header) -> Result<()> {
+    let name = HeaderName::from_bytes(header.name()).context("invalid HTTP/3 header name")?;
+    if name == CONNECTION
+        || name == TRANSFER_ENCODING
+        || name == UPGRADE
+        || name.as_str() == "keep-alive"
+        || name.as_str() == "proxy-connection"
+    {
+        bail!("HTTP/3 peer sent forbidden connection-specific header {name}");
+    }
+    let value = HeaderValue::from_bytes(header.value()).context("invalid HTTP/3 header value")?;
+    headers.append(name, value);
+    Ok(())
+}
+
+fn boxed_error(message: impl Into<String>) -> BoxError {
+    Box::new(io::Error::other(message.into()))
+}
+
+fn empty_body() -> BridgeBody {
+    Empty::<Bytes>::new()
+        .map_err(|never: Infallible| match never {})
+        .boxed_unsync()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_bodyless_get_and_head_are_early_data_safe() {
+        for method in [Method::GET, Method::HEAD] {
+            assert!(matches!(method, Method::GET | Method::HEAD));
+        }
+        assert!(!matches!(Method::POST, Method::GET | Method::HEAD));
+    }
+
+    #[test]
+    fn strips_connection_specific_headers_from_h3_requests() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("example.test"));
+        headers.insert(CONNECTION, HeaderValue::from_static("close"));
+        headers.insert("x-test", HeaderValue::from_static("ok"));
+        let encoded = encode_regular_headers(&headers);
+        assert!(encoded.iter().any(|header| header.name() == b"x-test"));
+        assert!(!encoded.iter().any(|header| header.name() == b"connection"));
+        assert!(!encoded.iter().any(|header| header.name() == b"host"));
+    }
+}
