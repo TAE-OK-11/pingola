@@ -93,7 +93,7 @@ jobs:
       - name: Real QUIC, HTTP/3, h2c bridge, and upstream H3 integration
         run: |
           tests/http3.sh
-          tests/upstream_http3.sh
+          bash tests/upstream_http3.sh
 
   image-test:
     if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.publish_images != true)
