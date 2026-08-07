@@ -25,12 +25,22 @@ jobs:
       - name: Install build and integration tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes clang cmake jq libclang-dev nghttp2-client ninja-build openssl perl pkg-config
+          sudo apt-get install --yes clang cmake jq libcap2-bin libclang-dev nghttp2-client ninja-build openssl perl pkg-config
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
 
       - name: Apply compression policy
         run: |
           python3 scripts/apply_modern_compression.py
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('tests/fixtures/integration.yaml')
+          text = path.read_text()
+          old = '''upstreams:\n  backend:\n    address: "127.0.0.1:19090"\n'''
+          new = '''upstreams:\n  backend:\n    address: "127.0.0.1:19090"\n  adguard_dns_doh:\n    address: "127.0.0.1:19090"\n'''
+          if old not in text:
+              raise SystemExit('integration backend upstream block not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
           cargo fmt --all
           bash -n tests/integration.sh
           python3 -m py_compile tests/backend.py
@@ -47,6 +57,7 @@ jobs:
           grep -F 'content-encoding: br' tests/integration.sh >/dev/null
           grep -F 'content-encoding: gzip' tests/integration.sh >/dev/null
           grep -F 'Navidrome response was unexpectedly compressed by the gateway' tests/integration.sh >/dev/null
+          grep -F 'adguard_dns_doh:' tests/fixtures/integration.yaml >/dev/null
 
       - name: Verify Rust and protocol behavior
         run: |
@@ -54,6 +65,7 @@ jobs:
           cargo clippy --all-targets --locked -- -D warnings
           cargo check --all-targets --locked --no-default-features --features system-allocator,tls-boringssl
           cargo check --all-targets --locked --no-default-features --features jemalloc,tls-boringssl
+          sudo setcap cap_net_bind_service=+ep target/debug/pingora
           tests/service_matrix.sh
           tests/integration.sh
           tests/http3.sh
