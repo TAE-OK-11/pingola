@@ -64,7 +64,7 @@ grep -q '\[ok\] certificate/private key match' "${RUNTIME}/valid.log"
 
 printf '%s\n' 'not a certificate' >"${RUNTIME}/invalid.crt"
 write_config "${RUNTIME}/invalid.yaml" "${RUNTIME}/invalid.crt" "${RUNTIME}/a.key" 443
-expect_failure invalid_pem 'certificate PEM parse.*contains no certificates' \
+expect_failure invalid_pem 'certificate PEM parse.*rejected by Cloudflare BoringSSL' \
   "${BIN}" --config "${RUNTIME}/invalid.yaml" --check
 
 write_config "${RUNTIME}/mismatch.yaml" "${RUNTIME}/a.crt" "${RUNTIME}/b.key" 443
