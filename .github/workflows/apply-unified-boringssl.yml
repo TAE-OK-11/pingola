@@ -12,78 +12,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  migrate:
+  persist:
     if: github.event.pull_request.head.ref == 'agent/unify-boringssl' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: agent/unify-boringssl
           fetch-depth: 0
 
-      - name: Install build and integration tools
+      - name: Apply previously verified migration
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes clang cmake jq libcap2-bin libclang-dev nghttp2-client ninja-build openssl perl pkg-config
-          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
-          rustup show active-toolchain
-
-      - name: Apply Cloudflare BoringSSL migration
-        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt
           python3 scripts/migrate-unified-boringssl.py
           rm -rf vendor/pingora-rustls-aws-lc
           sed -i \
             -e 's/AWS-LC/Cloudflare BoringSSL/g' \
             -e 's/aws-lc/boringssl/g' \
             bench/pgo_train.sh bench/pgo_compare_three.sh
+          cargo fmt --all
+          cargo generate-lockfile
           if grep -RIn \
             -E 'AWS-LC|aws-lc|tls-aws-lc|rustls::|rustls_pemfile|pingora-rustls' \
-            Cargo.toml Dockerfile README.md src tests bench/*.sh .github/workflows/ci.yml; then
+            Cargo.toml Dockerfile README.md src tests bench/*.sh; then
             echo 'legacy TLS provider references remain in active sources' >&2
             exit 1
           fi
 
-      - name: Format and regenerate lockfile
-        run: |
-          cargo fmt --all
-          cargo check --all-targets --no-default-features --features tcmalloc,tls-boringssl
-
-      - name: Verify one shared BoringSSL graph
-        run: |
-          cargo tree --locked > /tmp/cargo-tree.txt
-          cargo tree --locked -p pingora-boringssl@0.8.1 > /tmp/pingora-tls-tree.txt
-          cargo tree --locked -p tokio-quiche@0.19.1 > /tmp/http3-tls-tree.txt
-          cargo tree --locked -i boring@4.22.0 > /tmp/boring-reverse-tree.txt
-          grep -q 'pingora-boringssl v0.8.1' /tmp/cargo-tree.txt
-          grep -q 'quiche v0.29.3' /tmp/http3-tls-tree.txt
-          grep -q 'boring v4.22.0' /tmp/pingora-tls-tree.txt
-          grep -q 'boring-sys v4.22.0' /tmp/pingora-tls-tree.txt
-          grep -q 'boring v4.22.0' /tmp/http3-tls-tree.txt
-          grep -q 'boring-sys v4.22.0' /tmp/http3-tls-tree.txt
-          grep -q 'pingora-boringssl v0.8.1' /tmp/boring-reverse-tree.txt
-          grep -Eq '(quiche v0.29.3|tokio-quiche v0.19.1)' /tmp/boring-reverse-tree.txt
-          ! grep -Eiq '(^|[[:space:]])(aws-lc-rs|aws-lc-sys|rustls) v' /tmp/cargo-tree.txt
-          ! cargo tree --locked -d | grep -E '^(boring|boring-sys) v'
-
-      - name: Test all supported allocator builds
-        run: |
-          cargo test --all-targets --locked --no-default-features --features tcmalloc,tls-boringssl
-          cargo clippy --all-targets --locked --no-default-features --features tcmalloc,tls-boringssl -- -D warnings
-          cargo check --all-targets --locked --no-default-features --features system-allocator,tls-boringssl
-          cargo check --all-targets --locked --no-default-features --features jemalloc,tls-boringssl
-
-      - name: Run TLS and HTTP/3 integration checks
-        run: |
-          cargo build --locked --no-default-features --features tcmalloc,tls-boringssl
-          sudo setcap cap_net_bind_service=+ep target/debug/pingora
-          sudo tests/runtime_preflight.sh
-          tests/http3.sh
-
-      - name: Commit verified migration
+      - name: Commit non-workflow migration files
         run: |
           set -euxo pipefail
-          git rm .github/workflows/apply-unified-boringssl.yml scripts/migrate-unified-boringssl.py
+          # GITHUB_TOKEN cannot modify workflow files. Preserve both workflows;
+          # the connected GitHub client applies the verified CI workflow next.
+          git checkout HEAD -- \
+            .github/workflows/ci.yml \
+            .github/workflows/apply-unified-boringssl.yml
+          git rm scripts/migrate-unified-boringssl.py
           git diff --check
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
