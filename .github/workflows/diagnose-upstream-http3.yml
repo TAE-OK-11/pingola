@@ -22,18 +22,11 @@ jobs:
           ref: agent/upstream-http3
           fetch-depth: 0
 
-      - name: Install tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install --yes -qq clang cmake jq libcap2-bin libclang-dev ninja-build openssl perl pkg-config >/dev/null
-          rustup toolchain install 1.97.1 --profile minimal --component rustfmt >/dev/null 2>&1
-
       - name: Run compact runtime diagnostic
         shell: bash
         run: |
           set -uo pipefail
           python3 scripts/apply_upstream_h3_zero_rtt.py
-          cargo fmt --all
           if ! cargo build --quiet --locked; then
             echo 'BUILD_FAILED' > runtime-diagnostics.txt
           else
