@@ -17,7 +17,7 @@ server:
   upstream_keepalive_pool_size: 128
   downstream_keepalive_requests: 500
   max_retries: 2
-  graceful_shutdown_timeout_seconds: 60
+  graceful_shutdown_timeout_seconds: 5
   static_cache_bytes: 33554432
   access_log: false
   health_socket: /tmp/pingora/health.sock

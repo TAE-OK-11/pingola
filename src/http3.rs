@@ -30,7 +30,8 @@ use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::ConnectionHook;
 use tokio_quiche::quiche::h3::{self, NameValue};
 use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
-use tokio_quiche::{ConnectionParams, ServerH3Driver, listen};
+use tokio_quiche::socket::QuicListener;
+use tokio_quiche::{ConnectionParams, ServerH3Driver, listen_with_capabilities};
 
 use crate::config::RuntimeConfig;
 use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, RateLimiter};
@@ -183,12 +184,24 @@ async fn run(
             .context("HTTP/3 hybrid PQ TLS preflight failed")?,
     );
 
-    let mut sockets = Vec::with_capacity(server.http3_listen.len());
+    let mut quic_listeners = Vec::with_capacity(server.http3_listen.len());
     for address in &server.http3_listen {
         let socket = UdpSocket::bind(address)
             .await
             .with_context(|| format!("failed to bind HTTP/3 UDP listener {address}"))?;
-        sockets.push(socket);
+        let mut listener = QuicListener::try_from(socket)
+            .with_context(|| format!("failed to prepare HTTP/3 QUIC listener {address}"))?;
+        // tokio-quiche listeners default every socket capability to OFF. On Linux
+        // this best-effort probe enables the supported subset of UDP GSO/GRO,
+        // SO_TXTIME pacing, RX queue overflow accounting, and PMTU probe sockopts.
+        // Unsupported kernel/NIC capabilities remain disabled instead of failing
+        // startup, so the same image stays portable across hosts.
+        listener.apply_max_capabilities();
+        info!(
+            "HTTP/3 UDP offload capabilities: address={} capabilities={:?}",
+            address, listener.capabilities
+        );
+        quic_listeners.push(listener);
     }
 
     let mut quic = QuicSettings::default();
@@ -203,11 +216,20 @@ async fn run(
     quic.max_recv_udp_payload_size = HTTP3_MAX_UDP_PAYLOAD_SIZE;
     quic.max_send_udp_payload_size = HTTP3_MAX_UDP_PAYLOAD_SIZE;
     quic.discover_path_mtu = true;
-    // Keep QUIC packet sends paced instead of bursty.
+    quic.pmtud_max_probes = 3;
+    // Keep QUIC packet sends paced instead of bursty. With the listener socket
+    // capabilities enabled above, tokio-quiche can use SO_TXTIME where Linux
+    // supports it and falls back to userspace pacing otherwise.
     quic.enable_pacing = true;
+    quic.enable_hystart = true;
     quic.send_capacity_factor = HTTP3_SEND_CAPACITY_FACTOR;
     quic.enable_early_data = false;
     quic.disable_active_migration = true;
+    // Keep connection-ID/path state minimal. NAT rebinding can still be handled
+    // sequentially while an attacker cannot queue multiple PATH_CHALLENGE frames.
+    quic.active_connection_id_limit = 2;
+    quic.max_path_challenge_recv_queue_len = 1;
+    quic.grease = true;
     // Stateless Retry proves source-address ownership before the server allocates
     // a full QUIC connection and starts expensive TLS work.
     quic.disable_client_ip_validation = false;
@@ -224,8 +246,8 @@ async fn run(
             connection_hook: Some(Arc::new(HybridPqQuicTlsHook)),
         },
     );
-    let listeners = listen(sockets, params, DefaultMetrics)
-        .context("failed to create quiche HTTP/3 listeners")?;
+    let listeners = listen_with_capabilities(quic_listeners, params, DefaultMetrics)
+        .context("failed to create quiche HTTP/3 listeners with UDP offload capabilities")?;
 
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
@@ -320,7 +342,7 @@ async fn run(
     }
 
     info!(
-        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} hybrid_pq={} stateless_retry=true max_amplification={} early_data=false migration=false pmtud=true pacing=true max_udp_payload={} send_capacity_factor={} admission_rate={}/s burst={} max_connections_per_ip={} handshake_timeout={}s",
+        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} hybrid_pq={} stateless_retry=true max_amplification={} early_data=false migration=false pmtud=true pacing=true socket_offload=auto[gso,gro,so_txtime,rxq_ovfl,pmtu_probe] max_udp_payload={} send_capacity_factor={} admission_rate={}/s burst={} max_connections_per_ip={} handshake_timeout={}s",
         server.http3_listen,
         internal,
         tokio_quiche::quiche::PROTOCOL_VERSION,

@@ -279,6 +279,10 @@ WORKDIR /tmp/pingora
 
 EXPOSE 80/tcp 443/tcp 443/udp
 
+# Pingora handles SIGTERM as a graceful shutdown request. Keep the image's stop
+# contract explicit for Docker/Compose and other OCI runtimes.
+STOPSIGNAL SIGTERM
+
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD ["/usr/local/bin/pingora", "--healthcheck"]
 

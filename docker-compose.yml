@@ -8,7 +8,8 @@ services:
         RUST_TARGET_CPU: x86-64-v2
     network_mode: host
     restart: unless-stopped
-    stop_grace_period: 65s
+    stop_signal: SIGTERM
+    stop_grace_period: 8s
     pids_limit: 256
     read_only: true
     ulimits:
