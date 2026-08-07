@@ -1,8 +1,9 @@
 use std::collections::{HashMap, VecDeque};
-use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener, ToSocketAddrs};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener, ToSocketAddrs,
+};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread;
@@ -10,11 +11,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use futures::{StreamExt, stream};
+use futures::stream;
 use http::header::{CONNECTION, HOST, TE, TRANSFER_ENCODING, UPGRADE};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Empty, StreamBody};
+use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Body as _, Frame, Incoming};
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
@@ -43,7 +44,7 @@ const SEND_CAPACITY_FACTOR: f64 = 2.0;
 type BoxError = Box<dyn StdError + Send + Sync>;
 type BridgeBody = UnsyncBoxBody<Bytes, BoxError>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BridgeRoute {
     address: SocketAddr,
     available: Arc<AtomicBool>,
@@ -68,10 +69,6 @@ pub struct UpstreamH3Registry {
 impl UpstreamH3Registry {
     pub fn route(&self, name: &str) -> Option<&BridgeRoute> {
         self.routes.get(name)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
     }
 }
 
@@ -109,9 +106,9 @@ pub fn start(runtime: Arc<RuntimeConfig>) -> Result<Arc<UpstreamH3Registry>> {
         let server_name = upstream_server_name(name, upstream)?;
         let listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .with_context(|| format!("failed to allocate HTTP/3 bridge listener for {name}"))?;
-        listener
-            .set_nonblocking(true)
-            .with_context(|| format!("failed to make HTTP/3 bridge listener nonblocking for {name}"))?;
+        listener.set_nonblocking(true).with_context(|| {
+            format!("failed to make HTTP/3 bridge listener nonblocking for {name}")
+        })?;
         let address = listener.local_addr()?;
         let available = Arc::new(AtomicBool::new(false));
         let forced = upstream.protocol == UpstreamProtocol::Http3;
@@ -191,10 +188,7 @@ pub fn start(runtime: Arc<RuntimeConfig>) -> Result<Arc<UpstreamH3Registry>> {
     for (name, route) in &registry.routes {
         info!(
             "upstream HTTP/3 bridge started: upstream={} h2c={} forced={} hybrid_pq={} early_data=replay-safe-only",
-            name,
-            route.address,
-            route.forced,
-            HYBRID_PQ_GROUPS,
+            name, route.address, route.forced, HYBRID_PQ_GROUPS,
         );
     }
     Ok(registry)
@@ -269,7 +263,7 @@ impl H3Pool {
         Ok(RequestHandle {
             id,
             commands: self.commands.clone(),
-            opened: opened_rx,
+            opened: Some(opened_rx),
             response: response_rx,
         })
     }
@@ -278,37 +272,19 @@ impl H3Pool {
 struct RequestHandle {
     id: u64,
     commands: mpsc::Sender<Command>,
-    opened: oneshot::Receiver<Result<(), String>>,
+    opened: Option<oneshot::Receiver<Result<(), String>>>,
     response: oneshot::Receiver<Result<ResponseHead, String>>,
 }
 
 impl RequestHandle {
     async fn wait_opened(&mut self) -> Result<(), BoxError> {
-        self.opened
+        let opened = self.opened.take().ok_or_else(|| {
+            boxed_error("upstream HTTP/3 request open channel was already consumed")
+        })?;
+        opened
             .await
             .map_err(|_| boxed_error("upstream HTTP/3 request open channel closed"))?
             .map_err(boxed_error)
-    }
-
-    async fn send_body(&self, data: Bytes, fin: bool) -> Result<(), BoxError> {
-        self.commands
-            .send(Command::Body {
-                id: self.id,
-                data,
-                fin,
-            })
-            .await
-            .map_err(|_| boxed_error("upstream HTTP/3 body channel closed"))
-    }
-
-    async fn send_trailers(&self, headers: Vec<h3::Header>) -> Result<(), BoxError> {
-        self.commands
-            .send(Command::Trailers {
-                id: self.id,
-                headers,
-            })
-            .await
-            .map_err(|_| boxed_error("upstream HTTP/3 trailer channel closed"))
     }
 
     async fn response(self) -> Result<ResponseHead, BoxError> {
@@ -346,7 +322,6 @@ enum Command {
 }
 
 struct PendingRequest {
-    id: u64,
     headers: Vec<h3::Header>,
     has_body: bool,
     allow_early_data: bool,
@@ -385,19 +360,16 @@ async fn pool_manager(
             // as soon as BoringSSL enters early-data state, before 1-RTT completes.
             available.store(true, Ordering::Release);
         }
-        let result = run_connection(
-            &settings,
-            &session,
-            &mut commands,
-            available.clone(),
-        )
-        .await;
+        let result = run_connection(&settings, &session, &mut commands, available.clone()).await;
         available.store(false, Ordering::Release);
         if commands.is_closed() {
             return;
         }
         if let Err(error) = result {
-            warn!("upstream HTTP/3 connection stopped upstream={}: {error:#}", settings.name);
+            warn!(
+                "upstream HTTP/3 connection stopped upstream={}: {error:#}",
+                settings.name
+            );
         }
         tokio::time::sleep(RECONNECT_DELAY).await;
     }
@@ -597,7 +569,6 @@ fn handle_command(
             requests.insert(
                 id,
                 PendingRequest {
-                    id,
                     headers,
                     has_body,
                     allow_early_data,
@@ -636,7 +607,7 @@ fn handle_command(
                 .ok_or_else(|| anyhow!("HTTP/3 request trailers arrived before stream open"))?;
             let h3_conn = h3_conn.ok_or_else(|| anyhow!("HTTP/3 connection is not ready"))?;
             h3_conn
-                .send_additional_headers(conn, stream_id, &headers, true)
+                .send_additional_headers(conn, stream_id, &headers, true, true)
                 .map_err(|error| anyhow!("HTTP/3 request trailer send failed: {error:?}"))?;
         }
     }
@@ -653,7 +624,9 @@ fn dispatch_waiting(
     let count = waiting.len();
     for _ in 0..count {
         let Some(id) = waiting.pop_front() else { break };
-        let Some(request) = requests.get_mut(&id) else { continue };
+        let Some(request) = requests.get_mut(&id) else {
+            continue;
+        };
         if request.stream_id.is_some() {
             continue;
         }
@@ -699,7 +672,11 @@ async fn process_h3_events(
         let (stream_id, event) = match h3_conn.poll(conn) {
             Ok(event) => event,
             Err(h3::Error::Done) => break,
-            Err(error) => return Err(anyhow!("upstream HTTP/3 event processing failed: {error:?}")),
+            Err(error) => {
+                return Err(anyhow!(
+                    "upstream HTTP/3 event processing failed: {error:?}"
+                ));
+            }
         };
         let Some(request_id) = stream_to_request.get(&stream_id).copied() else {
             continue;
@@ -720,7 +697,11 @@ async fn process_h3_events(
                         .take()
                         .ok_or_else(|| anyhow!("HTTP/3 response sender missing"))?;
                     request.response_started = true;
-                    let _ = response.send(Ok(ResponseHead { status, headers, body }));
+                    let _ = response.send(Ok(ResponseHead {
+                        status,
+                        headers,
+                        body,
+                    }));
                 } else {
                     let trailers = decode_trailers(&list)?;
                     request
@@ -752,12 +733,11 @@ async fn process_h3_events(
             }
             h3::Event::Finished => {
                 stream_to_request.remove(&stream_id);
-                if let Some(mut request) = requests.remove(&request_id) {
-                    if !request.response_started {
-                        if let Some(response) = request.response.take() {
-                            let _ = response.send(Err("HTTP/3 response finished before headers".into()));
-                        }
-                    }
+                if let Some(mut request) = requests.remove(&request_id)
+                    && !request.response_started
+                    && let Some(response) = request.response.take()
+                {
+                    let _ = response.send(Err("HTTP/3 response finished before headers".into()));
                 }
             }
             h3::Event::Reset(code) => {
@@ -859,8 +839,8 @@ async fn proxy_bridge_request(
                         return;
                     }
                 };
-                if let Some(data) = frame.data_ref() {
-                    if commands
+                if let Some(data) = frame.data_ref()
+                    && commands
                         .send(Command::Body {
                             id,
                             data: data.clone(),
@@ -868,13 +848,19 @@ async fn proxy_bridge_request(
                         })
                         .await
                         .is_err()
-                    {
-                        return;
-                    }
+                {
+                    return;
                 }
                 if let Some(trailers) = frame.trailers_ref() {
                     let trailers = encode_regular_headers(trailers);
-                    if commands.send(Command::Trailers { id, headers: trailers }).await.is_err() {
+                    if commands
+                        .send(Command::Trailers {
+                            id,
+                            headers: trailers,
+                        })
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     sent_fin = true;
@@ -899,7 +885,7 @@ async fn proxy_bridge_request(
     }
     let stream = stream::unfold(response.body, |mut rx| async move {
         rx.recv().await.map(|item| {
-            let item = item.map_err(|message| boxed_error(message));
+            let item = item.map_err(boxed_error);
             (item, rx)
         })
     });
@@ -919,7 +905,10 @@ fn encode_request_headers(parts: &http::request::Parts) -> Result<Vec<h3::Header
         .path_and_query()
         .map_or("/", |value| value.as_str());
     let mut output = Vec::with_capacity(parts.headers.len() + 4);
-    output.push(h3::Header::new(b":method", parts.method.as_str().as_bytes()));
+    output.push(h3::Header::new(
+        b":method",
+        parts.method.as_str().as_bytes(),
+    ));
     output.push(h3::Header::new(b":scheme", b"https"));
     output.push(h3::Header::new(b":authority", authority.as_bytes()));
     output.push(h3::Header::new(b":path", path.as_bytes()));
@@ -961,7 +950,10 @@ fn decode_response_headers(list: &[h3::Header]) -> Result<(StatusCode, HeaderMap
         regular_seen = true;
         append_h3_header(&mut headers, header)?;
     }
-    Ok((status.ok_or_else(|| anyhow!("HTTP/3 response missing :status"))?, headers))
+    Ok((
+        status.ok_or_else(|| anyhow!("HTTP/3 response missing :status"))?,
+        headers,
+    ))
 }
 
 fn decode_trailers(list: &[h3::Header]) -> Result<HeaderMap> {
@@ -992,12 +984,6 @@ fn append_h3_header(headers: &mut HeaderMap, header: &h3::Header) -> Result<()> 
 
 fn boxed_error(message: impl Into<String>) -> BoxError {
     Box::new(io::Error::other(message.into()))
-}
-
-fn empty_body() -> BridgeBody {
-    Empty::<Bytes>::new()
-        .map_err(|never: Infallible| match never {})
-        .boxed_unsync()
 }
 
 #[cfg(test)]

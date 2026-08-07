@@ -7,6 +7,7 @@ mod limits;
 mod preflight;
 mod static_files;
 mod tls_policy;
+mod upstream_h3;
 
 use std::fs::{self, Permissions};
 use std::io::{Read, Write};
@@ -274,7 +275,10 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     let mut server = Server::new_with_opt_and_conf(None, pingora_config);
     server.bootstrap();
 
-    let gateway = Gateway::new(runtime.clone()).context("service bootstrap failed")?;
+    let upstream_h3 =
+        upstream_h3::start(runtime.clone()).context("upstream HTTP/3 bridge startup failed")?;
+    let gateway =
+        Gateway::new(runtime.clone(), upstream_h3.clone()).context("service bootstrap failed")?;
     let mut http_options = HttpServerOptions::default();
     http_options.request_header_timeout = Some(Duration::from_secs(
         server_config.downstream_request_header_timeout_seconds,
@@ -335,8 +339,8 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     );
 
     if !server_config.http3_listen.is_empty() {
-        let h2c_gateway =
-            Gateway::new(runtime.clone()).context("HTTP/3 h2c service bootstrap failed")?;
+        let h2c_gateway = Gateway::new(runtime.clone(), upstream_h3.clone())
+            .context("HTTP/3 h2c service bootstrap failed")?;
         let mut h2c_options = HttpServerOptions::default();
         h2c_options.h2c = true;
         h2c_options.request_header_timeout = Some(Duration::from_secs(

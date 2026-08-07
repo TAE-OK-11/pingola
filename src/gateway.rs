@@ -38,6 +38,7 @@ use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_hos
 use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
 use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, RateLimiter};
 use crate::static_files::StaticFiles;
+use crate::upstream_h3::{BridgeRoute, UpstreamH3Registry};
 
 const STREAM_PREFIXES: &[&str] = &[
     "/rest/stream",
@@ -183,8 +184,15 @@ impl RouteClass {
 }
 
 #[derive(Clone, Debug)]
+struct PreparedH3Peer {
+    peer: HttpPeer,
+    route: BridgeRoute,
+}
+
+#[derive(Clone, Debug)]
 struct PreparedUpstream {
     peer: HttpPeer,
+    h3: Option<PreparedH3Peer>,
     read_timeout_seconds: Option<u64>,
     write_timeout_seconds: Option<u64>,
 }
@@ -194,6 +202,7 @@ struct PreparedPlan {
     domain: http::HeaderValue,
     handler: HandlerKind,
     peer: HttpPeer,
+    h3: Option<PreparedH3Peer>,
     route: RouteClass,
     rate_limit: Option<(f64, u32)>,
     active_request_limit: usize,
@@ -292,7 +301,10 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    pub fn new(runtime: Arc<RuntimeConfig>) -> anyhow::Result<Self> {
+    pub fn new(
+        runtime: Arc<RuntimeConfig>,
+        upstream_h3: Arc<UpstreamH3Registry>,
+    ) -> anyhow::Result<Self> {
         let roots = runtime
             .config
             .hosts
@@ -309,7 +321,8 @@ impl Gateway {
             .upstreams
             .iter()
             .map(|(name, upstream)| {
-                prepare_upstream(name, upstream).map(|prepared| (name.clone(), prepared))
+                prepare_upstream(name, upstream, &upstream_h3)
+                    .map(|prepared| (name.clone(), prepared))
             })
             .collect::<anyhow::Result<HashMap<_, _>>>()?;
         let mut hosts = AHashMap::with_capacity(
@@ -338,6 +351,7 @@ impl Gateway {
                         domain: domain_header.clone(),
                         handler: host.handler,
                         peer: prepare_route_peer(upstream, route),
+                        h3: prepare_route_h3(upstream, route),
                         route,
                         rate_limit: effective_rate_limit(&runtime, route),
                         active_request_limit: runtime
@@ -665,11 +679,18 @@ impl ProxyHttp for Gateway {
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let plan = self.request_plan(ctx)?;
+        if let Some(h3) = &plan.h3
+            && h3.route.should_use_h3()
+        {
+            return Ok(Box::new(h3.peer.clone()));
+        }
         Ok(Box::new(plan.peer.clone()))
     }
 
     fn precomputed_upstream_peer<'a>(&'a self, ctx: &Self::CTX) -> Option<&'a HttpPeer> {
-        self.plans.get(ctx.plan_index).map(|plan| &plan.peer)
+        self.plans
+            .get(ctx.plan_index)
+            .and_then(|plan| plan.h3.is_none().then_some(&plan.peer))
     }
 
     fn h1_bodyless_fast_path(&self, session: &Session, ctx: &Self::CTX) -> bool {
@@ -1481,6 +1502,19 @@ fn upstream_name_for_route(
     }
 }
 
+fn prepare_route_h3(upstream: &PreparedUpstream, route: RouteClass) -> Option<PreparedH3Peer> {
+    if route == RouteClass::VaultwardenHub {
+        return None;
+    }
+    let mut h3 = upstream.h3.clone()?;
+    h3.peer.group_key = 10_000 + route.upstream_pool_group();
+    let (read_timeout, write_timeout) = upstream_timeouts(route, upstream);
+    h3.peer.options.read_timeout = Some(read_timeout);
+    h3.peer.options.write_timeout = Some(write_timeout);
+    h3.peer.cache_reuse_hash();
+    Some(h3)
+}
+
 fn prepare_route_peer(upstream: &PreparedUpstream, route: RouteClass) -> HttpPeer {
     let mut peer = upstream.peer.clone();
     peer.group_key = route.upstream_pool_group();
@@ -1500,6 +1534,7 @@ fn prepare_route_peer(upstream: &PreparedUpstream, route: RouteClass) -> HttpPee
 fn prepare_upstream(
     name: &str,
     upstream: &crate::config::UpstreamConfig,
+    upstream_h3: &UpstreamH3Registry,
 ) -> anyhow::Result<PreparedUpstream> {
     let address = upstream
         .address
@@ -1529,9 +1564,14 @@ fn prepare_upstream(
     peer.options.verify_cert = upstream.verify_certificate;
     peer.options.verify_hostname = upstream.verify_certificate;
     peer.options.alpn = match upstream.protocol {
-        UpstreamProtocol::Auto if upstream.tls => ALPN::H2H1,
+        UpstreamProtocol::Auto | UpstreamProtocol::Http3 | UpstreamProtocol::Http3Preferred
+            if upstream.tls =>
+        {
+            ALPN::H2H1
+        }
         UpstreamProtocol::Auto | UpstreamProtocol::Http1 => ALPN::H1,
         UpstreamProtocol::Http2 => ALPN::H2,
+        UpstreamProtocol::Http3 | UpstreamProtocol::Http3Preferred => ALPN::H1,
     };
     peer.options.max_h2_streams = upstream.http2_max_concurrent_streams;
     peer.options.tcp_keepalive = Some(TcpKeepalive {
@@ -1541,8 +1581,23 @@ fn prepare_upstream(
         #[cfg(target_os = "linux")]
         user_timeout: Duration::from_secs(90),
     });
+    let h3 = upstream_h3.route(name).map(|route| {
+        let mut peer = HttpPeer::new(route.address(), false, String::new());
+        peer.options.connection_timeout =
+            Some(Duration::from_secs(upstream.connect_timeout_seconds));
+        peer.options.total_connection_timeout =
+            Some(Duration::from_secs(upstream.connect_timeout_seconds));
+        peer.options.idle_timeout = Some(Duration::from_secs(upstream.idle_timeout_seconds));
+        peer.options.alpn = ALPN::H2;
+        peer.options.max_h2_streams = upstream.http3_max_concurrent_streams;
+        PreparedH3Peer {
+            peer,
+            route: route.clone(),
+        }
+    });
     Ok(PreparedUpstream {
         peer,
+        h3,
         read_timeout_seconds: upstream.read_timeout_seconds,
         write_timeout_seconds: upstream.write_timeout_seconds,
     })
@@ -1720,7 +1775,8 @@ hosts:
 
     #[test]
     fn prepared_host_lookup_is_case_insensitive_and_peers_cache_pool_hash() {
-        let gateway = Gateway::new(Arc::new(runtime())).unwrap();
+        let gateway =
+            Gateway::new(Arc::new(runtime()), Arc::new(UpstreamH3Registry::default())).unwrap();
         let host = gateway.host("APP.EXAMPLE.COM:443").unwrap();
         assert_eq!(host.domain.as_ref(), "app.example.com");
         let plan = &gateway.plans[host.plan("/rest/stream").unwrap()];
@@ -1939,7 +1995,7 @@ write_timeout_seconds: 9
 "#,
         )
         .unwrap();
-        let upstream = prepare_upstream("test", &upstream).unwrap();
+        let upstream = prepare_upstream("test", &upstream, &UpstreamH3Registry::default()).unwrap();
         assert_eq!(
             upstream_timeouts(RouteClass::NavidromeStream, &upstream),
             (Duration::from_secs(7), Duration::from_secs(9))
@@ -1954,7 +2010,7 @@ write_timeout_seconds: 9
     fn omitted_upstream_timeout_uses_each_route_default() {
         let upstream: crate::config::UpstreamConfig =
             serde_saphyr::from_str("address: 127.0.0.1:9000").unwrap();
-        let upstream = prepare_upstream("test", &upstream).unwrap();
+        let upstream = prepare_upstream("test", &upstream, &UpstreamH3Registry::default()).unwrap();
         assert_eq!(
             upstream_timeouts(RouteClass::NavidromeStream, &upstream),
             (Duration::from_secs(3600), Duration::from_secs(3600))
@@ -1973,7 +2029,8 @@ write_timeout_seconds: 9
     fn invalid_upstream_address_is_rejected_before_serving_requests() {
         let upstream: crate::config::UpstreamConfig =
             serde_saphyr::from_str("address: '127.0.0.1:not-a-port'").unwrap();
-        let error = prepare_upstream("broken", &upstream).unwrap_err();
+        let error =
+            prepare_upstream("broken", &upstream, &UpstreamH3Registry::default()).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("name=broken"));
         assert!(message.contains("127.0.0.1:not-a-port"));
@@ -1984,7 +2041,7 @@ write_timeout_seconds: 9
         let upstream: crate::config::UpstreamConfig =
             serde_saphyr::from_str("address: 127.0.0.1:9443\ntls: true\nsni: upstream.test")
                 .unwrap();
-        let prepared = prepare_upstream("test", &upstream).unwrap();
+        let prepared = prepare_upstream("test", &upstream, &UpstreamH3Registry::default()).unwrap();
         assert_eq!(prepared.peer.options.alpn, ALPN::H2H1);
         assert_eq!(prepared.peer.options.max_h2_streams, 32);
 
@@ -1997,14 +2054,15 @@ write_timeout_seconds: 9
     fn plaintext_auto_stays_h1_and_explicit_http2_enables_h2c() {
         let automatic: crate::config::UpstreamConfig =
             serde_saphyr::from_str("address: 127.0.0.1:9000").unwrap();
-        let automatic = prepare_upstream("auto", &automatic).unwrap();
+        let automatic =
+            prepare_upstream("auto", &automatic, &UpstreamH3Registry::default()).unwrap();
         assert_eq!(automatic.peer.options.alpn, ALPN::H1);
 
         let h2c: crate::config::UpstreamConfig = serde_saphyr::from_str(
             "address: 127.0.0.1:9000\nprotocol: http2\nhttp2_max_concurrent_streams: 64",
         )
         .unwrap();
-        let h2c = prepare_upstream("h2c", &h2c).unwrap();
+        let h2c = prepare_upstream("h2c", &h2c, &UpstreamH3Registry::default()).unwrap();
         assert_eq!(h2c.peer.options.alpn, ALPN::H2);
         assert_eq!(h2c.peer.options.max_h2_streams, 64);
     }

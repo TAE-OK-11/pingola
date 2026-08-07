@@ -161,6 +161,7 @@ async fn run(
     ready: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<()> {
     let server = &runtime.config.server;
+    let allow_early_data = server.http3_enable_early_data;
     let certificate = server
         .certificate
         .as_deref()
@@ -223,7 +224,7 @@ async fn run(
     quic.enable_pacing = true;
     quic.enable_hystart = true;
     quic.send_capacity_factor = HTTP3_SEND_CAPACITY_FACTOR;
-    quic.enable_early_data = false;
+    quic.enable_early_data = allow_early_data;
     quic.disable_active_migration = true;
     // Keep connection-ID/path state minimal. NAT rebinding can still be handled
     // sequentially while an attacker cannot queue multiple PATH_CHALLENGE frames.
@@ -330,6 +331,7 @@ async fn run(
                                 internal_token: internal_token.clone(),
                                 client: client.clone(),
                                 alt_svc: alt_svc.clone(),
+                                allow_early_data,
                             },
                             permit,
                             client_permit,
@@ -342,12 +344,13 @@ async fn run(
     }
 
     info!(
-        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} hybrid_pq={} stateless_retry=true max_amplification={} early_data=false migration=false pmtud=true pacing=true socket_offload=auto[gso,gro,so_txtime,rxq_ovfl,pmtu_probe] max_udp_payload={} send_capacity_factor={} admission_rate={}/s burst={} max_connections_per_ip={} handshake_timeout={}s",
+        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} hybrid_pq={} stateless_retry=true max_amplification={} early_data={} migration=false pmtud=true pacing=true socket_offload=auto[gso,gro,so_txtime,rxq_ovfl,pmtu_probe] max_udp_payload={} send_capacity_factor={} admission_rate={}/s burst={} max_connections_per_ip={} handshake_timeout={}s",
         server.http3_listen,
         internal,
         tokio_quiche::quiche::PROTOCOL_VERSION,
         HYBRID_PQ_GROUPS,
         HTTP3_MAX_AMPLIFICATION_FACTOR,
+        allow_early_data,
         HTTP3_MAX_UDP_PAYLOAD_SIZE,
         HTTP3_SEND_CAPACITY_FACTOR,
         server.http3_connection_rate_per_second,
@@ -368,6 +371,7 @@ struct Http3ConnectionContext {
     internal_token: HeaderValue,
     client: ProxyClient,
     alt_svc: Option<HeaderValue>,
+    allow_early_data: bool,
 }
 
 async fn handle_connection(
@@ -384,19 +388,25 @@ async fn handle_connection(
                 is_in_early_data,
                 ..
             } => {
-                if *is_in_early_data {
-                    warn!("HTTP/3 early-data request rejected peer={peer}");
+                if *is_in_early_data
+                    && (!context.allow_early_data
+                        || !early_data_request_is_replay_safe(&incoming_headers))
+                {
+                    warn!("HTTP/3 unsafe early-data request rejected peer={peer}");
                     let IncomingH3Headers { mut send, .. } = incoming_headers;
                     if let Err(error) = send_error(
                         &mut send,
                         StatusCode::TOO_EARLY,
-                        "HTTP/3 early data is not accepted",
+                        "HTTP/3 early data is limited to bodyless GET/HEAD",
                     )
                     .await
                     {
                         warn!("failed to reject HTTP/3 early-data request peer={peer}: {error:#}");
                     }
                     continue;
+                }
+                if *is_in_early_data {
+                    info!("HTTP/3 early-data request accepted peer={peer}");
                 }
                 tokio::spawn(proxy_request(incoming_headers, context.clone()));
             }
@@ -408,6 +418,20 @@ async fn handle_connection(
     }
 }
 
+fn early_data_request_is_replay_safe(incoming: &IncomingH3Headers) -> bool {
+    if !incoming.read_fin {
+        return false;
+    }
+    incoming
+        .headers
+        .iter()
+        .find(|header| header.name() == b":method")
+        .is_some_and(|header| {
+            header.value().eq_ignore_ascii_case(b"GET")
+                || header.value().eq_ignore_ascii_case(b"HEAD")
+        })
+}
+
 async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionContext) {
     let Http3ConnectionContext {
         peer,
@@ -416,6 +440,7 @@ async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionCont
         internal_token,
         client,
         alt_svc,
+        allow_early_data: _,
     } = context;
     let IncomingH3Headers {
         headers,

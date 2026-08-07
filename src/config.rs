@@ -107,6 +107,10 @@ fn default_upstream_http2_streams() -> usize {
     32
 }
 
+fn default_upstream_http3_streams() -> usize {
+    64
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -133,6 +137,8 @@ pub struct ServerConfig {
     pub http3_max_concurrent_streams: u32,
     #[serde(default = "default_http3_handshake_timeout")]
     pub http3_handshake_timeout_seconds: u64,
+    #[serde(default)]
+    pub http3_enable_early_data: bool,
     #[serde(default = "default_http3_connection_rate_per_second")]
     pub http3_connection_rate_per_second: f64,
     #[serde(default = "default_http3_connection_burst")]
@@ -183,6 +189,10 @@ pub struct UpstreamConfig {
     pub protocol: UpstreamProtocol,
     #[serde(default = "default_upstream_http2_streams")]
     pub http2_max_concurrent_streams: usize,
+    #[serde(default = "default_upstream_http3_streams")]
+    pub http3_max_concurrent_streams: usize,
+    #[serde(default)]
+    pub http3_early_data: bool,
     #[serde(default)]
     pub sni: Option<String>,
     #[serde(default = "default_true")]
@@ -209,6 +219,14 @@ pub enum UpstreamProtocol {
     Auto,
     Http1,
     Http2,
+    Http3,
+    Http3Preferred,
+}
+
+impl UpstreamProtocol {
+    pub fn uses_http3(self) -> bool {
+        matches!(self, Self::Http3 | Self::Http3Preferred)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq)]
@@ -534,6 +552,12 @@ fn validate(config: &Config) -> Result<()> {
         }
         if !(1..=1024).contains(&upstream.http2_max_concurrent_streams) {
             bail!("upstream {name} http2_max_concurrent_streams must be between 1 and 1024");
+        }
+        if !(1..=1024).contains(&upstream.http3_max_concurrent_streams) {
+            bail!("upstream {name} http3_max_concurrent_streams must be between 1 and 1024");
+        }
+        if upstream.protocol.uses_http3() && !upstream.tls {
+            bail!("HTTP/3 upstream {name} requires tls: true");
         }
     }
 
