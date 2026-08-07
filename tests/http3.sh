@@ -31,7 +31,7 @@ chmod 0600 "${RUNTIME}/key.pem"
 chmod 0644 "${RUNTIME}/cert.pem"
 
 cargo build --manifest-path "${ROOT}/Cargo.toml" --locked \
-  --bin pingora --example http3_probe
+  --bin pingora --example http3_probe --example pq_tls_probe
 python3 "${ROOT}/tests/backend.py" >"${BACKEND_LOG}" 2>&1 &
 BACKEND_PID=$!
 RUST_LOG=info "${ROOT}/target/debug/pingora" \
@@ -50,6 +50,10 @@ for _ in {1..100}; do
   sleep 0.1
 done
 kill -0 "${GATEWAY_PID}"
+
+pq_curve=$("${ROOT}/target/debug/examples/pq_tls_probe" \
+  127.0.0.1:18444 app.test)
+[[ "${pq_curve}" == "X25519MLKEM768" ]]
 
 # Browsers normally discover HTTP/3 from an initial H1 or H2 TLS
 # response. Direct redirects must advertise the configured UDP port
@@ -104,6 +108,7 @@ spoof_location=$(curl --noproxy '*' -sSI -H 'host: app.test' \
 [[ "${spoof_location}" == "https://app.test/headers" ]]
 
 grep -q 'HTTP/3 frontend started:.*internal=h2c://' "${GATEWAY_LOG}"
+grep -q 'HTTP/3 frontend started:.*hybrid_pq=X25519MLKEM768:X25519:P-256.*stateless_retry=true.*max_amplification=3' "${GATEWAY_LOG}"
 grep -q 'http3_udp=\["127.0.0.1:18443"\]' "${GATEWAY_LOG}"
 
-echo "HTTP/3 QUIC proxy, h2c internal multiplexing, static response, Alt-Svc, forwarding, and private-header isolation tests passed"
+echo "HTTP/3 hybrid PQ TLS, stateless Retry, anti-DDoS admission, QUIC proxy, h2c multiplexing, Alt-Svc, forwarding, and isolation tests passed"

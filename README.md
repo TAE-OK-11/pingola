@@ -1,6 +1,6 @@
 # Pingora
 
-Cloudflare [Pingora](https://github.com/cloudflare/pingora)를 기반으로 AWS-LC,
+Cloudflare [Pingora](https://github.com/cloudflare/pingora)를 기반으로 Cloudflare BoringSSL,
 HTTP/1.1, HTTP/2를 지원하는 JBS 리버스 프록시입니다. 기본 설정은 PiKKY 정적
 사이트, Navidrome, Vaultwarden, CouchDB, AdGuard Home/DoH를 1 vCPU / 1 GB Linux
 호스트에서 운영하도록 bounded cache·buffer·limiter를 사용합니다.
@@ -9,20 +9,20 @@ HTTP/1.1, HTTP/2를 지원하는 JBS 리버스 프록시입니다. 기본 설정
 crate와 충돌하지 않도록 `jbs-pingora`, 실행 binary와 제품명은 `pingora`입니다.
 upstream dependency는 Rust 코드에서 `cloudflare_pingora` alias로 가져옵니다.
 
-TLS provider는 AWS-LC/rustls 하나만 지원합니다. BoringSSL 비교 feature와 image
-게시 경로는 제거했으며, 다른 TLS provider를 지정한 Docker build는 즉시 실패합니다.
-`aws-lc-rs 1.17.3`, `aws-lc-sys 0.43.0`, `rustls 0.23.42`를 lockfile로 고정합니다.
+TLS provider는 Cloudflare `boring`/BoringSSL 하나만 지원합니다. Pingora와
+HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항목을
+공유하며, 다른 TLS provider를 지정한 Docker build는 즉시 실패합니다.
 
 ## 주요 기능과 한계
 
-- AWS-LC를 사용하는 rustls와 다운스트림 TLS 1.3 전용 정책
+- Cloudflare BoringSSL를 사용하는 rustls와 다운스트림 TLS 1.3 전용 정책
 - HTTP/1.1 및 HTTP/2, 기본 최대 32개 동시 H2 stream(설정으로 1~1024 override)
 - IPv4/IPv6 listener와 IPv6 socket의 명시적 `IPV6_V6ONLY=true`
 - Host allowlist, trusted proxy 기반 `X-Forwarded-For`, body 크기 제한
 - 서비스·route별 rate limit 및 active request/H2 stream limit
 - Navidrome audio 무압축 streaming, Vaultwarden/CouchDB route 압축, DoH 정책
 - PiKKY 정적 파일 gzip/Brotli/Zstd 동적·사전 압축, bounded asset LRU cache
-- AWS-LC TLS 파일 사전 검사와 UID/GID/mode/symlink 대상 진단
+- Cloudflare BoringSSL TLS 파일 사전 검사와 UID/GID/mode/symlink 대상 진단
 - Rust global allocator로 정적 링크된 Google TCMalloc(8 KiB logical page)
 - UID/GID `10001:10001`, read-only root filesystem, 최소 capability
 
@@ -412,7 +412,7 @@ docker build --build-arg ALLOCATOR=tcmalloc \
 
 # GitHub Actions와 동일한 AMD Zen 1 PGO image를 로컬에서 재현하는 경우
 docker build --build-arg ALLOCATOR=tcmalloc \
-  --build-arg TLS_PROVIDER=aws-lc \
+  --build-arg TLS_PROVIDER=boringssl \
   --build-arg PGO_MODE=train \
   --build-arg PGO_TRAIN_TARGET_CPU=x86-64-v2 \
   --build-arg RUST_TARGET_CPU=znver1 \
@@ -560,3 +560,8 @@ curl --fail http://127.0.0.1/nginx-health
 
 Apache-2.0. Vendored Pingora rustls adapter는 원본 Cloudflare 저작권과 라이선스를
 보존합니다.
+
+
+## Hybrid post-quantum TLS and QUIC admission hardening
+
+JBS Pingora prefers `X25519MLKEM768` for TLS 1.3 on both TCP and QUIC, with `X25519` and `P-256` retained as compatibility fallbacks. QUIC source-address validation is mandatory, so new clients complete a stateless Retry before a full connection is allocated. The server also enforces the QUIC 3x anti-amplification bound, disables 0-RTT and active migration, applies a bounded handshake timeout, and limits new/active QUIC connections per source IP. The defaults are 64 new connections/s with a burst of 128, at most 128 active QUIC connections per IP, and a 5-second QUIC handshake timeout.
