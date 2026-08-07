@@ -32,8 +32,9 @@ Pingora 0.8.1은 다운스트림 HTTP/3/QUIC server를 제공하지 않으므로
 압축은 적용하지 않습니다. 그 외 압축 가능한 프록시 응답(Vaultwarden, CouchDB,
 AdGuard UI)은 client의 `Accept-Encoding`을 정확히 협상해 같은 q-value에서는
 `zstd` → `br` → `gzip` 순으로 선택하고 level 1 streaming 압축을 적용합니다.
-Range/206, 이미 인코딩된 응답, `no-transform`, 1 KiB 미만, WebSocket/본문 없는 응답과
-DoH `application/dns-message` 같은 비압축 MIME은 identity를 유지합니다.
+Range/206, 이미 인코딩된 응답, `no-transform`, 1 KiB 미만, Vaultwarden 인증/token,
+notifications/WebSocket Hub, 본문 없는 응답과 DoH `application/dns-message` 같은
+보안상 민감하거나 비압축 MIME은 identity를 유지합니다.
 
 ## 새 이름과 한 릴리스 호환성
 
