@@ -139,8 +139,8 @@ impl RateLimiter {
     }
 }
 
-/// Counts active requests per IP. HTTP/2 requests are streams, not TCP
-/// connections, so the type intentionally describes what is actually bounded.
+/// Counts active resources per IP. It is used for HTTP requests/streams and
+/// for QUIC connections, with the `zone` separating independent limits.
 pub struct ActiveRequestLimiter {
     counters: DashMap<ClientKey, Arc<AtomicUsize>>,
     counter_count: AtomicUsize,

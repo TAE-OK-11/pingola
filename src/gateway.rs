@@ -38,6 +38,7 @@ use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_hos
 use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
 use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, RateLimiter};
 use crate::static_files::StaticFiles;
+use crate::upstream_h3::{BridgeRoute, UpstreamH3Registry};
 
 const STREAM_PREFIXES: &[&str] = &[
     "/rest/stream",
@@ -66,6 +67,8 @@ thread_local! {
 }
 const NO_PLAN: usize = usize::MAX;
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+const HTTP3_INTERNAL: HeaderName = HeaderName::from_static("x-jbs-http3-internal");
+const HTTP3_PORT: HeaderName = HeaderName::from_static("x-jbs-http3-port");
 #[cfg(test)]
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
@@ -181,8 +184,15 @@ impl RouteClass {
 }
 
 #[derive(Clone, Debug)]
+struct PreparedH3Peer {
+    peer: HttpPeer,
+    route: BridgeRoute,
+}
+
+#[derive(Clone, Debug)]
 struct PreparedUpstream {
     peer: HttpPeer,
+    h3: Option<PreparedH3Peer>,
     read_timeout_seconds: Option<u64>,
     write_timeout_seconds: Option<u64>,
 }
@@ -192,6 +202,7 @@ struct PreparedPlan {
     domain: http::HeaderValue,
     handler: HandlerKind,
     peer: HttpPeer,
+    h3: Option<PreparedH3Peer>,
     route: RouteClass,
     rate_limit: Option<(f64, u32)>,
     active_request_limit: usize,
@@ -250,6 +261,8 @@ pub struct RequestContext {
     plan_index: usize,
     client_ip: IpAddr,
     tls: bool,
+    http3: bool,
+    forwarded_port: Option<u16>,
     body_bytes: usize,
     retries: usize,
     identity_acceptable: bool,
@@ -265,6 +278,8 @@ impl Default for RequestContext {
             plan_index: NO_PLAN,
             client_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             tls: false,
+            http3: false,
+            forwarded_port: None,
             body_bytes: 0,
             retries: 0,
             identity_acceptable: true,
@@ -286,7 +301,10 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    pub fn new(runtime: Arc<RuntimeConfig>) -> anyhow::Result<Self> {
+    pub fn new(
+        runtime: Arc<RuntimeConfig>,
+        upstream_h3: Arc<UpstreamH3Registry>,
+    ) -> anyhow::Result<Self> {
         let roots = runtime
             .config
             .hosts
@@ -303,7 +321,8 @@ impl Gateway {
             .upstreams
             .iter()
             .map(|(name, upstream)| {
-                prepare_upstream(name, upstream).map(|prepared| (name.clone(), prepared))
+                prepare_upstream(name, upstream, &upstream_h3)
+                    .map(|prepared| (name.clone(), prepared))
             })
             .collect::<anyhow::Result<HashMap<_, _>>>()?;
         let mut hosts = AHashMap::with_capacity(
@@ -332,6 +351,7 @@ impl Gateway {
                         domain: domain_header.clone(),
                         handler: host.handler,
                         peer: prepare_route_peer(upstream, route),
+                        h3: prepare_route_h3(upstream, route),
                         route,
                         rate_limit: effective_rate_limit(&runtime, route),
                         active_request_limit: runtime
@@ -436,11 +456,32 @@ impl ProxyHttp for Gateway {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        let tls = is_tls(session);
+        let http3 = is_internal_http3(&self.runtime, session);
+        let tls = is_tls(session) || http3;
+        ctx.http3 = http3;
+        ctx.forwarded_port = http3
+            .then(|| {
+                session
+                    .req_header()
+                    .headers
+                    .get(&HTTP3_PORT)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .or_else(|| self.runtime.http3_public_port())
+            })
+            .flatten();
         let path = session.req_header().uri.path();
 
         if path == "/pingora-health" || path == "/pingora-live" || path == "/pingora-ready" {
-            return send_empty(session, 204, None, tls, &[("x-proxy-product", "Pingora")]).await;
+            return send_empty(
+                &self.runtime,
+                session,
+                204,
+                None,
+                tls,
+                &[("x-proxy-product", "Pingora")],
+            )
+            .await;
         }
         if path == "/pingola-health" {
             if self.runtime.config.server.legacy_pingola_health {
@@ -450,6 +491,7 @@ impl ProxyHttp for Gateway {
                     );
                 });
                 return send_empty(
+                    &self.runtime,
                     session,
                     204,
                     None,
@@ -458,10 +500,26 @@ impl ProxyHttp for Gateway {
                 )
                 .await;
             }
-            return send_empty(session, 404, None, tls, &[("x-proxy-product", "Pingora")]).await;
+            return send_empty(
+                &self.runtime,
+                session,
+                404,
+                None,
+                tls,
+                &[("x-proxy-product", "Pingora")],
+            )
+            .await;
         }
         if path == "/nginx-health" {
-            return send_empty(session, 404, None, tls, &[("x-proxy-product", "Pingora")]).await;
+            return send_empty(
+                &self.runtime,
+                session,
+                404,
+                None,
+                tls,
+                &[("x-proxy-product", "Pingora")],
+            )
+            .await;
         }
         if path == "/pingora-health/details" {
             let unix_socket = session
@@ -469,18 +527,25 @@ impl ProxyHttp for Gateway {
                 .and_then(|address| address.as_inet())
                 .is_none();
             if !self.runtime.config.server.health_details || !unix_socket {
-                return send_empty(session, 404, None, tls, &[("x-proxy-product", "Pingora")])
-                    .await;
+                return send_empty(
+                    &self.runtime,
+                    session,
+                    404,
+                    None,
+                    tls,
+                    &[("x-proxy-product", "Pingora")],
+                )
+                .await;
             }
             return send_health_details(session, &self.runtime).await;
         }
 
         let Some(authority) = request_authority(session.req_header()) else {
-            return send_empty(session, 400, None, tls, &[]).await;
+            return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
         };
         let Some(host) = self.host(authority) else {
             session.set_keepalive(None);
-            return send_empty(session, 421, None, tls, &[]).await;
+            return send_empty(&self.runtime, session, 421, None, tls, &[]).await;
         };
 
         if !tls && host.redirect_http {
@@ -491,6 +556,7 @@ impl ProxyHttp for Gateway {
                 .map_or("/", |value| value.as_str());
             let location = format!("https://{}{path_and_query}", host.domain.as_ref());
             return send_empty(
+                &self.runtime,
                 session,
                 308,
                 Some(host.handler),
@@ -510,6 +576,7 @@ impl ProxyHttp for Gateway {
             }
             if !self.acquire_global_request(ctx) {
                 return send_empty(
+                    &self.runtime,
                     session,
                     429,
                     Some(host.handler),
@@ -527,6 +594,7 @@ impl ProxyHttp for Gateway {
         if host.handler == HandlerKind::NavidromeMain && path == "/" {
             let location = format!("https://{}/app/", host.domain.as_ref());
             return send_empty(
+                &self.runtime,
                 session,
                 308,
                 Some(host.handler),
@@ -537,25 +605,26 @@ impl ProxyHttp for Gateway {
         }
 
         let Some(plan_index) = host.plan(path) else {
-            return send_empty(session, 500, Some(host.handler), tls, &[]).await;
+            return send_empty(&self.runtime, session, 500, Some(host.handler), tls, &[]).await;
         };
         let plan = &self.plans[plan_index];
         let encoding = configure_downstream_compression(session, plan.route)?;
         if encoding.preferred == ContentCoding::NotAcceptable {
-            return send_empty(session, 406, Some(plan.handler), tls, &[]).await;
+            return send_empty(&self.runtime, session, 406, Some(plan.handler), tls, &[]).await;
         }
         ctx.identity_acceptable = encoding.identity_acceptable;
         ctx.compression_selected = encoding.preferred.as_str().is_some();
         ctx.tls = tls;
 
         if content_length(session.req_header()).is_some_and(|length| length > plan.max_body_bytes) {
-            return send_empty(session, 413, Some(plan.handler), tls, &[]).await;
+            return send_empty(&self.runtime, session, 413, Some(plan.handler), tls, &[]).await;
         }
 
         if let Some((rate, burst)) = plan.rate_limit
             && !self.rates.allow(plan.route.name(), client_ip, rate, burst)
         {
             return send_empty(
+                &self.runtime,
                 session,
                 429,
                 Some(plan.handler),
@@ -567,6 +636,7 @@ impl ProxyHttp for Gateway {
 
         if !self.acquire_global_request(ctx) {
             return send_empty(
+                &self.runtime,
                 session,
                 429,
                 Some(plan.handler),
@@ -583,6 +653,7 @@ impl ProxyHttp for Gateway {
                 plan.active_request_limit,
             ) else {
                 return send_empty(
+                    &self.runtime,
                     session,
                     429,
                     Some(plan.handler),
@@ -608,11 +679,18 @@ impl ProxyHttp for Gateway {
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let plan = self.request_plan(ctx)?;
+        if let Some(h3) = &plan.h3
+            && h3.route.should_use_h3()
+        {
+            return Ok(Box::new(h3.peer.clone()));
+        }
         Ok(Box::new(plan.peer.clone()))
     }
 
     fn precomputed_upstream_peer<'a>(&'a self, ctx: &Self::CTX) -> Option<&'a HttpPeer> {
-        self.plans.get(ctx.plan_index).map(|plan| &plan.peer)
+        self.plans
+            .get(ctx.plan_index)
+            .and_then(|plan| plan.h3.is_none().then_some(&plan.peer))
     }
 
     fn h1_bodyless_fast_path(&self, session: &Session, ctx: &Self::CTX) -> bool {
@@ -640,14 +718,18 @@ impl ProxyHttp for Gateway {
 
         upstream_request.remove_header(&FORWARDED);
         upstream_request.remove_header(&X_FORWARDED_FOR);
+        upstream_request.remove_header(&HTTP3_INTERNAL);
+        upstream_request.remove_header(&HTTP3_PORT);
         upstream_request.insert_header(HOST, upstream_host)?;
         upstream_request.insert_header("x-real-ip", client_ip.clone())?;
         upstream_request.insert_header("x-forwarded-for", client_ip)?;
         upstream_request.insert_header("x-forwarded-host", plan.domain.clone())?;
-        let listener_port = session
-            .server_addr()
-            .and_then(|address| address.as_inet())
-            .map(|address| address.port());
+        let listener_port = ctx.forwarded_port.or_else(|| {
+            session
+                .server_addr()
+                .and_then(|address| address.as_inet())
+                .map(|address| address.port())
+        });
         upstream_request.insert_header(
             "x-forwarded-port",
             forwarded_port_value(listener_port, ctx.tls)?,
@@ -754,6 +836,11 @@ impl ProxyHttp for Gateway {
             && session.is_upgrade_req();
         strip_response_hop_headers(response, forwards_upgrade)?;
         insert_security_headers(response, plan.handler, ctx.tls)?;
+        if ctx.tls
+            && let Some(alt_svc) = self.runtime.http3_alt_svc_header()
+        {
+            response.insert_header("alt-svc", alt_svc)?;
+        }
         if ctx.compression_selected && response_status_is_interim(response.status.as_u16()) {
             // 100/103 are interim headers. Do not permanently disable the
             // compressor before the final response arrives.
@@ -932,7 +1019,10 @@ fn forwards_accept_encoding(route: RouteClass) -> bool {
 }
 
 fn uses_downstream_compression(route: RouteClass) -> bool {
-    matches!(route, RouteClass::Vaultwarden | RouteClass::Couchdb)
+    matches!(
+        route,
+        RouteClass::Vaultwarden | RouteClass::Couchdb | RouteClass::AdguardUi
+    )
 }
 
 fn configure_downstream_compression(
@@ -1220,6 +1310,28 @@ fn is_tls(session: &Session) -> bool {
         .is_some()
 }
 
+fn is_internal_http3(runtime: &RuntimeConfig, session: &Session) -> bool {
+    let Some(expected) = runtime.http3_internal_addr() else {
+        return false;
+    };
+    let server_matches = session
+        .server_addr()
+        .and_then(|address| address.as_inet())
+        .is_some_and(|address| *address == expected);
+    let peer_is_loopback = session
+        .client_addr()
+        .and_then(|address| address.as_inet())
+        .is_some_and(|address| address.ip().is_loopback());
+    let marker_matches = runtime.http3_internal_token().is_some_and(|expected| {
+        session
+            .req_header()
+            .headers
+            .get(&HTTP3_INTERNAL)
+            .is_some_and(|value| value == expected)
+    });
+    server_matches && peer_is_loopback && marker_matches
+}
+
 fn session_client_ip(runtime: &RuntimeConfig, session: &Session) -> IpAddr {
     let peer_ip = session
         .client_addr()
@@ -1390,6 +1502,19 @@ fn upstream_name_for_route(
     }
 }
 
+fn prepare_route_h3(upstream: &PreparedUpstream, route: RouteClass) -> Option<PreparedH3Peer> {
+    if route == RouteClass::VaultwardenHub {
+        return None;
+    }
+    let mut h3 = upstream.h3.clone()?;
+    h3.peer.group_key = 10_000 + route.upstream_pool_group();
+    let (read_timeout, write_timeout) = upstream_timeouts(route, upstream);
+    h3.peer.options.read_timeout = Some(read_timeout);
+    h3.peer.options.write_timeout = Some(write_timeout);
+    h3.peer.cache_reuse_hash();
+    Some(h3)
+}
+
 fn prepare_route_peer(upstream: &PreparedUpstream, route: RouteClass) -> HttpPeer {
     let mut peer = upstream.peer.clone();
     peer.group_key = route.upstream_pool_group();
@@ -1409,6 +1534,7 @@ fn prepare_route_peer(upstream: &PreparedUpstream, route: RouteClass) -> HttpPee
 fn prepare_upstream(
     name: &str,
     upstream: &crate::config::UpstreamConfig,
+    upstream_h3: &UpstreamH3Registry,
 ) -> anyhow::Result<PreparedUpstream> {
     let address = upstream
         .address
@@ -1438,9 +1564,14 @@ fn prepare_upstream(
     peer.options.verify_cert = upstream.verify_certificate;
     peer.options.verify_hostname = upstream.verify_certificate;
     peer.options.alpn = match upstream.protocol {
-        UpstreamProtocol::Auto if upstream.tls => ALPN::H2H1,
+        UpstreamProtocol::Auto | UpstreamProtocol::Http3 | UpstreamProtocol::Http3Preferred
+            if upstream.tls =>
+        {
+            ALPN::H2H1
+        }
         UpstreamProtocol::Auto | UpstreamProtocol::Http1 => ALPN::H1,
         UpstreamProtocol::Http2 => ALPN::H2,
+        UpstreamProtocol::Http3 | UpstreamProtocol::Http3Preferred => ALPN::H1,
     };
     peer.options.max_h2_streams = upstream.http2_max_concurrent_streams;
     peer.options.tcp_keepalive = Some(TcpKeepalive {
@@ -1450,8 +1581,23 @@ fn prepare_upstream(
         #[cfg(target_os = "linux")]
         user_timeout: Duration::from_secs(90),
     });
+    let h3 = upstream_h3.route(name).map(|route| {
+        let mut peer = HttpPeer::new(route.address(), false, String::new());
+        peer.options.connection_timeout =
+            Some(Duration::from_secs(upstream.connect_timeout_seconds));
+        peer.options.total_connection_timeout =
+            Some(Duration::from_secs(upstream.connect_timeout_seconds));
+        peer.options.idle_timeout = Some(Duration::from_secs(upstream.idle_timeout_seconds));
+        peer.options.alpn = ALPN::H2;
+        peer.options.max_h2_streams = upstream.http3_max_concurrent_streams;
+        PreparedH3Peer {
+            peer,
+            route: route.clone(),
+        }
+    });
     Ok(PreparedUpstream {
         peer,
+        h3,
         read_timeout_seconds: upstream.read_timeout_seconds,
         write_timeout_seconds: upstream.write_timeout_seconds,
     })
@@ -1506,6 +1652,7 @@ fn insert_security_headers(
 }
 
 async fn send_empty(
+    runtime: &RuntimeConfig,
     session: &mut Session,
     status: u16,
     handler: Option<HandlerKind>,
@@ -1519,6 +1666,9 @@ async fn send_empty(
     }
     if let Some(handler) = handler {
         insert_security_headers(&mut response, handler, tls)?;
+    }
+    if tls && let Some(alt_svc) = runtime.http3_alt_svc_header() {
+        response.insert_header("alt-svc", alt_svc)?;
     }
     session
         .write_response_header(Box::new(response), true)
@@ -1625,7 +1775,8 @@ hosts:
 
     #[test]
     fn prepared_host_lookup_is_case_insensitive_and_peers_cache_pool_hash() {
-        let gateway = Gateway::new(Arc::new(runtime())).unwrap();
+        let gateway =
+            Gateway::new(Arc::new(runtime()), Arc::new(UpstreamH3Registry::default())).unwrap();
         let host = gateway.host("APP.EXAMPLE.COM:443").unwrap();
         assert_eq!(host.domain.as_ref(), "app.example.com");
         let plan = &gateway.plans[host.plan("/rest/stream").unwrap()];
@@ -1684,8 +1835,13 @@ hosts:
             assert!(!forwards_accept_encoding(route), "route={route:?}");
         }
 
-        assert!(uses_downstream_compression(RouteClass::Vaultwarden));
-        assert!(uses_downstream_compression(RouteClass::Couchdb));
+        for route in [
+            RouteClass::Vaultwarden,
+            RouteClass::Couchdb,
+            RouteClass::AdguardUi,
+        ] {
+            assert!(uses_downstream_compression(route), "route={route:?}");
+        }
         for route in [
             RouteClass::NavidromeStream,
             RouteClass::NavidromeCover,
@@ -1693,7 +1849,6 @@ hosts:
             RouteClass::VaultwardenAuth,
             RouteClass::VaultwardenHub,
             RouteClass::Doh,
-            RouteClass::AdguardUi,
         ] {
             assert!(!uses_downstream_compression(route), "route={route:?}");
         }
@@ -1840,7 +1995,7 @@ write_timeout_seconds: 9
 "#,
         )
         .unwrap();
-        let upstream = prepare_upstream("test", &upstream).unwrap();
+        let upstream = prepare_upstream("test", &upstream, &UpstreamH3Registry::default()).unwrap();
         assert_eq!(
             upstream_timeouts(RouteClass::NavidromeStream, &upstream),
             (Duration::from_secs(7), Duration::from_secs(9))
@@ -1855,7 +2010,7 @@ write_timeout_seconds: 9
     fn omitted_upstream_timeout_uses_each_route_default() {
         let upstream: crate::config::UpstreamConfig =
             serde_saphyr::from_str("address: 127.0.0.1:9000").unwrap();
-        let upstream = prepare_upstream("test", &upstream).unwrap();
+        let upstream = prepare_upstream("test", &upstream, &UpstreamH3Registry::default()).unwrap();
         assert_eq!(
             upstream_timeouts(RouteClass::NavidromeStream, &upstream),
             (Duration::from_secs(3600), Duration::from_secs(3600))
@@ -1874,7 +2029,8 @@ write_timeout_seconds: 9
     fn invalid_upstream_address_is_rejected_before_serving_requests() {
         let upstream: crate::config::UpstreamConfig =
             serde_saphyr::from_str("address: '127.0.0.1:not-a-port'").unwrap();
-        let error = prepare_upstream("broken", &upstream).unwrap_err();
+        let error =
+            prepare_upstream("broken", &upstream, &UpstreamH3Registry::default()).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("name=broken"));
         assert!(message.contains("127.0.0.1:not-a-port"));
@@ -1885,7 +2041,7 @@ write_timeout_seconds: 9
         let upstream: crate::config::UpstreamConfig =
             serde_saphyr::from_str("address: 127.0.0.1:9443\ntls: true\nsni: upstream.test")
                 .unwrap();
-        let prepared = prepare_upstream("test", &upstream).unwrap();
+        let prepared = prepare_upstream("test", &upstream, &UpstreamH3Registry::default()).unwrap();
         assert_eq!(prepared.peer.options.alpn, ALPN::H2H1);
         assert_eq!(prepared.peer.options.max_h2_streams, 32);
 
@@ -1898,14 +2054,15 @@ write_timeout_seconds: 9
     fn plaintext_auto_stays_h1_and_explicit_http2_enables_h2c() {
         let automatic: crate::config::UpstreamConfig =
             serde_saphyr::from_str("address: 127.0.0.1:9000").unwrap();
-        let automatic = prepare_upstream("auto", &automatic).unwrap();
+        let automatic =
+            prepare_upstream("auto", &automatic, &UpstreamH3Registry::default()).unwrap();
         assert_eq!(automatic.peer.options.alpn, ALPN::H1);
 
         let h2c: crate::config::UpstreamConfig = serde_saphyr::from_str(
             "address: 127.0.0.1:9000\nprotocol: http2\nhttp2_max_concurrent_streams: 64",
         )
         .unwrap();
-        let h2c = prepare_upstream("h2c", &h2c).unwrap();
+        let h2c = prepare_upstream("h2c", &h2c, &UpstreamH3Registry::default()).unwrap();
         assert_eq!(h2c.peer.options.alpn, ALPN::H2);
         assert_eq!(h2c.peer.options.max_h2_streams, 64);
     }

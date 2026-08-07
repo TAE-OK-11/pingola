@@ -2,9 +2,12 @@ mod allocator;
 mod config;
 mod content_encoding;
 mod gateway;
+mod http3;
 mod limits;
 mod preflight;
 mod static_files;
+mod tls_policy;
+mod upstream_h3;
 
 use std::fs::{self, Permissions};
 use std::io::{Read, Write};
@@ -16,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use boring::ssl::SslVersion;
 use clap::Parser;
 use cloudflare_pingora::apps::HttpServerOptions;
 use cloudflare_pingora::listeners::TcpSocketOptions;
@@ -30,9 +34,10 @@ use log::info;
 use crate::config::RuntimeConfig;
 use crate::gateway::Gateway;
 use crate::preflight::check_runtime;
+use crate::tls_policy::HYBRID_PQ_GROUPS;
 
-#[cfg(not(feature = "tls-aws-lc"))]
-compile_error!("the AWS-LC TLS provider is required: enable tls-aws-lc");
+#[cfg(not(feature = "tls-boringssl"))]
+compile_error!("the Cloudflare BoringSSL provider is required: enable tls-boringssl");
 
 const PRIMARY_CONFIG: &str = "/etc/pingora/pingora.yaml";
 const LEGACY_CONFIG: &str = "/etc/pingola/pingola.yaml";
@@ -81,7 +86,6 @@ fn main() -> Result<()> {
         return run_healthcheck(target, &config_path);
     }
 
-    install_aws_lc_tls13_provider().context("TLS provider initialization failed")?;
     let runtime =
         Arc::new(RuntimeConfig::load(&config_path).with_context(|| {
             format!("configuration validation failed: {}", config_path.display())
@@ -93,7 +97,10 @@ fn main() -> Result<()> {
             config_path.display(),
             runtime.config.hosts.len(),
             runtime.config.upstreams.len(),
-            runtime.config.server.http_listen.len() + runtime.config.server.https_listen.len()
+            runtime.config.server.http_listen.len()
+                + runtime.config.server.https_listen.len()
+                + runtime.config.server.http3_listen.len()
+                + usize::from(!runtime.config.server.http3_listen.is_empty())
         );
         let report = check_runtime(&runtime, cli.check_bind);
         report.print();
@@ -233,24 +240,18 @@ fn probe_health(stream: &mut (impl Read + Write), target: &str) -> Result<()> {
     }
 }
 
-fn install_aws_lc_tls13_provider() -> Result<()> {
-    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    provider
-        .cipher_suites
-        .retain(|suite| suite.version() == &rustls::version::TLS13);
-    provider
-        .install_default()
-        .map_err(|_| anyhow!("a process-wide rustls crypto provider was installed before AWS-LC"))
-}
-
 #[inline]
 fn tls_provider_name() -> &'static str {
-    "AWS-LC/rustls"
+    "Cloudflare BoringSSL"
 }
 
-fn enforce_tls13(_tls: &mut TlsSettings) -> Result<()> {
-    // The vendored rustls adapter constructs the listener with TLS 1.3 as its
-    // only protocol version, and the process provider contains TLS 1.3 suites only.
+fn enforce_tls13(tls: &mut TlsSettings) -> Result<()> {
+    tls.set_min_proto_version(Some(SslVersion::TLS1_3))
+        .context("failed to set BoringSSL minimum protocol to TLS 1.3")?;
+    tls.set_max_proto_version(Some(SslVersion::TLS1_3))
+        .context("failed to set BoringSSL maximum protocol to TLS 1.3")?;
+    tls.set_curves_list(HYBRID_PQ_GROUPS)
+        .context("failed to configure X25519MLKEM768 hybrid post-quantum groups")?;
     Ok(())
 }
 
@@ -274,7 +275,10 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     let mut server = Server::new_with_opt_and_conf(None, pingora_config);
     server.bootstrap();
 
-    let gateway = Gateway::new(runtime.clone()).context("service bootstrap failed")?;
+    let upstream_h3 =
+        upstream_h3::start(runtime.clone()).context("upstream HTTP/3 bridge startup failed")?;
+    let gateway =
+        Gateway::new(runtime.clone(), upstream_h3.clone()).context("service bootstrap failed")?;
     let mut http_options = HttpServerOptions::default();
     http_options.request_header_timeout = Some(Duration::from_secs(
         server_config.downstream_request_header_timeout_seconds,
@@ -334,11 +338,40 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         Some(Permissions::from_mode(0o600)),
     );
 
+    if !server_config.http3_listen.is_empty() {
+        let h2c_gateway = Gateway::new(runtime.clone(), upstream_h3.clone())
+            .context("HTTP/3 h2c service bootstrap failed")?;
+        let mut h2c_options = HttpServerOptions::default();
+        h2c_options.h2c = true;
+        h2c_options.request_header_timeout = Some(Duration::from_secs(
+            server_config.downstream_request_header_timeout_seconds,
+        ));
+        let mut h2c_service = ProxyServiceBuilder::new(&server.configuration, h2c_gateway)
+            .name("pingora-http3-h2c-handoff")
+            .server_options(h2c_options)
+            .build();
+        h2c_service.set_connection_limit(server_config.downstream_max_connections);
+        let mut h2c_stream_options = default_h2_options();
+        h2c_stream_options.max_concurrent_streams(server_config.http3_max_concurrent_streams);
+        h2c_stream_options.max_header_list_size(64 * 1024);
+        if let Some(proxy) = h2c_service.app_logic_mut() {
+            proxy.h2_options = Some(h2c_stream_options);
+        }
+        let internal = server_config.http3_internal_listen.to_string();
+        h2c_service.add_tcp_with_settings(&internal, listener_options(&internal)?);
+        server.add_service(h2c_service);
+    }
+
+    http3::start(runtime.clone()).context("HTTP/3 frontend startup failed")?;
+
     info!(
-        "starting Pingora with {} TLS 1.3: http={:?} https={:?} health_socket={} threads={}",
+        "starting Pingora with {} TLS 1.3 hybrid_pq={}: http={:?} https={:?} http3_udp={:?} http3_internal={} health_socket={} threads={}",
         tls_provider_name(),
+        HYBRID_PQ_GROUPS,
         server_config.http_listen,
         server_config.https_listen,
+        server_config.http3_listen,
+        server_config.http3_internal_listen,
         server_config.health_socket.display(),
         server_config.threads
     );

@@ -3,6 +3,11 @@ server:
     - "127.0.0.1:80"
   https_listen:
     - "127.0.0.1:443"
+  http3_listen:
+    - "127.0.0.1:8443"
+  http3_internal_listen: "127.0.0.1:18080"
+  http3_max_idle_timeout_seconds: 15
+  http3_max_concurrent_streams: 16
   certificate: /tmp/pingora-integration/cert.pem
   private_key: /tmp/pingora-integration/key.pem
   threads: 1
@@ -20,6 +25,8 @@ trusted_proxies:
 
 upstreams:
   backend:
+    address: "127.0.0.1:19090"
+  adguard_dns_doh:
     address: "127.0.0.1:19090"
 
 hosts:
@@ -39,5 +46,17 @@ hosts:
     domains:
       - vault.test
     handler: vaultwarden
+    upstream: backend
+    redirect_http: true
+  couch:
+    domains:
+      - couch.test
+    handler: couchdb
+    upstream: backend
+    redirect_http: true
+  adguard:
+    domains:
+      - dns.test
+    handler: adguard-dns
     upstream: backend
     redirect_http: true

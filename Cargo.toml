@@ -12,25 +12,32 @@ name = "pingora"
 path = "src/main.rs"
 
 [features]
-default = ["tcmalloc", "tls-aws-lc"]
+default = ["tcmalloc", "tls-boringssl"]
 jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemallocator"]
 tcmalloc = ["dep:tcmalloc-better"]
 system-allocator = []
-tls-aws-lc = ["cloudflare-pingora/rustls"]
+tls-boringssl = ["cloudflare-pingora/boringssl"]
 
 [dependencies]
 anyhow = "1.0.104"
 ahash = "0.8.12"
 arrayvec = "0.7.8"
 async-trait = "0.1.91"
+boring = { version = "=4.22.0", features = ["pq-experimental"] }
 brotli = "8.0.4"
 bytes = "1.12.1"
 clap = { version = "4.6.5", features = ["derive", "env"] }
 dashmap = "6.2.1"
 env_logger = "0.11.11"
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
+futures = "0.3.33"
+getrandom = "0.4.3"
+hex = "0.4.3"
 http = "1.5.0"
+http-body-util = "0.1.4"
 httpdate = "1.0.3"
+hyper = { version = "1.11.0", features = ["client", "server", "http2"] }
+hyper-util = { version = "0.1.20", features = ["client-legacy", "http2", "tokio"] }
 ipnet = { version = "2.12.1", features = ["serde"] }
 log = { version = "0.4.33", features = ["release_max_level_info"] }
 lru = "0.18.2"
@@ -38,8 +45,6 @@ mime_guess = "2.0.5"
 parking_lot = "0.12.5"
 percent-encoding = "2.3.2"
 cloudflare-pingora = { package = "pingora", version = "=0.8.1", default-features = false, features = ["proxy"] }
-rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"] }
-rustls-pemfile = "2.2.0"
 rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -49,19 +54,19 @@ tcmalloc-better = { version = "=0.1.19", optional = true }
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats", "use_std"], optional = true }
 tikv-jemallocator = { version = "0.7.0", features = ["stats"], optional = true }
 tokio = { version = "1.53.1", features = ["fs", "net", "rt-multi-thread", "sync", "time"] }
+tokio-quiche = { version = "=0.19.1", default-features = false }
 zstd = "0.13.3"
 
 [dev-dependencies]
 h2 = "0.4.15"
 tempfile = "3.27.0"
 
-# Pingora 0.8.1's rustls adapter hardcodes Ring. Keep the upstream API while
-# selecting AWS-LC for both Pingora and this binary, avoiding two crypto stacks.
+# Keep the vendored Pingora HTTP patches while using Pingora's official
+# BoringSSL adapter. Pingora and quiche share boring 4.22.0.
 [patch.crates-io]
 pingora-core = { path = "vendor/pingora-core-0.8.1" }
 pingora-http = { path = "vendor/pingora-http-0.8.1" }
 pingora-proxy = { path = "vendor/pingora-proxy-0.8.1" }
-pingora-rustls = { path = "vendor/pingora-rustls-aws-lc" }
 
 [profile.release]
 codegen-units = 1

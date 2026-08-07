@@ -1,6 +1,6 @@
 # Pingora
 
-Cloudflare [Pingora](https://github.com/cloudflare/pingora)를 기반으로 AWS-LC,
+Cloudflare [Pingora](https://github.com/cloudflare/pingora)를 기반으로 Cloudflare BoringSSL,
 HTTP/1.1, HTTP/2를 지원하는 JBS 리버스 프록시입니다. 기본 설정은 PiKKY 정적
 사이트, Navidrome, Vaultwarden, CouchDB, AdGuard Home/DoH를 1 vCPU / 1 GB Linux
 호스트에서 운영하도록 bounded cache·buffer·limiter를 사용합니다.
@@ -9,29 +9,34 @@ HTTP/1.1, HTTP/2를 지원하는 JBS 리버스 프록시입니다. 기본 설정
 crate와 충돌하지 않도록 `jbs-pingora`, 실행 binary와 제품명은 `pingora`입니다.
 upstream dependency는 Rust 코드에서 `cloudflare_pingora` alias로 가져옵니다.
 
-TLS provider는 AWS-LC/rustls 하나만 지원합니다. BoringSSL 비교 feature와 image
-게시 경로는 제거했으며, 다른 TLS provider를 지정한 Docker build는 즉시 실패합니다.
-`aws-lc-rs 1.17.3`, `aws-lc-sys 0.43.0`, `rustls 0.23.42`를 lockfile로 고정합니다.
+TLS provider는 Cloudflare `boring`/BoringSSL 하나만 지원합니다. Pingora와
+HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항목을
+공유하며, 다른 TLS provider를 지정한 Docker build는 즉시 실패합니다.
 
 ## 주요 기능과 한계
 
-- AWS-LC를 사용하는 rustls와 다운스트림 TLS 1.3 전용 정책
+- Cloudflare BoringSSL를 사용하는 rustls와 다운스트림 TLS 1.3 전용 정책
 - HTTP/1.1 및 HTTP/2, 기본 최대 32개 동시 H2 stream(설정으로 1~1024 override)
+- upstream HTTP/3/QUIC (`http3`/`http3-preferred`) + connection reuse + replay-safe 0-RTT session resumption
+- QUIC Stateless Retry defaults ON; only a trusted private H3 origin should set `server.http3_stateless_retry: false` when accepted 0-RTT is required
 - IPv4/IPv6 listener와 IPv6 socket의 명시적 `IPV6_V6ONLY=true`
 - Host allowlist, trusted proxy 기반 `X-Forwarded-For`, body 크기 제한
 - 서비스·route별 rate limit 및 active request/H2 stream limit
 - Navidrome audio 무압축 streaming, Vaultwarden/CouchDB route 압축, DoH 정책
 - PiKKY 정적 파일 gzip/Brotli/Zstd 동적·사전 압축, bounded asset LRU cache
-- AWS-LC TLS 파일 사전 검사와 UID/GID/mode/symlink 대상 진단
+- Cloudflare BoringSSL TLS 파일 사전 검사와 UID/GID/mode/symlink 대상 진단
 - Rust global allocator로 정적 링크된 Google TCMalloc(8 KiB logical page)
 - UID/GID `10001:10001`, read-only root filesystem, 최소 capability
 
 Pingora 0.8.1은 다운스트림 HTTP/3/QUIC server를 제공하지 않으므로 HTTP/3와
 `Alt-Svc`는 지원하지 않습니다. gzip/Brotli/Zstd 동적 압축은 PiKKY 정적 파일에만
-직접 적용합니다. Navidrome API/cover는 client의 `Accept-Encoding`을 origin에
-전달하고, Vaultwarden 일반 API와 CouchDB의 압축 가능한 응답은 Pingora가 level 1
-gzip으로 streaming 압축합니다. Audio stream, Vaultwarden 인증·notifications hub 및
-DoH는 압축하지 않습니다.
+직접 적용합니다. Navidrome API/cover는 client의 `Accept-Encoding`을 origin에 전달하고 gateway
+압축은 적용하지 않습니다. 그 외 압축 가능한 프록시 응답(Vaultwarden, CouchDB,
+AdGuard UI)은 client의 `Accept-Encoding`을 정확히 협상해 같은 q-value에서는
+`zstd` → `br` → `gzip` 순으로 선택하고 level 1 streaming 압축을 적용합니다.
+Range/206, 이미 인코딩된 응답, `no-transform`, 1 KiB 미만, Vaultwarden 인증/token,
+notifications/WebSocket Hub, 본문 없는 응답과 DoH `application/dns-message` 같은
+보안상 민감하거나 비압축 MIME은 identity를 유지합니다.
 
 ## 새 이름과 한 릴리스 호환성
 
@@ -89,10 +94,11 @@ docker compose ps
 ```
 
 기본 Compose는 기존 `10.77.0.1` 및 localhost upstream 접근을 위해 host network를
-사용합니다. 같은 호스트의 80/tcp와 443/tcp가 비어 있어야 합니다. Compose의
-`stop_grace_period: 65s`는 기본 60초 graceful drain보다 길게 잡혀 Docker가 재생 중인
-stream을 10초 기본 timeout으로 강제 종료하지 않게 하며, file descriptor limit은
-32,768, process/thread 수는 256으로 명시해 자원 증가를 bounded 상태로 유지합니다.
+사용합니다. 같은 호스트의 80/tcp와 443/tcp가 비어 있어야 합니다. Compose는 `SIGTERM`을 명시적으로 사용하고 `stop_grace_period: 8s`를 둡니다.
+Pingora는 새 연결을 즉시 받지 않은 뒤 기본 5초 동안만 in-flight 요청을 graceful drain하므로
+이미지 업데이트가 60초씩 지연되지 않습니다. 8초는 Pingora drain 뒤 정리할 여유를 주며,
+file descriptor limit은 32,768, process/thread 수는 256으로 명시해 자원 증가를 bounded
+상태로 유지합니다.
 
 Let's Encrypt의 `live/<domain>/*.pem`은 실제 파일이 아니라
 `archive/<domain>/*N.pem`을 가리키는 symlink입니다. `live` directory나 PEM
@@ -412,7 +418,7 @@ docker build --build-arg ALLOCATOR=tcmalloc \
 
 # GitHub Actions와 동일한 AMD Zen 1 PGO image를 로컬에서 재현하는 경우
 docker build --build-arg ALLOCATOR=tcmalloc \
-  --build-arg TLS_PROVIDER=aws-lc \
+  --build-arg TLS_PROVIDER=boringssl \
   --build-arg PGO_MODE=train \
   --build-arg PGO_TRAIN_TARGET_CPU=x86-64-v2 \
   --build-arg RUST_TARGET_CPU=znver1 \
@@ -560,3 +566,8 @@ curl --fail http://127.0.0.1/nginx-health
 
 Apache-2.0. Vendored Pingora rustls adapter는 원본 Cloudflare 저작권과 라이선스를
 보존합니다.
+
+
+## Hybrid post-quantum TLS and QUIC admission hardening
+
+JBS Pingora prefers `X25519MLKEM768` for TLS 1.3 on both TCP and QUIC, with `X25519` and `P-256` retained as compatibility fallbacks. QUIC source-address validation is mandatory, so new clients complete a stateless Retry before a full connection is allocated. The server also enforces the QUIC 3x anti-amplification bound, disables 0-RTT and active migration, applies a bounded handshake timeout, and limits new/active QUIC connections per source IP. The defaults are 64 new connections/s with a burst of 128, at most 128 active QUIC connections per IP, and a 5-second QUIC handshake timeout.

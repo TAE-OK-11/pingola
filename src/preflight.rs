@@ -1,12 +1,12 @@
 use std::fs::{self, File, Metadata};
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use boring::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use rustix::process::{getegid, geteuid};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::config::RuntimeConfig;
@@ -73,7 +73,7 @@ pub fn check_runtime(runtime: &RuntimeConfig, check_bind: bool) -> CheckReport {
     let mut report = CheckReport::default();
     let server = &runtime.config.server;
 
-    if server.https_listen.is_empty() {
+    if server.https_listen.is_empty() && server.http3_listen.is_empty() {
         report.ok("TLS files", "not required (no HTTPS listeners)");
     } else {
         check_tls(runtime, &mut report);
@@ -139,7 +139,10 @@ pub fn check_runtime(runtime: &RuntimeConfig, check_bind: bool) -> CheckReport {
     if check_bind {
         check_listener_binds(runtime, &mut report);
     } else {
-        let count = server.http_listen.len() + server.https_listen.len();
+        let count = server.http_listen.len()
+            + server.https_listen.len()
+            + server.http3_listen.len()
+            + usize::from(!server.http3_listen.is_empty());
         report.ok(
             "listener syntax",
             format!("{count} numeric socket addresses parsed; bind skipped"),
@@ -160,29 +163,96 @@ fn check_tls(runtime: &RuntimeConfig, report: &mut CheckReport) {
         .as_deref()
         .expect("schema validation requires private_key for HTTPS");
 
-    let certificate_bytes = check_file_read("certificate open", certificate, report);
-    let private_key_bytes = check_file_read("private key open", private_key, report);
+    let certificate_readable = check_file_read("certificate open", certificate, report).is_some();
+    let private_key_readable = check_file_read("private key open", private_key, report).is_some();
 
-    let certificates = certificate_bytes
-        .as_deref()
-        .and_then(|bytes| parse_certificates(bytes, certificate, report));
-    let key = private_key_bytes
-        .as_deref()
-        .and_then(|bytes| parse_private_key(bytes, private_key, report));
-
-    if let (Some(certificates), Some(key)) = (certificates, key) {
-        match rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certificates, key)
-        {
-            Ok(_) => report.ok(
+    let mut acceptor = match SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()) {
+        Ok(acceptor) => acceptor,
+        Err(error) => {
+            report.error(
+                "BoringSSL context",
+                format!("failed to create Cloudflare BoringSSL acceptor: {error}"),
+            );
+            report.error(
                 "certificate/private key match",
-                "rustls accepted the certificate chain and private key",
+                "not checked because the BoringSSL acceptor could not be created",
+            );
+            return;
+        }
+    };
+
+    let certificate_ok = if certificate_readable {
+        match acceptor.set_certificate_chain_file(certificate) {
+            Ok(()) => {
+                report.ok(
+                    "certificate PEM parse",
+                    format!(
+                        "path={} accepted by Cloudflare BoringSSL",
+                        certificate.display()
+                    ),
+                );
+                true
+            }
+            Err(error) => {
+                report.error(
+                    "certificate PEM parse",
+                    format!(
+                        "path={} rejected by Cloudflare BoringSSL: {error}",
+                        certificate.display()
+                    ),
+                );
+                false
+            }
+        }
+    } else {
+        report.error(
+            "certificate PEM parse",
+            "not checked because the certificate file could not be read",
+        );
+        false
+    };
+
+    let private_key_ok = if private_key_readable {
+        match acceptor.set_private_key_file(private_key, SslFiletype::PEM) {
+            Ok(()) => {
+                report.ok(
+                    "private key PEM parse",
+                    format!(
+                        "path={} accepted by Cloudflare BoringSSL (key material redacted)",
+                        private_key.display()
+                    ),
+                );
+                true
+            }
+            Err(error) => {
+                report.error(
+                    "private key PEM parse",
+                    format!(
+                        "path={} rejected by Cloudflare BoringSSL: {error}",
+                        private_key.display()
+                    ),
+                );
+                false
+            }
+        }
+    } else {
+        report.error(
+            "private key PEM parse",
+            "not checked because the private key file could not be read",
+        );
+        false
+    };
+
+    if certificate_ok && private_key_ok {
+        match acceptor.check_private_key() {
+            Ok(()) => report.ok(
+                "certificate/private key match",
+                "Cloudflare BoringSSL accepted the certificate chain and matching private key",
             ),
             Err(error) => report.error(
                 "certificate/private key match",
                 format!(
-                    "TLS settings creation rejected certificate={} private_key={}: {error}",
+                    "Cloudflare BoringSSL rejected certificate={} private_key={}: {error}",
                     certificate.display(),
                     private_key.display()
                 ),
@@ -191,7 +261,7 @@ fn check_tls(runtime: &RuntimeConfig, report: &mut CheckReport) {
     } else {
         report.error(
             "certificate/private key match",
-            "not checked because one or both PEM files could not be parsed",
+            "not checked because one or both PEM files were rejected",
         );
     }
 }
@@ -226,73 +296,6 @@ fn read_limited(path: &Path) -> Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
-}
-
-fn parse_certificates(
-    bytes: &[u8],
-    path: &Path,
-    report: &mut CheckReport,
-) -> Option<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(bytes);
-    let parsed = rustls_pemfile::certs(&mut reader).collect::<std::io::Result<Vec<_>>>();
-    match parsed {
-        Ok(certificates) if !certificates.is_empty() => {
-            report.ok(
-                "certificate PEM parse",
-                format!(
-                    "path={} certificates={}",
-                    path.display(),
-                    certificates.len()
-                ),
-            );
-            Some(certificates)
-        }
-        Ok(_) => {
-            report.error(
-                "certificate PEM parse",
-                format!("path={} contains no certificates", path.display()),
-            );
-            None
-        }
-        Err(error) => {
-            report.error(
-                "certificate PEM parse",
-                format!("path={} invalid PEM: {error}", path.display()),
-            );
-            None
-        }
-    }
-}
-
-fn parse_private_key(
-    bytes: &[u8],
-    path: &Path,
-    report: &mut CheckReport,
-) -> Option<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(bytes);
-    match rustls_pemfile::private_key(&mut reader) {
-        Ok(Some(key)) => {
-            report.ok(
-                "private key PEM parse",
-                format!("path={} parsed (key material redacted)", path.display()),
-            );
-            Some(key)
-        }
-        Ok(None) => {
-            report.error(
-                "private key PEM parse",
-                format!("path={} contains no supported private key", path.display()),
-            );
-            None
-        }
-        Err(error) => {
-            report.error(
-                "private key PEM parse",
-                format!("path={} invalid PEM: {error}", path.display()),
-            );
-            None
-        }
-    }
 }
 
 fn check_listener_binds(runtime: &RuntimeConfig, report: &mut CheckReport) {
@@ -331,7 +334,69 @@ fn check_listener_binds(runtime: &RuntimeConfig, report: &mut CheckReport) {
             ),
         }
     }
+    if !runtime.config.server.http3_listen.is_empty() {
+        let address = runtime.config.server.http3_internal_listen;
+        match bind_listener(&address.to_string()) {
+            Ok(socket) => {
+                report.ok(
+                    format!("listener bind HTTP/3 internal {address}"),
+                    "bound loopback TCP",
+                );
+                sockets.push(socket);
+            }
+            Err(error) => report.error(
+                format!("listener bind HTTP/3 internal {address}"),
+                format!("failed to bind internal TCP address {address}: {error:#}"),
+            ),
+        }
+    }
+    let mut udp_sockets = Vec::new();
+    for address in &runtime.config.server.http3_listen {
+        match bind_udp_listener(address) {
+            Ok(socket) => {
+                report.ok(
+                    format!("listener bind HTTP/3 UDP {address}"),
+                    if address.starts_with('[') {
+                        "bound with IPV6_V6ONLY=true".to_string()
+                    } else {
+                        "bound".to_string()
+                    },
+                );
+                udp_sockets.push(socket);
+            }
+            Err(error) => report.error(
+                format!("listener bind HTTP/3 UDP {address}"),
+                format!("failed to bind UDP address {address}: {error:#}"),
+            ),
+        }
+    }
+    drop(udp_sockets);
     drop(sockets);
+}
+
+fn bind_udp_listener(address: &str) -> Result<Socket> {
+    let address = address
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid UDP listener address {address}"))?;
+    let domain = if address.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .with_context(|| format!("failed to create UDP socket for {address}"))?;
+    socket
+        .set_reuse_address(true)
+        .with_context(|| format!("failed to set SO_REUSEADDR for UDP {address}"))?;
+    if address.is_ipv6() {
+        socket
+            .set_only_v6(true)
+            .with_context(|| format!("failed to set IPV6_V6ONLY for UDP {address}"))?;
+    }
+    socket
+        .bind(&address.into())
+        .with_context(|| format!("UDP bind failed for {address}"))?;
+    Ok(socket)
 }
 
 fn bind_listener(address: &str) -> Result<Socket> {
