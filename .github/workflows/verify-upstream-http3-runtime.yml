@@ -28,15 +28,20 @@ jobs:
           sudo apt-get install --yes clang cmake jq libcap2-bin libclang-dev nghttp2-client ninja-build openssl perl pkg-config
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
 
-      - name: Apply deterministic 0-RTT reconnect
+      - name: Apply final upstream HTTP3 runtime changes
         run: |
           python3 scripts/apply_upstream_h3_zero_rtt.py
+          python3 scripts/apply_private_h3_0rtt_retry.py
           cargo fmt --all
           git diff --check
           bash -n tests/upstream_http3.sh
           grep -F 'can_resume_early' src/upstream_h3.rs >/dev/null
           grep -F 'session ticket cached' src/upstream_h3.rs >/dev/null
           grep -F 'early-data request sent stream=' src/upstream_h3.rs >/dev/null
+          grep -F 'pub http3_stateless_retry: bool' src/config.rs >/dev/null
+          grep -F 'quic.disable_client_ip_validation = !stateless_retry;' src/http3.rs >/dev/null
+          grep -F 'http3_stateless_retry: false' tests/fixtures/upstream_http3_origin.yaml >/dev/null
+          grep -F 'tests/upstream_http3.sh' .github/workflows/ci.yml >/dev/null
 
       - name: Verify Rust and real upstream HTTP3
         run: |
@@ -58,14 +63,15 @@ jobs:
           fi
           bash tests/http3.sh
 
-      - name: Commit verified runtime changes
+      - name: Commit verified product changes and retire migration CI
         run: |
           set -euxo pipefail
-          git checkout HEAD -- .github/workflows/verify-upstream-http3-runtime.yml
           git rm scripts/apply_upstream_h3_zero_rtt.py
+          git rm scripts/apply_private_h3_0rtt_retry.py
+          git rm .github/workflows/verify-upstream-http3-runtime.yml
           git diff --check
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
-          git commit -m 'perf(http3): make upstream session resumption use true 0-RTT'
+          git commit -m 'perf(http3): finalize private-origin 0-RTT upstream transport'
           git push origin HEAD:agent/upstream-http3
