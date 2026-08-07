@@ -1,0 +1,60 @@
+name: verify-upstream-http3-runtime
+
+on:
+  pull_request:
+    branches: [agent/quiche-http3]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-http3-runtime-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify-runtime:
+    if: github.event.pull_request.head.ref == 'agent/upstream-http3' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: agent/upstream-http3
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake jq libcap2-bin libclang-dev nghttp2-client ninja-build openssl perl pkg-config
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+
+      - name: Apply deterministic 0-RTT reconnect
+        run: |
+          python3 scripts/apply_upstream_h3_zero_rtt.py
+          cargo fmt --all
+          git diff --check
+          bash -n tests/upstream_http3.sh
+          grep -F 'can_resume_early' src/upstream_h3.rs >/dev/null
+          grep -F 'session ticket cached' src/upstream_h3.rs >/dev/null
+          grep -F 'early-data request sent stream=' src/upstream_h3.rs >/dev/null
+
+      - name: Verify Rust and real upstream HTTP3
+        run: |
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo build --locked
+          sudo setcap cap_net_bind_service=+ep target/debug/pingora
+          tests/upstream_http3.sh
+          tests/http3.sh
+
+      - name: Commit verified runtime changes
+        run: |
+          set -euxo pipefail
+          git checkout HEAD -- .github/workflows/verify-upstream-http3-runtime.yml
+          git rm scripts/apply_upstream_h3_zero_rtt.py
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'perf(http3): make upstream session resumption use true 0-RTT'
+          git push origin HEAD:agent/upstream-http3
