@@ -26,10 +26,5 @@ replace_once(
         bail!("server.http3_max_connections_per_ip must not exceed server.downstream_max_connections");
     }
 ''',
-    '''    if !config.server.http3_listen.is_empty()
-        && config.server.http3_max_connections_per_ip > config.server.downstream_max_connections
-    {
-        bail!("server.http3_max_connections_per_ip must not exceed server.downstream_max_connections");
-    }
-''',
+    "",
 )
