@@ -40,11 +40,22 @@ jobs:
 
       - name: Verify Rust and real upstream HTTP3
         run: |
+          set -euxo pipefail
           cargo test --all-targets --locked
           cargo clippy --all-targets --locked -- -D warnings
           cargo build --locked
           sudo setcap cap_net_bind_service=+ep target/debug/pingora
-          bash tests/upstream_http3.sh
+          if ! bash -x tests/upstream_http3.sh; then
+            echo '===== origin.log =====' >&2
+            cat /tmp/pingora-upstream-http3/origin.log >&2 2>/dev/null || true
+            echo '===== front.log =====' >&2
+            cat /tmp/pingora-upstream-http3/front.log >&2 2>/dev/null || true
+            echo '===== fallback.log =====' >&2
+            cat /tmp/pingora-upstream-http3/fallback.log >&2 2>/dev/null || true
+            echo '===== backend.log =====' >&2
+            cat /tmp/pingora-upstream-http3/backend.log >&2 2>/dev/null || true
+            exit 1
+          fi
           bash tests/http3.sh
 
       - name: Commit verified runtime changes
