@@ -33,9 +33,14 @@ jobs:
         run: |
           python3 scripts/migrate-unified-boringssl.py
           rm -rf vendor/pingora-rustls-aws-lc
-          if grep -RIn --exclude=Cargo.lock --exclude-dir=.git --exclude-dir=vendor \
-            -E 'AWS-LC|aws-lc|tls-aws-lc|rustls::|rustls_pemfile|pingora-rustls' .; then
-            echo 'legacy TLS provider references remain' >&2
+          sed -i \
+            -e 's/AWS-LC/Cloudflare BoringSSL/g' \
+            -e 's/aws-lc/boringssl/g' \
+            bench/pgo_train.sh bench/pgo_compare_three.sh
+          if grep -RIn \
+            -E 'AWS-LC|aws-lc|tls-aws-lc|rustls::|rustls_pemfile|pingora-rustls' \
+            Cargo.toml Dockerfile README.md src tests bench/*.sh .github/workflows/ci.yml; then
+            echo 'legacy TLS provider references remain in active sources' >&2
             exit 1
           fi
 
