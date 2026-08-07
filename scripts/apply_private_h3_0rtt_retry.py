@@ -8,6 +8,7 @@ def replace(path, old, new, count=1):
         raise SystemExit(f"missing replacement in {path}: {old[:140]!r}")
     p.write_text(text.replace(old, new, count))
 
+
 # Secure default stays ON. Trusted private H3 origins can explicitly disable
 # Retry so accepted 0-RTT data is not forced through address-validation Retry.
 replace(
@@ -79,6 +80,20 @@ replace(
   # This fixture models a trusted private origin. Public listeners keep the
   # default Retry protection enabled; private origin 0-RTT explicitly opts out.
   http3_stateless_retry: false
+''',
+)
+
+# Make the private-origin 0-RTT/fallback runtime test part of the single
+# authoritative CI workflow instead of maintaining a second self-mutating one.
+replace(
+    ".github/workflows/ci.yml",
+    '''      - name: Real QUIC, HTTP/3, and h2c bridge integration
+        run: tests/http3.sh
+''',
+    '''      - name: Real QUIC, HTTP/3, h2c bridge, and upstream H3 integration
+        run: |
+          tests/http3.sh
+          tests/upstream_http3.sh
 ''',
 )
 
