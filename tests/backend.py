@@ -17,6 +17,9 @@ class Handler(BaseHTTPRequestHandler):
                 "path": self.path,
                 "body_length": len(body),
                 "headers": {key.lower(): value for key, value in self.headers.items()},
+                "padding": "compressible-response-" * 256
+                if self.path.startswith("/compress-large")
+                else "",
             },
             separators=(",", ":"),
         ).encode()
