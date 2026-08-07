@@ -6,7 +6,7 @@ ARG RUST_TARGET_TRIPLE=x86_64-unknown-linux-gnu
 ARG RUST_TARGET_CPU=x86-64-v2
 ARG RUST_LTO=fat
 ARG RUST_CODEGEN_UNITS=1
-ARG TLS_PROVIDER=aws-lc
+ARG TLS_PROVIDER=boringssl
 ARG PGO_MODE=off
 ARG PGO_TRAIN_TARGET_CPU=x86-64-v2
 # Production mix: H2 remains the largest workload, while H3 receives a
@@ -81,8 +81,8 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; \
     esac; \
     case "${TLS_PROVIDER}" in \
-      aws-lc) ;; \
-      *) echo "unsupported TLS provider (AWS-LC is required): ${TLS_PROVIDER}" >&2; exit 2 ;; \
+      boringssl) ;; \
+      *) echo "unsupported TLS provider (Cloudflare BoringSSL is required): ${TLS_PROVIDER}" >&2; exit 2 ;; \
     esac; \
     case "${PGO_MODE}" in \
       off|train) ;; \

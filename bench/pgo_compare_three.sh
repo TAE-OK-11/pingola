@@ -135,7 +135,7 @@ for key in baseline old-pgo new-pgo; do
   pgo=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.rust.pgo"}}' "${image}")
   revision=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${image}")
   [[ "${allocator}" == tcmalloc ]] || die "${key} allocator=${allocator}, expected=tcmalloc"
-  [[ "${tls}" == aws-lc ]] || die "${key} TLS provider=${tls}, expected=aws-lc"
+  [[ "${tls}" == boringssl ]] || die "${key} TLS provider=${tls}, expected=boringssl"
   docker run --rm --entrypoint /usr/local/bin/pingora "${image}" --allocator-info \
     >"${OUTPUT}/${key}-allocator.txt"
   grep -q '^allocator=tcmalloc ' "${OUTPUT}/${key}-allocator.txt" || \

@@ -229,7 +229,7 @@ train_tls() {
 
     # Give the replacement NewSessionTicket enough time to arrive. At 50 ms
     # the handshake succeeded but sess_out was intermittently absent; 200 ms
-    # was verified for 20 consecutive rotations on the target AWS-LC host.
+    # was verified for 20 consecutive rotations on the target Cloudflare BoringSSL host.
     if [[ ${resume_rc} -ne 0 && ${resume_rc} -ne 124 ]] || \
       [[ ! -s "${OUTPUT_DIR}/tls-session-next.pem" ]]; then
       echo "TLS resumption failed: exit=${resume_rc}" >&2
