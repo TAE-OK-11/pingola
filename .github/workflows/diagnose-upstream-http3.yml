@@ -26,7 +26,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install --yes -qq clang cmake jq libcap2-bin libclang-dev ninja-build openssl perl pkg-config >/dev/null
-          rustup toolchain install 1.97.1 --profile minimal >/dev/null 2>&1
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt >/dev/null 2>&1
 
       - name: Run compact runtime diagnostic
         shell: bash
