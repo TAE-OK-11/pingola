@@ -32,6 +32,7 @@ jobs:
         run: |
           python3 scripts/apply_upstream_h3.py
           python3 scripts/fix_upstream_h3_compile.py
+          python3 scripts/fix_upstream_h3_scope.py
           cargo generate-lockfile
           cargo fmt --all
           git diff --check
@@ -52,7 +53,7 @@ jobs:
         run: |
           set -euxo pipefail
           git checkout HEAD -- .github/workflows/apply-upstream-http3.yml
-          git rm scripts/apply_upstream_h3.py scripts/fix_upstream_h3_compile.py
+          git rm scripts/apply_upstream_h3.py scripts/fix_upstream_h3_compile.py scripts/fix_upstream_h3_scope.py
           git diff --check
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
