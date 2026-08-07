@@ -63,12 +63,14 @@ jobs:
           fi
           bash tests/http3.sh
 
-      - name: Commit verified product changes and retire migration CI
+      - name: Commit verified product changes
         run: |
           set -euxo pipefail
+          # GITHUB_TOKEN cannot modify workflow files without workflows scope.
+          # Restore them here; workflow consolidation is performed separately.
+          git checkout HEAD -- .github/workflows/ci.yml .github/workflows/verify-upstream-http3-runtime.yml
           git rm scripts/apply_upstream_h3_zero_rtt.py
           git rm scripts/apply_private_h3_0rtt_retry.py
-          git rm .github/workflows/verify-upstream-http3-runtime.yml
           git diff --check
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
