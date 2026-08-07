@@ -1,0 +1,395 @@
+name: apply-unified-boringssl
+
+on:
+  push:
+    branches: [agent/unify-boringssl]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: agent/unify-boringssl
+          fetch-depth: 0
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake libclang-dev ninja-build perl pkg-config
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          rustup show active-toolchain
+
+      - name: Migrate Pingora and preflight to Cloudflare BoringSSL
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def read(path: str) -> str:
+              return Path(path).read_text()
+
+          def write(path: str, text: str) -> None:
+              Path(path).write_text(text)
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          cargo = read("Cargo.toml")
+          cargo = replace_once(
+              cargo,
+              'default = ["tcmalloc", "tls-aws-lc"]',
+              'default = ["tcmalloc", "tls-boringssl"]',
+              "default TLS feature",
+          )
+          cargo = replace_once(
+              cargo,
+              'tls-aws-lc = ["cloudflare-pingora/rustls"]',
+              'tls-boringssl = ["cloudflare-pingora/boringssl"]',
+              "Pingora TLS feature",
+          )
+          cargo = replace_once(
+              cargo,
+              'brotli = "8.0.4"\n',
+              'boring = { version = "=4.22.0", features = ["pq-experimental"] }\n'
+              'brotli = "8.0.4"\n',
+              "boring dependency insertion",
+          )
+          cargo = replace_once(
+              cargo,
+              'rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"] }\n',
+              '',
+              "rustls dependency removal",
+          )
+          cargo = replace_once(
+              cargo,
+              'rustls-pemfile = "2.2.0"\n',
+              '',
+              "rustls-pemfile removal",
+          )
+          cargo = replace_once(
+              cargo,
+              '# Pingora 0.8.1\'s rustls adapter hardcodes Ring. Keep the upstream API while\n'
+              '# selecting AWS-LC for both Pingora and this binary, avoiding two crypto stacks.\n',
+              '# Keep the vendored Pingora HTTP patches while using Pingora\'s official\n'
+              '# BoringSSL adapter. Pingora and quiche share boring 4.22.0.\n',
+              "patch explanation",
+          )
+          cargo = replace_once(
+              cargo,
+              'pingora-rustls = { path = "vendor/pingora-rustls-aws-lc" }\n',
+              '',
+              "vendored rustls patch removal",
+          )
+          write("Cargo.toml", cargo)
+
+          main = read("src/main.rs")
+          main = replace_once(
+              main,
+              'use anyhow::{Context, Result, anyhow, bail};\nuse clap::Parser;\n',
+              'use anyhow::{Context, Result, anyhow, bail};\nuse boring::ssl::SslVersion;\nuse clap::Parser;\n',
+              "BoringSSL main import",
+          )
+          main = replace_once(
+              main,
+              '#[cfg(not(feature = "tls-aws-lc"))]\n'
+              'compile_error!("the AWS-LC TLS provider is required: enable tls-aws-lc");',
+              '#[cfg(not(feature = "tls-boringssl"))]\n'
+              'compile_error!("the Cloudflare BoringSSL provider is required: enable tls-boringssl");',
+              "compile-time provider guard",
+          )
+          main = replace_once(
+              main,
+              '    install_aws_lc_tls13_provider().context("TLS provider initialization failed")?;\n',
+              '',
+              "AWS-LC provider initialization",
+          )
+          main, count = re.subn(
+              r'fn install_aws_lc_tls13_provider\(\) -> Result<\(\)> \{.*?\n\}\n\n',
+              '',
+              main,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit(f"AWS-LC provider function: expected one match, found {count}")
+          main = replace_once(
+              main,
+              '    "AWS-LC/rustls"\n',
+              '    "Cloudflare BoringSSL"\n',
+              "provider display name",
+          )
+          main = replace_once(
+              main,
+              'fn enforce_tls13(_tls: &mut TlsSettings) -> Result<()> {\n'
+              '    // The vendored rustls adapter constructs the listener with TLS 1.3 as its\n'
+              '    // only protocol version, and the process provider contains TLS 1.3 suites only.\n'
+              '    Ok(())\n'
+              '}\n',
+              'fn enforce_tls13(tls: &mut TlsSettings) -> Result<()> {\n'
+              '    tls.set_min_proto_version(Some(SslVersion::TLS1_3))\n'
+              '        .context("failed to set BoringSSL minimum protocol to TLS 1.3")?;\n'
+              '    tls.set_max_proto_version(Some(SslVersion::TLS1_3))\n'
+              '        .context("failed to set BoringSSL maximum protocol to TLS 1.3")?;\n'
+              '    Ok(())\n'
+              '}\n',
+              "TLS 1.3 enforcement",
+          )
+          write("src/main.rs", main)
+
+          preflight = read("src/preflight.rs")
+          preflight = replace_once(
+              preflight,
+              'use std::io::{BufReader, Read};\n',
+              'use std::io::Read;\n',
+              "preflight IO import",
+          )
+          preflight = replace_once(
+              preflight,
+              'use anyhow::{Context, Result, anyhow};\n',
+              'use anyhow::{Context, Result, anyhow};\n'
+              'use boring::ssl::{SslAcceptor, SslFiletype, SslMethod};\n',
+              "preflight BoringSSL import",
+          )
+          preflight = replace_once(
+              preflight,
+              'use rustls::pki_types::{CertificateDer, PrivateKeyDer};\n',
+              '',
+              "preflight rustls import removal",
+          )
+          new_check_tls = r'''fn check_tls(runtime: &RuntimeConfig, report: &mut CheckReport) {
+    let server = &runtime.config.server;
+    let certificate = server
+        .certificate
+        .as_deref()
+        .expect("schema validation requires certificate for HTTPS");
+    let private_key = server
+        .private_key
+        .as_deref()
+        .expect("schema validation requires private_key for HTTPS");
+
+    let certificate_readable = check_file_read("certificate open", certificate, report).is_some();
+    let private_key_readable = check_file_read("private key open", private_key, report).is_some();
+
+    let mut acceptor = match SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()) {
+        Ok(acceptor) => acceptor,
+        Err(error) => {
+            report.error(
+                "BoringSSL context",
+                format!("failed to create Cloudflare BoringSSL acceptor: {error}"),
+            );
+            report.error(
+                "certificate/private key match",
+                "not checked because the BoringSSL acceptor could not be created",
+            );
+            return;
+        }
+    };
+
+    let certificate_ok = if certificate_readable {
+        match acceptor.set_certificate_chain_file(certificate) {
+            Ok(()) => {
+                report.ok(
+                    "certificate PEM parse",
+                    format!("path={} accepted by Cloudflare BoringSSL", certificate.display()),
+                );
+                true
+            }
+            Err(error) => {
+                report.error(
+                    "certificate PEM parse",
+                    format!("path={} rejected by Cloudflare BoringSSL: {error}", certificate.display()),
+                );
+                false
+            }
+        }
+    } else {
+        report.error(
+            "certificate PEM parse",
+            "not checked because the certificate file could not be read",
+        );
+        false
+    };
+
+    let private_key_ok = if private_key_readable {
+        match acceptor.set_private_key_file(private_key, SslFiletype::PEM) {
+            Ok(()) => {
+                report.ok(
+                    "private key PEM parse",
+                    format!(
+                        "path={} accepted by Cloudflare BoringSSL (key material redacted)",
+                        private_key.display()
+                    ),
+                );
+                true
+            }
+            Err(error) => {
+                report.error(
+                    "private key PEM parse",
+                    format!("path={} rejected by Cloudflare BoringSSL: {error}", private_key.display()),
+                );
+                false
+            }
+        }
+    } else {
+        report.error(
+            "private key PEM parse",
+            "not checked because the private key file could not be read",
+        );
+        false
+    };
+
+    if certificate_ok && private_key_ok {
+        match acceptor.check_private_key() {
+            Ok(()) => report.ok(
+                "certificate/private key match",
+                "Cloudflare BoringSSL accepted the certificate chain and matching private key",
+            ),
+            Err(error) => report.error(
+                "certificate/private key match",
+                format!(
+                    "Cloudflare BoringSSL rejected certificate={} private_key={}: {error}",
+                    certificate.display(),
+                    private_key.display()
+                ),
+            ),
+        }
+    } else {
+        report.error(
+            "certificate/private key match",
+            "not checked because one or both PEM files were rejected",
+        );
+    }
+}
+'''
+          preflight, count = re.subn(
+              r'fn check_tls\(runtime: &RuntimeConfig, report: &mut CheckReport\) \{.*?\n\}\n\nfn check_file_read',
+              new_check_tls + '\nfn check_file_read',
+              preflight,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit(f"preflight TLS checker: expected one match, found {count}")
+          preflight, count = re.subn(
+              r'\nfn parse_certificates\(.*?\n\}\n\nfn check_listener_binds',
+              '\nfn check_listener_binds',
+              preflight,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit(f"rustls PEM helpers: expected one match, found {count}")
+          write("src/preflight.rs", preflight)
+
+          ci = read(".github/workflows/ci.yml")
+          ci, count = re.subn(
+              r'      - name: Verify TLS provider boundaries\n        run: \|\n.*?(?=      - name: Unit tests)',
+              '''      - name: Verify unified Cloudflare BoringSSL provider
+        run: |
+          cargo tree --locked > /tmp/cargo-tree.txt
+          cargo tree --locked -p pingora-boringssl@0.8.1 > /tmp/pingora-tls-tree.txt
+          cargo tree --locked -p tokio-quiche@0.19.1 > /tmp/http3-tls-tree.txt
+          cargo tree --locked -i boring@4.22.0 > /tmp/boring-reverse-tree.txt
+          grep -q 'pingora-boringssl v0.8.1' /tmp/cargo-tree.txt
+          grep -q 'quiche v0.29.3' /tmp/http3-tls-tree.txt
+          grep -q 'boring v4.22.0' /tmp/pingora-tls-tree.txt
+          grep -q 'boring-sys v4.22.0' /tmp/pingora-tls-tree.txt
+          grep -q 'boring v4.22.0' /tmp/http3-tls-tree.txt
+          grep -q 'boring-sys v4.22.0' /tmp/http3-tls-tree.txt
+          grep -q 'pingora-boringssl v0.8.1' /tmp/boring-reverse-tree.txt
+          grep -Eq '(quiche v0.29.3|tokio-quiche v0.19.1)' /tmp/boring-reverse-tree.txt
+          ! grep -Eiq '(^|[[:space:]])(aws-lc-rs|aws-lc-sys|rustls) v' /tmp/cargo-tree.txt
+          ! cargo tree --locked -d | grep -E '^(boring|boring-sys) v'
+''',
+              ci,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit(f"CI TLS boundary step: expected one match, found {count}")
+          ci = ci.replace("tls-aws-lc", "tls-boringssl")
+          ci = ci.replace("aws-lc", "boringssl")
+          ci = ci.replace("AWS-LC TCP TLS", "Cloudflare BoringSSL TLS")
+          write(".github/workflows/ci.yml", ci)
+
+          dockerfile = read("Dockerfile")
+          dockerfile = dockerfile.replace("aws-lc", "boringssl")
+          dockerfile = dockerfile.replace("AWS-LC", "Cloudflare BoringSSL")
+          write("Dockerfile", dockerfile)
+
+          runtime_test = read("tests/docker_runtime.sh")
+          runtime_test = runtime_test.replace("aws-lc", "boringssl")
+          write("tests/docker_runtime.sh", runtime_test)
+
+          readme = read("README.md")
+          readme = readme.replace(
+              "TLS provider는 AWS-LC/rustls 하나만 지원합니다. BoringSSL 비교 feature와 image\n"
+              "게시 경로는 제거했으며, 다른 TLS provider를 지정한 Docker build는 즉시 실패합니다.\n"
+              "`aws-lc-rs 1.17.3`, `aws-lc-sys 0.43.0`, `rustls 0.23.42`를 lockfile로 고정합니다.\n",
+              "TLS provider는 Cloudflare `boring`/BoringSSL 하나만 지원합니다. Pingora와\n"
+              "HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항목을\n"
+              "공유하며, 다른 TLS provider를 지정한 Docker build는 즉시 실패합니다.\n",
+          )
+          readme = readme.replace("AWS-LC/rustls", "Cloudflare BoringSSL")
+          readme = readme.replace("AWS-LC", "Cloudflare BoringSSL")
+          readme = readme.replace("aws-lc", "boringssl")
+          readme = readme.replace("tls-aws-lc", "tls-boringssl")
+          write("README.md", readme)
+          PY
+
+          rm -rf vendor/pingora-rustls-aws-lc
+
+          if grep -RIn --exclude=Cargo.lock --exclude-dir=.git --exclude-dir=vendor \
+            -E 'AWS-LC|aws-lc|tls-aws-lc|rustls::|rustls_pemfile|pingora-rustls' .; then
+            echo 'legacy TLS provider references remain' >&2
+            exit 1
+          fi
+
+      - name: Format and regenerate the lockfile
+        run: |
+          cargo fmt --all
+          cargo check --all-targets --no-default-features --features tcmalloc,tls-boringssl
+
+      - name: Verify the unified TLS graph
+        run: |
+          cargo tree --locked > /tmp/cargo-tree.txt
+          cargo tree --locked -p pingora-boringssl@0.8.1 > /tmp/pingora-tls-tree.txt
+          cargo tree --locked -p tokio-quiche@0.19.1 > /tmp/http3-tls-tree.txt
+          cargo tree --locked -i boring@4.22.0 > /tmp/boring-reverse-tree.txt
+          grep -q 'pingora-boringssl v0.8.1' /tmp/cargo-tree.txt
+          grep -q 'boring v4.22.0' /tmp/pingora-tls-tree.txt
+          grep -q 'boring-sys v4.22.0' /tmp/pingora-tls-tree.txt
+          grep -q 'quiche v0.29.3' /tmp/http3-tls-tree.txt
+          grep -q 'boring v4.22.0' /tmp/http3-tls-tree.txt
+          grep -q 'boring-sys v4.22.0' /tmp/http3-tls-tree.txt
+          grep -q 'pingora-boringssl v0.8.1' /tmp/boring-reverse-tree.txt
+          grep -Eq '(quiche v0.29.3|tokio-quiche v0.19.1)' /tmp/boring-reverse-tree.txt
+          ! grep -Eiq '(^|[[:space:]])(aws-lc-rs|aws-lc-sys|rustls) v' /tmp/cargo-tree.txt
+          ! cargo tree --locked -d | grep -E '^(boring|boring-sys) v'
+
+      - name: Test BoringSSL builds
+        run: |
+          cargo test --all-targets --locked --no-default-features --features tcmalloc,tls-boringssl
+          cargo clippy --all-targets --locked --no-default-features --features tcmalloc,tls-boringssl -- -D warnings
+          cargo check --all-targets --locked --no-default-features --features system-allocator,tls-boringssl
+          cargo check --all-targets --locked --no-default-features --features jemalloc,tls-boringssl
+
+      - name: Commit verified migration
+        run: |
+          set -euxo pipefail
+          git rm .github/workflows/apply-unified-boringssl.yml
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'refactor(tls): unify on Cloudflare BoringSSL'
+          git push origin HEAD:agent/unify-boringssl
