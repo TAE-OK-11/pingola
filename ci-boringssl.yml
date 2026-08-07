@@ -66,7 +66,7 @@ jobs:
           grep -q 'boring-sys v4.22.0' /tmp/http3-tls-tree.txt
           grep -q 'pingora-boringssl v0.8.1' /tmp/boring-reverse-tree.txt
           grep -Eq '(quiche v0.29.3|tokio-quiche v0.19.1)' /tmp/boring-reverse-tree.txt
-          ! grep -Eiq '(^|[[:space:]])(boringssl-rs|boringssl-sys|rustls) v' /tmp/cargo-tree.txt
+          ! grep -Eiq '(^|[[:space:]])(aws-lc-rs|aws-lc-sys|rustls) v' /tmp/cargo-tree.txt
           ! cargo tree --locked -d | grep -E '^(boring|boring-sys) v'
       - name: Unit tests
         run: cargo test --all-targets --locked
