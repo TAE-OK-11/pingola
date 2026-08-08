@@ -291,6 +291,9 @@ impl fmt::Debug for Http3InternalToken {
 pub struct RuntimeConfig {
     pub config: Arc<Config>,
     http3_internal_token: Option<Http3InternalToken>,
+    http3_internal_addr: Option<SocketAddr>,
+    http3_public_port: Option<u16>,
+    http3_alt_svc_header: Option<HeaderValue>,
 }
 
 impl RuntimeConfig {
@@ -304,7 +307,27 @@ impl RuntimeConfig {
 
     pub fn new(config: Config) -> Result<Self> {
         validate(&config)?;
-        let http3_internal_token = if config.server.http3_listen.is_empty() {
+
+        // Listener validation already guarantees that every H3 address parses
+        // and uses the same non-zero UDP port. Resolve and encode these values
+        // once at startup instead of repeating SocketAddr parsing, formatting,
+        // allocation, and HeaderValue validation on every TLS H1/H2 response.
+        let http3_public_port = config
+            .server
+            .http3_listen
+            .first()
+            .map(|address| {
+                address
+                    .parse::<SocketAddr>()
+                    .expect("validated HTTP/3 listener address")
+                    .port()
+            });
+        let http3_internal_addr = http3_public_port.map(|_| config.server.http3_internal_listen);
+        let http3_alt_svc_header = http3_public_port.map(|port| {
+            HeaderValue::from_str(&format!(r#"h3=":{port}"; ma=86400"#))
+                .expect("validated HTTP/3 port produces a valid Alt-Svc header")
+        });
+        let http3_internal_token = if http3_public_port.is_none() {
             None
         } else {
             let mut token = [0_u8; 32];
@@ -318,6 +341,9 @@ impl RuntimeConfig {
         Ok(Self {
             config: Arc::new(config),
             http3_internal_token,
+            http3_internal_addr,
+            http3_public_port,
+            http3_alt_svc_header,
         })
     }
 
@@ -325,23 +351,19 @@ impl RuntimeConfig {
         self.http3_internal_token.as_ref().map(|token| &token.0)
     }
 
+    #[inline]
     pub fn http3_internal_addr(&self) -> Option<SocketAddr> {
-        (!self.config.server.http3_listen.is_empty())
-            .then_some(self.config.server.http3_internal_listen)
+        self.http3_internal_addr
     }
 
+    #[inline]
     pub fn http3_public_port(&self) -> Option<u16> {
-        self.config
-            .server
-            .http3_listen
-            .first()
-            .and_then(|address| address.parse::<SocketAddr>().ok())
-            .map(|address| address.port())
+        self.http3_public_port
     }
 
+    #[inline]
     pub fn http3_alt_svc_header(&self) -> Option<HeaderValue> {
-        let port = self.http3_public_port()?;
-        HeaderValue::from_str(&format!(r#"h3=":{port}"; ma=86400"#)).ok()
+        self.http3_alt_svc_header.clone()
     }
 
     pub fn is_trusted_proxy(&self, ip: std::net::IpAddr) -> bool {
@@ -643,6 +665,27 @@ hosts:
         let config = sample_config();
         assert_eq!(config.server.downstream_keepalive_requests, 500);
         assert!(RuntimeConfig::new(config).is_ok());
+    }
+
+    #[test]
+    fn precomputes_http3_runtime_metadata() {
+        let mut config = sample_config();
+        config.server.http3_listen = vec!["127.0.0.1:18443".into()];
+        config.server.http3_internal_listen = "127.0.0.1:18080".parse().unwrap();
+        config.server.certificate = Some(PathBuf::from("/tmp/cert.pem"));
+        config.server.private_key = Some(PathBuf::from("/tmp/key.pem"));
+
+        let runtime = RuntimeConfig::new(config).unwrap();
+        assert_eq!(runtime.http3_public_port(), Some(18443));
+        assert_eq!(
+            runtime.http3_internal_addr(),
+            Some("127.0.0.1:18080".parse().unwrap())
+        );
+        assert_eq!(
+            runtime.http3_alt_svc_header().unwrap(),
+            HeaderValue::from_static("h3=\":18443\"; ma=86400")
+        );
+        assert!(runtime.http3_internal_token().is_some());
     }
 
     #[test]
