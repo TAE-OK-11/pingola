@@ -466,12 +466,27 @@ async fn pool_manager(
             reconnect_delay = next_reconnect_delay(reconnect_delay);
             delay
         };
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(reconnect_delay_with_jitter(delay)).await;
     }
 }
 
 fn next_reconnect_delay(current: Duration) -> Duration {
     current.saturating_mul(2).min(MAX_RECONNECT_DELAY)
+}
+
+fn reconnect_delay_with_jitter(delay: Duration) -> Duration {
+    let mut entropy = [0_u8; 2];
+    if getrandom::fill(&mut entropy).is_err() {
+        return delay;
+    }
+    reconnect_delay_from_sample(delay, u16::from_ne_bytes(entropy))
+}
+
+fn reconnect_delay_from_sample(delay: Duration, sample: u16) -> Duration {
+    // Spread reconnects across 80-120% of the exponential delay so a fleet
+    // does not synchronize after an origin or network outage.
+    let percentage = 80 + u32::from(sample) % 41;
+    delay.mul_f64(f64::from(percentage) / 100.0)
 }
 
 async fn run_connection(
@@ -543,11 +558,11 @@ async fn run_connection(
     .with_context(|| format!("failed to create QUIC connection for {}", settings.name))?;
 
     let cached_session = session.lock().clone();
-    if let Some(cached_session) = cached_session.as_deref() {
-        if let Err(error) = conn.set_session(cached_session) {
-            *session.lock() = None;
-            bail!("cached upstream QUIC session was rejected and invalidated: {error}");
-        }
+    if let Some(cached_session) = cached_session.as_deref()
+        && let Err(error) = conn.set_session(cached_session)
+    {
+        *session.lock() = None;
+        bail!("cached upstream QUIC session was rejected and invalidated: {error}");
     }
 
     let mut h3_config = h3::Config::new().context("failed to create H3 config")?;
@@ -559,6 +574,7 @@ async fn run_connection(
     let mut pending_writes = VecDeque::<u64>::new();
     let mut recv_buf = vec![0_u8; 64 * 1024];
     let mut send_buf = vec![0_u8; 64 * 1024];
+    let mut pending_send = None;
     let handshake_deadline = Instant::now() + settings.connect_timeout;
     let mut established_logged = false;
     let mut session_logged = false;
@@ -647,9 +663,13 @@ async fn run_connection(
                 &mut recv_buf,
             )?;
         }
-        flush_quic(&socket, &mut conn, &mut send_buf).await?;
+        flush_ready_quic(&socket, &mut conn, &mut send_buf, &mut pending_send).await?;
 
         let timeout = conn.timeout().unwrap_or(Duration::from_secs(1));
+        let pacing_delay = pending_send
+            .as_ref()
+            .map(|send: &ScheduledSend| send.at.saturating_duration_since(Instant::now()))
+            .unwrap_or_default();
         tokio::select! {
             recv = socket.recv_from(&mut recv_buf) => {
                 let (len, from) = recv.context("upstream QUIC UDP receive failed")?;
@@ -675,6 +695,12 @@ async fn run_connection(
             }
             _ = tokio::time::sleep(timeout) => {
                 conn.on_timeout();
+            }
+            _ = tokio::time::sleep(pacing_delay), if pending_send.is_some() => {
+                let send = pending_send
+                    .take()
+                    .expect("pacing branch requires a scheduled QUIC packet");
+                send_quic_datagram(&socket, &send_buf[..send.len]).await?;
             }
         }
     }
@@ -939,7 +965,15 @@ fn process_h3_events(
                     .ok_or_else(|| anyhow!("HTTP/3 response has no request state"))?
                     .response_started;
                 if !response_started {
-                    let (status, headers) = decode_response_headers(&list)?;
+                    let (status, headers) = match decode_response_headers(&list) {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            let message = format!("invalid upstream HTTP/3 response: {error:#}");
+                            warn!("{message} stream={stream_id}");
+                            cancel_request(request_id, &message, conn, requests, stream_to_request);
+                            continue;
+                        }
+                    };
                     if status.is_informational() {
                         continue;
                     }
@@ -980,7 +1014,15 @@ fn process_h3_events(
                         );
                     }
                 } else {
-                    let trailers = decode_trailers(&list)?;
+                    let trailers = match decode_trailers(&list) {
+                        Ok(trailers) => trailers,
+                        Err(error) => {
+                            let message = format!("invalid upstream HTTP/3 trailers: {error:#}");
+                            warn!("{message} stream={stream_id}");
+                            cancel_request(request_id, &message, conn, requests, stream_to_request);
+                            continue;
+                        }
+                    };
                     let send_result = requests
                         .get(&request_id)
                         .ok_or_else(|| anyhow!("HTTP/3 response has no request state"))?
@@ -1094,11 +1136,20 @@ fn cancel_request(
     request.fail(message);
 }
 
-async fn flush_quic(
+struct ScheduledSend {
+    len: usize,
+    at: Instant,
+}
+
+async fn flush_ready_quic(
     socket: &UdpSocket,
     conn: &mut quiche::Connection,
     out: &mut [u8],
+    pending: &mut Option<ScheduledSend>,
 ) -> Result<()> {
+    if pending.is_some() {
+        return Ok(());
+    }
     loop {
         let (write, send_info) = match conn.send(out) {
             Ok(value) => value,
@@ -1107,13 +1158,28 @@ async fn flush_quic(
         };
         let now = Instant::now();
         if send_info.at > now {
-            tokio::time::sleep(send_info.at.duration_since(now)).await;
+            *pending = Some(ScheduledSend {
+                len: write,
+                at: send_info.at,
+            });
+            return Ok(());
         }
-        socket
-            .send(&out[..write])
-            .await
-            .context("upstream QUIC UDP send failed")?;
+        send_quic_datagram(socket, &out[..write]).await?;
     }
+}
+
+async fn send_quic_datagram(socket: &UdpSocket, packet: &[u8]) -> Result<()> {
+    let written = socket
+        .send(packet)
+        .await
+        .context("upstream QUIC UDP send failed")?;
+    if written != packet.len() {
+        bail!(
+            "upstream QUIC UDP send was truncated: expected={} written={written}",
+            packet.len()
+        );
+    }
+    Ok(())
 }
 
 fn fail_all(requests: &mut HashMap<u64, PendingRequest>, message: &str) {
@@ -1194,13 +1260,12 @@ async fn proxy_bridge_request(
                     sent_fin = true;
                 }
             }
-            if !sent_fin {
-                if send_body_command(&commands, id, Bytes::new(), true)
+            if !sent_fin
+                && send_body_command(&commands, id, Bytes::new(), true)
                     .await
                     .is_err()
-                {
-                    let _ = commands.send(Command::Cancel { id }).await;
-                }
+            {
+                let _ = commands.send(Command::Cancel { id }).await;
             }
         });
     }
@@ -1401,5 +1466,56 @@ mod tests {
         assert!(encoded.iter().any(|header| header.name() == b"x-test"));
         assert!(!encoded.iter().any(|header| header.name() == b"connection"));
         assert!(!encoded.iter().any(|header| header.name() == b"host"));
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded_and_jittered() {
+        assert_eq!(
+            next_reconnect_delay(MIN_RECONNECT_DELAY),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            next_reconnect_delay(MAX_RECONNECT_DELAY),
+            MAX_RECONNECT_DELAY
+        );
+        assert_eq!(
+            reconnect_delay_from_sample(Duration::from_secs(5), 0),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            reconnect_delay_from_sample(Duration::from_secs(5), 40),
+            Duration::from_secs(6)
+        );
+    }
+
+    #[test]
+    fn truncated_response_body_reports_an_error_and_cancels() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use futures::StreamExt;
+
+            let (commands, mut command_rx) = mpsc::channel(1);
+            let (body_tx, body_rx) = mpsc::channel(1);
+            drop(body_tx);
+            let finished = Arc::new(AtomicBool::new(false));
+            let cancellation = ResponseCancellation {
+                id: 42,
+                commands,
+                finished: finished.clone(),
+            };
+            let body = response_body_stream(body_rx, finished, cancellation);
+            futures::pin_mut!(body);
+
+            let error = body.next().await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("before the stream finished"));
+            assert!(body.next().await.is_none());
+            assert!(matches!(
+                command_rx.recv().await,
+                Some(Command::Cancel { id: 42 })
+            ));
+        });
     }
 }
