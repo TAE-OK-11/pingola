@@ -185,6 +185,9 @@ async fn run(
         .to_str()
         .ok_or_else(|| anyhow!("HTTP/3 private key path is not valid UTF-8"))?;
 
+    // Build once before binding to guarantee the PQ group and certificate are
+    // accepted. The connection hook repeats the same construction per listener
+    // and fails closed if that invariant unexpectedly changes.
     drop(
         build_hybrid_pq_quic_context(certificate, private_key)
             .context("HTTP/3 hybrid PQ TLS preflight failed")?,
@@ -197,6 +200,11 @@ async fn run(
             .with_context(|| format!("failed to bind HTTP/3 UDP listener {address}"))?;
         let mut listener = QuicListener::try_from(socket)
             .with_context(|| format!("failed to prepare HTTP/3 QUIC listener {address}"))?;
+        // tokio-quiche listeners default every socket capability to OFF. On Linux
+        // this best-effort probe enables the supported subset of UDP GSO/GRO,
+        // SO_TXTIME pacing, RX queue overflow accounting, and PMTU probe sockopts.
+        // Unsupported kernel/NIC capabilities remain disabled instead of failing
+        // startup, so the same image stays portable across hosts.
         listener.apply_max_capabilities();
         info!(
             "HTTP/3 UDP offload capabilities: address={} capabilities={:?}",
@@ -218,14 +226,23 @@ async fn run(
     quic.max_send_udp_payload_size = HTTP3_MAX_UDP_PAYLOAD_SIZE;
     quic.discover_path_mtu = true;
     quic.pmtud_max_probes = 3;
+    // Keep QUIC packet sends paced instead of bursty. With the listener socket
+    // capabilities enabled above, tokio-quiche can use SO_TXTIME where Linux
+    // supports it and falls back to userspace pacing otherwise.
     quic.enable_pacing = true;
     quic.enable_hystart = true;
     quic.send_capacity_factor = HTTP3_SEND_CAPACITY_FACTOR;
     quic.enable_early_data = allow_early_data;
     quic.disable_active_migration = true;
+    // Keep connection-ID/path state minimal. NAT rebinding can still be handled
+    // sequentially while an attacker cannot queue multiple PATH_CHALLENGE frames.
     quic.active_connection_id_limit = 2;
     quic.max_path_challenge_recv_queue_len = 1;
     quic.grease = true;
+    // Stateless Retry proves source-address ownership before the server allocates
+    // a full QUIC connection and starts expensive TLS work. Keep it enabled by
+    // default for public listeners; trusted private origins may explicitly turn
+    // it off to permit true accepted 0-RTT without a Retry round trip.
     quic.disable_client_ip_validation = !stateless_retry;
     quic.max_amplification_factor = HTTP3_MAX_AMPLIFICATION_FACTOR;
 
@@ -246,8 +263,16 @@ async fn run(
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
     connector.set_connect_timeout(Some(Duration::from_secs(2)));
+    // A single cleartext HTTP/2 connection multiplexes all concurrent H3
+    // streams for this internal authority. There is intentionally no H1
+    // fallback for ordinary requests, so a protocol regression fails fast.
+    // WebSocket Extended CONNECT uses a dedicated raw H1.1 handshake to this
+    // same h2c listener, which supports H1 and H2 coexistence.
     let client: ProxyClient = Client::builder(TokioExecutor::new())
         .http2_only(true)
+        // Grow loopback H2 flow-control windows for large and
+        // concurrent audio responses instead of stalling on
+        // conservative static defaults.
         .http2_adaptive_window(true)
         .pool_max_idle_per_host(1)
         .build(connector);
@@ -604,9 +629,8 @@ fn build_internal_websocket_request(decoded: &DecodedRequest, key: &str) -> Resu
     request.extend_from_slice(path.as_bytes());
     request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
     request.extend_from_slice(host.as_bytes());
-    request.extend_from_slice(
-        b"\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: ",
-    );
+    request
+        .extend_from_slice(b"\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: ");
     request.extend_from_slice(key.as_bytes());
     request.extend_from_slice(b"\r\n");
 
@@ -1007,6 +1031,8 @@ fn request_body(
         loop {
             match recv.recv().await {
                 Some(InboundFrame::Body(data, fin)) => {
+                    // InboundFrame owns the BytesMut allocation. Freeze it into
+                    // Bytes and transfer ownership into Hyper without copying.
                     let frame = Frame::data(data.freeze());
                     return Some((Ok::<_, BoxError>(frame), (recv, fin)));
                 }
