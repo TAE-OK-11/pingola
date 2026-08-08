@@ -53,7 +53,7 @@ socket2 = "0.6.5"
 tcmalloc-better = { version = "=0.1.19", optional = true }
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats", "use_std"], optional = true }
 tikv-jemallocator = { version = "0.7.0", features = ["stats"], optional = true }
-tokio = { version = "1.53.1", features = ["fs", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "rt-multi-thread", "sync", "time"] }
 tokio-quiche = { version = "=0.19.1", default-features = false }
 zstd = "0.13.3"
 
