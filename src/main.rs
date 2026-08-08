@@ -42,6 +42,17 @@ compile_error!("the Cloudflare BoringSSL provider is required: enable tls-boring
 const PRIMARY_CONFIG: &str = "/etc/pingora/pingora.yaml";
 const LEGACY_CONFIG: &str = "/etc/pingola/pingola.yaml";
 
+// The h2 crate defaults to 64 KiB stream/connection flow-control windows and
+// 16 KiB frames. Moderate public windows reduce WINDOW_UPDATE and DATA-frame
+// churn for uploads/replication without granting each Internet stream a huge
+// receive allowance. The H3 handoff is loopback-only and authenticated, so it
+// can use wider windows to keep QUIC->H2 bridging from becoming the bottleneck.
+const PUBLIC_H2_STREAM_WINDOW: u32 = 256 * 1024;
+const PUBLIC_H2_CONNECTION_WINDOW: u32 = 2 * 1024 * 1024;
+const INTERNAL_H2_STREAM_WINDOW: u32 = 1024 * 1024;
+const INTERNAL_H2_CONNECTION_WINDOW: u32 = 8 * 1024 * 1024;
+const H2_MAX_FRAME_SIZE: u32 = 64 * 1024;
+
 #[derive(Debug, Parser)]
 #[command(version, about = "JBS Pingora reverse proxy")]
 struct Cli {
@@ -191,8 +202,7 @@ fn run_healthcheck(target: &str, config_path: &Path) -> Result<()> {
         let address = target.strip_prefix("tcp:").unwrap_or(&target);
         let socket = resolve_health_address(address)?;
         let mut stream = TcpStream::connect_timeout(&socket, timeout).with_context(|| {
-            format!("healthcheck failed to connect to actual target tcp:{address}")
-        })?;
+            format!("healthcheck failed to connect to actual target tcp:{address}"))?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
         probe_health(&mut stream, &format!("tcp:{address}"))
@@ -301,6 +311,9 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     let mut h2_options = default_h2_options();
     h2_options.max_concurrent_streams(server_config.http2_max_concurrent_streams);
     h2_options.max_header_list_size(16 * 1024);
+    h2_options.initial_window_size(PUBLIC_H2_STREAM_WINDOW);
+    h2_options.initial_connection_window_size(PUBLIC_H2_CONNECTION_WINDOW);
+    h2_options.max_frame_size(H2_MAX_FRAME_SIZE);
     if let Some(proxy) = service.app_logic_mut() {
         proxy.h2_options = Some(h2_options);
     }
@@ -354,6 +367,9 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         let mut h2c_stream_options = default_h2_options();
         h2c_stream_options.max_concurrent_streams(server_config.http3_max_concurrent_streams);
         h2c_stream_options.max_header_list_size(64 * 1024);
+        h2c_stream_options.initial_window_size(INTERNAL_H2_STREAM_WINDOW);
+        h2c_stream_options.initial_connection_window_size(INTERNAL_H2_CONNECTION_WINDOW);
+        h2c_stream_options.max_frame_size(H2_MAX_FRAME_SIZE);
         if let Some(proxy) = h2c_service.app_logic_mut() {
             proxy.h2_options = Some(h2c_stream_options);
         }
