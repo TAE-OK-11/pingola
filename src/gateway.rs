@@ -76,6 +76,7 @@ const HTTP3_PORT: HeaderName = HeaderName::from_static("x-jbs-http3-port");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const MAX_CONNECTION_NOMINATIONS: usize = 10;
+const STATIC_ACTIVE_REQUESTS_PER_CLIENT: usize = 16;
 #[cfg(test)]
 const PROXY_AUTHENTICATE: HeaderName = HeaderName::from_static("proxy-authenticate");
 #[cfg(test)]
@@ -588,13 +589,11 @@ impl ProxyHttp for Gateway {
             session.set_read_timeout(Some(Duration::from_secs(30)));
             session.set_write_timeout(Some(Duration::from_secs(30)));
             session.set_keepalive(Some(30));
-            if self.runtime.config.server.global_active_requests > 0 {
-                let Some(client_ip) = session_client_ip(&self.runtime, session, http3) else {
-                    session.set_keepalive(None);
-                    return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
-                };
-                ctx.client_ip = client_ip;
-            }
+            let Some(client_ip) = session_client_ip(&self.runtime, session, http3) else {
+                session.set_keepalive(None);
+                return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
+            };
+            ctx.client_ip = client_ip;
             if !self.acquire_global_request(ctx) {
                 return send_empty(
                     &self.runtime,
@@ -606,6 +605,22 @@ impl ProxyHttp for Gateway {
                 )
                 .await;
             }
+            let Some(permit) = self.active_requests.acquire(
+                "static",
+                client_ip,
+                STATIC_ACTIVE_REQUESTS_PER_CLIENT,
+            ) else {
+                return send_empty(
+                    &self.runtime,
+                    session,
+                    429,
+                    Some(host.handler),
+                    tls,
+                    &[("retry-after", "1")],
+                )
+                .await;
+            };
+            ctx._active_request_permit = Some(permit);
             return self.static_files.serve(&host.name, session, tls).await;
         }
 
