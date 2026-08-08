@@ -312,16 +312,12 @@ impl RuntimeConfig {
         // and uses the same non-zero UDP port. Resolve and encode these values
         // once at startup instead of repeating SocketAddr parsing, formatting,
         // allocation, and HeaderValue validation on every TLS H1/H2 response.
-        let http3_public_port = config
-            .server
-            .http3_listen
-            .first()
-            .map(|address| {
-                address
-                    .parse::<SocketAddr>()
-                    .expect("validated HTTP/3 listener address")
-                    .port()
-            });
+        let http3_public_port = config.server.http3_listen.first().map(|address| {
+            address
+                .parse::<SocketAddr>()
+                .expect("validated HTTP/3 listener address")
+                .port()
+        });
         let http3_internal_addr = http3_public_port.map(|_| config.server.http3_internal_listen);
         let http3_alt_svc_header = http3_public_port.map(|port| {
             HeaderValue::from_str(&format!(r#"h3=":{port}"; ma=86400"#))
