@@ -202,7 +202,8 @@ fn run_healthcheck(target: &str, config_path: &Path) -> Result<()> {
         let address = target.strip_prefix("tcp:").unwrap_or(&target);
         let socket = resolve_health_address(address)?;
         let mut stream = TcpStream::connect_timeout(&socket, timeout).with_context(|| {
-            format!("healthcheck failed to connect to actual target tcp:{address}"))?;
+            format!("healthcheck failed to connect to actual target tcp:{address}")
+        })?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
         probe_health(&mut stream, &format!("tcp:{address}"))
