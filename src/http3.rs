@@ -7,13 +7,11 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use boring::{base64, sha};
 use boring::ssl::{SslContextBuilder, SslFiletype};
+use boring::{base64, sha};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt, stream};
-use http::header::{
-    CONNECTION, CONTENT_LENGTH, HOST, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
-};
+use http::header::{CONNECTION, CONTENT_LENGTH, HOST, TE, TRAILER, TRANSFER_ENCODING, UPGRADE};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, StreamBody};
@@ -631,7 +629,8 @@ fn build_internal_websocket_request(decoded: &DecodedRequest, key: &str) -> Resu
     request.extend_from_slice(path.as_bytes());
     request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
     request.extend_from_slice(host.as_bytes());
-    request.extend_from_slice(b"\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: ");
+    request
+        .extend_from_slice(b"\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: ");
     request.extend_from_slice(key.as_bytes());
     request.extend_from_slice(b"\r\n");
 
@@ -723,8 +722,8 @@ fn parse_http1_response_head(head: &[u8]) -> Result<(StatusCode, HeaderMap)> {
         .ok_or_else(|| anyhow!("internal WebSocket response is missing status"))?
         .parse::<u16>()
         .context("invalid internal WebSocket response status")?;
-    let status = StatusCode::from_u16(status)
-        .context("invalid internal WebSocket response status code")?;
+    let status =
+        StatusCode::from_u16(status).context("invalid internal WebSocket response status code")?;
 
     let mut headers = HeaderMap::new();
     for raw_line in lines {
@@ -753,10 +752,16 @@ fn strip_line_cr(line: &[u8]) -> &[u8] {
 }
 
 fn trim_ascii_header_value(mut value: &[u8]) -> &[u8] {
-    while value.first().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(*byte, b' ' | b'\t'))
+    {
         value = &value[1..];
     }
-    while value.last().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
+    while value
+        .last()
+        .is_some_and(|byte| matches!(*byte, b' ' | b'\t'))
+    {
         value = &value[..value.len() - 1];
     }
     value
@@ -800,10 +805,7 @@ async fn send_websocket_response_headers(
     alt_svc: Option<&HeaderValue>,
 ) -> Result<()> {
     let mut output = Vec::with_capacity(headers.len() + 2);
-    output.push(h3::Header::new(
-        b":status",
-        status.as_str().as_bytes(),
-    ));
+    output.push(h3::Header::new(b":status", status.as_str().as_bytes()));
     let mut has_alt_svc = false;
     for (name, value) in headers {
         if forbidden_websocket_bridge_response_header(name) {
@@ -1277,11 +1279,8 @@ mod tests {
             HeaderValue::from_static("unit-test-token"),
         )
         .unwrap();
-        let request = build_internal_websocket_request(
-            &decoded,
-            "dGhlIHNhbXBsZSBub25jZQ==",
-        )
-        .unwrap();
+        let request =
+            build_internal_websocket_request(&decoded, "dGhlIHNhbXBsZSBub25jZQ==").unwrap();
         let request = String::from_utf8(request).unwrap();
         assert!(request.starts_with("GET /notifications/hub?id=1 HTTP/1.1\r\n"));
         assert!(request.contains("Host: vault.example\r\n"));
