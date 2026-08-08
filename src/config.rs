@@ -291,6 +291,8 @@ impl fmt::Debug for Http3InternalToken {
 pub struct RuntimeConfig {
     pub config: Arc<Config>,
     http3_internal_token: Option<Http3InternalToken>,
+    http3_public_port: Option<u16>,
+    http3_alt_svc_header: Option<HeaderValue>,
 }
 
 impl RuntimeConfig {
@@ -304,6 +306,20 @@ impl RuntimeConfig {
 
     pub fn new(config: Config) -> Result<Self> {
         validate(&config)?;
+        // Validation guarantees every listener is a SocketAddr and all HTTP/3
+        // listeners use the same non-zero port. Cache both derived values once
+        // so the response hot path only clones an immutable HeaderValue.
+        let http3_public_port = config
+            .server
+            .http3_listen
+            .first()
+            .map(|address| address.parse::<SocketAddr>().map(|address| address.port()))
+            .transpose()
+            .context("validated HTTP/3 listener became invalid")?;
+        let http3_alt_svc_header = http3_public_port
+            .map(|port| HeaderValue::from_str(&format!("h3=\":{port}\"; ma=86400")))
+            .transpose()
+            .context("HTTP/3 Alt-Svc value is not a valid header")?;
         let http3_internal_token = if config.server.http3_listen.is_empty() {
             None
         } else {
@@ -318,6 +334,8 @@ impl RuntimeConfig {
         Ok(Self {
             config: Arc::new(config),
             http3_internal_token,
+            http3_public_port,
+            http3_alt_svc_header,
         })
     }
 
@@ -331,17 +349,11 @@ impl RuntimeConfig {
     }
 
     pub fn http3_public_port(&self) -> Option<u16> {
-        self.config
-            .server
-            .http3_listen
-            .first()
-            .and_then(|address| address.parse::<SocketAddr>().ok())
-            .map(|address| address.port())
+        self.http3_public_port
     }
 
-    pub fn http3_alt_svc_header(&self) -> Option<HeaderValue> {
-        let port = self.http3_public_port()?;
-        HeaderValue::from_str(&format!(r#"h3=":{port}"; ma=86400"#)).ok()
+    pub fn http3_alt_svc_header(&self) -> Option<&HeaderValue> {
+        self.http3_alt_svc_header.as_ref()
     }
 
     pub fn is_trusted_proxy(&self, ip: std::net::IpAddr) -> bool {
@@ -653,10 +665,26 @@ hosts:
             let network: IpNet = broad.parse().unwrap();
             assert!(!config.trusted_proxies.contains(&network), "{broad}");
         }
+        for loopback in ["127.0.0.0/8", "::1/128"] {
+            let network: IpNet = loopback.parse().unwrap();
+            assert!(!config.trusted_proxies.contains(&network), "{loopback}");
+        }
         for name in ["adguard_dns_doh", "adguard_korea_doh"] {
             let upstream = config.upstreams.get(name).unwrap();
             assert!(upstream.tls && upstream.verify_certificate, "{name}");
         }
+    }
+
+    #[test]
+    fn caches_http3_public_metadata() {
+        let config: Config =
+            serde_saphyr::from_str(include_str!("../config/pingora.yaml")).unwrap();
+        let runtime = RuntimeConfig::new(config).unwrap();
+        assert_eq!(runtime.http3_public_port(), Some(443));
+        assert_eq!(
+            runtime.http3_alt_svc_header().unwrap(),
+            "h3=\":443\"; ma=86400"
+        );
     }
 
     #[test]

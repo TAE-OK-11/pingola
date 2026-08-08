@@ -77,7 +77,9 @@ mod my_acl {
     }
 }
 
-pub struct MyProxy;
+pub struct MyProxy {
+    credential: String,
+}
 
 #[async_trait]
 impl ProxyHttp for MyProxy {
@@ -88,7 +90,7 @@ impl ProxyHttp for MyProxy {
     fn init_downstream_modules(&self, modules: &mut HttpModules) {
         // Add the module to MyProxy
         modules.add_module(Box::new(my_acl::MyAcl {
-            credential: "testcode".into(),
+            credential: self.credential.clone(),
         }))
     }
 
@@ -106,20 +108,25 @@ impl ProxyHttp for MyProxy {
     }
 }
 
-// RUST_LOG=INFO cargo run --example use_module
+// PINGORA_EXAMPLE_TOKEN=replace-me RUST_LOG=INFO cargo run --example use_module
 // curl 127.0.0.1:6193 -H "Host: one.one.one.one" -v
-// curl 127.0.0.1:6193 -H "Host: one.one.one.one" -H "Authorization: basic testcode"
+// curl 127.0.0.1:6193 -H "Host: one.one.one.one" -H "Authorization: basic replace-me"
 // curl 127.0.0.1:6193 -H "Host: one.one.one.one" -H "Authorization: basic wrong" -v
 fn main() {
     env_logger::init();
+    let credential = std::env::var("PINGORA_EXAMPLE_TOKEN")
+        .expect("set PINGORA_EXAMPLE_TOKEN before running this authentication example");
 
     // read command line arguments
     let opt = Opt::parse_args();
     let mut my_server = Server::new(Some(opt)).unwrap();
     my_server.bootstrap();
 
-    let mut my_proxy = pingora_proxy::http_proxy_service(&my_server.configuration, MyProxy);
-    my_proxy.add_tcp("0.0.0.0:6193");
+    let mut my_proxy = pingora_proxy::http_proxy_service(
+        &my_server.configuration,
+        MyProxy { credential },
+    );
+    my_proxy.add_tcp("127.0.0.1:6193");
 
     my_server.add_service(my_proxy);
     my_server.run_forever();

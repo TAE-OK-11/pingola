@@ -33,10 +33,21 @@ impl FixedBuffer {
 
     // TODO: maybe store a Vec of Bytes for zero-copy
     pub fn write_to_buffer(&mut self, data: &Bytes) {
-        if !self.truncated && (self.buffer.len() + data.len() <= self.capacity) {
+        if self.truncated {
+            return;
+        }
+        if self
+            .buffer
+            .len()
+            .checked_add(data.len())
+            .is_some_and(|length| length <= self.capacity)
+        {
             self.buffer.extend_from_slice(data);
         } else {
-            // TODO: clear data because the data held here is useless anyway?
+            // A truncated retry body can never be replayed. Release its
+            // allocation immediately instead of pinning it for the lifetime
+            // of the downstream connection.
+            self.buffer = BytesMut::new();
             self.truncated = true;
         }
     }
@@ -57,5 +68,23 @@ impl FixedBuffer {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncation_discards_unusable_retry_storage() {
+        let mut buffer = FixedBuffer::new(4);
+        buffer.write_to_buffer(&Bytes::from_static(b"1234"));
+        buffer.write_to_buffer(&Bytes::from_static(b"5"));
+        assert!(buffer.is_truncated());
+        assert!(buffer.get_buffer().is_none());
+
+        buffer.clear();
+        buffer.write_to_buffer(&Bytes::from_static(b"ok"));
+        assert_eq!(buffer.get_buffer().unwrap(), Bytes::from_static(b"ok"));
     }
 }

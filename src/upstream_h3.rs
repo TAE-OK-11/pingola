@@ -23,7 +23,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use log::{info, warn};
 use parking_lot::Mutex;
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_quiche::quiche;
 use tokio_quiche::quiche::h3::{self, NameValue};
 
@@ -36,7 +36,9 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_UDP_PAYLOAD: usize = 1452;
 const MAX_H3_HEADER_BYTES: u64 = 64 * 1024;
 const MAX_REQUEST_COMMANDS: usize = 256;
+const MAX_PENDING_REQUESTS: usize = 256;
 const MAX_BODY_FRAMES: usize = 64;
+const H3_BODY_RECV_BUFFER: usize = 16 * 1024;
 const INITIAL_MAX_DATA: u64 = 64 * 1024 * 1024;
 const INITIAL_STREAM_WINDOW: u64 = 16 * 1024 * 1024;
 const H3_CONTROL_STREAMS: u64 = 8;
@@ -228,6 +230,7 @@ fn upstream_server_name(name: &str, upstream: &UpstreamConfig) -> Result<String>
 struct H3Pool {
     commands: mpsc::Sender<Command>,
     next_id: Arc<AtomicU64>,
+    request_slots: Arc<Semaphore>,
 }
 
 impl H3Pool {
@@ -236,6 +239,7 @@ impl H3Pool {
         let pool = Arc::new(Self {
             commands,
             next_id: Arc::new(AtomicU64::new(1)),
+            request_slots: Arc::new(Semaphore::new(MAX_PENDING_REQUESTS)),
         });
         tokio::spawn(pool_manager(settings, receiver, available));
         pool
@@ -247,6 +251,11 @@ impl H3Pool {
         has_body: bool,
         allow_early_data: bool,
     ) -> Result<RequestHandle, BoxError> {
+        let permit = self
+            .request_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| boxed_error("upstream HTTP/3 request capacity is exhausted"))?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (opened_tx, opened_rx) = oneshot::channel();
         let (response_tx, response_rx) = oneshot::channel();
@@ -259,6 +268,7 @@ impl H3Pool {
                 cancel: self.commands.clone(),
                 opened: opened_tx,
                 response: response_tx,
+                permit,
             })
             .await
             .map_err(|_| boxed_error("upstream HTTP/3 worker is unavailable"))?;
@@ -308,7 +318,7 @@ impl RequestHandle {
 impl Drop for RequestHandle {
     fn drop(&mut self) {
         if self.cancel_on_drop {
-            let _ = self.commands.try_send(Command::Cancel { id: self.id });
+            enqueue_cancel(&self.commands, self.id);
         }
     }
 }
@@ -330,8 +340,20 @@ struct ResponseCancellation {
 impl Drop for ResponseCancellation {
     fn drop(&mut self) {
         if !self.finished.load(Ordering::Acquire) {
-            let _ = self.commands.try_send(Command::Cancel { id: self.id });
+            enqueue_cancel(&self.commands, self.id);
         }
+    }
+}
+
+fn enqueue_cancel(commands: &mpsc::Sender<Command>, id: u64) {
+    let command = Command::Cancel { id };
+    if let Err(mpsc::error::TrySendError::Full(command)) = commands.try_send(command)
+        && let Ok(runtime) = tokio::runtime::Handle::try_current()
+    {
+        let commands = commands.clone();
+        runtime.spawn(async move {
+            let _ = commands.send(command).await;
+        });
     }
 }
 
@@ -344,6 +366,7 @@ enum Command {
         cancel: mpsc::Sender<Command>,
         opened: oneshot::Sender<Result<(), String>>,
         response: oneshot::Sender<Result<ResponseHead, String>>,
+        permit: OwnedSemaphorePermit,
     },
     Body {
         id: u64,
@@ -396,6 +419,7 @@ struct PendingRequest {
     stream_id: Option<u64>,
     response_started: bool,
     pending_write: Option<PendingWrite>,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl PendingRequest {
@@ -572,8 +596,9 @@ async fn run_connection(
     let mut stream_to_request = HashMap::<u64, u64>::new();
     let mut waiting = VecDeque::<u64>::new();
     let mut pending_writes = VecDeque::<u64>::new();
-    let mut recv_buf = vec![0_u8; 64 * 1024];
-    let mut send_buf = vec![0_u8; 64 * 1024];
+    let mut recv_buf = vec![0_u8; MAX_UDP_PAYLOAD];
+    let mut send_buf = vec![0_u8; MAX_UDP_PAYLOAD];
+    let mut body_buf = vec![0_u8; H3_BODY_RECV_BUFFER];
     let mut pending_send = None;
     let handshake_deadline = Instant::now() + settings.connect_timeout;
     let mut established_logged = false;
@@ -660,7 +685,7 @@ async fn run_connection(
                 &mut conn,
                 &mut requests,
                 &mut stream_to_request,
-                &mut recv_buf,
+                &mut body_buf,
             )?;
         }
         flush_ready_quic(&socket, &mut conn, &mut send_buf, &mut pending_send).await?;
@@ -734,6 +759,7 @@ fn handle_command(
             cancel,
             opened,
             response,
+            permit,
         } => {
             let (body_tx, body_rx) = mpsc::channel(MAX_BODY_FRAMES);
             let response_finished = Arc::new(AtomicBool::new(false));
@@ -752,6 +778,7 @@ fn handle_command(
                     stream_id: None,
                     response_started: false,
                     pending_write: None,
+                    _permit: permit,
                 },
             );
             waiting.push_back(id);
@@ -927,7 +954,11 @@ fn dispatch_waiting(
             }
             Err(h3::Error::StreamBlocked)
             | Err(h3::Error::TransportError(quiche::Error::StreamLimit)) => {
-                waiting.push_back(id);
+                // Stream capacity is connection-global. Retrying every other
+                // queued request would only rescan the full queue and receive
+                // the same result on each event-loop turn.
+                waiting.push_front(id);
+                break;
             }
             Err(error) => {
                 let request = requests.remove(&id).expect("request still exists");
@@ -1103,7 +1134,12 @@ fn cancel_abandoned_responses(
     let abandoned: Vec<_> = requests
         .iter()
         .filter_map(|(&id, request)| {
-            (request.response_started && request.body_tx.is_closed()).then_some(id)
+            let response_dropped = request
+                .response
+                .as_ref()
+                .is_some_and(oneshot::Sender::is_closed);
+            (response_dropped || (request.response_started && request.body_tx.is_closed()))
+                .then_some(id)
         })
         .collect();
     for id in abandoned {
@@ -1236,6 +1272,7 @@ async fn proxy_bridge_request(
                     Ok(frame) => frame,
                     Err(error) => {
                         warn!("h2c bridge request body read failed id={id}: {error}");
+                        let _ = commands.send(Command::Cancel { id }).await;
                         return;
                     }
                 };

@@ -31,8 +31,6 @@ server:
   downstream_request_header_timeout_seconds: 15
 
 trusted_proxies:
-  - "127.0.0.0/8"
-  - "::1/128"
   - "173.245.48.0/20"
   - "103.21.244.0/22"
   - "103.22.200.0/22"

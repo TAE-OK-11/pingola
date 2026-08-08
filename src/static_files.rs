@@ -26,6 +26,8 @@ use crate::content_encoding::{ContentCoding, negotiate};
 
 const MAX_BUFFERED_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_ACTIVE_STATIC_REQUESTS: usize = 256;
+const MAX_ACTIVE_STATIC_STREAMS: usize = 32;
 const ZERO: HeaderValue = HeaderValue::from_static("0");
 const ACCEPT_ENCODING_VALUE: HeaderValue = HeaderValue::from_static("Accept-Encoding");
 const NO_CACHE: HeaderValue = HeaderValue::from_static("no-cache");
@@ -127,6 +129,8 @@ pub struct StaticFiles {
     roots: HashMap<String, PathBuf>,
     cache: AssetCache,
     cold_read_slot: Semaphore,
+    request_slots: Semaphore,
+    stream_slots: Semaphore,
 }
 
 impl StaticFiles {
@@ -146,10 +150,18 @@ impl StaticFiles {
             cache: AssetCache::new(cache_bytes),
             // Bound whole-file allocations as well as CPU-heavy compression.
             cold_read_slot: Semaphore::new(1),
+            // HTTP/2 and HTTP/3 multiplexing means a socket limit alone does
+            // not bound metadata work or open file descriptors.
+            request_slots: Semaphore::new(MAX_ACTIVE_STATIC_REQUESTS),
+            stream_slots: Semaphore::new(MAX_ACTIVE_STATIC_STREAMS),
         })
     }
 
     pub async fn serve(&self, host_name: &str, session: &mut Session, tls: bool) -> Result<bool> {
+        let _request_permit = match self.request_slots.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => return send_empty(session, 503, &[("retry-after", "1")], tls).await,
+        };
         let method = session.req_header().method.clone();
         if method != Method::GET && method != Method::HEAD {
             return send_empty(session, 405, &[("allow", "GET, HEAD")], tls).await;
@@ -177,6 +189,10 @@ impl StaticFiles {
             if !negotiation.identity_acceptable {
                 return send_empty(session, 406, &[], tls).await;
             }
+            let _stream_permit = match self.stream_slots.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => return send_empty(session, 503, &[("retry-after", "1")], tls).await,
+            };
             let content_type = content_type(&path);
             return serve_streaming_file(
                 session,
@@ -253,6 +269,9 @@ impl StaticFiles {
                 }
             }
         };
+        // Cold filesystem/compression work is complete. Do not retain the
+        // sole producer permit while a downstream consumes the cached body.
+        drop(cold_read_permit);
 
         if if_none_match_matches(&session.req_header().headers, asset.etag.as_bytes()) {
             let mut response = ResponseHeader::build(304, Some(8)).unwrap();
@@ -288,7 +307,6 @@ impl StaticFiles {
                 .write_response_body(Some(asset.body.clone()), true)
                 .await?;
         }
-        drop(cold_read_permit);
         Ok(true)
     }
 
