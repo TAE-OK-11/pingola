@@ -1,9 +1,11 @@
+use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use ahash::RandomState;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use parking_lot::Mutex;
@@ -11,7 +13,16 @@ use parking_lot::Mutex;
 const MAX_RATE_BUCKETS: usize = 262_144;
 const RATE_BUCKET_IDLE: Duration = Duration::from_secs(600);
 const RATE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+const RATE_CLEANUP_OBSERVATIONS: u16 = 1 << 14;
 const MAX_ACTIVE_COUNTERS: usize = 32_768;
+
+thread_local! {
+    // Housekeeping does not require a process-wide sequence number. Keeping the
+    // sampling counter per worker removes one contended atomic RMW from every
+    // rate-limited H1 request / H2 stream while the capacity-full path still
+    // forces cleanup synchronously.
+    static RATE_CLEANUP_TICK: Cell<u16> = const { Cell::new(0) };
+}
 
 #[derive(Clone, Eq)]
 struct ClientKey {
@@ -27,9 +38,45 @@ impl PartialEq for ClientKey {
 
 impl Hash for ClientKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.zone.hash(state);
+        // Production zones are fixed static strings. Hash a compact tag instead
+        // of scanning the same route name on every request. Unknown zones keep
+        // their full string hash so tests and future callers remain isolated.
+        match production_zone_tag(self.zone) {
+            Some(tag) => tag.hash(state),
+            None => {
+                u8::MAX.hash(state);
+                self.zone.hash(state);
+            }
+        }
         self.ip.hash(state);
     }
+}
+
+#[inline]
+fn production_zone_tag(zone: &str) -> Option<u8> {
+    match zone {
+        "global" => Some(1),
+        "http3-connection" => Some(2),
+        "navidrome_stream" => Some(3),
+        "navidrome_cover" => Some(4),
+        "navidrome_api" => Some(5),
+        "vaultwarden_auth" => Some(6),
+        "vaultwarden_hub" => Some(7),
+        "vaultwarden" => Some(8),
+        "couchdb" => Some(9),
+        "doh" => Some(10),
+        "adguard_ui" => Some(11),
+        _ => None,
+    }
+}
+
+#[inline]
+fn rate_cleanup_sample_due() -> bool {
+    RATE_CLEANUP_TICK.with(|tick| {
+        let next = tick.get().wrapping_add(1);
+        tick.set(next);
+        next % RATE_CLEANUP_OBSERVATIONS == 0
+    })
 }
 
 struct Bucket {
@@ -37,12 +84,14 @@ struct Bucket {
     updated_at: Instant,
 }
 
+type RateBucketMap = DashMap<ClientKey, Bucket, RandomState>;
+type ActiveCounterMap = DashMap<ClientKey, Arc<AtomicUsize>, RandomState>;
+
 /// Per-client token buckets. The map is sharded so unrelated clients do not
 /// contend on a global lock.
 pub struct RateLimiter {
-    buckets: DashMap<ClientKey, Bucket>,
+    buckets: RateBucketMap,
     bucket_count: AtomicUsize,
-    observations: AtomicU64,
     max_buckets: usize,
     last_cleanup: Mutex<Instant>,
 }
@@ -55,9 +104,10 @@ impl RateLimiter {
     fn with_max_buckets(max_buckets: usize) -> Self {
         let now = Instant::now();
         Self {
-            buckets: DashMap::new(),
+            // AHash is keyed per limiter instance and substantially cheaper than
+            // std HashMap's default hasher for the tiny (zone, IP) hot-path key.
+            buckets: DashMap::with_hasher(RandomState::new()),
             bucket_count: AtomicUsize::new(0),
-            observations: AtomicU64::new(0),
             max_buckets,
             last_cleanup: Mutex::new(now.checked_sub(RATE_CLEANUP_INTERVAL).unwrap_or(now)),
         }
@@ -78,7 +128,7 @@ impl RateLimiter {
             removed += usize::from(!keep);
             keep
         });
-        self.bucket_count.fetch_sub(removed, Ordering::AcqRel);
+        self.bucket_count.fetch_sub(removed, Ordering::Relaxed);
         true
     }
 
@@ -92,7 +142,7 @@ impl RateLimiter {
         debug_assert!(requests_per_second > 0.0);
         let now = Instant::now();
         let capacity = f64::from(burst) + 1.0;
-        if self.observations.fetch_add(1, Ordering::Relaxed) & 0x3fff == 0x3fff {
+        if rate_cleanup_sample_due() {
             self.cleanup_idle(now);
         }
 
@@ -107,7 +157,7 @@ impl RateLimiter {
                 Entry::Vacant(entry) => {
                     if self
                         .bucket_count
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                             (count < self.max_buckets).then_some(count + 1)
                         })
                         .is_ok()
@@ -142,7 +192,7 @@ impl RateLimiter {
 /// Counts active resources per IP. It is used for HTTP requests/streams and
 /// for QUIC connections, with the `zone` separating independent limits.
 pub struct ActiveRequestLimiter {
-    counters: DashMap<ClientKey, Arc<AtomicUsize>>,
+    counters: ActiveCounterMap,
     counter_count: AtomicUsize,
     max_counters: usize,
     cleanup: Mutex<()>,
@@ -155,7 +205,7 @@ impl ActiveRequestLimiter {
 
     fn with_max_counters(max_counters: usize) -> Self {
         Self {
-            counters: DashMap::new(),
+            counters: DashMap::with_hasher(RandomState::new()),
             counter_count: AtomicUsize::new(0),
             max_counters,
             cleanup: Mutex::new(()),
@@ -168,11 +218,11 @@ impl ActiveRequestLimiter {
         };
         let mut removed = 0;
         self.counters.retain(|_, counter| {
-            let keep = counter.load(Ordering::Acquire) != 0;
+            let keep = counter.load(Ordering::Relaxed) != 0;
             removed += usize::from(!keep);
             keep
         });
-        self.counter_count.fetch_sub(removed, Ordering::AcqRel);
+        self.counter_count.fetch_sub(removed, Ordering::Relaxed);
         true
     }
 
@@ -186,11 +236,11 @@ impl ActiveRequestLimiter {
 
         // Existing clients are the overwhelmingly common path. A read lookup
         // avoids constructing a DashMap entry and cloning ClientKey on every
-        // request. Holding the map guard through the increment prevents a
+        // request. Holding the map guard through the atomic increment prevents a
         // capacity cleanup from removing this counter concurrently.
         if let Some(counter) = self.counters.get(&key) {
             counter
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     (current < limit).then_some(current + 1)
                 })
                 .ok()?;
@@ -206,7 +256,7 @@ impl ActiveRequestLimiter {
                 Entry::Occupied(entry) => {
                     let counter = entry.get().clone();
                     counter
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                             (current < limit).then_some(current + 1)
                         })
                         .ok()?;
@@ -215,7 +265,7 @@ impl ActiveRequestLimiter {
                 Entry::Vacant(entry) => {
                     if self
                         .counter_count
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                             (count < self.max_counters).then_some(count + 1)
                         })
                         .is_ok()
@@ -243,7 +293,7 @@ pub struct ActiveRequestPermit {
 
 impl Drop for ActiveRequestPermit {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -283,7 +333,7 @@ mod tests {
         assert_eq!(limiter.counters.len(), 1);
         drop(limiter.acquire("api", ip, 1).unwrap());
         assert_eq!(limiter.counters.len(), 1);
-        assert_eq!(limiter.counter_count.load(Ordering::Acquire), 1);
+        assert_eq!(limiter.counter_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -299,7 +349,7 @@ mod tests {
                 .acquire("api", "192.0.2.41".parse().unwrap(), 1)
                 .is_some()
         );
-        assert_eq!(limiter.counter_count.load(Ordering::Acquire), 1);
+        assert_eq!(limiter.counter_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -324,7 +374,32 @@ mod tests {
             .updated_at = Instant::now() - Duration::from_secs(601);
 
         assert!(limiter.allow("api", "192.0.2.21".parse().unwrap(), 1.0, 0));
-        assert_eq!(limiter.bucket_count.load(Ordering::Acquire), 1);
+        assert_eq!(limiter.bucket_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn production_zone_tags_are_unique() {
+        let zones = [
+            "global",
+            "http3-connection",
+            "navidrome_stream",
+            "navidrome_cover",
+            "navidrome_api",
+            "vaultwarden_auth",
+            "vaultwarden_hub",
+            "vaultwarden",
+            "couchdb",
+            "doh",
+            "adguard_ui",
+        ];
+        let mut tags = zones
+            .iter()
+            .map(|zone| production_zone_tag(zone).unwrap())
+            .collect::<Vec<_>>();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags.len(), zones.len());
+        assert_eq!(production_zone_tag("test-zone"), None);
     }
 
     #[test]
@@ -359,11 +434,11 @@ mod tests {
                 for _ in 0..ITERATIONS {
                     match limiter.acquire("api", ip, 1) {
                         Some(permit) => {
-                            if granted.fetch_add(1, Ordering::AcqRel) != 0 {
-                                violated.store(true, Ordering::Release);
+                            if granted.fetch_add(1, Ordering::Relaxed) != 0 {
+                                violated.store(true, Ordering::Relaxed);
                             }
                             thread::yield_now();
-                            granted.fetch_sub(1, Ordering::AcqRel);
+                            granted.fetch_sub(1, Ordering::Relaxed);
                             drop(permit);
                         }
                         _ => {
@@ -377,6 +452,6 @@ mod tests {
             worker.join().unwrap();
         }
 
-        assert!(!violated.load(Ordering::Acquire));
+        assert!(!violated.load(Ordering::Relaxed));
     }
 }
