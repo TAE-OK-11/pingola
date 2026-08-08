@@ -31,7 +31,8 @@ use crate::config::{RuntimeConfig, UpstreamConfig, UpstreamProtocol};
 use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const RECONNECT_DELAY: Duration = Duration::from_millis(100);
+const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(100);
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_UDP_PAYLOAD: usize = 1452;
 const MAX_H3_HEADER_BYTES: u64 = 64 * 1024;
 const MAX_REQUEST_COMMANDS: usize = 256;
@@ -255,6 +256,7 @@ impl H3Pool {
                 headers,
                 has_body,
                 allow_early_data,
+                cancel: self.commands.clone(),
                 opened: opened_tx,
                 response: response_tx,
             })
@@ -264,7 +266,8 @@ impl H3Pool {
             id,
             commands: self.commands.clone(),
             opened: Some(opened_rx),
-            response: response_rx,
+            response: Some(response_rx),
+            cancel_on_drop: true,
         })
     }
 }
@@ -273,7 +276,8 @@ struct RequestHandle {
     id: u64,
     commands: mpsc::Sender<Command>,
     opened: Option<oneshot::Receiver<Result<(), String>>>,
-    response: oneshot::Receiver<Result<ResponseHead, String>>,
+    response: Option<oneshot::Receiver<Result<ResponseHead, String>>>,
+    cancel_on_drop: bool,
 }
 
 impl RequestHandle {
@@ -287,11 +291,25 @@ impl RequestHandle {
             .map_err(boxed_error)
     }
 
-    async fn response(self) -> Result<ResponseHead, BoxError> {
-        self.response
+    async fn response(mut self) -> Result<ResponseHead, BoxError> {
+        let response = self
+            .response
+            .take()
+            .ok_or_else(|| boxed_error("upstream HTTP/3 response channel was already consumed"))?;
+        let response = response
             .await
             .map_err(|_| boxed_error("upstream HTTP/3 response channel closed"))?
-            .map_err(boxed_error)
+            .map_err(boxed_error);
+        self.cancel_on_drop = false;
+        response
+    }
+}
+
+impl Drop for RequestHandle {
+    fn drop(&mut self) {
+        if self.cancel_on_drop {
+            let _ = self.commands.try_send(Command::Cancel { id: self.id });
+        }
     }
 }
 
@@ -299,6 +317,22 @@ struct ResponseHead {
     status: StatusCode,
     headers: HeaderMap,
     body: mpsc::Receiver<Result<Frame<Bytes>, String>>,
+    finished: Arc<AtomicBool>,
+    cancellation: ResponseCancellation,
+}
+
+struct ResponseCancellation {
+    id: u64,
+    commands: mpsc::Sender<Command>,
+    finished: Arc<AtomicBool>,
+}
+
+impl Drop for ResponseCancellation {
+    fn drop(&mut self) {
+        if !self.finished.load(Ordering::Acquire) {
+            let _ = self.commands.try_send(Command::Cancel { id: self.id });
+        }
+    }
 }
 
 enum Command {
@@ -307,6 +341,7 @@ enum Command {
         headers: Vec<h3::Header>,
         has_body: bool,
         allow_early_data: bool,
+        cancel: mpsc::Sender<Command>,
         opened: oneshot::Sender<Result<(), String>>,
         response: oneshot::Sender<Result<ResponseHead, String>>,
     },
@@ -314,24 +349,53 @@ enum Command {
         id: u64,
         data: Bytes,
         fin: bool,
+        completed: oneshot::Sender<Result<(), String>>,
     },
     Trailers {
         id: u64,
         headers: Vec<h3::Header>,
+        completed: oneshot::Sender<Result<(), String>>,
     },
+    Cancel {
+        id: u64,
+    },
+}
+
+enum PendingWrite {
+    Body {
+        data: Bytes,
+        offset: usize,
+        fin: bool,
+        completed: oneshot::Sender<Result<(), String>>,
+    },
+    Trailers {
+        headers: Vec<h3::Header>,
+        completed: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+impl PendingWrite {
+    fn fail(self, message: &str) {
+        let completed = match self {
+            Self::Body { completed, .. } | Self::Trailers { completed, .. } => completed,
+        };
+        let _ = completed.send(Err(message.to_string()));
+    }
 }
 
 struct PendingRequest {
     headers: Vec<h3::Header>,
     has_body: bool,
     allow_early_data: bool,
+    cancel: mpsc::Sender<Command>,
     opened: Option<oneshot::Sender<Result<(), String>>>,
     response: Option<oneshot::Sender<Result<ResponseHead, String>>>,
     body_tx: mpsc::Sender<Result<Frame<Bytes>, String>>,
     body_rx: Option<mpsc::Receiver<Result<Frame<Bytes>, String>>>,
+    response_finished: Arc<AtomicBool>,
     stream_id: Option<u64>,
     response_started: bool,
-    sent_in_early_data: bool,
+    pending_write: Option<PendingWrite>,
 }
 
 impl PendingRequest {
@@ -344,6 +408,9 @@ impl PendingRequest {
         } else {
             let _ = self.body_tx.try_send(Err(message.to_string()));
         }
+        if let Some(write) = self.pending_write.take() {
+            write.fail(message);
+        }
     }
 }
 
@@ -354,6 +421,7 @@ async fn pool_manager(
 ) {
     let session = Arc::new(Mutex::new(None::<Vec<u8>>));
     let mut connected_once = false;
+    let mut reconnect_delay = MIN_RECONNECT_DELAY;
     loop {
         // After a session ticket exists, do not burn the 0-RTT opportunity by
         // reconnecting before there is application data to send. Mark the
@@ -380,7 +448,7 @@ async fn pool_manager(
         )
         .await;
         connected_once = true;
-        available.store(false, Ordering::Release);
+        let was_available = available.swap(false, Ordering::AcqRel);
         if commands.is_closed() {
             return;
         }
@@ -390,8 +458,20 @@ async fn pool_manager(
                 settings.name
             );
         }
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        let delay = if was_available {
+            reconnect_delay = MIN_RECONNECT_DELAY;
+            MIN_RECONNECT_DELAY
+        } else {
+            let delay = reconnect_delay;
+            reconnect_delay = next_reconnect_delay(reconnect_delay);
+            delay
+        };
+        tokio::time::sleep(delay).await;
     }
+}
+
+fn next_reconnect_delay(current: Duration) -> Duration {
+    current.saturating_mul(2).min(MAX_RECONNECT_DELAY)
 }
 
 async fn run_connection(
@@ -464,8 +544,10 @@ async fn run_connection(
 
     let cached_session = session.lock().clone();
     if let Some(cached_session) = cached_session.as_deref() {
-        conn.set_session(cached_session)
-            .context("cached upstream QUIC session was rejected")?;
+        if let Err(error) = conn.set_session(cached_session) {
+            *session.lock() = None;
+            bail!("cached upstream QUIC session was rejected and invalidated: {error}");
+        }
     }
 
     let mut h3_config = h3::Config::new().context("failed to create H3 config")?;
@@ -474,6 +556,7 @@ async fn run_connection(
     let mut requests = HashMap::<u64, PendingRequest>::new();
     let mut stream_to_request = HashMap::<u64, u64>::new();
     let mut waiting = VecDeque::<u64>::new();
+    let mut pending_writes = VecDeque::<u64>::new();
     let mut recv_buf = vec![0_u8; 64 * 1024];
     let mut send_buf = vec![0_u8; 64 * 1024];
     let handshake_deadline = Instant::now() + settings.connect_timeout;
@@ -483,22 +566,21 @@ async fn run_connection(
     if let Some(command) = initial_command {
         handle_command(
             command,
-            h3_conn.as_mut(),
             &mut conn,
             &mut requests,
             &mut stream_to_request,
             &mut waiting,
-        )?;
+            &mut pending_writes,
+        );
     }
 
-    loop {
+    let result: Result<()> = async {
+        loop {
         if conn.is_closed() {
-            fail_all(&mut requests, "upstream QUIC connection closed");
             bail!("upstream QUIC connection closed");
         }
         if !conn.is_established() && Instant::now() >= handshake_deadline {
             conn.close(false, 0x1, b"handshake timeout").ok();
-            fail_all(&mut requests, "upstream QUIC handshake timed out");
             bail!("upstream QUIC handshake timed out");
         }
 
@@ -538,6 +620,11 @@ async fn run_connection(
         }
 
         if let Some(h3_conn) = h3_conn.as_mut() {
+            cancel_abandoned_responses(
+                &mut conn,
+                &mut requests,
+                &mut stream_to_request,
+            );
             dispatch_waiting(
                 h3_conn,
                 &mut conn,
@@ -545,14 +632,20 @@ async fn run_connection(
                 &mut stream_to_request,
                 &mut waiting,
             )?;
+            drive_pending_writes(
+                h3_conn,
+                &mut conn,
+                &mut requests,
+                &mut stream_to_request,
+                &mut pending_writes,
+            );
             process_h3_events(
                 h3_conn,
                 &mut conn,
                 &mut requests,
                 &mut stream_to_request,
                 &mut recv_buf,
-            )
-            .await?;
+            )?;
         }
         flush_quic(&socket, &mut conn, &mut send_buf).await?;
 
@@ -573,84 +666,198 @@ async fn run_connection(
                 };
                 handle_command(
                     command,
-                    h3_conn.as_mut(),
                     &mut conn,
                     &mut requests,
                     &mut stream_to_request,
                     &mut waiting,
-                )?;
+                    &mut pending_writes,
+                );
             }
             _ = tokio::time::sleep(timeout) => {
                 conn.on_timeout();
             }
         }
     }
+    }
+    .await;
+
+    let message = result
+        .as_ref()
+        .err()
+        .map_or("upstream QUIC worker stopped".to_string(), |error| {
+            format!("upstream QUIC worker stopped: {error:#}")
+        });
+    fail_all(&mut requests, &message);
+    result
 }
 
 fn handle_command(
     command: Command,
-    h3_conn: Option<&mut h3::Connection>,
     conn: &mut quiche::Connection,
     requests: &mut HashMap<u64, PendingRequest>,
     stream_to_request: &mut HashMap<u64, u64>,
     waiting: &mut VecDeque<u64>,
-) -> Result<()> {
+    pending_writes: &mut VecDeque<u64>,
+) {
     match command {
         Command::Open {
             id,
             headers,
             has_body,
             allow_early_data,
+            cancel,
             opened,
             response,
         } => {
             let (body_tx, body_rx) = mpsc::channel(MAX_BODY_FRAMES);
+            let response_finished = Arc::new(AtomicBool::new(false));
             requests.insert(
                 id,
                 PendingRequest {
                     headers,
                     has_body,
                     allow_early_data,
+                    cancel,
                     opened: Some(opened),
                     response: Some(response),
                     body_tx,
                     body_rx: Some(body_rx),
+                    response_finished,
                     stream_id: None,
                     response_started: false,
-                    sent_in_early_data: false,
+                    pending_write: None,
                 },
             );
             waiting.push_back(id);
-            if let Some(h3_conn) = h3_conn {
-                dispatch_waiting(h3_conn, conn, requests, stream_to_request, waiting)?;
-            }
         }
-        Command::Body { id, data, fin } => {
-            let request = requests
-                .get(&id)
-                .ok_or_else(|| anyhow!("HTTP/3 request disappeared before body write"))?;
-            let stream_id = request
-                .stream_id
-                .ok_or_else(|| anyhow!("HTTP/3 request body arrived before stream open"))?;
-            let h3_conn = h3_conn.ok_or_else(|| anyhow!("HTTP/3 connection is not ready"))?;
-            h3_conn
-                .send_body(conn, stream_id, &data, fin)
-                .map_err(|error| anyhow!("HTTP/3 request body send failed: {error:?}"))?;
+        Command::Body {
+            id,
+            data,
+            fin,
+            completed,
+        } => {
+            enqueue_write(
+                id,
+                PendingWrite::Body {
+                    data,
+                    offset: 0,
+                    fin,
+                    completed,
+                },
+                requests,
+                pending_writes,
+            );
         }
-        Command::Trailers { id, headers } => {
-            let request = requests
-                .get(&id)
-                .ok_or_else(|| anyhow!("HTTP/3 request disappeared before trailers"))?;
-            let stream_id = request
-                .stream_id
-                .ok_or_else(|| anyhow!("HTTP/3 request trailers arrived before stream open"))?;
-            let h3_conn = h3_conn.ok_or_else(|| anyhow!("HTTP/3 connection is not ready"))?;
-            h3_conn
-                .send_additional_headers(conn, stream_id, &headers, true, true)
-                .map_err(|error| anyhow!("HTTP/3 request trailer send failed: {error:?}"))?;
+        Command::Trailers {
+            id,
+            headers,
+            completed,
+        } => {
+            enqueue_write(
+                id,
+                PendingWrite::Trailers { headers, completed },
+                requests,
+                pending_writes,
+            );
+        }
+        Command::Cancel { id } => {
+            cancel_request(
+                id,
+                "downstream cancelled HTTP/3 request",
+                conn,
+                requests,
+                stream_to_request,
+            );
         }
     }
-    Ok(())
+}
+
+fn enqueue_write(
+    id: u64,
+    write: PendingWrite,
+    requests: &mut HashMap<u64, PendingRequest>,
+    pending_writes: &mut VecDeque<u64>,
+) {
+    let Some(request) = requests.get_mut(&id) else {
+        write.fail("HTTP/3 request ended before its body was sent");
+        return;
+    };
+    if request.stream_id.is_none() {
+        write.fail("HTTP/3 request body arrived before the stream opened");
+        return;
+    }
+    if request.pending_write.is_some() {
+        write.fail("HTTP/3 request has more than one pending body write");
+        return;
+    }
+    request.pending_write = Some(write);
+    pending_writes.push_back(id);
+}
+
+fn drive_pending_writes(
+    h3_conn: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    requests: &mut HashMap<u64, PendingRequest>,
+    stream_to_request: &mut HashMap<u64, u64>,
+    pending_writes: &mut VecDeque<u64>,
+) {
+    let count = pending_writes.len();
+    for _ in 0..count {
+        let Some(id) = pending_writes.pop_front() else {
+            break;
+        };
+        let Some(request) = requests.get_mut(&id) else {
+            continue;
+        };
+        let Some(stream_id) = request.stream_id else {
+            continue;
+        };
+        let Some(mut write) = request.pending_write.take() else {
+            continue;
+        };
+
+        let result = match &mut write {
+            PendingWrite::Body {
+                data, offset, fin, ..
+            } => match h3_conn.send_body(conn, stream_id, &data[*offset..], *fin) {
+                Ok(written) => {
+                    *offset += written;
+                    if *offset == data.len() {
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                Err(h3::Error::Done | h3::Error::StreamBlocked) => Ok(false),
+                Err(error) => Err(format!("HTTP/3 request body send failed: {error:?}")),
+            },
+            PendingWrite::Trailers { headers, .. } => {
+                match h3_conn.send_additional_headers(conn, stream_id, headers, true, true) {
+                    Ok(()) => Ok(true),
+                    Err(h3::Error::Done | h3::Error::StreamBlocked) => Ok(false),
+                    Err(error) => Err(format!("HTTP/3 request trailer send failed: {error:?}")),
+                }
+            }
+        };
+
+        match result {
+            Ok(true) => {
+                let completed = match write {
+                    PendingWrite::Body { completed, .. }
+                    | PendingWrite::Trailers { completed, .. } => completed,
+                };
+                let _ = completed.send(Ok(()));
+            }
+            Ok(false) => {
+                request.pending_write = Some(write);
+                pending_writes.push_back(id);
+            }
+            Err(message) => {
+                write.fail(&message);
+                cancel_request(id, &message, conn, requests, stream_to_request);
+            }
+        }
+    }
 }
 
 fn dispatch_waiting(
@@ -681,7 +888,6 @@ fn dispatch_waiting(
         match h3_conn.send_request(conn, &request.headers, !request.has_body) {
             Ok(stream_id) => {
                 request.stream_id = Some(stream_id);
-                request.sent_in_early_data = in_early_data;
                 if in_early_data {
                     info!(
                         "upstream HTTP/3 early-data request sent stream={} request_id={}",
@@ -706,7 +912,7 @@ fn dispatch_waiting(
     Ok(())
 }
 
-async fn process_h3_events(
+fn process_h3_events(
     h3_conn: &mut h3::Connection,
     conn: &mut quiche::Connection,
     requests: &mut HashMap<u64, PendingRequest>,
@@ -728,11 +934,18 @@ async fn process_h3_events(
         };
         match event {
             h3::Event::Headers { list, .. } => {
-                let request = requests
-                    .get_mut(&request_id)
-                    .ok_or_else(|| anyhow!("HTTP/3 response has no request state"))?;
-                if !request.response_started {
+                let response_started = requests
+                    .get(&request_id)
+                    .ok_or_else(|| anyhow!("HTTP/3 response has no request state"))?
+                    .response_started;
+                if !response_started {
                     let (status, headers) = decode_response_headers(&list)?;
+                    if status.is_informational() {
+                        continue;
+                    }
+                    let request = requests
+                        .get_mut(&request_id)
+                        .ok_or_else(|| anyhow!("HTTP/3 response has no request state"))?;
                     let body = request
                         .body_rx
                         .take()
@@ -742,59 +955,94 @@ async fn process_h3_events(
                         .take()
                         .ok_or_else(|| anyhow!("HTTP/3 response sender missing"))?;
                     request.response_started = true;
-                    let _ = response.send(Ok(ResponseHead {
-                        status,
-                        headers,
-                        body,
-                    }));
+                    let finished = request.response_finished.clone();
+                    let cancellation = ResponseCancellation {
+                        id: request_id,
+                        commands: request.cancel.clone(),
+                        finished: finished.clone(),
+                    };
+                    if response
+                        .send(Ok(ResponseHead {
+                            status,
+                            headers,
+                            body,
+                            finished,
+                            cancellation,
+                        }))
+                        .is_err()
+                    {
+                        cancel_request(
+                            request_id,
+                            "downstream dropped HTTP/3 response headers",
+                            conn,
+                            requests,
+                            stream_to_request,
+                        );
+                    }
                 } else {
                     let trailers = decode_trailers(&list)?;
-                    request
+                    let send_result = requests
+                        .get(&request_id)
+                        .ok_or_else(|| anyhow!("HTTP/3 response has no request state"))?
                         .body_tx
-                        .send(Ok(Frame::trailers(trailers)))
-                        .await
-                        .map_err(|_| anyhow!("downstream dropped HTTP/3 response trailers"))?;
-                }
-            }
-            h3::Event::Data => {
-                let request = requests
-                    .get_mut(&request_id)
-                    .ok_or_else(|| anyhow!("HTTP/3 data has no request state"))?;
-                loop {
-                    match h3_conn.recv_body(conn, stream_id, body_buf) {
-                        Ok(read) => {
-                            request
-                                .body_tx
-                                .send(Ok(Frame::data(Bytes::copy_from_slice(&body_buf[..read]))))
-                                .await
-                                .map_err(|_| anyhow!("downstream dropped HTTP/3 response body"))?;
-                        }
-                        Err(h3::Error::Done) => break,
-                        Err(error) => {
-                            return Err(anyhow!("HTTP/3 response body receive failed: {error:?}"));
-                        }
+                        .try_send(Ok(Frame::trailers(trailers)));
+                    if let Err(error) = send_result {
+                        let message = match error {
+                            mpsc::error::TrySendError::Full(_) => {
+                                "HTTP/3 response buffer limit exceeded while sending trailers"
+                            }
+                            mpsc::error::TrySendError::Closed(_) => {
+                                "downstream dropped HTTP/3 response trailers"
+                            }
+                        };
+                        cancel_request(request_id, message, conn, requests, stream_to_request);
                     }
                 }
             }
+            h3::Event::Data => loop {
+                match h3_conn.recv_body(conn, stream_id, body_buf) {
+                    Ok(read) => {
+                        let send_result = requests
+                            .get(&request_id)
+                            .ok_or_else(|| anyhow!("HTTP/3 data has no request state"))?
+                            .body_tx
+                            .try_send(Ok(Frame::data(Bytes::copy_from_slice(&body_buf[..read]))));
+                        if let Err(error) = send_result {
+                            let message = match error {
+                                mpsc::error::TrySendError::Full(_) => {
+                                    "HTTP/3 response buffer limit exceeded"
+                                }
+                                mpsc::error::TrySendError::Closed(_) => {
+                                    "downstream dropped HTTP/3 response body"
+                                }
+                            };
+                            cancel_request(request_id, message, conn, requests, stream_to_request);
+                            break;
+                        }
+                    }
+                    Err(h3::Error::Done) => break,
+                    Err(error) => {
+                        return Err(anyhow!("HTTP/3 response body receive failed: {error:?}"));
+                    }
+                }
+            },
             h3::Event::Finished => {
                 stream_to_request.remove(&stream_id);
-                if let Some(mut request) = requests.remove(&request_id)
-                    && !request.response_started
-                    && let Some(response) = request.response.take()
-                {
-                    let _ = response.send(Err("HTTP/3 response finished before headers".into()));
+                if let Some(mut request) = requests.remove(&request_id) {
+                    if request.response_started {
+                        request.response_finished.store(true, Ordering::Release);
+                    } else if let Some(response) = request.response.take() {
+                        let _ =
+                            response.send(Err("HTTP/3 response finished before headers".into()));
+                    }
+                    if let Some(write) = request.pending_write.take() {
+                        write.fail("HTTP/3 response finished before request upload completed");
+                    }
                 }
             }
             h3::Event::Reset(code) => {
-                stream_to_request.remove(&stream_id);
-                if let Some(mut request) = requests.remove(&request_id) {
-                    let message = format!("HTTP/3 stream reset by upstream code={code}");
-                    if let Some(response) = request.response.take() {
-                        let _ = response.send(Err(message));
-                    } else {
-                        let _ = request.body_tx.send(Err(message)).await;
-                    }
-                }
+                let message = format!("HTTP/3 stream reset by upstream code={code}");
+                cancel_request(request_id, &message, conn, requests, stream_to_request);
             }
             h3::Event::GoAway => {
                 return Err(anyhow!("upstream HTTP/3 peer sent GOAWAY id={stream_id}"));
@@ -803,6 +1051,47 @@ async fn process_h3_events(
         }
     }
     Ok(())
+}
+
+fn cancel_abandoned_responses(
+    conn: &mut quiche::Connection,
+    requests: &mut HashMap<u64, PendingRequest>,
+    stream_to_request: &mut HashMap<u64, u64>,
+) {
+    let abandoned: Vec<_> = requests
+        .iter()
+        .filter_map(|(&id, request)| {
+            (request.response_started && request.body_tx.is_closed()).then_some(id)
+        })
+        .collect();
+    for id in abandoned {
+        cancel_request(
+            id,
+            "downstream dropped HTTP/3 response",
+            conn,
+            requests,
+            stream_to_request,
+        );
+    }
+}
+
+fn cancel_request(
+    id: u64,
+    message: &str,
+    conn: &mut quiche::Connection,
+    requests: &mut HashMap<u64, PendingRequest>,
+    stream_to_request: &mut HashMap<u64, u64>,
+) {
+    let Some(request) = requests.remove(&id) else {
+        return;
+    };
+    if let Some(stream_id) = request.stream_id {
+        stream_to_request.remove(&stream_id);
+        let code = h3::WireErrorCode::RequestCancelled as u64;
+        let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Read, code);
+        let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Write, code);
+    }
+    request.fail(message);
 }
 
 async fn flush_quic(
@@ -885,57 +1174,116 @@ async fn proxy_bridge_request(
                     }
                 };
                 if let Some(data) = frame.data_ref()
-                    && commands
-                        .send(Command::Body {
-                            id,
-                            data: data.clone(),
-                            fin: false,
-                        })
+                    && !data.is_empty()
+                    && send_body_command(&commands, id, data.clone(), false)
                         .await
                         .is_err()
                 {
+                    let _ = commands.send(Command::Cancel { id }).await;
                     return;
                 }
                 if let Some(trailers) = frame.trailers_ref() {
                     let trailers = encode_regular_headers(trailers);
-                    if commands
-                        .send(Command::Trailers {
-                            id,
-                            headers: trailers,
-                        })
+                    if send_trailers_command(&commands, id, trailers)
                         .await
                         .is_err()
                     {
+                        let _ = commands.send(Command::Cancel { id }).await;
                         return;
                     }
                     sent_fin = true;
                 }
             }
             if !sent_fin {
-                let _ = commands
-                    .send(Command::Body {
-                        id,
-                        data: Bytes::new(),
-                        fin: true,
-                    })
-                    .await;
+                if send_body_command(&commands, id, Bytes::new(), true)
+                    .await
+                    .is_err()
+                {
+                    let _ = commands.send(Command::Cancel { id }).await;
+                }
             }
         });
     }
 
-    let response = handle.response().await?;
-    let mut builder = Response::builder().status(response.status);
+    let ResponseHead {
+        status,
+        headers: response_headers,
+        body,
+        finished,
+        cancellation,
+    } = handle.response().await?;
+    let mut builder = Response::builder().status(status);
     if let Some(headers) = builder.headers_mut() {
-        *headers = response.headers;
+        *headers = response_headers;
     }
-    let stream = stream::unfold(response.body, |mut rx| async move {
-        rx.recv().await.map(|item| {
-            let item = item.map_err(boxed_error);
-            (item, rx)
-        })
-    });
+    let stream = response_body_stream(body, finished, cancellation);
     let body = StreamBody::new(stream).boxed_unsync();
     builder.body(body).map_err(|error| error.into())
+}
+
+async fn send_body_command(
+    commands: &mpsc::Sender<Command>,
+    id: u64,
+    data: Bytes,
+    fin: bool,
+) -> Result<(), String> {
+    let (completed, completion) = oneshot::channel();
+    commands
+        .send(Command::Body {
+            id,
+            data,
+            fin,
+            completed,
+        })
+        .await
+        .map_err(|_| "upstream HTTP/3 worker is unavailable".to_string())?;
+    completion
+        .await
+        .map_err(|_| "upstream HTTP/3 body completion channel closed".to_string())?
+}
+
+async fn send_trailers_command(
+    commands: &mpsc::Sender<Command>,
+    id: u64,
+    headers: Vec<h3::Header>,
+) -> Result<(), String> {
+    let (completed, completion) = oneshot::channel();
+    commands
+        .send(Command::Trailers {
+            id,
+            headers,
+            completed,
+        })
+        .await
+        .map_err(|_| "upstream HTTP/3 worker is unavailable".to_string())?;
+    completion
+        .await
+        .map_err(|_| "upstream HTTP/3 trailer completion channel closed".to_string())?
+}
+
+fn response_body_stream(
+    body: mpsc::Receiver<Result<Frame<Bytes>, String>>,
+    finished: Arc<AtomicBool>,
+    cancellation: ResponseCancellation,
+) -> impl futures::Stream<Item = Result<Frame<Bytes>, BoxError>> {
+    stream::unfold(
+        (body, finished, cancellation, false),
+        |(mut body, finished, cancellation, reported_incomplete)| async move {
+            match body.recv().await {
+                Some(item) => Some((
+                    item.map_err(boxed_error),
+                    (body, finished, cancellation, reported_incomplete),
+                )),
+                None if finished.load(Ordering::Acquire) || reported_incomplete => None,
+                None => Some((
+                    Err(boxed_error(
+                        "upstream HTTP/3 response ended before the stream finished",
+                    )),
+                    (body, finished, cancellation, true),
+                )),
+            }
+        },
+    )
 }
 
 fn encode_request_headers(parts: &http::request::Parts) -> Result<Vec<h3::Header>, BoxError> {
