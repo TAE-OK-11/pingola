@@ -387,8 +387,19 @@ impl Gateway {
         })
     }
 
+    #[inline]
     fn host(&self, authority: &str) -> Option<&PreparedHost> {
+        // H1 Host and H2 :authority are normally already the canonical lower-case
+        // hostname without an explicit default port. Hit the prepared map first
+        // and only pay normalization + a second hash lookup for compatibility
+        // forms such as mixed case, a trailing dot, or host:port.
+        if let Some(host) = self.hosts.get::<str>(authority) {
+            return Some(host);
+        }
         let domain = normalized_host(authority);
+        if domain.as_ref() == authority {
+            return None;
+        }
         self.hosts.get::<str>(domain.as_ref())
     }
 
@@ -708,7 +719,7 @@ impl ProxyHttp for Gateway {
     ) -> Result<()> {
         let plan = self.request_plan(ctx)?;
         strip_request_hop_headers(session.req_header(), upstream_request)?;
-        upstream_request.headers.reserve(6);
+        upstream_request.headers.reserve(8);
         let client_ip = forwarded_client_ip_value(ctx.client_ip)?;
         let upstream_host = if plan.route == RouteClass::Doh {
             DIRECT_DOH_HOST
@@ -1276,6 +1287,17 @@ fn is_fixed_response_removed_header(name: &HeaderName) -> bool {
 }
 
 fn request_authority(request: &RequestHeader) -> Option<&str> {
+    // H2 requests normally carry :authority in the URI and no Host field.
+    // Avoid constructing a Host value iterator on that common path while still
+    // retaining the strict duplicate-Host validation for H1 and compatibility
+    // H2 requests that explicitly include Host.
+    if request.version == Version::HTTP_2
+        && !request.headers.contains_key(HOST)
+        && let Some(authority) = request.uri.authority()
+    {
+        return Some(authority.as_str());
+    }
+
     let mut host_values = request.headers.get_all(HOST).iter();
     let host = host_values.next();
     if host_values.next().is_some() {
@@ -1311,6 +1333,20 @@ fn is_tls(session: &Session) -> bool {
 }
 
 fn is_internal_http3(runtime: &RuntimeConfig, session: &Session) -> bool {
+    // Public H1/H2 traffic never has the private handoff marker. Check the
+    // cheapest and most selective condition first so ordinary requests avoid
+    // two socket-address lookups entirely. The loopback/local-address checks
+    // remain mandatory after the token matches, preserving the trust boundary.
+    let marker_matches = runtime.http3_internal_token().is_some_and(|expected| {
+        session
+            .req_header()
+            .headers
+            .get(&HTTP3_INTERNAL)
+            .is_some_and(|value| value == expected)
+    });
+    if !marker_matches {
+        return false;
+    }
     let Some(expected) = runtime.http3_internal_addr() else {
         return false;
     };
@@ -1322,14 +1358,7 @@ fn is_internal_http3(runtime: &RuntimeConfig, session: &Session) -> bool {
         .client_addr()
         .and_then(|address| address.as_inet())
         .is_some_and(|address| address.ip().is_loopback());
-    let marker_matches = runtime.http3_internal_token().is_some_and(|expected| {
-        session
-            .req_header()
-            .headers
-            .get(&HTTP3_INTERNAL)
-            .is_some_and(|value| value == expected)
-    });
-    server_matches && peer_is_loopback && marker_matches
+    server_matches && peer_is_loopback
 }
 
 fn session_client_ip(runtime: &RuntimeConfig, session: &Session) -> IpAddr {
@@ -1777,6 +1806,8 @@ hosts:
     fn prepared_host_lookup_is_case_insensitive_and_peers_cache_pool_hash() {
         let gateway =
             Gateway::new(Arc::new(runtime()), Arc::new(UpstreamH3Registry::default())).unwrap();
+        let exact = gateway.host("app.example.com").unwrap();
+        assert_eq!(exact.domain.as_ref(), "app.example.com");
         let host = gateway.host("APP.EXAMPLE.COM:443").unwrap();
         assert_eq!(host.domain.as_ref(), "app.example.com");
         let plan = &gateway.plans[host.plan("/rest/stream").unwrap()];
