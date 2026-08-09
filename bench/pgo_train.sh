@@ -346,6 +346,8 @@ server:
   access_log: false
   http2_max_concurrent_streams: 32
   static_cache_bytes: 1048576
+  # h2load multiplexes this benchmark through one loopback client identity.
+  static_active_requests_per_client: 1000000
   graceful_shutdown_timeout_seconds: 2
 trusted_proxies: ["127.0.0.0/8"]
 upstreams:

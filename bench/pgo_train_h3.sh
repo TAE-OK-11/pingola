@@ -108,6 +108,8 @@ server:
   max_retries: 2
   access_log: false
   static_cache_bytes: 1048576
+  # Keep profile collection focused on proxy work rather than admission control.
+  static_active_requests_per_client: 1000000
   graceful_shutdown_timeout_seconds: 2
 trusted_proxies: ["127.0.0.0/8"]
 upstreams:
