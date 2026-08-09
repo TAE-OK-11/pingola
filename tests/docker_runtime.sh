@@ -99,7 +99,7 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.target-cpu"}}' "${name}") == "${EXPECTED_TARGET_CPU}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.lto"}}' "${name}") == "${EXPECTED_LTO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.tls.provider"}}' "${name}") == "${EXPECTED_TLS_PROVIDER}" ]]
-  [[ $(docker.inspect --format '{{index .Config.Labels "org.opencontainers.image.http3.provider"}}' "${name}") == quiche ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.http3.provider"}}' "${name}") == quiche ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.quic.tls.provider"}}' "${name}") == boringssl ]]
   docker image inspect "${IMAGE}" | jq -e '.[0].Config.ExposedPorts["443/udp"] != null' >/dev/null
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.pgo"}}' "${name}") == "${EXPECTED_PGO}" ]]
