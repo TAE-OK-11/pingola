@@ -32,6 +32,9 @@ jobs:
           set -euxo pipefail
           test "$(uname -m)" = x86_64
           grep -q 'vendor_id[[:space:]]*: AuthenticAMD' /proc/cpuinfo
+          command -v docker
+          command -v jq
+          command -v openssl
           lscpu
           for flag in avx avx2 bmi1 bmi2 fma sse4_2; do
             grep -m1 '^flags' /proc/cpuinfo | grep -qw "${flag}"
@@ -99,18 +102,18 @@ jobs:
           sbom: true
 
       - name: Verify znver1 profile and runtime
-        env:
-          IMAGE: ghcr.io/tae-ok-11/pingora:${{ github.ref_name == 'main' && 'latest-znver1' || format('sha-{0}-znver1', github.sha) }}
-          PINGORA_TEST_IMAGE: ghcr.io/tae-ok-11/pingora:latest-znver1
-          PINGORA_EXPECTED_TARGET_CPU: znver1
-          PINGORA_EXPECTED_LTO: fat
-          PINGORA_EXPECTED_TLS_PROVIDER: boringssl
-          PINGORA_EXPECTED_PGO: train
         run: |
           set -euxo pipefail
           IMAGE_REF=$(echo '${{ steps.meta.outputs.tags }}' | head -n1)
+          test -n "${IMAGE_REF}"
           test "$(docker image inspect "${IMAGE_REF}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.target-cpu"]')" = znver1
           test "$(docker image inspect "${IMAGE_REF}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo-train-target-cpu"]')" = znver1
           test "$(docker image inspect "${IMAGE_REF}" | jq -r '.[0].Config.Labels["org.opencontainers.image.native.pgo"]')" = on
           docker run --rm --entrypoint sh "${IMAGE_REF}" -c \
             'test -s /usr/share/doc/pingora/pgo-profile-summary.txt && test -s /usr/share/doc/pingora/pgo-native-profile-summary.txt'
+          PINGORA_TEST_IMAGE="${IMAGE_REF}" \
+          PINGORA_EXPECTED_TARGET_CPU=znver1 \
+          PINGORA_EXPECTED_LTO=fat \
+          PINGORA_EXPECTED_TLS_PROVIDER=boringssl \
+          PINGORA_EXPECTED_PGO=train \
+            tests/docker_runtime.sh
