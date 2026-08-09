@@ -43,6 +43,8 @@ const INITIAL_MAX_DATA: u64 = 64 * 1024 * 1024;
 const INITIAL_STREAM_WINDOW: u64 = 16 * 1024 * 1024;
 const H3_CONTROL_STREAMS: u64 = 8;
 const SEND_CAPACITY_FACTOR: f64 = 2.0;
+const CC_CUBIC: &str = "cubic";
+const CC_BBR2: &str = "bbr2";
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 type BridgeBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -85,6 +87,7 @@ struct BridgeSettings {
     idle_timeout: Duration,
     max_streams: u64,
     enable_early_data: bool,
+    cc_algorithm: &'static str,
 }
 
 struct BridgeSpec {
@@ -135,6 +138,11 @@ pub fn start(runtime: Arc<RuntimeConfig>) -> Result<Arc<UpstreamH3Registry>> {
                 idle_timeout: Duration::from_secs(upstream.idle_timeout_seconds.max(1)),
                 max_streams: upstream.http3_max_concurrent_streams as u64,
                 enable_early_data: upstream.http3_early_data,
+                cc_algorithm: if upstream.http3_bbr2 {
+                    CC_BBR2
+                } else {
+                    CC_CUBIC
+                },
             },
             available,
         });
@@ -546,6 +554,14 @@ async fn run_connection(
     quic_config
         .set_application_protos(h3::APPLICATION_PROTOCOL)
         .context("failed to configure HTTP/3 ALPN")?;
+    quic_config
+        .set_cc_algorithm_name(settings.cc_algorithm)
+        .with_context(|| {
+            format!(
+                "failed to configure upstream HTTP/3 congestion control {}",
+                settings.cc_algorithm
+            )
+        })?;
     quic_config.verify_peer(settings.verify_peer);
     quic_config.set_max_idle_timeout(settings.idle_timeout.as_millis() as u64);
     quic_config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD);
@@ -636,11 +652,12 @@ async fn run_connection(
             available.store(true, Ordering::Release);
             if !established_logged {
                 info!(
-                    "upstream HTTP/3 established upstream={} peer={} resumed={} early_data_enabled={} hybrid_pq={}",
+                    "upstream HTTP/3 established upstream={} peer={} resumed={} early_data_enabled={} cc={} hybrid_pq={}",
                     settings.name,
                     settings.origin,
                     conn.is_resumed(),
                     settings.enable_early_data,
+                    settings.cc_algorithm,
                     HYBRID_PQ_GROUPS,
                 );
                 established_logged = true;
