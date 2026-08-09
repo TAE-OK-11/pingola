@@ -25,7 +25,6 @@ case "${CC}" in
   cubic) BBR2=false ;;
   *) echo "unsupported upstream H3 congestion control: ${CC}" >&2; exit 2 ;;
 esac
-
 case "${ECDSA_CURVE}" in
   prime256v1|secp384r1) ;;
   *) echo "unsupported ECDSA curve: ${ECDSA_CURVE}" >&2; exit 2 ;;
@@ -97,7 +96,7 @@ upstreams:
     protocol: http1
     idle_timeout_seconds: 30
 hosts:
-  profile: { domains: ["origin.test"], handler: vaultwarden, upstream: backend }
+  profile: { domains: ["origin.test", "pgo.test"], handler: vaultwarden, upstream: backend }
 route_limits:
   vaultwarden: { rate_per_second: 0, active_requests: 0 }
 EOF_ORIGIN
@@ -180,9 +179,6 @@ run_h2load stream-10m -n 12 -c 2 -m 2 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/10485760"
 
-# Let the one-second upstream idle timer close the QUIC connection, then send a
-# replay-safe GET. Repeating this trains reconnect, session caching/resumption,
-# and the 0-RTT-capable client path without making handshakes dominate the mix.
 for index in $(seq 1 8); do
   sleep 1.2
   run_h2load "resume-${index}" -n 32 -c 1 -m 1 --sni pgo.test \
