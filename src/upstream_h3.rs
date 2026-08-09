@@ -138,7 +138,11 @@ pub fn start(runtime: Arc<RuntimeConfig>) -> Result<Arc<UpstreamH3Registry>> {
                 idle_timeout: Duration::from_secs(upstream.idle_timeout_seconds.max(1)),
                 max_streams: upstream.http3_max_concurrent_streams as u64,
                 enable_early_data: upstream.http3_early_data,
-                cc_algorithm: if upstream.http3_bbr2 { CC_BBR2 } else { CC_CUBIC },
+                cc_algorithm: if upstream.http3_bbr2 {
+                    CC_BBR2
+                } else {
+                    CC_CUBIC
+                },
             },
             available,
         });
