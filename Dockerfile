@@ -9,7 +9,7 @@ ARG RUST_CODEGEN_UNITS=1
 ARG TLS_PROVIDER=boringssl
 ARG PGO_MODE=off
 ARG PGO_TRAIN_TARGET_CPU=x86-64-v2
-ARG PGO_NATIVE_BORING=on
+ARG PGO_NATIVE_BORING=off
 # Rust PGO: H2 stays deliberately strong because the downstream H3 frontend
 # reaches the main proxy through an internal H2C bridge. H3 client/server and
 # congestion-control paths receive dedicated profiles instead of being folded
