@@ -607,10 +607,7 @@ impl ProxyHttp for Gateway {
             let Some(permit) = self.active_requests.acquire(
                 "static",
                 client_ip,
-                self.runtime
-                    .config
-                    .server
-                    .static_active_requests_per_client,
+                self.runtime.config.server.static_active_requests_per_client,
             ) else {
                 return send_empty(
                     &self.runtime,
