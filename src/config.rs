@@ -69,6 +69,10 @@ fn default_downstream_request_header_timeout() -> u64 {
     15
 }
 
+fn default_static_active_requests_per_client() -> usize {
+    16
+}
+
 fn default_health_socket() -> PathBuf {
     PathBuf::from("/tmp/pingora/health.sock")
 }
@@ -173,6 +177,8 @@ pub struct ServerConfig {
     pub health_details: bool,
     #[serde(default)]
     pub global_active_requests: usize,
+    #[serde(default = "default_static_active_requests_per_client")]
+    pub static_active_requests_per_client: usize,
     #[serde(default = "default_http2_max_concurrent_streams")]
     pub http2_max_concurrent_streams: u32,
     #[serde(default = "default_downstream_max_connections")]
@@ -430,6 +436,9 @@ fn validate(config: &Config) -> Result<()> {
     if !(1..=1_000_000).contains(&config.server.downstream_max_connections) {
         bail!("server.downstream_max_connections must be between 1 and 1000000");
     }
+    if !(1..=1_000_000).contains(&config.server.static_active_requests_per_client) {
+        bail!("server.static_active_requests_per_client must be between 1 and 1000000");
+    }
     if !(1..=300).contains(&config.server.downstream_request_header_timeout_seconds) {
         bail!("server.downstream_request_header_timeout_seconds must be between 1 and 300");
     }
@@ -654,6 +663,7 @@ hosts:
     fn accepts_unique_normalized_domains() {
         let config = sample_config();
         assert_eq!(config.server.downstream_keepalive_requests, 500);
+        assert_eq!(config.server.static_active_requests_per_client, 16);
         assert!(RuntimeConfig::new(config).is_ok());
     }
 
@@ -706,6 +716,11 @@ hosts:
         for invalid in [0, 301] {
             let mut config = sample_config();
             config.server.downstream_request_header_timeout_seconds = invalid;
+            assert!(RuntimeConfig::new(config).is_err());
+        }
+        for invalid in [0, 1_000_001] {
+            let mut config = sample_config();
+            config.server.static_active_requests_per_client = invalid;
             assert!(RuntimeConfig::new(config).is_err());
         }
     }

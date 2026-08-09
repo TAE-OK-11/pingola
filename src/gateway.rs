@@ -76,7 +76,6 @@ const HTTP3_PORT: HeaderName = HeaderName::from_static("x-jbs-http3-port");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const MAX_CONNECTION_NOMINATIONS: usize = 10;
-const STATIC_ACTIVE_REQUESTS_PER_CLIENT: usize = 16;
 #[cfg(test)]
 const PROXY_AUTHENTICATE: HeaderName = HeaderName::from_static("proxy-authenticate");
 #[cfg(test)]
@@ -608,7 +607,10 @@ impl ProxyHttp for Gateway {
             let Some(permit) = self.active_requests.acquire(
                 "static",
                 client_ip,
-                STATIC_ACTIVE_REQUESTS_PER_CLIENT,
+                self.runtime
+                    .config
+                    .server
+                    .static_active_requests_per_client,
             ) else {
                 return send_empty(
                     &self.runtime,

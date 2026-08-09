@@ -296,6 +296,9 @@ route_limits:
 connection이 아니라 활성 HTTP request이며 HTTP/2에서는 stream입니다. 서비스별
 zone은 서로 격리되고, 전체 IP limit이 필요하면 `server.global_active_requests`를
 별도로 설정합니다. 설정 reload는 아직 지원하지 않으므로 변경 후 재시작해야 합니다.
+정적 파일의 느린 reader가 파일 및 메모리 permit을 독점하지 않도록
+`server.static_active_requests_per_client`는 client IP별 활성 요청을 제한하며 기본값과
+운영 설정은 16입니다.
 Rate limiter의 client bucket은 최대 262,144개로 제한하며, 한도에 도달하면 기존
 client는 계속 처리하고 새로운 client는 idle bucket 정리 전까지 fail-closed로 429를
 받습니다. 따라서 고유 source IP flood에서도 limiter memory가 무제한 증가하지 않습니다.

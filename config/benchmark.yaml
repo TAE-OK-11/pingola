@@ -15,6 +15,8 @@ server:
   max_retries: 0
   graceful_shutdown_timeout_seconds: 2
   static_cache_bytes: 1048576
+  # h2load multiplexes the static workload through one loopback client identity.
+  static_active_requests_per_client: 1000000
   access_log: false
   legacy_pingola_health: false
   http2_max_concurrent_streams: 128
