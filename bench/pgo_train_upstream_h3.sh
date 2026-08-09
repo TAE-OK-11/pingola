@@ -79,6 +79,7 @@ server:
   http3_internal_listen: "127.0.0.1:${ORIGIN_INTERNAL_PORT}"
   http3_max_idle_timeout_seconds: 30
   http3_max_concurrent_streams: 128
+  http3_enable_early_data: true
   http3_stateless_retry: false
   certificate: ${RUNTIME_DIR}/cert.pem
   private_key: ${RUNTIME_DIR}/key.pem
@@ -203,6 +204,8 @@ stream_1m_requests=96
 stream_10m_requests=12
 resumption_cycles=8
 resumption_requests=256
+early_data_client=true
+early_data_origin=true
 EOF_WORKLOAD
 
 kill -TERM "${PINGORA_PID}"
