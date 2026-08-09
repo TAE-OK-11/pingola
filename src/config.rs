@@ -201,6 +201,10 @@ pub struct UpstreamConfig {
     pub http3_max_concurrent_streams: usize,
     #[serde(default)]
     pub http3_early_data: bool,
+    /// Enables quiche's BBRv2 (gcongestion) implementation for this HTTP/3
+    /// upstream. When disabled, quiche keeps its default CUBIC controller.
+    #[serde(default)]
+    pub http3_bbr2: bool,
     #[serde(default)]
     pub sni: Option<String>,
     #[serde(default = "default_true")]
@@ -762,6 +766,7 @@ hosts:
         let automatic: UpstreamConfig = serde_saphyr::from_str("address: 127.0.0.1:9000").unwrap();
         assert_eq!(automatic.protocol, UpstreamProtocol::Auto);
         assert_eq!(automatic.http2_max_concurrent_streams, 32);
+        assert!(!automatic.http3_bbr2);
 
         let h2c: UpstreamConfig = serde_saphyr::from_str(
             "address: 127.0.0.1:9000\nprotocol: http2\nhttp2_max_concurrent_streams: 64",
@@ -769,6 +774,15 @@ hosts:
         .unwrap();
         assert_eq!(h2c.protocol, UpstreamProtocol::Http2);
         assert_eq!(h2c.http2_max_concurrent_streams, 64);
+    }
+
+    #[test]
+    fn parses_upstream_http3_bbr2_toggle() {
+        let upstream: UpstreamConfig = serde_saphyr::from_str(
+            "address: 127.0.0.1:443\ntls: true\nprotocol: http3\nhttp3_bbr2: true",
+        )
+        .unwrap();
+        assert!(upstream.http3_bbr2);
     }
 
     #[test]
