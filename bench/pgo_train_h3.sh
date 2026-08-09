@@ -71,8 +71,12 @@ run_probe() {
   local path=$3
   local requests=$4
 
-  "${HTTP3_PROBE_BIN}" "127.0.0.1:${HTTP3_PORT}" "${authority}" "${path}" "${requests}" \
-    >"${OUTPUT_DIR}/${name}.out" 2>"${OUTPUT_DIR}/${name}.log"
+  if ! "${HTTP3_PROBE_BIN}" "127.0.0.1:${HTTP3_PORT}" "${authority}" "${path}" "${requests}" \
+    >"${OUTPUT_DIR}/${name}.out" 2>"${OUTPUT_DIR}/${name}.log"; then
+    echo "HTTP/3 PGO workload failed: ${name}" >&2
+    sed -n '1,160p' "${OUTPUT_DIR}/${name}.log" >&2
+    return 1
+  fi
 }
 
 rm -rf "${RUNTIME_DIR}"
@@ -103,7 +107,8 @@ server:
   health_socket: ${RUNTIME_DIR}/health.sock
   threads: 1
   upstream_keepalive_pool_size: 128
-  downstream_keepalive_requests: 500
+  # Persistent profile probes deliberately exceed the production value (500).
+  downstream_keepalive_requests: 1000000
   downstream_max_connections: 4096
   max_retries: 2
   access_log: false
