@@ -45,6 +45,16 @@ small set of documented local changes.
   for every request and response even though most traffic uses only a handful.
   The upstream `patched_http1` feature retains its initialized buffer because
   its separate unchecked parser does not expose the uninitialized-header API.
+- Local change: initialize HTTP/1 body read slices before passing them to
+  `AsyncReadExt::read`.
+- Reason: extending `BytesMut` with `set_len` exposed uninitialized allocation
+  bytes through an initialized mutable slice, violating Rust's unsafe-code
+  contract on a network-reachable body path.
+- Local change: discard the bounded retry-body allocation as soon as buffering
+  truncates.
+- Reason: a truncated request cannot be replayed, so retaining its contents
+  only pins memory until the downstream connection closes. This follows the
+  post-0.8.1 Cloudflare Pingora optimization.
 
 Remove dependency patches after a released Pingora version adopts equivalent
 versions. Re-evaluate the reuse-hash cache whenever `HttpPeer` changes.

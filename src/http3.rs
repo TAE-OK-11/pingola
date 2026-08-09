@@ -276,7 +276,9 @@ async fn run(
         .http3_internal_token()
         .cloned()
         .ok_or_else(|| anyhow!("HTTP/3 internal token was not initialized"))?;
-    let alt_svc = runtime.http3_alt_svc_header();
+    let alt_svc = runtime.http3_alt_svc_header().cloned();
+    let max_requests_per_connection = u64::from(server.downstream_keepalive_requests);
+    let post_accept_timeout = Duration::from_secs(server.downstream_request_header_timeout_seconds);
     let connection_limit = Arc::new(Semaphore::new(server.downstream_max_connections));
     let admission = Arc::new(Http3Admission::new(
         server.http3_connection_rate_per_second,
@@ -320,7 +322,9 @@ async fn run(
                             }
                         };
                         let settings = Http3Settings {
+                            max_requests_per_connection: Some(max_requests_per_connection),
                             max_header_list_size: Some(64 * 1024),
+                            post_accept_timeout: Some(post_accept_timeout),
                             ..Http3Settings::default()
                         };
                         let (driver, controller) = ServerH3Driver::new(settings);

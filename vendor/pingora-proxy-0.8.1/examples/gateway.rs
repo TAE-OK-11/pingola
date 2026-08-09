@@ -24,13 +24,13 @@ use pingora_core::Result;
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 
-fn check_login(req: &pingora_http::RequestHeader) -> bool {
-    // implement you logic check logic here
-    req.headers.get("Authorization").map(|v| v.as_bytes()) == Some(b"password")
+fn check_login(req: &pingora_http::RequestHeader, expected: &http::HeaderValue) -> bool {
+    req.headers.get(http::header::AUTHORIZATION) == Some(expected)
 }
 
 pub struct MyGateway {
     req_metric: prometheus::IntCounter,
+    expected_authorization: http::HeaderValue,
 }
 
 #[async_trait]
@@ -40,7 +40,7 @@ impl ProxyHttp for MyGateway {
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         if session.req_header().uri.path().starts_with("/login")
-            && !check_login(session.req_header())
+            && !check_login(session.req_header(), &self.expected_authorization)
         {
             let _ = session
                 .respond_error_with_body(403, Bytes::from_static(b"no way!"))
@@ -105,15 +105,19 @@ impl ProxyHttp for MyGateway {
     }
 }
 
-// RUST_LOG=INFO cargo run --example gateway
+// PINGORA_EXAMPLE_TOKEN=replace-me RUST_LOG=INFO cargo run --example gateway
 // curl 127.0.0.1:6191 -H "Host: one.one.one.one"
 // curl 127.0.0.1:6190/family/ -H "Host: one.one.one.one"
-// curl 127.0.0.1:6191/login/ -H "Host: one.one.one.one" -I -H "Authorization: password"
+// curl 127.0.0.1:6191/login/ -H "Host: one.one.one.one" -I -H "Authorization: Bearer replace-me"
 // curl 127.0.0.1:6191/login/ -H "Host: one.one.one.one" -I -H "Authorization: bad"
 // For metrics
 // curl 127.0.0.1:6192/
 fn main() {
     env_logger::init();
+    let token = std::env::var("PINGORA_EXAMPLE_TOKEN")
+        .expect("set PINGORA_EXAMPLE_TOKEN before running this authentication example");
+    let expected_authorization = http::HeaderValue::try_from(format!("Bearer {token}"))
+        .expect("PINGORA_EXAMPLE_TOKEN must form a valid Authorization header");
 
     // read command line arguments
     let opt = Opt::parse_args();
@@ -124,9 +128,10 @@ fn main() {
         &my_server.configuration,
         MyGateway {
             req_metric: register_int_counter!("req_counter", "Number of requests").unwrap(),
+            expected_authorization,
         },
     );
-    my_proxy.add_tcp("0.0.0.0:6191");
+    my_proxy.add_tcp("127.0.0.1:6191");
     my_server.add_service(my_proxy);
 
     let mut prometheus_service_http =

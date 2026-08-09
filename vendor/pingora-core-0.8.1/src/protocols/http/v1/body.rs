@@ -179,10 +179,10 @@ impl BodyReader {
             body_buf.put_slice(buf_to_rewind);
         }
         if buf_size > buf_to_rewind.len() {
-            //body_buf.resize(buf_size, 0);
-            unsafe {
-                body_buf.set_len(buf_size);
-            }
+            // AsyncReadExt::read receives an initialized `&mut [u8]`. Exposing
+            // spare capacity with set_len() first violates that contract and
+            // can make a network body read observe uninitialized storage.
+            body_buf.resize(buf_size, 0);
         }
         self.body_buf = Some(body_buf);
     }

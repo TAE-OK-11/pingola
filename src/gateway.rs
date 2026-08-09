@@ -66,12 +66,16 @@ thread_local! {
     };
 }
 const NO_PLAN: usize = usize::MAX;
+const REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MIN_REQUEST_BODY_RATE: usize = 64 * 1024;
+const MAX_REQUEST_BODY_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const HTTP3_INTERNAL: HeaderName = HeaderName::from_static("x-jbs-http3-internal");
 const HTTP3_PORT: HeaderName = HeaderName::from_static("x-jbs-http3-port");
 #[cfg(test)]
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
+const MAX_CONNECTION_NOMINATIONS: usize = 10;
 #[cfg(test)]
 const PROXY_AUTHENTICATE: HeaderName = HeaderName::from_static("proxy-authenticate");
 #[cfg(test)]
@@ -264,6 +268,7 @@ pub struct RequestContext {
     http3: bool,
     forwarded_port: Option<u16>,
     body_bytes: usize,
+    body_deadline: Option<Instant>,
     retries: usize,
     identity_acceptable: bool,
     compression_selected: bool,
@@ -281,6 +286,7 @@ impl Default for RequestContext {
             http3: false,
             forwarded_port: None,
             body_bytes: 0,
+            body_deadline: None,
             retries: 0,
             identity_acceptable: true,
             compression_selected: false,
@@ -470,6 +476,17 @@ impl ProxyHttp for Gateway {
                     .or_else(|| self.runtime.http3_public_port())
             })
             .flatten();
+        if request_target_has_forbidden_bytes(session.req_header()) {
+            session.set_keepalive(None);
+            return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
+        }
+        let declared_content_length = match validated_request_content_length(session.req_header()) {
+            Ok(length) => length,
+            Err(()) => {
+                session.set_keepalive(None);
+                return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
+            }
+        };
         let path = session.req_header().uri.path();
 
         if path == "/pingora-health" || path == "/pingora-live" || path == "/pingora-ready" {
@@ -571,9 +588,11 @@ impl ProxyHttp for Gateway {
             session.set_read_timeout(Some(Duration::from_secs(30)));
             session.set_write_timeout(Some(Duration::from_secs(30)));
             session.set_keepalive(Some(30));
-            if self.runtime.config.server.global_active_requests > 0 {
-                ctx.client_ip = session_client_ip(&self.runtime, session);
-            }
+            let Some(client_ip) = session_client_ip(&self.runtime, session, http3) else {
+                session.set_keepalive(None);
+                return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
+            };
+            ctx.client_ip = client_ip;
             if !self.acquire_global_request(ctx) {
                 return send_empty(
                     &self.runtime,
@@ -585,10 +604,29 @@ impl ProxyHttp for Gateway {
                 )
                 .await;
             }
+            let Some(permit) = self.active_requests.acquire(
+                "static",
+                client_ip,
+                self.runtime.config.server.static_active_requests_per_client,
+            ) else {
+                return send_empty(
+                    &self.runtime,
+                    session,
+                    429,
+                    Some(host.handler),
+                    tls,
+                    &[("retry-after", "1")],
+                )
+                .await;
+            };
+            ctx._active_request_permit = Some(permit);
             return self.static_files.serve(&host.name, session, tls).await;
         }
 
-        let client_ip = session_client_ip(&self.runtime, session);
+        let Some(client_ip) = session_client_ip(&self.runtime, session, http3) else {
+            session.set_keepalive(None);
+            return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
+        };
         ctx.client_ip = client_ip;
 
         if host.handler == HandlerKind::NavidromeMain && path == "/" {
@@ -616,7 +654,7 @@ impl ProxyHttp for Gateway {
         ctx.compression_selected = encoding.preferred.as_str().is_some();
         ctx.tls = tls;
 
-        if content_length(session.req_header()).is_some_and(|length| length > plan.max_body_bytes) {
+        if declared_content_length.is_some_and(|length| length > plan.max_body_bytes) {
             return send_empty(&self.runtime, session, 413, Some(plan.handler), tls, &[]).await;
         }
 
@@ -665,7 +703,15 @@ impl ProxyHttp for Gateway {
             ctx._active_request_permit = Some(permit);
         }
 
-        session.set_read_timeout(Some(plan.downstream_timeout));
+        let has_request_body = declared_content_length.is_some_and(|length| length > 0)
+            || session.req_header().headers.contains_key(TRANSFER_ENCODING)
+            || !matches!(session.req_header().method, Method::GET | Method::HEAD);
+        if has_request_body {
+            session.set_read_timeout(Some(REQUEST_BODY_IDLE_TIMEOUT));
+            ctx.body_deadline = Some(Instant::now() + request_body_lifetime(plan.max_body_bytes));
+        } else {
+            session.set_read_timeout(Some(plan.downstream_timeout));
+        }
         session.set_write_timeout(Some(plan.downstream_timeout));
         session.set_keepalive(Some(30));
         ctx.plan_index = plan_index;
@@ -804,11 +850,21 @@ impl ProxyHttp for Gateway {
 
     async fn request_body_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        if ctx
+            .body_deadline
+            .is_some_and(|deadline| Instant::now() > deadline)
+        {
+            session.set_keepalive(None);
+            return Err(Error::explain(
+                HTTPStatus(408),
+                "request body upload deadline exceeded",
+            ));
+        }
         ctx.body_bytes = ctx
             .body_bytes
             .saturating_add(body.as_ref().map_or(0, Bytes::len));
@@ -818,6 +874,12 @@ impl ProxyHttp for Gateway {
             .is_some_and(|plan| ctx.body_bytes > plan.max_body_bytes)
         {
             return Err(Error::explain(HTTPStatus(413), "request body is too large"));
+        }
+        if end_of_stream {
+            ctx.body_deadline = None;
+            if let Some(plan) = self.plans.get(ctx.plan_index) {
+                session.set_read_timeout(Some(plan.downstream_timeout));
+            }
         }
         Ok(())
     }
@@ -839,7 +901,7 @@ impl ProxyHttp for Gateway {
         if ctx.tls
             && let Some(alt_svc) = self.runtime.http3_alt_svc_header()
         {
-            response.insert_header("alt-svc", alt_svc)?;
+            response.insert_header("alt-svc", alt_svc.clone())?;
         }
         if ctx.compression_selected && response_status_is_interim(response.status.as_u16()) {
             // 100/103 are interim headers. Do not permanently disable the
@@ -1143,8 +1205,8 @@ fn compressible_proxy_content_type(value: &str) -> bool {
 fn connection_option_names(
     headers: &http::HeaderMap,
     invalid_status: u16,
-) -> Result<Vec<HeaderName>> {
-    let mut names = Vec::new();
+) -> Result<arrayvec::ArrayVec<HeaderName, MAX_CONNECTION_NOMINATIONS>> {
+    let mut names = arrayvec::ArrayVec::new();
     for field in [&CONNECTION, &PROXY_CONNECTION] {
         for value in headers.get_all(field).iter() {
             for token in value.as_bytes().split(|byte| *byte == b',') {
@@ -1165,6 +1227,12 @@ fn connection_option_names(
                         format!("Connection header names critical framing field {name}"),
                     ));
                 }
+                if names.len() == MAX_CONNECTION_NOMINATIONS {
+                    return Err(Error::explain(
+                        HTTPStatus(invalid_status),
+                        "too many Connection header options",
+                    ));
+                }
                 names.push(name);
             }
         }
@@ -1180,12 +1248,20 @@ fn strip_request_hop_headers(
     // Connection options as they are parsed. This preserves the full RFC
     // validation while avoiding a per-request Vec allocation on HTTP/1
     // keep-alive traffic.
+    let mut nominations = 0;
     for field in [&CONNECTION, &PROXY_CONNECTION] {
         for value in downstream.headers.get_all(field).iter() {
             for token in value.as_bytes().split(|byte| *byte == b',') {
                 let token = token.trim_ascii();
                 if token.is_empty() {
                     continue;
+                }
+                nominations += 1;
+                if nominations > MAX_CONNECTION_NOMINATIONS {
+                    return Err(Error::explain(
+                        HTTPStatus(400),
+                        "too many Connection header options",
+                    ));
                 }
                 let name = HeaderName::from_bytes(token).map_err(|error| {
                     Error::because(HTTPStatus(400), "invalid Connection header option", error)
@@ -1211,6 +1287,7 @@ fn strip_request_hop_headers(
     for name in fixed {
         upstream.remove_header(&name);
     }
+    normalize_content_length_headers(&mut upstream.headers, 400)?;
     Ok(())
 }
 
@@ -1234,6 +1311,7 @@ fn strip_response_hop_headers(response: &mut ResponseHeader, forwards_upgrade: b
     for name in fixed {
         response.remove_header(&name);
     }
+    normalize_content_length_headers(&mut response.headers, 502)?;
     if forwards_upgrade {
         let upgrade = upgrade.ok_or_else(|| {
             Error::explain(
@@ -1285,12 +1363,101 @@ fn request_authority(request: &RequestHeader) -> Option<&str> {
         .or_else(|| request.uri.authority().map(|value| value.as_str()))
 }
 
-fn content_length(request: &RequestHeader) -> Option<usize> {
+fn request_target_has_forbidden_bytes(request: &RequestHeader) -> bool {
     request
-        .headers
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
+        .uri
+        .path_and_query()
+        .map_or("/", |value| value.as_str())
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, 0x00 | b'\n' | b'\r' | b' '))
+}
+
+fn request_body_lifetime(max_body_bytes: usize) -> Duration {
+    let transfer_seconds =
+        max_body_bytes.saturating_add(MIN_REQUEST_BODY_RATE - 1) / MIN_REQUEST_BODY_RATE;
+    Duration::from_secs(u64::try_from(transfer_seconds).unwrap_or(u64::MAX).max(60))
+        .min(MAX_REQUEST_BODY_LIFETIME)
+}
+
+fn validated_content_length(headers: &http::HeaderMap) -> std::result::Result<Option<usize>, ()> {
+    let mut expected = None;
+    for value in headers.get_all(CONTENT_LENGTH).iter() {
+        let value = value.to_str().map_err(|_| ())?;
+        for token in value.split(',') {
+            let token = token.trim_ascii();
+            if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(());
+            }
+            let length = token.parse::<usize>().map_err(|_| ())?;
+            if expected.is_some_and(|previous| previous != length) {
+                return Err(());
+            }
+            expected = Some(length);
+        }
+    }
+    Ok(expected)
+}
+
+fn validated_request_content_length(
+    request: &RequestHeader,
+) -> std::result::Result<Option<usize>, ()> {
+    let length = validated_content_length(&request.headers)?;
+    if request.headers.contains_key(TRANSFER_ENCODING)
+        && (length.is_some() || !matches!(request.version, Version::HTTP_10 | Version::HTTP_11))
+    {
+        return Err(());
+    }
+    Ok(length)
+}
+
+fn normalize_content_length_headers(
+    headers: &mut http::HeaderMap,
+    invalid_status: u16,
+) -> Result<()> {
+    let length = validated_content_length(headers).map_err(|()| {
+        Error::explain(
+            HTTPStatus(invalid_status),
+            "invalid or conflicting Content-Length fields",
+        )
+    })?;
+    if headers.contains_key(TRANSFER_ENCODING) && length.is_some() {
+        return Err(Error::explain(
+            HTTPStatus(invalid_status),
+            "message contains both Transfer-Encoding and Content-Length",
+        ));
+    }
+    if let Some(length) = length {
+        let already_canonical = {
+            let mut values = headers.get_all(CONTENT_LENGTH).iter();
+            values.next().is_some_and(|value| {
+                !value.as_bytes().is_empty()
+                    && value.as_bytes().iter().all(u8::is_ascii_digit)
+                    && values.next().is_none()
+            })
+        };
+        if already_canonical {
+            return Ok(());
+        }
+        headers.remove(CONTENT_LENGTH);
+        let mut encoded = ArrayString::<39>::new();
+        write!(&mut encoded, "{length}").map_err(|error| {
+            Error::because(
+                HTTPStatus(invalid_status),
+                "validated Content-Length could not be formatted",
+                error,
+            )
+        })?;
+        let value = HeaderValue::from_str(&encoded).map_err(|error| {
+            Error::because(
+                HTTPStatus(invalid_status),
+                "validated Content-Length could not be encoded",
+                error,
+            )
+        })?;
+        headers.insert(CONTENT_LENGTH, value);
+    }
+    Ok(())
 }
 
 fn request_is_replay_safe(session: &mut Session) -> bool {
@@ -1299,8 +1466,10 @@ fn request_is_replay_safe(session: &mut Session) -> bool {
 
 fn request_header_is_replay_safe(request: &RequestHeader) -> bool {
     matches!(request.method, Method::GET | Method::HEAD)
-        && content_length(request).is_none_or(|length| length == 0)
-        && !request.headers.contains_key(TRANSFER_ENCODING)
+        && matches!(
+            validated_request_content_length(request),
+            Ok(None | Some(0))
+        )
 }
 
 fn is_tls(session: &Session) -> bool {
@@ -1332,20 +1501,40 @@ fn is_internal_http3(runtime: &RuntimeConfig, session: &Session) -> bool {
     server_matches && peer_is_loopback && marker_matches
 }
 
-fn session_client_ip(runtime: &RuntimeConfig, session: &Session) -> IpAddr {
+fn session_client_ip(
+    runtime: &RuntimeConfig,
+    session: &Session,
+    internal_http3: bool,
+) -> Option<IpAddr> {
     let peer_ip = session
         .client_addr()
         .and_then(|address| address.as_inet())
         .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |address| address.ip());
-    let Some(forwarded_for) = session
-        .req_header()
-        .headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return peer_ip;
+    if !internal_http3 && !runtime.is_trusted_proxy(peer_ip) {
+        return Some(peer_ip);
+    }
+    let forwarded_for = match canonical_forwarded_for(&session.req_header().headers) {
+        Ok(Some(value)) => value,
+        Ok(None) => return Some(peer_ip),
+        Err(()) => return None,
     };
-    resolve_client_ip(runtime, peer_ip, Some(forwarded_for))
+    if internal_http3 {
+        return (!forwarded_for.contains(','))
+            .then(|| forwarded_for.trim().parse::<IpAddr>().ok())
+            .flatten();
+    }
+    Some(resolve_client_ip(runtime, peer_ip, Some(forwarded_for)))
+}
+
+fn canonical_forwarded_for(headers: &http::HeaderMap) -> std::result::Result<Option<&str>, ()> {
+    let mut values = headers.get_all(X_FORWARDED_FOR).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    value.to_str().map(Some).map_err(|_| ())
 }
 
 fn forwarded_port_value(port: Option<u16>, tls: bool) -> Result<HeaderValue> {
@@ -1668,7 +1857,7 @@ async fn send_empty(
         insert_security_headers(&mut response, handler, tls)?;
     }
     if tls && let Some(alt_svc) = runtime.http3_alt_svc_header() {
-        response.insert_header("alt-svc", alt_svc)?;
+        response.insert_header("alt-svc", alt_svc.clone())?;
     }
     session
         .write_response_header(Box::new(response), true)
@@ -1931,6 +2120,62 @@ hosts:
             .unwrap();
         let mut upstream = downstream.clone();
         assert!(strip_request_hop_headers(&downstream, &mut upstream).is_err());
+    }
+
+    #[test]
+    fn connection_option_count_is_bounded() {
+        let mut downstream = RequestHeader::build(Method::GET, b"/", None).unwrap();
+        downstream
+            .insert_header(CONNECTION, "x-1,x-2,x-3,x-4,x-5,x-6,x-7,x-8,x-9,x-10,x-11")
+            .unwrap();
+        let mut upstream = downstream.clone();
+        assert!(strip_request_hop_headers(&downstream, &mut upstream).is_err());
+    }
+
+    #[test]
+    fn content_length_is_reconciled_and_conflicts_are_rejected() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        headers.append(CONTENT_LENGTH, HeaderValue::from_static("5, 5"));
+        assert_eq!(validated_content_length(&headers), Ok(Some(5)));
+        normalize_content_length_headers(&mut headers, 400).unwrap();
+        assert_eq!(headers.get_all(CONTENT_LENGTH).iter().count(), 1);
+        assert_eq!(headers[CONTENT_LENGTH], "5");
+
+        headers.append(CONTENT_LENGTH, HeaderValue::from_static("6"));
+        assert!(validated_content_length(&headers).is_err());
+        for invalid in ["", "+5", "5x", "5,,5"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(CONTENT_LENGTH, HeaderValue::from_str(invalid).unwrap());
+            assert!(validated_content_length(&headers).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn transfer_encoding_cannot_conflict_or_cross_h2() {
+        let mut request = RequestHeader::build(Method::POST, b"/", None).unwrap();
+        request.insert_header(CONTENT_LENGTH, "5").unwrap();
+        request.insert_header(TRANSFER_ENCODING, "chunked").unwrap();
+        assert!(validated_request_content_length(&request).is_err());
+
+        request.remove_header(&CONTENT_LENGTH);
+        request.version = Version::HTTP_2;
+        assert!(validated_request_content_length(&request).is_err());
+    }
+
+    #[test]
+    fn duplicate_forwarded_for_fields_are_not_canonical() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(X_FORWARDED_FOR, HeaderValue::from_static("192.0.2.1"));
+        assert_eq!(canonical_forwarded_for(&headers), Ok(Some("192.0.2.1")));
+        headers.append(X_FORWARDED_FOR, HeaderValue::from_static("198.51.100.2"));
+        assert!(canonical_forwarded_for(&headers).is_err());
+    }
+
+    #[test]
+    fn request_body_lifetime_is_bounded() {
+        assert_eq!(request_body_lifetime(0), Duration::from_secs(60));
+        assert_eq!(request_body_lifetime(usize::MAX), MAX_REQUEST_BODY_LIFETIME);
     }
 
     #[test]

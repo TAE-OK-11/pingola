@@ -69,6 +69,10 @@ fn default_downstream_request_header_timeout() -> u64 {
     15
 }
 
+fn default_static_active_requests_per_client() -> usize {
+    16
+}
+
 fn default_health_socket() -> PathBuf {
     PathBuf::from("/tmp/pingora/health.sock")
 }
@@ -173,6 +177,8 @@ pub struct ServerConfig {
     pub health_details: bool,
     #[serde(default)]
     pub global_active_requests: usize,
+    #[serde(default = "default_static_active_requests_per_client")]
+    pub static_active_requests_per_client: usize,
     #[serde(default = "default_http2_max_concurrent_streams")]
     pub http2_max_concurrent_streams: u32,
     #[serde(default = "default_downstream_max_connections")]
@@ -291,6 +297,8 @@ impl fmt::Debug for Http3InternalToken {
 pub struct RuntimeConfig {
     pub config: Arc<Config>,
     http3_internal_token: Option<Http3InternalToken>,
+    http3_public_port: Option<u16>,
+    http3_alt_svc_header: Option<HeaderValue>,
 }
 
 impl RuntimeConfig {
@@ -304,6 +312,20 @@ impl RuntimeConfig {
 
     pub fn new(config: Config) -> Result<Self> {
         validate(&config)?;
+        // Validation guarantees every listener is a SocketAddr and all HTTP/3
+        // listeners use the same non-zero port. Cache both derived values once
+        // so the response hot path only clones an immutable HeaderValue.
+        let http3_public_port = config
+            .server
+            .http3_listen
+            .first()
+            .map(|address| address.parse::<SocketAddr>().map(|address| address.port()))
+            .transpose()
+            .context("validated HTTP/3 listener became invalid")?;
+        let http3_alt_svc_header = http3_public_port
+            .map(|port| HeaderValue::from_str(&format!("h3=\":{port}\"; ma=86400")))
+            .transpose()
+            .context("HTTP/3 Alt-Svc value is not a valid header")?;
         let http3_internal_token = if config.server.http3_listen.is_empty() {
             None
         } else {
@@ -318,6 +340,8 @@ impl RuntimeConfig {
         Ok(Self {
             config: Arc::new(config),
             http3_internal_token,
+            http3_public_port,
+            http3_alt_svc_header,
         })
     }
 
@@ -331,17 +355,11 @@ impl RuntimeConfig {
     }
 
     pub fn http3_public_port(&self) -> Option<u16> {
-        self.config
-            .server
-            .http3_listen
-            .first()
-            .and_then(|address| address.parse::<SocketAddr>().ok())
-            .map(|address| address.port())
+        self.http3_public_port
     }
 
-    pub fn http3_alt_svc_header(&self) -> Option<HeaderValue> {
-        let port = self.http3_public_port()?;
-        HeaderValue::from_str(&format!(r#"h3=":{port}"; ma=86400"#)).ok()
+    pub fn http3_alt_svc_header(&self) -> Option<&HeaderValue> {
+        self.http3_alt_svc_header.as_ref()
     }
 
     pub fn is_trusted_proxy(&self, ip: std::net::IpAddr) -> bool {
@@ -417,6 +435,9 @@ fn validate(config: &Config) -> Result<()> {
     }
     if !(1..=1_000_000).contains(&config.server.downstream_max_connections) {
         bail!("server.downstream_max_connections must be between 1 and 1000000");
+    }
+    if !(1..=1_000_000).contains(&config.server.static_active_requests_per_client) {
+        bail!("server.static_active_requests_per_client must be between 1 and 1000000");
     }
     if !(1..=300).contains(&config.server.downstream_request_header_timeout_seconds) {
         bail!("server.downstream_request_header_timeout_seconds must be between 1 and 300");
@@ -642,6 +663,7 @@ hosts:
     fn accepts_unique_normalized_domains() {
         let config = sample_config();
         assert_eq!(config.server.downstream_keepalive_requests, 500);
+        assert_eq!(config.server.static_active_requests_per_client, 16);
         assert!(RuntimeConfig::new(config).is_ok());
     }
 
@@ -653,10 +675,26 @@ hosts:
             let network: IpNet = broad.parse().unwrap();
             assert!(!config.trusted_proxies.contains(&network), "{broad}");
         }
+        for loopback in ["127.0.0.0/8", "::1/128"] {
+            let network: IpNet = loopback.parse().unwrap();
+            assert!(!config.trusted_proxies.contains(&network), "{loopback}");
+        }
         for name in ["adguard_dns_doh", "adguard_korea_doh"] {
             let upstream = config.upstreams.get(name).unwrap();
             assert!(upstream.tls && upstream.verify_certificate, "{name}");
         }
+    }
+
+    #[test]
+    fn caches_http3_public_metadata() {
+        let config: Config =
+            serde_saphyr::from_str(include_str!("../config/pingora.yaml")).unwrap();
+        let runtime = RuntimeConfig::new(config).unwrap();
+        assert_eq!(runtime.http3_public_port(), Some(443));
+        assert_eq!(
+            runtime.http3_alt_svc_header().unwrap(),
+            "h3=\":443\"; ma=86400"
+        );
     }
 
     #[test]
@@ -678,6 +716,11 @@ hosts:
         for invalid in [0, 301] {
             let mut config = sample_config();
             config.server.downstream_request_header_timeout_seconds = invalid;
+            assert!(RuntimeConfig::new(config).is_err());
+        }
+        for invalid in [0, 1_000_001] {
+            let mut config = sample_config();
+            config.server.static_active_requests_per_client = invalid;
             assert!(RuntimeConfig::new(config).is_err());
         }
     }
