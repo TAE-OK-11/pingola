@@ -185,17 +185,18 @@ run_h2load large-json -n 1000 -c 4 -m 8 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/json/65536"
 
-# The upstream-H3 response handoff is intentionally bounded to 64 x 16 KiB
-# frames per stream. Keep each synthetic response below that per-response queue
-# while repeating enough transfers to preserve a sustained bulk-QUIC workload.
-# This trains BBRv2/CUBIC and streaming hot paths without teaching PGO an
-# artificial queue-overflow/reset path from a single oversized fixture body.
-run_h2load stream-512k -n 160 -c 2 -m 2 -w 16 -W 20 --sni pgo.test \
+# The H3->H2C response handoff is bounded, and concurrent synthetic bulk
+# streams can fill it faster than the consumer gets scheduled on a 1-thread
+# training fixture. Preserve the same ~116 MiB bulk-transfer volume as the
+# previous 512/768 KiB profile, but serialize smaller 256/384 KiB responses.
+# This still trains sustained BBRv2/CUBIC QUIC transfer hot paths without
+# biasing the profile toward an artificial local handoff-overflow/reset path.
+run_h2load stream-256k -n 320 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
-  "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/524288"
-run_h2load stream-768k -n 48 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
+  "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/262144"
+run_h2load stream-384k -n 96 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
-  "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/786432"
+  "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/393216"
 
 # The target uses a deliberately short three-second upstream QUIC idle timeout
 # only for this training fixture. Waiting past it repeatedly exercises reconnect,
@@ -221,8 +222,8 @@ congestion_control=${CC}
 small_requests=6000
 medium_requests=3000
 large_json_requests=1000
-stream_512k_requests=160
-stream_768k_requests=48
+stream_256k_requests=320
+stream_384k_requests=96
 resumption_cycles=8
 resumption_requests=256
 early_data_client=true
