@@ -105,8 +105,8 @@ jobs:
             type=gha,scope=image-test-znver1-off
             type=gha,scope=image-x86-64-v2-full-pgo
           cache-to: type=gha,mode=max,scope=image-znver1-full-pgo
-          provenance: mode=max
-          sbom: true
+          provenance: ${{ github.event_name != 'pull_request' && 'mode=max' || 'false' }}
+          sbom: ${{ github.event_name != 'pull_request' }}
 
       - name: Verify znver1 profile and runtime
         run: |
