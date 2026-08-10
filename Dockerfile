@@ -44,6 +44,7 @@ RUN apt-get update \
         cmake \
         curl \
         git \
+        libclang-rt-dev \
         lld \
         llvm \
         nghttp2-client \
@@ -65,7 +66,8 @@ COPY --link vendor ./vendor
 COPY --link src ./src
 COPY --link examples/http3_probe.rs ./examples/
 COPY --link bench/backend.rs bench/pgo_client.rs bench/pgo_train.sh bench/pgo_train_h3.sh \
-    bench/pgo_train_upstream_h3.sh bench/build_pgo.sh ./bench/
+    bench/pgo_train_upstream_h3.sh bench/build_pgo.sh bench/clang_rust_pgo_filter.sh \
+    bench/clangxx_rust_pgo_filter.sh ./bench/
 
 ARG RUST_TARGET_TRIPLE
 ARG RUST_TARGET_CPU
@@ -92,8 +94,8 @@ ARG BORING_PGO_WEIGHT_UPSTREAM_H3_BBR2
 ARG BORING_PGO_WEIGHT_UPSTREAM_H3_CUBIC
 ARG BORING_PGO_WEIGHT_TLS
 
-ENV CC=clang \
-    CXX=clang++ \
+ENV CC=/src/bench/clang_rust_pgo_filter.sh \
+    CXX=/src/bench/clangxx_rust_pgo_filter.sh \
     CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${RUST_CODEGEN_UNITS} \
     CARGO_PROFILE_RELEASE_LTO=${RUST_LTO} \
@@ -110,7 +112,8 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
     case "${PGO_MODE}" in off|train) ;; *) echo "unsupported PGO mode: ${PGO_MODE}" >&2; exit 2 ;; esac; \
     case "${RUST_LTO}" in thin|fat) ;; *) echo "unsupported Rust LTO mode: ${RUST_LTO}" >&2; exit 2 ;; esac; \
     case "${RUST_CODEGEN_UNITS}" in 1|2|4|8|16) ;; *) echo "unsupported codegen units: ${RUST_CODEGEN_UNITS}" >&2; exit 2 ;; esac; \
-    chmod 755 bench/pgo_train.sh bench/pgo_train_h3.sh bench/pgo_train_upstream_h3.sh bench/build_pgo.sh; \
+    chmod 755 bench/pgo_train.sh bench/pgo_train_h3.sh bench/pgo_train_upstream_h3.sh bench/build_pgo.sh \
+      bench/clang_rust_pgo_filter.sh bench/clangxx_rust_pgo_filter.sh; \
     if [ "${PGO_MODE}" = off ]; then \
       case "${RUST_TARGET_CPU}" in \
         x86-64-v2) NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic' ;; \
