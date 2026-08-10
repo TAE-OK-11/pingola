@@ -33,6 +33,7 @@ use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(100);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const H3_RESPONSE_BACKPRESSURE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const MAX_UDP_PAYLOAD: usize = 1452;
 const MAX_H3_HEADER_BYTES: u64 = 64 * 1024;
 const MAX_REQUEST_COMMANDS: usize = 256;
@@ -455,10 +456,6 @@ async fn pool_manager(
     let mut connected_once = false;
     let mut reconnect_delay = MIN_RECONNECT_DELAY;
     loop {
-        // After a session ticket exists, do not burn the 0-RTT opportunity by
-        // reconnecting before there is application data to send. Mark the
-        // bridge selectable and wait for one request; run_connection queues it
-        // before the first QUIC flight so a replay-safe GET/HEAD can ride 0-RTT.
         let can_resume_early =
             connected_once && settings.enable_early_data && session.lock().is_some();
         let initial_command = if can_resume_early {
@@ -515,8 +512,6 @@ fn reconnect_delay_with_jitter(delay: Duration) -> Duration {
 }
 
 fn reconnect_delay_from_sample(delay: Duration, sample: u16) -> Duration {
-    // Spread reconnects across 80-120% of the exponential delay so a fleet
-    // does not synchronize after an origin or network outage.
     let percentage = 80 + u32::from(sample) % 41;
     delay.mul_f64(f64::from(percentage) / 100.0)
 }
@@ -633,119 +628,122 @@ async fn run_connection(
 
     let result: Result<()> = async {
         loop {
-        if conn.is_closed() {
-            bail!("upstream QUIC connection closed");
-        }
-        if !conn.is_established() && Instant::now() >= handshake_deadline {
-            conn.close(false, 0x1, b"handshake timeout").ok();
-            bail!("upstream QUIC handshake timed out");
-        }
-
-        let app_ready = conn.is_established() || conn.is_in_early_data();
-        if app_ready && h3_conn.is_none() {
-            h3_conn = Some(
-                h3::Connection::with_transport(&mut conn, &h3_config)
-                    .context("failed to create upstream HTTP/3 connection")?,
-            );
-        }
-        if conn.is_established() {
-            available.store(true, Ordering::Release);
-            if !established_logged {
-                info!(
-                    "upstream HTTP/3 established upstream={} peer={} resumed={} early_data_enabled={} cc={} hybrid_pq={}",
-                    settings.name,
-                    settings.origin,
-                    conn.is_resumed(),
-                    settings.enable_early_data,
-                    settings.cc_algorithm,
-                    HYBRID_PQ_GROUPS,
-                );
-                established_logged = true;
+            if conn.is_closed() {
+                bail!("upstream QUIC connection closed");
             }
-            if let Some(new_session) = conn.session() {
-                let mut cache = session.lock();
-                if cache.as_deref() != Some(new_session) {
-                    *cache = Some(new_session.to_vec());
-                    if !session_logged {
-                        info!(
-                            "upstream HTTP/3 session ticket cached upstream={}",
-                            settings.name
-                        );
-                        session_logged = true;
+            if !conn.is_established() && Instant::now() >= handshake_deadline {
+                conn.close(false, 0x1, b"handshake timeout").ok();
+                bail!("upstream QUIC handshake timed out");
+            }
+
+            let app_ready = conn.is_established() || conn.is_in_early_data();
+            if app_ready && h3_conn.is_none() {
+                h3_conn = Some(
+                    h3::Connection::with_transport(&mut conn, &h3_config)
+                        .context("failed to create upstream HTTP/3 connection")?,
+                );
+            }
+            if conn.is_established() {
+                available.store(true, Ordering::Release);
+                if !established_logged {
+                    info!(
+                        "upstream HTTP/3 established upstream={} peer={} resumed={} early_data_enabled={} cc={} hybrid_pq={}",
+                        settings.name,
+                        settings.origin,
+                        conn.is_resumed(),
+                        settings.enable_early_data,
+                        settings.cc_algorithm,
+                        HYBRID_PQ_GROUPS,
+                    );
+                    established_logged = true;
+                }
+                if let Some(new_session) = conn.session() {
+                    let mut cache = session.lock();
+                    if cache.as_deref() != Some(new_session) {
+                        *cache = Some(new_session.to_vec());
+                        if !session_logged {
+                            info!(
+                                "upstream HTTP/3 session ticket cached upstream={}",
+                                settings.name
+                            );
+                            session_logged = true;
+                        }
                     }
                 }
             }
-        }
 
-        if let Some(h3_conn) = h3_conn.as_mut() {
-            cancel_abandoned_responses(
-                &mut conn,
-                &mut requests,
-                &mut stream_to_request,
-            );
-            dispatch_waiting(
-                h3_conn,
-                &mut conn,
-                &mut requests,
-                &mut stream_to_request,
-                &mut waiting,
-            )?;
-            drive_pending_writes(
-                h3_conn,
-                &mut conn,
-                &mut requests,
-                &mut stream_to_request,
-                &mut pending_writes,
-            );
-            process_h3_events(
-                h3_conn,
-                &mut conn,
-                &mut requests,
-                &mut stream_to_request,
-                &mut body_buf,
-            )?;
-        }
-        flush_ready_quic(&socket, &mut conn, &mut send_buf, &mut pending_send).await?;
-
-        let timeout = conn.timeout().unwrap_or(Duration::from_secs(1));
-        let pacing_delay = pending_send
-            .as_ref()
-            .map(|send: &ScheduledSend| send.at.saturating_duration_since(Instant::now()))
-            .unwrap_or_default();
-        tokio::select! {
-            recv = socket.recv_from(&mut recv_buf) => {
-                let (len, from) = recv.context("upstream QUIC UDP receive failed")?;
-                let info = quiche::RecvInfo { from, to: local };
-                match conn.recv(&mut recv_buf[..len], info) {
-                    Ok(_) | Err(quiche::Error::Done) => {}
-                    Err(error) => return Err(anyhow!("upstream QUIC packet processing failed: {error:?}")),
-                }
-            }
-            command = commands.recv() => {
-                let Some(command) = command else {
-                    conn.close(true, 0, b"shutdown").ok();
-                    return Ok(());
-                };
-                handle_command(
-                    command,
+            let response_backpressured = if let Some(h3_conn) = h3_conn.as_mut() {
+                cancel_abandoned_responses(
+                    &mut conn,
+                    &mut requests,
+                    &mut stream_to_request,
+                );
+                dispatch_waiting(
+                    h3_conn,
                     &mut conn,
                     &mut requests,
                     &mut stream_to_request,
                     &mut waiting,
+                )?;
+                drive_pending_writes(
+                    h3_conn,
+                    &mut conn,
+                    &mut requests,
+                    &mut stream_to_request,
                     &mut pending_writes,
                 );
-            }
-            _ = tokio::time::sleep(timeout) => {
-                conn.on_timeout();
-            }
-            _ = tokio::time::sleep(pacing_delay), if pending_send.is_some() => {
-                let send = pending_send
-                    .take()
-                    .expect("pacing branch requires a scheduled QUIC packet");
-                send_quic_datagram(&socket, &send_buf[..send.len]).await?;
+                process_h3_events(
+                    h3_conn,
+                    &mut conn,
+                    &mut requests,
+                    &mut stream_to_request,
+                    &mut body_buf,
+                )?
+            } else {
+                false
+            };
+            flush_ready_quic(&socket, &mut conn, &mut send_buf, &mut pending_send).await?;
+
+            let timeout = conn.timeout().unwrap_or(Duration::from_secs(1));
+            let pacing_delay = pending_send
+                .as_ref()
+                .map(|send: &ScheduledSend| send.at.saturating_duration_since(Instant::now()))
+                .unwrap_or_default();
+            tokio::select! {
+                recv = socket.recv_from(&mut recv_buf), if !response_backpressured => {
+                    let (len, from) = recv.context("upstream QUIC UDP receive failed")?;
+                    let info = quiche::RecvInfo { from, to: local };
+                    match conn.recv(&mut recv_buf[..len], info) {
+                        Ok(_) | Err(quiche::Error::Done) => {}
+                        Err(error) => return Err(anyhow!("upstream QUIC packet processing failed: {error:?}")),
+                    }
+                }
+                command = commands.recv() => {
+                    let Some(command) = command else {
+                        conn.close(true, 0, b"shutdown").ok();
+                        return Ok(());
+                    };
+                    handle_command(
+                        command,
+                        &mut conn,
+                        &mut requests,
+                        &mut stream_to_request,
+                        &mut waiting,
+                        &mut pending_writes,
+                    );
+                }
+                _ = tokio::time::sleep(H3_RESPONSE_BACKPRESSURE_RETRY_DELAY), if response_backpressured => {}
+                _ = tokio::time::sleep(timeout) => {
+                    conn.on_timeout();
+                }
+                _ = tokio::time::sleep(pacing_delay), if pending_send.is_some() => {
+                    let send = pending_send
+                        .take()
+                        .expect("pacing branch requires a scheduled QUIC packet");
+                    send_quic_datagram(&socket, &send_buf[..send.len]).await?;
+                }
             }
         }
-    }
     }
     .await;
 
@@ -971,9 +969,6 @@ fn dispatch_waiting(
             }
             Err(h3::Error::StreamBlocked)
             | Err(h3::Error::TransportError(quiche::Error::StreamLimit)) => {
-                // Stream capacity is connection-global. Retrying every other
-                // queued request would only rescan the full queue and receive
-                // the same result on each event-loop turn.
                 waiting.push_front(id);
                 break;
             }
@@ -992,7 +987,7 @@ fn process_h3_events(
     requests: &mut HashMap<u64, PendingRequest>,
     stream_to_request: &mut HashMap<u64, u64>,
     body_buf: &mut [u8],
-) -> Result<()> {
+) -> Result<bool> {
     loop {
         let (stream_id, event) = match h3_conn.poll(conn) {
             Ok(event) => event,
@@ -1090,27 +1085,30 @@ fn process_h3_events(
                 }
             }
             h3::Event::Data => loop {
-                match h3_conn.recv_body(conn, stream_id, body_buf) {
-                    Ok(read) => {
-                        let send_result = requests
-                            .get(&request_id)
-                            .ok_or_else(|| anyhow!("HTTP/3 data has no request state"))?
-                            .body_tx
-                            .try_send(Ok(Frame::data(Bytes::copy_from_slice(&body_buf[..read]))));
-                        if let Err(error) = send_result {
-                            let message = match error {
-                                mpsc::error::TrySendError::Full(_) => {
-                                    "HTTP/3 response buffer limit exceeded"
-                                }
-                                mpsc::error::TrySendError::Closed(_) => {
-                                    "downstream dropped HTTP/3 response body"
-                                }
-                            };
-                            cancel_request(request_id, message, conn, requests, stream_to_request);
-                            break;
-                        }
+                let body_tx = requests
+                    .get(&request_id)
+                    .ok_or_else(|| anyhow!("HTTP/3 data has no request state"))?
+                    .body_tx
+                    .clone();
+                let permit = match body_tx.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(mpsc::error::TrySendError::Full(_)) => return Ok(true),
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        cancel_request(
+                            request_id,
+                            "downstream dropped HTTP/3 response body",
+                            conn,
+                            requests,
+                            stream_to_request,
+                        );
+                        break;
                     }
-                    Err(h3::Error::Done) => break,
+                };
+                match h3_conn.recv_body(conn, stream_id, body_buf) {
+                    Ok(read) if read > 0 => {
+                        permit.send(Ok(Frame::data(Bytes::copy_from_slice(&body_buf[..read]))));
+                    }
+                    Ok(_) | Err(h3::Error::Done) => break,
                     Err(error) => {
                         return Err(anyhow!("HTTP/3 response body receive failed: {error:?}"));
                     }
@@ -1140,7 +1138,7 @@ fn process_h3_events(
             h3::Event::PriorityUpdate => {}
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn cancel_abandoned_responses(
