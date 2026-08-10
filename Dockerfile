@@ -9,15 +9,29 @@ ARG RUST_CODEGEN_UNITS=1
 ARG TLS_PROVIDER=boringssl
 ARG PGO_MODE=off
 ARG PGO_TRAIN_TARGET_CPU=x86-64-v2
-# Production mix: H2 remains the largest workload, while H3 receives a
-# dedicated profile large enough to train QUIC, QPACK, and response streaming.
+ARG PGO_NATIVE_BORING=off
+# Rust PGO: H2 stays deliberately strong because the downstream H3 frontend
+# reaches the main proxy through an internal H2C bridge. H3 client/server and
+# congestion-control paths receive dedicated profiles instead of being folded
+# into one generic QUIC workload.
 ARG PGO_WEIGHT_H1=60
-ARG PGO_WEIGHT_H2=160
-ARG PGO_WEIGHT_H3=100
-ARG PGO_WEIGHT_TLS=15
-ARG PGO_WEIGHT_TAIL=30
+ARG PGO_WEIGHT_H2=180
+ARG PGO_WEIGHT_H3=900
+ARG PGO_WEIGHT_UPSTREAM_H3_BBR2=700
+ARG PGO_WEIGHT_UPSTREAM_H3_CUBIC=250
+ARG PGO_WEIGHT_TLS=300
+ARG PGO_WEIGHT_TAIL=80
 ARG PGO_TRAIN_ROUNDS=2
 ARG PGO_ECDSA_CURVE=prime256v1
+# Native Clang PGO is kept separate from rustc's bundled LLVM profile. The
+# workload is TLS/H2/H3 focused so BoringSSL and other target C/C++ hot paths
+# are optimized without merging incompatible Rust/Clang profraw formats.
+ARG PGO_NATIVE_TRAIN_ROUNDS=1
+ARG BORING_PGO_WEIGHT_H2=35
+ARG BORING_PGO_WEIGHT_H3=30
+ARG BORING_PGO_WEIGHT_UPSTREAM_H3_BBR2=10
+ARG BORING_PGO_WEIGHT_UPSTREAM_H3_CUBIC=5
+ARG BORING_PGO_WEIGHT_TLS=20
 ARG DEBIAN_SUITE=13
 
 FROM rust:1.97.1-slim-trixie@sha256:69153971349358535be9821190190f026a761f690c6b58c68a914d14ab2d610a AS builder
@@ -30,7 +44,9 @@ RUN apt-get update \
         cmake \
         curl \
         git \
+        libclang-rt-dev \
         lld \
+        llvm \
         nghttp2-client \
         ninja-build \
         openssl \
@@ -39,7 +55,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && git --version \
     && rustc --version \
-    && cargo --version
+    && cargo --version \
+    && clang --version | head -n1 \
+    && llvm-profdata --version | head -n1
 
 WORKDIR /src
 
@@ -47,7 +65,9 @@ COPY --link Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY --link vendor ./vendor
 COPY --link src ./src
 COPY --link examples/http3_probe.rs ./examples/
-COPY --link bench/backend.rs bench/pgo_client.rs bench/pgo_train.sh bench/pgo_train_h3.sh ./bench/
+COPY --link bench/backend.rs bench/pgo_client.rs bench/pgo_train.sh bench/pgo_train_h3.sh \
+    bench/pgo_train_upstream_h3.sh bench/build_pgo.sh bench/clang_rust_pgo_filter.sh \
+    bench/clangxx_rust_pgo_filter.sh ./bench/
 
 ARG RUST_TARGET_TRIPLE
 ARG RUST_TARGET_CPU
@@ -57,15 +77,26 @@ ARG ALLOCATOR=tcmalloc
 ARG TLS_PROVIDER
 ARG PGO_MODE
 ARG PGO_TRAIN_TARGET_CPU
+ARG PGO_NATIVE_BORING
 ARG PGO_WEIGHT_H1
 ARG PGO_WEIGHT_H2
 ARG PGO_WEIGHT_H3
+ARG PGO_WEIGHT_UPSTREAM_H3_BBR2
+ARG PGO_WEIGHT_UPSTREAM_H3_CUBIC
 ARG PGO_WEIGHT_TLS
 ARG PGO_WEIGHT_TAIL
-ARG PGO_ECDSA_CURVE
 ARG PGO_TRAIN_ROUNDS
+ARG PGO_ECDSA_CURVE
+ARG PGO_NATIVE_TRAIN_ROUNDS
+ARG BORING_PGO_WEIGHT_H2
+ARG BORING_PGO_WEIGHT_H3
+ARG BORING_PGO_WEIGHT_UPSTREAM_H3_BBR2
+ARG BORING_PGO_WEIGHT_UPSTREAM_H3_CUBIC
+ARG BORING_PGO_WEIGHT_TLS
 
-ENV CARGO_INCREMENTAL=0 \
+ENV CC=/src/bench/clang_rust_pgo_filter.sh \
+    CXX=/src/bench/clangxx_rust_pgo_filter.sh \
+    CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${RUST_CODEGEN_UNITS} \
     CARGO_PROFILE_RELEASE_LTO=${RUST_LTO} \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang \
@@ -74,139 +105,35 @@ ENV CARGO_INCREMENTAL=0 \
 
 RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=pingora-target-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR}-${TLS_PROVIDER}-${PGO_MODE}-${PGO_TRAIN_TARGET_CPU},target=/src/target,sharing=locked \
+    --mount=type=cache,id=pingora-target-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR}-${TLS_PROVIDER}-${PGO_MODE}-${PGO_TRAIN_TARGET_CPU}-${PGO_NATIVE_BORING},target=/src/target,sharing=locked \
     set -eux; \
-    case "${ALLOCATOR}" in \
-      jemalloc|tcmalloc|system-allocator) ;; \
-      *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; \
-    esac; \
-    case "${TLS_PROVIDER}" in \
-      boringssl) ;; \
-      *) echo "unsupported TLS provider (Cloudflare BoringSSL is required): ${TLS_PROVIDER}" >&2; exit 2 ;; \
-    esac; \
-    case "${PGO_MODE}" in \
-      off|train) ;; \
-      *) echo "unsupported PGO mode: ${PGO_MODE}" >&2; exit 2 ;; \
-    esac; \
-    case "${PGO_TRAIN_TARGET_CPU}" in \
-      x86-64-v2|znver1|znver2|znver3|znver4) ;; \
-      *) echo "unsupported PGO training target: ${PGO_TRAIN_TARGET_CPU}" >&2; exit 2 ;; \
-    esac; \
-    case "${RUST_TARGET_CPU}" in \
-      x86-64-v2|znver1|znver2|znver3|znver4) ;; \
-      *) echo "unsupported Rust target CPU: ${RUST_TARGET_CPU}" >&2; exit 2 ;; \
-    esac; \
-    case "${RUST_TARGET_CPU}" in \
-      x86-64-v2) TARGET_NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic' ;; \
-      *) TARGET_NATIVE_FLAGS="-O3 -march=${RUST_TARGET_CPU} -mtune=${RUST_TARGET_CPU}" ;; \
-    esac; \
-    case "${PGO_TRAIN_TARGET_CPU}" in \
-      x86-64-v2) TRAIN_NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic' ;; \
-      *) TRAIN_NATIVE_FLAGS="-O3 -march=${PGO_TRAIN_TARGET_CPU} -mtune=${PGO_TRAIN_TARGET_CPU}" ;; \
-    esac; \
-    case "${RUST_LTO}" in \
-      thin|fat) ;; \
-      *) echo "unsupported Rust LTO mode: ${RUST_LTO}" >&2; exit 2 ;; \
-    esac; \
-    case "${RUST_CODEGEN_UNITS}" in \
-      1|2|4|8|16) ;; \
-      *) echo "unsupported Rust codegen unit count: ${RUST_CODEGEN_UNITS}" >&2; exit 2 ;; \
-    esac; \
-    case "${PGO_ECDSA_CURVE}" in \
-      prime256v1|secp384r1) ;; \
-      *) echo "unsupported ECDSA curve: ${PGO_ECDSA_CURVE}" >&2; exit 2 ;; \
-    esac; \
-    for value in "${PGO_WEIGHT_H1}" "${PGO_WEIGHT_H2}" "${PGO_WEIGHT_H3}" "${PGO_WEIGHT_TLS}" "${PGO_WEIGHT_TAIL}" "${PGO_TRAIN_ROUNDS}"; do \
-      case "${value}" in ''|*[!0-9]*) echo "PGO weights/rounds must be positive integers" >&2; exit 2 ;; esac; \
-      test "${value}" -gt 0; \
-    done; \
-    chmod 755 bench/pgo_train.sh bench/pgo_train_h3.sh; \
+    case "${ALLOCATOR}" in jemalloc|tcmalloc|system-allocator) ;; *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; esac; \
+    case "${TLS_PROVIDER}" in boringssl) ;; *) echo "unsupported TLS provider: ${TLS_PROVIDER}" >&2; exit 2 ;; esac; \
+    case "${PGO_MODE}" in off|train) ;; *) echo "unsupported PGO mode: ${PGO_MODE}" >&2; exit 2 ;; esac; \
+    case "${RUST_LTO}" in thin|fat) ;; *) echo "unsupported Rust LTO mode: ${RUST_LTO}" >&2; exit 2 ;; esac; \
+    case "${RUST_CODEGEN_UNITS}" in 1|2|4|8|16) ;; *) echo "unsupported codegen units: ${RUST_CODEGEN_UNITS}" >&2; exit 2 ;; esac; \
+    chmod 755 bench/pgo_train.sh bench/pgo_train_h3.sh bench/pgo_train_upstream_h3.sh bench/build_pgo.sh \
+      bench/clang_rust_pgo_filter.sh bench/clangxx_rust_pgo_filter.sh; \
     if [ "${PGO_MODE}" = off ]; then \
+      case "${RUST_TARGET_CPU}" in \
+        x86-64-v2) NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic' ;; \
+        znver1|znver2|znver3|znver4) NATIVE_FLAGS="-O3 -march=${RUST_TARGET_CPU} -mtune=${RUST_TARGET_CPU}" ;; \
+        *) echo "unsupported Rust target CPU: ${RUST_TARGET_CPU}" >&2; exit 2 ;; \
+      esac; \
       CARGO_TARGET_DIR=/src/target/release \
-      CFLAGS="${TARGET_NATIVE_FLAGS}" \
-      CXXFLAGS="${TARGET_NATIVE_FLAGS}" \
+      CFLAGS="${NATIVE_FLAGS}" CXXFLAGS="${NATIVE_FLAGS}" \
       RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU}" \
         cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
           --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
       install -Dm755 "/src/target/release/${RUST_TARGET_TRIPLE}/release/pingora" /out/pingora; \
     else \
-      rustup component add llvm-tools-preview; \
-      rustc --edition=2024 -D warnings -C opt-level=3 -C codegen-units=1 \
-        -C panic=abort -C target-cpu="${PGO_TRAIN_TARGET_CPU}" -C strip=symbols \
-        bench/backend.rs -o /tmp/pgo-backend; \
-      rustc --edition=2024 -D warnings -C opt-level=3 -C codegen-units=1 \
-        -C panic=abort -C target-cpu="${PGO_TRAIN_TARGET_CPU}" -C strip=symbols \
-        bench/pgo_client.rs -o /tmp/pgo-client; \
-      CARGO_TARGET_DIR=/src/target/pgo-tools \
-      CFLAGS="${TRAIN_NATIVE_FLAGS}" \
-      CXXFLAGS="${TRAIN_NATIVE_FLAGS}" \
-      RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${PGO_TRAIN_TARGET_CPU}" \
-        cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
-          --example http3_probe --no-default-features \
-          --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
-      H3_PROBE="/src/target/pgo-tools/${RUST_TARGET_TRIPLE}/release/examples/http3_probe"; \
-      test -x "${H3_PROBE}"; \
-      rm -rf /src/pgo-data; \
-      install -d /src/pgo-data/raw/h1 /src/pgo-data/raw/h2 /src/pgo-data/raw/h3 /src/pgo-data/raw/tls /src/pgo-data/raw/tail; \
-      CARGO_TARGET_DIR=/src/target/pgo-generate \
-      CFLAGS="${TRAIN_NATIVE_FLAGS}" \
-      CXXFLAGS="${TRAIN_NATIVE_FLAGS}" \
-      RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${PGO_TRAIN_TARGET_CPU} -C profile-generate=/src/pgo-data/raw" \
-        cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
-          --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
-      PGO_BIN="/src/target/pgo-generate/${RUST_TARGET_TRIPLE}/release/pingora"; \
-      test -x "${PGO_BIN}"; \
-      for round in $(seq 1 "${PGO_TRAIN_ROUNDS}"); do \
-        for scenario in h1 h2 tls tail; do \
-          echo "PGO training scenario=${scenario} round=${round}/${PGO_TRAIN_ROUNDS}"; \
-          PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" PGO_TRAIN_ROUND="${round}" \
-            bench/pgo_train.sh "${PGO_BIN}" /tmp/pgo-backend /tmp/pgo-client \
-              "/src/pgo-data/raw/${scenario}" "${scenario}"; \
-        done; \
-        echo "PGO training scenario=h3 round=${round}/${PGO_TRAIN_ROUNDS}"; \
-        PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" PGO_TRAIN_ROUND="${round}" \
-          bench/pgo_train_h3.sh "${PGO_BIN}" /tmp/pgo-backend "${H3_PROBE}" \
-            /src/pgo-data/raw/h3; \
-      done; \
-      LLVM_PROFDATA="$(rustc --print target-libdir)/../bin/llvm-profdata"; \
-      test -x "${LLVM_PROFDATA}"; \
-      for scenario in h1 h2 h3 tls tail; do \
-        "${LLVM_PROFDATA}" merge --failure-mode=any \
-          -o "/src/pgo-data/${scenario}.profdata" "/src/pgo-data/raw/${scenario}"/*.profraw; \
-      done; \
-      "${LLVM_PROFDATA}" merge \
-        --weighted-input="${PGO_WEIGHT_H1},/src/pgo-data/h1.profdata" \
-        --weighted-input="${PGO_WEIGHT_H2},/src/pgo-data/h2.profdata" \
-        --weighted-input="${PGO_WEIGHT_H3},/src/pgo-data/h3.profdata" \
-        --weighted-input="${PGO_WEIGHT_TLS},/src/pgo-data/tls.profdata" \
-        --weighted-input="${PGO_WEIGHT_TAIL},/src/pgo-data/tail.profdata" \
-        -o /src/pgo-data/merged.profdata; \
-      test -s /src/pgo-data/merged.profdata; \
-      { \
-        echo "weights h1=${PGO_WEIGHT_H1} h2=${PGO_WEIGHT_H2} h3=${PGO_WEIGHT_H3} tls=${PGO_WEIGHT_TLS} tail=${PGO_WEIGHT_TAIL} rounds=${PGO_TRAIN_ROUNDS}"; \
-        "${LLVM_PROFDATA}" show --counts --covered --topn=100 /src/pgo-data/merged.profdata; \
-        echo; echo "=== h1 vs h2 overlap ==="; \
-        "${LLVM_PROFDATA}" overlap /src/pgo-data/h1.profdata /src/pgo-data/h2.profdata || true; \
-        echo; echo "=== h2 vs h3 overlap ==="; \
-        "${LLVM_PROFDATA}" overlap /src/pgo-data/h2.profdata /src/pgo-data/h3.profdata || true; \
-        echo; echo "=== h3 vs tls overlap ==="; \
-        "${LLVM_PROFDATA}" overlap /src/pgo-data/h3.profdata /src/pgo-data/tls.profdata || true; \
-        echo; echo "=== h3 vs tail overlap ==="; \
-        "${LLVM_PROFDATA}" overlap /src/pgo-data/h3.profdata /src/pgo-data/tail.profdata || true; \
-      } > /src/pgo-data/profile-summary.txt; \
-      PROFILE_SHA="$(sha256sum /src/pgo-data/merged.profdata | cut -d ' ' -f 1)"; \
-      PROFILE_PATH="/src/pgo-data/merged-${PROFILE_SHA}.profdata"; \
-      cp /src/pgo-data/merged.profdata "${PROFILE_PATH}"; \
-      FINAL_RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU} -C profile-use=${PROFILE_PATH} -C llvm-args=-pgo-warn-missing-function"; \
-      CARGO_TARGET_DIR=/src/target/pgo-use \
-      CFLAGS="${TARGET_NATIVE_FLAGS}" \
-      CXXFLAGS="${TARGET_NATIVE_FLAGS}" \
-      RUSTFLAGS="${FINAL_RUSTFLAGS}" \
-        cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
-          --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
-      FINAL_BIN="/src/target/pgo-use/${RUST_TARGET_TRIPLE}/release/pingora"; \
-      install -Dm755 "${FINAL_BIN}" /out/pingora; \
-      install -Dm644 /src/pgo-data/profile-summary.txt /out/pgo-profile-summary.txt; \
+      export RUST_TARGET_TRIPLE RUST_TARGET_CPU RUST_LTO RUST_CODEGEN_UNITS ALLOCATOR TLS_PROVIDER; \
+      export PGO_TRAIN_TARGET_CPU PGO_NATIVE_BORING PGO_WEIGHT_H1 PGO_WEIGHT_H2 PGO_WEIGHT_H3; \
+      export PGO_WEIGHT_UPSTREAM_H3_BBR2 PGO_WEIGHT_UPSTREAM_H3_CUBIC PGO_WEIGHT_TLS PGO_WEIGHT_TAIL; \
+      export PGO_TRAIN_ROUNDS PGO_ECDSA_CURVE PGO_NATIVE_TRAIN_ROUNDS; \
+      export BORING_PGO_WEIGHT_H2 BORING_PGO_WEIGHT_H3 BORING_PGO_WEIGHT_UPSTREAM_H3_BBR2; \
+      export BORING_PGO_WEIGHT_UPSTREAM_H3_CUBIC BORING_PGO_WEIGHT_TLS RUSTFLAGS_COMMON; \
+      bench/build_pgo.sh; \
     fi
 
 FROM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS runtime
@@ -217,13 +144,17 @@ ARG ALLOCATOR=tcmalloc
 ARG TLS_PROVIDER
 ARG PGO_MODE
 ARG PGO_TRAIN_TARGET_CPU
+ARG PGO_NATIVE_BORING
 ARG PGO_WEIGHT_H1
 ARG PGO_WEIGHT_H2
 ARG PGO_WEIGHT_H3
+ARG PGO_WEIGHT_UPSTREAM_H3_BBR2
+ARG PGO_WEIGHT_UPSTREAM_H3_CUBIC
 ARG PGO_WEIGHT_TLS
 ARG PGO_WEIGHT_TAIL
 ARG PGO_ECDSA_CURVE
 ARG PGO_TRAIN_ROUNDS
+ARG PGO_NATIVE_TRAIN_ROUNDS
 ARG RUST_VERSION
 ARG RUST_TARGET_TRIPLE
 ARG RUST_TARGET_CPU
@@ -241,14 +172,18 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.http3.provider="quiche" \
       org.opencontainers.image.quic.tls.provider="boringssl" \
       org.opencontainers.image.rust.pgo="${PGO_MODE}" \
+      org.opencontainers.image.native.pgo="${PGO_NATIVE_BORING}" \
       org.opencontainers.image.rust.pgo-train-target-cpu="${PGO_TRAIN_TARGET_CPU}" \
       org.opencontainers.image.rust.pgo-weight-h1="${PGO_WEIGHT_H1}" \
       org.opencontainers.image.rust.pgo-weight-h2="${PGO_WEIGHT_H2}" \
       org.opencontainers.image.rust.pgo-weight-h3="${PGO_WEIGHT_H3}" \
+      org.opencontainers.image.rust.pgo-weight-upstream-h3-bbr2="${PGO_WEIGHT_UPSTREAM_H3_BBR2}" \
+      org.opencontainers.image.rust.pgo-weight-upstream-h3-cubic="${PGO_WEIGHT_UPSTREAM_H3_CUBIC}" \
       org.opencontainers.image.rust.pgo-weight-tls="${PGO_WEIGHT_TLS}" \
       org.opencontainers.image.rust.pgo-weight-tail="${PGO_WEIGHT_TAIL}" \
       org.opencontainers.image.rust.pgo-ecdsa-curve="${PGO_ECDSA_CURVE}" \
       org.opencontainers.image.rust.pgo-train-rounds="${PGO_TRAIN_ROUNDS}" \
+      org.opencontainers.image.native.pgo-train-rounds="${PGO_NATIVE_TRAIN_ROUNDS}" \
       org.opencontainers.image.base.name="debian:${DEBIAN_SUITE}-slim" \
       org.opencontainers.image.rust.version="${RUST_VERSION}" \
       org.opencontainers.image.rust.target="${RUST_TARGET_TRIPLE}" \
@@ -267,6 +202,9 @@ RUN --mount=from=builder,source=/out,target=/out,ro \
     && install -Dm755 /out/pingora /usr/local/bin/pingora \
     && if [ -f /out/pgo-profile-summary.txt ]; then \
          install -Dm644 /out/pgo-profile-summary.txt /usr/share/doc/pingora/pgo-profile-summary.txt; \
+       fi \
+    && if [ -f /out/pgo-native-profile-summary.txt ]; then \
+         install -Dm644 /out/pgo-native-profile-summary.txt /usr/share/doc/pingora/pgo-native-profile-summary.txt; \
        fi \
     && setcap cap_net_bind_service=+ep /usr/local/bin/pingora \
     && apt-get purge --yes --auto-remove libcap2-bin \

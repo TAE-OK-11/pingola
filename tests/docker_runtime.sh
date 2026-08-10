@@ -88,7 +88,7 @@ start_container() {
 }
 
 assert_container_hardening() {
-  local name=$1
+  local name=$1 native_pgo
   [[ $(docker inspect --format '{{.Config.User}}' "${name}") == 10001:10001 ]]
   [[ $(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "${name}") == true ]]
   [[ $(docker inspect --format '{{json .HostConfig.CapDrop}}' "${name}") == '["ALL"]' ]]
@@ -104,6 +104,16 @@ assert_container_hardening() {
   docker image inspect "${IMAGE}" | jq -e '.[0].Config.ExposedPorts["443/udp"] != null' >/dev/null
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.pgo"}}' "${name}") == "${EXPECTED_PGO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.linker"}}' "${name}") == lld ]]
+
+  native_pgo=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.native.pgo"}}' "${name}")
+  case "${native_pgo}" in on|off) ;; *) echo "invalid native PGO label: ${native_pgo}" >&2; return 1 ;; esac
+  if [[ "${EXPECTED_PGO}" == train ]]; then
+    docker exec "${name}" sh -c 'test -s /usr/share/doc/pingora/pgo-profile-summary.txt'
+    if [[ "${native_pgo}" == on ]]; then
+      docker exec "${name}" sh -c 'test -s /usr/share/doc/pingora/pgo-native-profile-summary.txt'
+    fi
+  fi
+
   if docker exec "${name}" sh -c 'command -v setcap >/dev/null || dpkg-query -W libcap2-bin >/dev/null 2>&1'; then
     echo "runtime image unexpectedly contains libcap2-bin" >&2
     return 1
@@ -127,8 +137,6 @@ chmod 0640 "${RUNTIME}/cert/key.pem" "${RUNTIME}/cert/cert.pem"
 if [[ ${EUID} -eq 0 ]]; then
   chown 0:10001 "${RUNTIME}/cert/key.pem" "${RUNTIME}/cert/cert.pem"
 elif command -v sudo >/dev/null 2>&1; then
-  # GitHub-hosted runners are unprivileged. Elevate only the fixture ownership
-  # change; Docker and every runtime assertion remain under the runner user.
   sudo chown 0:10001 "${RUNTIME}/cert/key.pem" "${RUNTIME}/cert/cert.pem"
 else
   echo "root or passwordless sudo is required to create the root:10001 TLS fixture" >&2
@@ -139,7 +147,8 @@ start_container pingora-test-https-ipv6 "${RUNTIME}/ipv6.yaml" \
 assert_container_hardening pingora-test-https-ipv6
 curl --noproxy '*' -gkfsS --http2 --resolve health.test:443:[::1] \
   https://health.test:443/pingora-ready -o /dev/null
-docker logs pingora-test-https-ipv6 2>&1   | grep -q 'HTTP/3 frontend started: udp=\["\[::1\]:8443"\]'
+docker logs pingora-test-https-ipv6 2>&1 \
+  | grep -q 'HTTP/3 frontend started: udp=\["\[::1\]:8443"\]'
 
 docker exec pingora-test-https-ipv6 /usr/local/bin/pingora \
   --config /etc/pingora/pingora.yaml --check >/dev/null

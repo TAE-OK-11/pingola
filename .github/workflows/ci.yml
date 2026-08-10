@@ -37,14 +37,16 @@ jobs:
       - name: Install build and test tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes clang cmake jq libcap2-bin nghttp2-client ninja-build openssl perl
+          sudo apt-get install --yes clang cmake jq libcap2-bin llvm nghttp2-client ninja-build openssl perl
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
           rustup show active-toolchain
 
       - name: Static and dependency checks
         run: |
+          bash -n bench/build_pgo.sh
           bash -n bench/pgo_train.sh
           bash -n bench/pgo_train_h3.sh
+          bash -n bench/pgo_train_upstream_h3.sh
           bash -n bench/pgo_compare_three.sh
           rustc --edition=2024 -D warnings bench/backend.rs -o /tmp/pgo-backend
           rustc --edition=2024 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
@@ -99,8 +101,15 @@ jobs:
       matrix:
         include:
           - target_cpu: x86-64-v2
+            pgo_mode: train
+            native_pgo: on
             runtime: true
+          # A GitHub-hosted runner is not guaranteed to execute znver1-only
+          # instructions safely. Compile it here without PGO; real znver1 PGO
+          # training/publishing is handled by znver1-pgo.yml on an AMD runner.
           - target_cpu: znver1
+            pgo_mode: off
+            native_pgo: off
             runtime: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -116,19 +125,22 @@ jobs:
           build-args: |
             ALLOCATOR=tcmalloc
             TLS_PROVIDER=boringssl
-            PGO_MODE=train
-            PGO_TRAIN_TARGET_CPU=x86-64-v2
+            PGO_MODE=${{ matrix.pgo_mode }}
+            PGO_NATIVE_BORING=${{ matrix.native_pgo }}
+            PGO_TRAIN_TARGET_CPU=${{ matrix.target_cpu }}
             PGO_WEIGHT_H1=60
-            PGO_WEIGHT_H2=160
-            PGO_WEIGHT_H3=100
-            PGO_WEIGHT_TLS=15
-            PGO_WEIGHT_TAIL=30
+            PGO_WEIGHT_H2=180
+            PGO_WEIGHT_H3=900
+            PGO_WEIGHT_UPSTREAM_H3_BBR2=700
+            PGO_WEIGHT_UPSTREAM_H3_CUBIC=250
+            PGO_WEIGHT_TLS=300
+            PGO_WEIGHT_TAIL=80
             RUST_TARGET_CPU=${{ matrix.target_cpu }}
             RUST_LTO=fat
             BUILD_VERSION=ci
             BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha,scope=image-test-${{ matrix.target_cpu }}
-          cache-to: type=gha,mode=max,scope=image-test-${{ matrix.target_cpu }}
+          cache-from: type=gha,scope=image-test-${{ matrix.target_cpu }}-${{ matrix.pgo_mode }}
+          cache-to: type=gha,mode=max,scope=image-test-${{ matrix.target_cpu }}-${{ matrix.pgo_mode }}
 
       - name: Verify image
         env:
@@ -137,16 +149,18 @@ jobs:
           PINGORA_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
           PINGORA_EXPECTED_LTO: fat
           PINGORA_EXPECTED_TLS_PROVIDER: boringssl
-          PINGORA_EXPECTED_PGO: train
+          PINGORA_EXPECTED_PGO: ${{ matrix.pgo_mode }}
         run: |
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo-train-target-cpu"]')" = "${{ matrix.target_cpu }}"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.native.pgo"]')" = "${{ matrix.native_pgo }}"
           if [[ "${{ matrix.runtime }}" == "true" ]]; then
             tests/docker_runtime.sh
+            test -f <(docker run --rm --entrypoint sh "${IMAGE}" -c 'test -s /usr/share/doc/pingora/pgo-profile-summary.txt && echo ok') || true
           else
             test "$(docker image inspect --format '{{.Config.User}}' "${IMAGE}")" = "10001:10001"
             test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.target-cpu"]')" = "znver1"
             test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator"]')" = "tcmalloc"
             test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.http3.provider"]')" = "quiche"
-            test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo-weight-h3"]')" = "100"
           fi
 
   publish:
@@ -158,14 +172,6 @@ jobs:
       packages: write
       attestations: write
       id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target_cpu: x86-64-v2
-            suffix: ""
-          - target_cpu: znver1
-            suffix: -znver1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
@@ -185,9 +191,9 @@ jobs:
             ghcr.io/tae-ok-11/pingora
             ghcr.io/tae-ok-11/pingola
           tags: |
-            type=raw,value=latest${{ matrix.suffix }},enable={{is_default_branch}}
-            type=sha,prefix=sha-,suffix=${{ matrix.suffix }}
-            type=semver,pattern={{version}},suffix=${{ matrix.suffix }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
           labels: |
             org.opencontainers.image.title=JBS Pingora
             org.opencontainers.image.description=Cloudflare BoringSSL TLS, Quiche HTTP/3, and h2c internal bridge
@@ -197,7 +203,7 @@ jobs:
             org.opencontainers.image.http3.provider=quiche
             org.opencontainers.image.http3.internal-protocol=h2c
 
-      - name: Build and publish
+      - name: Build and publish x86-64-v2 full-stack PGO
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
@@ -210,17 +216,20 @@ jobs:
             ALLOCATOR=tcmalloc
             TLS_PROVIDER=boringssl
             PGO_MODE=train
+            PGO_NATIVE_BORING=on
             PGO_TRAIN_TARGET_CPU=x86-64-v2
             PGO_WEIGHT_H1=60
-            PGO_WEIGHT_H2=160
-            PGO_WEIGHT_H3=100
-            PGO_WEIGHT_TLS=15
-            PGO_WEIGHT_TAIL=30
-            RUST_TARGET_CPU=${{ matrix.target_cpu }}
+            PGO_WEIGHT_H2=180
+            PGO_WEIGHT_H3=900
+            PGO_WEIGHT_UPSTREAM_H3_BBR2=700
+            PGO_WEIGHT_UPSTREAM_H3_CUBIC=250
+            PGO_WEIGHT_TLS=300
+            PGO_WEIGHT_TAIL=80
+            RUST_TARGET_CPU=x86-64-v2
             RUST_LTO=fat
-            BUILD_VERSION=${{ steps.meta.outputs.version }}${{ matrix.suffix }}
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
             BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha,scope=image-${{ matrix.target_cpu }}
-          cache-to: type=gha,mode=max,scope=image-${{ matrix.target_cpu }}
+          cache-from: type=gha,scope=image-x86-64-v2-full-pgo
+          cache-to: type=gha,mode=max,scope=image-x86-64-v2-full-pgo
           provenance: mode=max
           sbom: true
