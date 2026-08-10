@@ -95,7 +95,7 @@ server:
   certificate: ${RUNTIME_DIR}/cert.pem
   private_key: ${RUNTIME_DIR}/key.pem
   health_socket: ${RUNTIME_DIR}/origin-health.sock
-  threads: 1
+  threads: 2
   access_log: false
   downstream_keepalive_requests: 1000000
   downstream_max_connections: 4096
@@ -121,7 +121,7 @@ server:
   certificate: ${RUNTIME_DIR}/cert.pem
   private_key: ${RUNTIME_DIR}/key.pem
   health_socket: ${RUNTIME_DIR}/target-health.sock
-  threads: 1
+  threads: 2
   access_log: false
   upstream_keepalive_pool_size: 128
   downstream_keepalive_requests: 1000000
@@ -185,23 +185,23 @@ run_h2load large-json -n 1000 -c 4 -m 8 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/json/65536"
 
-# The H3->H2C response handoff is bounded, and concurrent synthetic bulk
-# streams can fill it faster than the consumer gets scheduled on a 1-thread
-# training fixture. Preserve the same ~116 MiB bulk-transfer volume as the
-# previous 512/768 KiB profile, but serialize smaller 256/384 KiB responses.
-# This still trains sustained BBRv2/CUBIC QUIC transfer hot paths without
-# biasing the profile toward an artificial local handoff-overflow/reset path.
-run_h2load stream-256k -n 320 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
+# Prefer a Content-Length bulk path for the majority of transfer training: it
+# matches large object/audio/range-style responses more closely than the
+# synthetic chunked fixture. Keep a separate chunked workload so incremental
+# response forwarding and H3/H2C handoff paths remain represented in PGO.
+# Both workloads are serialized to avoid teaching the profile a single-thread
+# synthetic queue-overflow artifact rather than steady production forwarding.
+run_h2load bulk-512k -n 160 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
-  "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/262144"
-run_h2load stream-384k -n 96 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
+  "https://127.0.0.1:${TARGET_HTTPS_PORT}/bytes/524288"
+run_h2load chunked-128k -n 256 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
-  "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/393216"
+  "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/131072"
 
 # The target uses a deliberately short three-second upstream QUIC idle timeout
 # only for this training fixture. Waiting past it repeatedly exercises reconnect,
 # ticket caching/resumption, and replay-safe early-data paths without risking
-# spurious idle expiry during the streaming workload above.
+# spurious idle expiry during the transfer workload above.
 for index in $(seq 1 8); do
   sleep 3.3
   run_h2load "resume-${index}" -n 32 -c 1 -m 1 --sni pgo.test \
@@ -222,8 +222,8 @@ congestion_control=${CC}
 small_requests=6000
 medium_requests=3000
 large_json_requests=1000
-stream_256k_requests=320
-stream_384k_requests=96
+bulk_512k_requests=160
+chunked_128k_requests=256
 resumption_cycles=8
 resumption_requests=256
 early_data_client=true
