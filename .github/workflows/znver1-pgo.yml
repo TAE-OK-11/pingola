@@ -6,6 +6,8 @@ concurrency:
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
     tags: ["v*"]
@@ -15,9 +17,10 @@ permissions:
 
 jobs:
   build-train-publish:
-    # Keep latest-znver1 aligned with main. This job intentionally requires a
-    # dedicated AMD Zen/znver1 self-hosted runner so the PGO profile is native.
-    runs-on: [self-hosted, linux, x64, znver1]
+    # Keep latest-znver1 aligned with main without depending on an optional
+    # self-hosted runner. The profile is still generated independently with
+    # target-cpu=znver1 and is never shared with the x86-64-v2 build.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -26,27 +29,23 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Verify native AMD training host
+      - name: Verify znver1-compatible training host
         run: |
           set -euxo pipefail
           test "$(uname -m)" = x86_64
-          grep -q 'vendor_id[[:space:]]*: AuthenticAMD' /proc/cpuinfo
           command -v docker
           command -v jq
           command -v openssl
           lscpu
-          for flag in avx avx2 bmi1 bmi2 fma sse4_2; do
-            grep -m1 '^flags' /proc/cpuinfo | grep -qw "${flag}"
+          flags=$(grep -m1 '^flags' /proc/cpuinfo)
+          for flag in aes avx avx2 bmi1 bmi2 fma pclmulqdq sse4_1 sse4_2 ssse3; do
+            grep -qw "${flag}" <<<"${flags}"
           done
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-        with:
-          # This runner is persistent and CPU-specific. Keeping BuildKit state
-          # preserves RUN --mount=type=cache Cargo/native build caches between
-          # znver1 PGO runs instead of relying only on exported GHA layer cache.
-          keep-state: true
 
       - name: Sign in to GHCR
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
         with:
           registry: ghcr.io
@@ -66,12 +65,13 @@ jobs:
             type=semver,pattern={{version}},suffix=-znver1
           labels: |
             org.opencontainers.image.title=JBS Pingora znver1
-            org.opencontainers.image.description=Native AMD znver1-trained full-stack PGO image
+            org.opencontainers.image.description=znver1-targeted full-stack PGO image
             org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
             org.opencontainers.image.allocator=tcmalloc
             org.opencontainers.image.tls.provider=boringssl
             org.opencontainers.image.http3.provider=quiche
             org.opencontainers.image.http3.internal-protocol=h2c
+            org.opencontainers.image.pgo.profile-family=znver1
 
       - name: Train, build and publish znver1 image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -79,7 +79,7 @@ jobs:
           context: .
           platforms: linux/amd64
           load: true
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           pull: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -103,9 +103,10 @@ jobs:
           cache-from: |
             type=gha,scope=image-znver1-full-pgo
             type=gha,scope=image-test-znver1-off
+            type=gha,scope=image-x86-64-v2-full-pgo
           cache-to: type=gha,mode=max,scope=image-znver1-full-pgo
-          provenance: mode=max
-          sbom: true
+          provenance: ${{ github.event_name != 'pull_request' && 'mode=max' || 'false' }}
+          sbom: ${{ github.event_name != 'pull_request' }}
 
       - name: Verify znver1 profile and runtime
         run: |
@@ -115,6 +116,7 @@ jobs:
           test "$(docker image inspect "${IMAGE_REF}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.target-cpu"]')" = znver1
           test "$(docker image inspect "${IMAGE_REF}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo-train-target-cpu"]')" = znver1
           test "$(docker image inspect "${IMAGE_REF}" | jq -r '.[0].Config.Labels["org.opencontainers.image.native.pgo"]')" = on
+          test "$(docker image inspect "${IMAGE_REF}" | jq -r '.[0].Config.Labels["org.opencontainers.image.pgo.profile-family"]')" = znver1
           docker run --rm --entrypoint sh "${IMAGE_REF}" -c \
             'test -s /usr/share/doc/pingora/pgo-profile-summary.txt && test -s /usr/share/doc/pingora/pgo-native-profile-summary.txt'
           PINGORA_TEST_IMAGE="${IMAGE_REF}" \
