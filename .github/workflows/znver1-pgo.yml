@@ -74,11 +74,15 @@ jobs:
             org.opencontainers.image.pgo.profile-family=znver1
 
       - name: Train, build and publish znver1 image
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           platforms: linux/amd64
-          load: true
+          # PRs need a local image for runtime tests. Production builds publish
+          # registry output only so provenance/SBOM attestations are not mixed
+          # with the Docker exporter.
+          load: ${{ github.event_name == 'pull_request' }}
           push: ${{ github.event_name != 'pull_request' }}
           pull: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -111,7 +115,13 @@ jobs:
       - name: Verify znver1 profile and runtime
         run: |
           set -euxo pipefail
-          IMAGE_REF=$(echo '${{ steps.meta.outputs.tags }}' | head -n1)
+          if [[ "${{ github.event_name }}" == pull_request ]]; then
+            IMAGE_REF=$(echo '${{ steps.meta.outputs.tags }}' | head -n1)
+          else
+            test -n '${{ steps.build.outputs.digest }}'
+            IMAGE_REF="ghcr.io/tae-ok-11/pingora@${{ steps.build.outputs.digest }}"
+            docker pull "${IMAGE_REF}"
+          fi
           test -n "${IMAGE_REF}"
           test "$(docker image inspect "${IMAGE_REF}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.target-cpu"]')" = znver1
           test "$(docker image inspect "${IMAGE_REF}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo-train-target-cpu"]')" = znver1
