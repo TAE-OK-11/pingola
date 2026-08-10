@@ -41,6 +41,18 @@ jobs:
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
           rustup show active-toolchain
 
+      - name: Restore Cargo build cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-verify-${{ runner.os }}-rust-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'vendor/**/Cargo.toml') }}
+          restore-keys: |
+            cargo-verify-${{ runner.os }}-rust-1.97.1-
+
       - name: Static and dependency checks
         run: |
           bash -n bench/build_pgo.sh
@@ -139,7 +151,9 @@ jobs:
             RUST_LTO=fat
             BUILD_VERSION=ci
             BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha,scope=image-test-${{ matrix.target_cpu }}-${{ matrix.pgo_mode }}
+          cache-from: |
+            type=gha,scope=image-test-${{ matrix.target_cpu }}-${{ matrix.pgo_mode }}
+            type=gha,scope=image-${{ matrix.target_cpu }}-full-pgo
           cache-to: type=gha,mode=max,scope=image-test-${{ matrix.target_cpu }}-${{ matrix.pgo_mode }}
 
       - name: Verify image
@@ -229,7 +243,9 @@ jobs:
             RUST_LTO=fat
             BUILD_VERSION=${{ steps.meta.outputs.version }}
             BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha,scope=image-x86-64-v2-full-pgo
+          cache-from: |
+            type=gha,scope=image-x86-64-v2-full-pgo
+            type=gha,scope=image-test-x86-64-v2-train
           cache-to: type=gha,mode=max,scope=image-x86-64-v2-full-pgo
           provenance: mode=max
           sbom: true
