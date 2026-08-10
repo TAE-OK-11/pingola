@@ -51,12 +51,23 @@ wait_tcp() {
   return 1
 }
 
+show_failure_logs() {
+  local file
+  for file in target.log origin.log backend.log; do
+    if [[ -s "${OUTPUT_DIR}/${file}" ]]; then
+      echo "=== ${file} (tail) ===" >&2
+      tail -n 160 "${OUTPUT_DIR}/${file}" >&2 || true
+    fi
+  done
+}
+
 run_h2load() {
   local name=$1; shift
   h2load "$@" >"${OUTPUT_DIR}/${name}.log" 2>&1
   grep -Eq '0 failed, 0 errored' "${OUTPUT_DIR}/${name}.log" || {
     echo "upstream H3 workload failed: ${name}" >&2
     sed -n '1,180p' "${OUTPUT_DIR}/${name}.log" >&2
+    show_failure_logs
     exit 1
   }
 }
@@ -130,7 +141,7 @@ upstreams:
     connect_timeout_seconds: 3
     read_timeout_seconds: 60
     write_timeout_seconds: 60
-    idle_timeout_seconds: 1
+    idle_timeout_seconds: 3
 hosts:
   profile: { domains: ["pgo.test"], handler: vaultwarden, upstream: origin_h3 }
 route_limits:
@@ -173,15 +184,22 @@ run_h2load medium -n 3000 -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
 run_h2load large-json -n 1000 -c 4 -m 8 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/json/65536"
-run_h2load stream-1m -n 96 -c 4 -m 4 -w 16 -W 20 --sni pgo.test \
+
+# Keep streaming in the profile, but cap concurrency so a noisy hosted runner
+# does not turn synthetic origin overload into accidental 5xx training data.
+run_h2load stream-1m -n 64 -c 2 -m 2 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/1048576"
-run_h2load stream-10m -n 12 -c 2 -m 2 -w 16 -W 20 --sni pgo.test \
+run_h2load stream-10m -n 8 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/10485760"
 
+# The target uses a deliberately short three-second upstream QUIC idle timeout
+# only for this training fixture. Waiting past it repeatedly exercises reconnect,
+# ticket caching/resumption, and replay-safe early-data paths without risking
+# spurious idle expiry during the streaming workload above.
 for index in $(seq 1 8); do
-  sleep 1.2
+  sleep 3.3
   run_h2load "resume-${index}" -n 32 -c 1 -m 1 --sni pgo.test \
     -H 'host: pgo.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${TARGET_HTTPS_PORT}/json/512"
@@ -200,8 +218,8 @@ congestion_control=${CC}
 small_requests=6000
 medium_requests=3000
 large_json_requests=1000
-stream_1m_requests=96
-stream_10m_requests=12
+stream_1m_requests=64
+stream_10m_requests=8
 resumption_cycles=8
 resumption_requests=256
 early_data_client=true
