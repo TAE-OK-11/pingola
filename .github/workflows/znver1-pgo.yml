@@ -15,9 +15,8 @@ permissions:
 
 jobs:
   build-train-publish:
-    # Automatic pushes are opt-in until an AMD self-hosted runner is registered.
-    # Manual dispatch always allows an explicit znver1 PGO training run.
-    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_ZNVER1_PGO == 'true'
+    # Keep latest-znver1 aligned with main. This job intentionally requires a
+    # dedicated AMD Zen/znver1 self-hosted runner so the PGO profile is native.
     runs-on: [self-hosted, linux, x64, znver1]
     permissions:
       contents: read
