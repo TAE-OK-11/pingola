@@ -25,14 +25,14 @@ use cloudflare_pingora::apps::HttpServerOptions;
 use cloudflare_pingora::listeners::TcpSocketOptions;
 use cloudflare_pingora::listeners::tls::TlsSettings;
 use cloudflare_pingora::protocols::TcpKeepalive;
-use cloudflare_pingora::protocols::http::v2::server::default_h2_options;
+use cloudflare_pingora::protocols::http::v2::server::{H2Options, default_h2_options};
 use cloudflare_pingora::proxy::ProxyServiceBuilder;
 use cloudflare_pingora::server::Server;
 use cloudflare_pingora::server::configuration::ServerConf;
 use log::info;
 
 use crate::config::RuntimeConfig;
-use crate::gateway::Gateway;
+use crate::gateway::{Gateway, GatewayShared};
 use crate::preflight::check_runtime;
 use crate::tls_policy::HYBRID_PQ_GROUPS;
 
@@ -277,8 +277,11 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
 
     let upstream_h3 =
         upstream_h3::start(runtime.clone()).context("upstream HTTP/3 bridge startup failed")?;
-    let gateway =
-        Gateway::new(runtime.clone(), upstream_h3.clone()).context("service bootstrap failed")?;
+    let shared = Arc::new(
+        GatewayShared::from_runtime(&runtime).context("shared gateway state bootstrap failed")?,
+    );
+    let gateway = Gateway::with_shared(runtime.clone(), upstream_h3.clone(), shared.clone())
+        .context("service bootstrap failed")?;
     let mut http_options = HttpServerOptions::default();
     http_options.request_header_timeout = Some(Duration::from_secs(
         server_config.downstream_request_header_timeout_seconds,
@@ -298,11 +301,10 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         .build();
     service.set_connection_limit(server_config.downstream_max_connections);
 
-    let mut h2_options = default_h2_options();
-    h2_options.max_concurrent_streams(server_config.http2_max_concurrent_streams);
-    h2_options.max_header_list_size(16 * 1024);
     if let Some(proxy) = service.app_logic_mut() {
-        proxy.h2_options = Some(h2_options);
+        proxy.h2_options = Some(public_h2_options(
+            server_config.http2_max_concurrent_streams,
+        ));
     }
 
     for address in &server_config.http_listen {
@@ -339,7 +341,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     );
 
     if !server_config.http3_listen.is_empty() {
-        let h2c_gateway = Gateway::new(runtime.clone(), upstream_h3.clone())
+        let h2c_gateway = Gateway::with_shared(runtime.clone(), upstream_h3.clone(), shared)
             .context("HTTP/3 h2c service bootstrap failed")?;
         let mut h2c_options = HttpServerOptions::default();
         h2c_options.h2c = true;
@@ -351,11 +353,10 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
             .server_options(h2c_options)
             .build();
         h2c_service.set_connection_limit(server_config.downstream_max_connections);
-        let mut h2c_stream_options = default_h2_options();
-        h2c_stream_options.max_concurrent_streams(server_config.http3_max_concurrent_streams);
-        h2c_stream_options.max_header_list_size(64 * 1024);
         if let Some(proxy) = h2c_service.app_logic_mut() {
-            proxy.h2_options = Some(h2c_stream_options);
+            proxy.h2_options = Some(handoff_h2_options(
+                server_config.http3_max_concurrent_streams,
+            ));
         }
         let internal = server_config.http3_internal_listen.to_string();
         h2c_service.add_tcp_with_settings(&internal, listener_options(&internal)?);
@@ -377,6 +378,39 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     );
     server.add_service(service);
     server.run_forever();
+}
+
+fn public_h2_options(max_concurrent_streams: u32) -> H2Options {
+    configure_h2_options(
+        max_concurrent_streams,
+        16 * 1024,
+        256 * 1024,
+        2 * 1024 * 1024,
+    )
+}
+
+fn handoff_h2_options(max_concurrent_streams: u32) -> H2Options {
+    configure_h2_options(
+        max_concurrent_streams,
+        64 * 1024,
+        256 * 1024,
+        4 * 1024 * 1024,
+    )
+}
+
+fn configure_h2_options(
+    max_concurrent_streams: u32,
+    max_header_list_size: u32,
+    stream_window: u32,
+    connection_window: u32,
+) -> H2Options {
+    let mut options = default_h2_options();
+    options.max_concurrent_streams(max_concurrent_streams);
+    options.max_header_list_size(max_header_list_size);
+    options.initial_window_size(stream_window);
+    options.initial_connection_window_size(connection_window);
+    options.max_frame_size(64 * 1024);
+    options
 }
 
 fn listener_options(address: &str) -> Result<TcpSocketOptions> {
@@ -404,5 +438,11 @@ mod tests {
     fn ipv6_listener_explicitly_uses_v6_only() {
         assert_eq!(listener_options("[::]:443").unwrap().ipv6_only, Some(true));
         assert_eq!(listener_options("0.0.0.0:443").unwrap().ipv6_only, None);
+    }
+
+    #[test]
+    fn downstream_h2_options_accept_the_fixed_windows() {
+        let _public = public_h2_options(32);
+        let _handoff = handoff_h2_options(64);
     }
 }

@@ -1,7 +1,8 @@
+use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -13,9 +14,35 @@ const RATE_BUCKET_IDLE: Duration = Duration::from_secs(600);
 const RATE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_ACTIVE_COUNTERS: usize = 32_768;
 
+thread_local! {
+    // Worker-local sampling avoids a shared atomic increment on every
+    // rate-limited request. Capacity-full vacant inserts still force a
+    // synchronous idle scan so the map cannot grow without bound.
+    static RATE_CLEANUP_TICK: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Compact admission zone. Hashed as a single byte so route-name strings
+/// stay off the request hot path.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum LimitZone {
+    Global = 0,
+    Static = 1,
+    Http3Connection = 2,
+    NavidromeStream = 3,
+    NavidromeCover = 4,
+    NavidromeApi = 5,
+    VaultwardenAuth = 6,
+    VaultwardenHub = 7,
+    Vaultwarden = 8,
+    Couchdb = 9,
+    Doh = 10,
+    AdguardUi = 11,
+}
+
 #[derive(Clone, Eq)]
 struct ClientKey {
-    zone: &'static str,
+    zone: LimitZone,
     ip: IpAddr,
 }
 
@@ -27,7 +54,7 @@ impl PartialEq for ClientKey {
 
 impl Hash for ClientKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.zone.hash(state);
+        (self.zone as u8).hash(state);
         self.ip.hash(state);
     }
 }
@@ -42,7 +69,6 @@ struct Bucket {
 pub struct RateLimiter {
     buckets: DashMap<ClientKey, Bucket>,
     bucket_count: AtomicUsize,
-    observations: AtomicU64,
     max_buckets: usize,
     last_cleanup: Mutex<Instant>,
 }
@@ -57,7 +83,6 @@ impl RateLimiter {
         Self {
             buckets: DashMap::new(),
             bucket_count: AtomicUsize::new(0),
-            observations: AtomicU64::new(0),
             max_buckets,
             last_cleanup: Mutex::new(now.checked_sub(RATE_CLEANUP_INTERVAL).unwrap_or(now)),
         }
@@ -82,17 +107,16 @@ impl RateLimiter {
         true
     }
 
-    pub fn allow(
-        &self,
-        zone: &'static str,
-        ip: IpAddr,
-        requests_per_second: f64,
-        burst: u32,
-    ) -> bool {
+    pub fn allow(&self, zone: LimitZone, ip: IpAddr, requests_per_second: f64, burst: u32) -> bool {
         debug_assert!(requests_per_second > 0.0);
         let now = Instant::now();
         let capacity = f64::from(burst) + 1.0;
-        if self.observations.fetch_add(1, Ordering::Relaxed) & 0x3fff == 0x3fff {
+        let tick = RATE_CLEANUP_TICK.with(|counter| {
+            let next = counter.get().wrapping_add(1);
+            counter.set(next);
+            next
+        });
+        if tick & 0x3fff == 0x3fff {
             self.cleanup_idle(now);
         }
 
@@ -178,7 +202,7 @@ impl ActiveRequestLimiter {
 
     pub fn acquire(
         &self,
-        zone: &'static str,
+        zone: LimitZone,
         ip: IpAddr,
         limit: usize,
     ) -> Option<ActiveRequestPermit> {
@@ -259,29 +283,29 @@ mod tests {
     fn token_bucket_honors_burst() {
         let limiter = RateLimiter::new();
         let ip = "192.0.2.1".parse().unwrap();
-        assert!(limiter.allow("api", ip, 1.0, 2));
-        assert!(limiter.allow("api", ip, 1.0, 2));
-        assert!(limiter.allow("api", ip, 1.0, 2));
-        assert!(!limiter.allow("api", ip, 1.0, 2));
+        assert!(limiter.allow(LimitZone::NavidromeApi, ip, 1.0, 2));
+        assert!(limiter.allow(LimitZone::NavidromeApi, ip, 1.0, 2));
+        assert!(limiter.allow(LimitZone::NavidromeApi, ip, 1.0, 2));
+        assert!(!limiter.allow(LimitZone::NavidromeApi, ip, 1.0, 2));
     }
 
     #[test]
     fn active_request_permit_releases_capacity() {
         let limiter = ActiveRequestLimiter::new();
         let ip = "192.0.2.2".parse().unwrap();
-        let permit = limiter.acquire("host", ip, 1).unwrap();
-        assert!(limiter.acquire("host", ip, 1).is_none());
+        let permit = limiter.acquire(LimitZone::Vaultwarden, ip, 1).unwrap();
+        assert!(limiter.acquire(LimitZone::Vaultwarden, ip, 1).is_none());
         drop(permit);
-        assert!(limiter.acquire("host", ip, 1).is_some());
+        assert!(limiter.acquire(LimitZone::Vaultwarden, ip, 1).is_some());
     }
 
     #[test]
     fn inactive_active_request_counter_is_reused_without_map_churn() {
         let limiter = ActiveRequestLimiter::new();
         let ip = "192.0.2.4".parse().unwrap();
-        drop(limiter.acquire("api", ip, 1).unwrap());
+        drop(limiter.acquire(LimitZone::NavidromeApi, ip, 1).unwrap());
         assert_eq!(limiter.counters.len(), 1);
-        drop(limiter.acquire("api", ip, 1).unwrap());
+        drop(limiter.acquire(LimitZone::NavidromeApi, ip, 1).unwrap());
         assert_eq!(limiter.counters.len(), 1);
         assert_eq!(limiter.counter_count.load(Ordering::Acquire), 1);
     }
@@ -291,12 +315,12 @@ mod tests {
         let limiter = ActiveRequestLimiter::with_max_counters(1);
         drop(
             limiter
-                .acquire("api", "192.0.2.40".parse().unwrap(), 1)
+                .acquire(LimitZone::NavidromeApi, "192.0.2.40".parse().unwrap(), 1)
                 .unwrap(),
         );
         assert!(
             limiter
-                .acquire("api", "192.0.2.41".parse().unwrap(), 1)
+                .acquire(LimitZone::NavidromeApi, "192.0.2.41".parse().unwrap(), 1)
                 .is_some()
         );
         assert_eq!(limiter.counter_count.load(Ordering::Acquire), 1);
@@ -305,25 +329,40 @@ mod tests {
     #[test]
     fn rate_bucket_capacity_is_bounded_and_fails_closed_for_new_clients() {
         let limiter = RateLimiter::with_max_buckets(1);
-        assert!(limiter.allow("api", "192.0.2.10".parse().unwrap(), 1.0, 0));
-        assert!(!limiter.allow("api", "192.0.2.11".parse().unwrap(), 1.0, 0));
+        assert!(limiter.allow(
+            LimitZone::NavidromeApi,
+            "192.0.2.10".parse().unwrap(),
+            1.0,
+            0
+        ));
+        assert!(!limiter.allow(
+            LimitZone::NavidromeApi,
+            "192.0.2.11".parse().unwrap(),
+            1.0,
+            0
+        ));
     }
 
     #[test]
     fn idle_rate_bucket_is_reclaimed_when_capacity_is_full() {
         let limiter = RateLimiter::with_max_buckets(1);
         let old_ip = "192.0.2.20".parse().unwrap();
-        assert!(limiter.allow("api", old_ip, 1.0, 0));
+        assert!(limiter.allow(LimitZone::NavidromeApi, old_ip, 1.0, 0));
         limiter
             .buckets
             .get_mut(&ClientKey {
-                zone: "api",
+                zone: LimitZone::NavidromeApi,
                 ip: old_ip,
             })
             .unwrap()
             .updated_at = Instant::now() - Duration::from_secs(601);
 
-        assert!(limiter.allow("api", "192.0.2.21".parse().unwrap(), 1.0, 0));
+        assert!(limiter.allow(
+            LimitZone::NavidromeApi,
+            "192.0.2.21".parse().unwrap(),
+            1.0,
+            0
+        ));
         assert_eq!(limiter.bucket_count.load(Ordering::Acquire), 1);
     }
 
@@ -331,10 +370,10 @@ mod tests {
     fn zones_are_isolated_for_the_same_client() {
         let limiter = ActiveRequestLimiter::new();
         let ip = "192.0.2.3".parse().unwrap();
-        let _stream = limiter.acquire("navidrome_stream", ip, 1).unwrap();
-        assert!(limiter.acquire("navidrome_stream", ip, 1).is_none());
-        assert!(limiter.acquire("vaultwarden", ip, 1).is_some());
-        assert!(limiter.acquire("doh", ip, 1).is_some());
+        let _stream = limiter.acquire(LimitZone::NavidromeStream, ip, 1).unwrap();
+        assert!(limiter.acquire(LimitZone::NavidromeStream, ip, 1).is_none());
+        assert!(limiter.acquire(LimitZone::Vaultwarden, ip, 1).is_some());
+        assert!(limiter.acquire(LimitZone::Doh, ip, 1).is_some());
     }
 
     #[test]
@@ -357,7 +396,7 @@ mod tests {
             workers.push(thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..ITERATIONS {
-                    match limiter.acquire("api", ip, 1) {
+                    match limiter.acquire(LimitZone::NavidromeApi, ip, 1) {
                         Some(permit) => {
                             if granted.fetch_add(1, Ordering::AcqRel) != 0 {
                                 violated.store(true, Ordering::Release);

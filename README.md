@@ -16,14 +16,14 @@ HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항�
 ## 주요 기능과 한계
 
 - Cloudflare BoringSSL를 사용하는 rustls와 다운스트림 TLS 1.3 전용 정책
-- HTTP/1.1 및 HTTP/2, 기본 최대 32개 동시 H2 stream(설정으로 1~1024 override)
+- HTTP/1.1 및 HTTP/2, 기본 최대 32개 동시 H2 stream(설정으로 1~1024 override), stream window 256 KiB / connection window 2 MiB / frame 64 KiB
 - upstream HTTP/3/QUIC (`http3`/`http3-preferred`) + connection reuse + replay-safe 0-RTT session resumption
 - QUIC Stateless Retry defaults ON; only a trusted private H3 origin should set `server.http3_stateless_retry: false` when accepted 0-RTT is required
 - IPv4/IPv6 listener와 IPv6 socket의 명시적 `IPV6_V6ONLY=true`
 - Host allowlist, trusted proxy 기반 `X-Forwarded-For`, body 크기 제한
-- 서비스·route별 rate limit 및 active request/H2 stream limit
+- 서비스·route별 rate limit 및 active request/H2 stream limit (H1/H2와 H3 handoff가 같은 process-wide 한도 공유)
 - Navidrome audio 무압축 streaming, Vaultwarden/CouchDB route 압축, DoH 정책
-- PiKKY 정적 파일 gzip/Brotli/Zstd 동적·사전 압축, bounded asset LRU cache
+- PiKKY 정적 파일 gzip/Brotli/Zstd 동적·사전 압축, bounded asset LRU cache, URI path 1초 TTL 캐시
 - Cloudflare BoringSSL TLS 파일 사전 검사와 UID/GID/mode/symlink 대상 진단
 - Rust global allocator로 정적 링크된 Google TCMalloc(8 KiB logical page)
 - UID/GID `10001:10001`, read-only root filesystem, 최소 capability
@@ -255,6 +255,10 @@ upstreams:
 Navidrome/Vaultwarden/CouchDB/AdGuard UI 기본 upstream은 명시적으로 `http1`을
 유지합니다. 설정 변경은 재시작 후 적용됩니다.
 
+다운스트림 H2 receive window는 설정 키 없이 고정합니다. 공개 리스너는 stream
+256 KiB / connection 2 MiB / frame 64 KiB이고, 신뢰 루프백 H3→H2c handoff만
+connection window 4 MiB입니다. 동시 stream 기본값 32는 그대로입니다.
+
 `server.downstream_keepalive_requests`는 downstream HTTP/1.1 connection을 주기적으로
 닫아 connection별 allocation을 회수하는 상한입니다. NGINX와 같은 방식으로 첫 요청을
 포함해 세며 기본값은 500, 허용 범위는 1~1,000,000입니다. 일반 운영에서는 기본값을
@@ -295,7 +299,8 @@ route_limits:
 음수, NaN, infinity 및 1,000,000 초과 값은 거부합니다. Limit 이름의 단위는 TCP
 connection이 아니라 활성 HTTP request이며 HTTP/2에서는 stream입니다. 서비스별
 zone은 서로 격리되고, 전체 IP limit이 필요하면 `server.global_active_requests`를
-별도로 설정합니다. 설정 reload는 아직 지원하지 않으므로 변경 후 재시작해야 합니다.
+별도로 설정합니다. 공개 H1/H2 리스너와 HTTP/3 → H2c handoff는 같은 limiter와
+정적 파일 캐시를 공유하므로 프로토콜을 바꿔 한도를 우회할 수 없습니다. 설정 reload는 아직 지원하지 않으므로 변경 후 재시작해야 합니다.
 정적 파일의 느린 reader가 파일 및 메모리 permit을 독점하지 않도록
 `server.static_active_requests_per_client`는 client IP별 활성 요청을 제한하며 기본값과
 운영 설정은 16입니다.
@@ -359,8 +364,9 @@ typed YAML parser인 `serde-saphyr`로 교체했으며, 직접 코드와 vendore
 범위는 `vendor/pingora-core-0.8.1/README.pingora-patch.md`에 기록합니다.
 
 정적 파일의 Content-Type/Length, ETag, Last-Modified는 asset cache miss 때 한 번
-검증된 HeaderValue로 만들고 hot path에서는 값만 재사용합니다. 경로 canonicalize는
-symlink 교체 경쟁 조건에서도 root 경계 검사를 유지하기 위해 요청마다 수행합니다.
+검증된 HeaderValue로 만들고 hot path에서는 값만 재사용합니다. URI에서 canonical
+path로의 해석은 1초 TTL 캐시를 쓰되, miss와 만료 때는 계속 canonicalize로 root
+경계를 검사합니다. 파일 교체 후 새 ETag는 최대 그 TTL 뒤에 보입니다.
 
 Builder와 runtime은 Debian 13 `trixie-slim`을 사용하고 Actions build마다 base
 manifest를 다시 확인합니다. Rust link는 GNU ld 대신 LLVM `lld`를 사용합니다.

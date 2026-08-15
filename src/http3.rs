@@ -34,7 +34,7 @@ use tokio_quiche::socket::QuicListener;
 use tokio_quiche::{ConnectionParams, ServerH3Driver, listen_with_capabilities};
 
 use crate::config::RuntimeConfig;
-use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, RateLimiter};
+use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, LimitZone, RateLimiter};
 use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
 
 const INTERNAL_MARKER: &str = "x-jbs-http3-internal";
@@ -44,7 +44,6 @@ const HTTP3_MAX_UDP_PAYLOAD_SIZE: usize = 1452;
 const HTTP3_CONTROL_STREAM_LIMIT: u64 = 8;
 const HTTP3_SEND_CAPACITY_FACTOR: f64 = 2.0;
 const HTTP3_MAX_AMPLIFICATION_FACTOR: usize = 3;
-const HTTP3_ADMISSION_ZONE: &str = "http3-connection";
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -108,7 +107,7 @@ impl Http3Admission {
 
     fn admit(&self, peer: SocketAddr) -> Result<ActiveRequestPermit, Http3AdmissionRejection> {
         if !self.rate.allow(
-            HTTP3_ADMISSION_ZONE,
+            LimitZone::Http3Connection,
             peer.ip(),
             self.rate_per_second,
             self.burst,
@@ -116,7 +115,7 @@ impl Http3Admission {
             return Err(Http3AdmissionRejection::RateLimited);
         }
         self.active
-            .acquire(HTTP3_ADMISSION_ZONE, peer.ip(), self.max_active)
+            .acquire(LimitZone::Http3Connection, peer.ip(), self.max_active)
             .ok_or(Http3AdmissionRejection::TooManyConnections)
     }
 }
