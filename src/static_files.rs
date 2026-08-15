@@ -234,17 +234,7 @@ impl StaticFiles {
                 Err(_) => return send_empty(session, 503, &[("retry-after", "1")], tls).await,
             };
             let content_type = content_type(path);
-            return serve_streaming_file(
-                session,
-                path,
-                resolved.length,
-                resolved.modified,
-                &content_type,
-                &method,
-                spa_fallback,
-                tls,
-            )
-            .await;
+            return serve_streaming_file(session, &resolved, &content_type, &method, tls).await;
         }
         let requested_encoding = if resolved.length >= 1024 && compressible_path(path) {
             match negotiation.preferred {
@@ -507,26 +497,22 @@ async fn resolve_path(root: &Path, uri_path: &str) -> Option<(PathBuf, bool)> {
 
 async fn serve_streaming_file(
     session: &mut Session,
-    path: &Path,
-    length: u64,
-    modified: SystemTime,
+    resolved: &ResolvedAsset,
     content_type: &str,
     method: &Method,
-    spa_fallback: bool,
     tls: bool,
 ) -> Result<bool> {
-    let modified_nanos = modified
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let etag = format!("W/\"{:x}-{:x}\"", length, modified_nanos);
+    let path = resolved.path.as_ref();
+    let length = resolved.length;
+    let modified = resolved.modified;
+    let etag = format!("W/\"{:x}-{:x}\"", length, resolved.modified_nanos);
 
     if if_none_match_matches(&session.req_header().headers, etag.as_bytes()) {
         let mut response = ResponseHeader::build(304, Some(8)).unwrap();
         response.insert_header(ETAG, etag)?;
         response.insert_header(LAST_MODIFIED, httpdate::fmt_http_date(modified))?;
         response.insert_header(VARY, ACCEPT_ENCODING_VALUE)?;
-        insert_cache_header(&mut response, path, spa_fallback)?;
+        insert_cache_header(&mut response, path, resolved.spa_fallback)?;
         insert_security_headers(&mut response, tls)?;
         session
             .write_response_header(Box::new(response), true)
@@ -552,7 +538,7 @@ async fn serve_streaming_file(
     response.insert_header(ETAG, etag)?;
     response.insert_header(LAST_MODIFIED, httpdate::fmt_http_date(modified))?;
     response.insert_header(VARY, ACCEPT_ENCODING_VALUE)?;
-    insert_cache_header(&mut response, path, spa_fallback)?;
+    insert_cache_header(&mut response, path, resolved.spa_fallback)?;
     insert_security_headers(&mut response, tls)?;
     session
         .write_response_header(Box::new(response), head || length == 0)

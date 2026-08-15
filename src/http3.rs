@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::convert::Infallible;
 use std::error::Error as StdError;
-use std::net::SocketAddr;
+use std::fmt::Write as _;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
@@ -44,6 +46,19 @@ const HTTP3_MAX_UDP_PAYLOAD_SIZE: usize = 1452;
 const HTTP3_CONTROL_STREAM_LIMIT: u64 = 8;
 const HTTP3_SEND_CAPACITY_FACTOR: f64 = 2.0;
 const HTTP3_MAX_AMPLIFICATION_FACTOR: usize = 3;
+// 1 vCPU / 1 GiB host: enough for Navidrome streams without the crate's
+// 24 MiB connection / 16 MiB stream receive windows.
+const HTTP3_INITIAL_MAX_DATA: u64 = 8 * 1024 * 1024;
+const HTTP3_STREAM_WINDOW: u64 = 2 * 1024 * 1024;
+const HTTP3_MAX_CONNECTION_WINDOW: u64 = 8 * 1024 * 1024;
+const HTTP3_MAX_STREAM_WINDOW: u64 = 4 * 1024 * 1024;
+const HTTP3_CC_BBR2: &str = "bbr2";
+
+thread_local! {
+    static CLIENT_IP_HEADER_CACHE: RefCell<Option<(IpAddr, HeaderValue)>> = const {
+        RefCell::new(None)
+    };
+}
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -131,11 +146,7 @@ pub fn start(runtime: Arc<RuntimeConfig>) -> Result<()> {
     thread::Builder::new()
         .name("jbs-http3".to_string())
         .spawn(move || {
-            let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(worker_threads)
-                .thread_name("jbs-h3-worker")
-                .enable_all()
-                .build();
+            let tokio_runtime = bounded_tokio_runtime(worker_threads, "jbs-h3-worker");
             let result = match tokio_runtime {
                 Ok(tokio_runtime) => tokio_runtime.block_on(run(runtime, ready_tx)),
                 Err(error) => {
@@ -214,15 +225,25 @@ async fn run(
     quic.listen_backlog = server.downstream_max_connections.min(16_384);
     quic.initial_max_streams_bidi = u64::from(server.http3_max_concurrent_streams);
     quic.initial_max_streams_uni = HTTP3_CONTROL_STREAM_LIMIT;
+    quic.initial_max_data = HTTP3_INITIAL_MAX_DATA;
+    quic.initial_max_stream_data_bidi_local = HTTP3_STREAM_WINDOW;
+    quic.initial_max_stream_data_bidi_remote = HTTP3_STREAM_WINDOW;
+    quic.initial_max_stream_data_uni = HTTP3_STREAM_WINDOW;
+    quic.max_connection_window = HTTP3_MAX_CONNECTION_WINDOW;
+    quic.max_stream_window = HTTP3_MAX_STREAM_WINDOW;
     quic.max_recv_udp_payload_size = HTTP3_MAX_UDP_PAYLOAD_SIZE;
     quic.max_send_udp_payload_size = HTTP3_MAX_UDP_PAYLOAD_SIZE;
     quic.discover_path_mtu = true;
     quic.pmtud_max_probes = 3;
+    // BBRv2 keeps lossy mobile paths from collapsing to CUBIC's conservative
+    // window. HyStart++ does not apply to BBR.
+    quic.cc_algorithm = HTTP3_CC_BBR2.to_string();
+    quic.enable_relaxed_loss_threshold = true;
     // Keep QUIC packet sends paced instead of bursty. With the listener socket
     // capabilities enabled above, tokio-quiche can use SO_TXTIME where Linux
     // supports it and falls back to userspace pacing otherwise.
     quic.enable_pacing = true;
-    quic.enable_hystart = true;
+    quic.enable_hystart = false;
     quic.send_capacity_factor = HTTP3_SEND_CAPACITY_FACTOR;
     quic.enable_early_data = allow_early_data;
     quic.disable_active_migration = true;
@@ -261,21 +282,34 @@ async fn run(
     // silent performance regression.
     let client: ProxyClient = Client::builder(TokioExecutor::new())
         .http2_only(true)
-        // Grow loopback H2 flow-control windows for large and
-        // concurrent audio responses instead of stalling on
-        // conservative static defaults.
-        .http2_adaptive_window(true)
+        // Match the trusted H3→H2c handoff windows. Adaptive windows can
+        // grow past the 1 GiB host budget under concurrent audio streams.
+        .http2_adaptive_window(false)
+        .http2_initial_stream_window_size(256 * 1024)
+        .http2_initial_connection_window_size(4 * 1024 * 1024)
+        .http2_max_frame_size(64 * 1024)
         .pool_max_idle_per_host(1)
         .build(connector);
     let internal = server.http3_internal_listen;
     let public_port = runtime
         .http3_public_port()
         .ok_or_else(|| anyhow!("HTTP/3 public port was not configured"))?;
+    let public_port_header = HeaderValue::from_str(&public_port.to_string())
+        .context("HTTP/3 public port is not a valid header value")?;
     let internal_token = runtime
         .http3_internal_token()
         .cloned()
         .ok_or_else(|| anyhow!("HTTP/3 internal token was not initialized"))?;
     let alt_svc = runtime.http3_alt_svc_header().cloned();
+    let internal_uri_prefix = format!("http://{internal}");
+    let shared = Arc::new(Http3Shared {
+        internal_uri_prefix,
+        public_port: public_port_header,
+        internal_token,
+        client,
+        alt_svc,
+        allow_early_data,
+    });
     let max_requests_per_connection = u64::from(server.downstream_keepalive_requests);
     let post_accept_timeout = Duration::from_secs(server.downstream_request_header_timeout_seconds);
     let connection_limit = Arc::new(Semaphore::new(server.downstream_max_connections));
@@ -286,9 +320,7 @@ async fn run(
     ));
 
     for mut listener in listeners {
-        let client = client.clone();
-        let alt_svc = alt_svc.clone();
-        let internal_token = internal_token.clone();
+        let shared = shared.clone();
         let connection_limit = connection_limit.clone();
         let admission = admission.clone();
         tokio::spawn(async move {
@@ -332,12 +364,7 @@ async fn run(
                             controller,
                             Http3ConnectionContext {
                                 peer,
-                                internal,
-                                public_port,
-                                internal_token: internal_token.clone(),
-                                client: client.clone(),
-                                alt_svc: alt_svc.clone(),
-                                allow_early_data,
+                                shared: shared.clone(),
                             },
                             permit,
                             client_permit,
@@ -350,16 +377,18 @@ async fn run(
     }
 
     info!(
-        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} hybrid_pq={} stateless_retry={} max_amplification={} early_data={} migration=false pmtud=true pacing=true socket_offload=auto[gso,gro,so_txtime,rxq_ovfl,pmtu_probe] max_udp_payload={} send_capacity_factor={} admission_rate={}/s burst={} max_connections_per_ip={} handshake_timeout={}s",
+        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} hybrid_pq={} cc={} stateless_retry={} max_amplification={} early_data={} migration=false pmtud=true pacing=true socket_offload=auto[gso,gro,so_txtime,rxq_ovfl,pmtu_probe] max_udp_payload={} send_capacity_factor={} stream_window={} admission_rate={}/s burst={} max_connections_per_ip={} handshake_timeout={}s",
         server.http3_listen,
         internal,
         tokio_quiche::quiche::PROTOCOL_VERSION,
         HYBRID_PQ_GROUPS,
+        HTTP3_CC_BBR2,
         stateless_retry,
         HTTP3_MAX_AMPLIFICATION_FACTOR,
         allow_early_data,
         HTTP3_MAX_UDP_PAYLOAD_SIZE,
         HTTP3_SEND_CAPACITY_FACTOR,
+        HTTP3_STREAM_WINDOW,
         server.http3_connection_rate_per_second,
         server.http3_connection_burst,
         server.http3_max_connections_per_ip,
@@ -370,15 +399,19 @@ async fn run(
     Ok(())
 }
 
-#[derive(Clone)]
-struct Http3ConnectionContext {
-    peer: SocketAddr,
-    internal: SocketAddr,
-    public_port: u16,
+struct Http3Shared {
+    internal_uri_prefix: String,
+    public_port: HeaderValue,
     internal_token: HeaderValue,
     client: ProxyClient,
     alt_svc: Option<HeaderValue>,
     allow_early_data: bool,
+}
+
+#[derive(Clone)]
+struct Http3ConnectionContext {
+    peer: SocketAddr,
+    shared: Arc<Http3Shared>,
 }
 
 async fn handle_connection(
@@ -396,7 +429,7 @@ async fn handle_connection(
                 ..
             } => {
                 if *is_in_early_data
-                    && (!context.allow_early_data
+                    && (!context.shared.allow_early_data
                         || !early_data_request_is_replay_safe(&incoming_headers))
                 {
                     warn!("HTTP/3 unsafe early-data request rejected peer={peer}");
@@ -440,15 +473,7 @@ fn early_data_request_is_replay_safe(incoming: &IncomingH3Headers) -> bool {
 }
 
 async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionContext) {
-    let Http3ConnectionContext {
-        peer,
-        internal,
-        public_port,
-        internal_token,
-        client,
-        alt_svc,
-        allow_early_data: _,
-    } = context;
+    let peer = context.peer;
     let IncomingH3Headers {
         headers,
         send,
@@ -456,45 +481,31 @@ async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionCont
         read_fin,
         ..
     } = incoming;
-    if let Err(error) = proxy_request_inner(
-        headers,
-        send,
-        recv,
-        read_fin,
-        peer,
-        internal,
-        public_port,
-        internal_token,
-        client,
-        alt_svc,
-    )
-    .await
-    {
+    if let Err(error) = proxy_request_inner(headers, send, recv, read_fin, context).await {
         warn!("HTTP/3 stream proxy failed peer={peer}: {error:#}");
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn proxy_request_inner(
     headers: Vec<h3::Header>,
     mut send: OutboundFrameSender,
     recv: tokio_quiche::http3::driver::InboundFrameStream,
     read_fin: bool,
-    peer: SocketAddr,
-    internal: SocketAddr,
-    public_port: u16,
-    internal_token: HeaderValue,
-    client: ProxyClient,
-    alt_svc: Option<HeaderValue>,
+    context: Http3ConnectionContext,
 ) -> Result<()> {
-    let decoded =
-        match decode_request_headers(&headers, peer, internal, public_port, internal_token) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                send_error(&mut send, StatusCode::BAD_REQUEST, "invalid HTTP/3 request").await?;
-                return Err(error);
-            }
-        };
+    let decoded = match decode_request_headers(
+        &headers,
+        context.peer,
+        &context.shared.internal_uri_prefix,
+        &context.shared.public_port,
+        &context.shared.internal_token,
+    ) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            send_error(&mut send, StatusCode::BAD_REQUEST, "invalid HTTP/3 request").await?;
+            return Err(error);
+        }
+    };
     if decoded.method == Method::CONNECT {
         send_error(
             &mut send,
@@ -514,11 +525,14 @@ async fn proxy_request_inner(
         .context("failed to build internal HTTP/3 proxy request")?;
     *request.headers_mut() = decoded.headers;
 
-    let response = tokio::time::timeout(Duration::from_secs(3600), client.request(request))
-        .await
-        .map_err(|_| anyhow!("internal Pingora h2c request timed out"))?
-        .context("internal Pingora h2c request failed")?;
-    forward_response(response, &mut send, alt_svc).await
+    let response = tokio::time::timeout(
+        Duration::from_secs(3600),
+        context.shared.client.request(request),
+    )
+    .await
+    .map_err(|_| anyhow!("internal Pingora h2c request timed out"))?
+    .context("internal Pingora h2c request failed")?;
+    forward_response(response, &mut send, context.shared.alt_svc.clone()).await
 }
 
 struct DecodedRequest {
@@ -530,9 +544,9 @@ struct DecodedRequest {
 fn decode_request_headers(
     headers: &[h3::Header],
     peer: SocketAddr,
-    internal: SocketAddr,
-    public_port: u16,
-    internal_token: HeaderValue,
+    internal_uri_prefix: &str,
+    public_port: &HeaderValue,
+    internal_token: &HeaderValue,
 ) -> Result<DecodedRequest> {
     let mut method = None;
     let mut scheme = None;
@@ -588,27 +602,64 @@ fn decode_request_headers(
     if !path.starts_with('/') {
         bail!("HTTP/3 :path must be origin-form");
     }
-    let uri: Uri = format!("http://{internal}{path}")
-        .parse()
-        .context("failed to construct internal URI")?;
+    let mut uri = String::with_capacity(internal_uri_prefix.len() + path.len());
+    uri.push_str(internal_uri_prefix);
+    uri.push_str(path);
+    let uri: Uri = uri.parse().context("failed to construct internal URI")?;
 
     output.insert(HOST, authority);
-    output.insert(
-        "x-forwarded-for",
-        HeaderValue::from_str(&peer.ip().to_string()).context("invalid client IP header")?,
-    );
+    output.insert("x-forwarded-for", forwarded_client_ip_value(peer.ip())?);
     output.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-    let public_port = HeaderValue::from_str(&public_port.to_string())
-        .context("invalid HTTP/3 public port header")?;
     output.insert("x-forwarded-port", public_port.clone());
-    output.insert(INTERNAL_MARKER, internal_token);
-    output.insert(INTERNAL_PORT, public_port);
+    output.insert(INTERNAL_MARKER, internal_token.clone());
+    output.insert(INTERNAL_PORT, public_port.clone());
 
     Ok(DecodedRequest {
         method,
         uri,
         headers: output,
     })
+}
+
+fn forwarded_client_ip_value(ip: IpAddr) -> Result<HeaderValue> {
+    if let Some(value) = CLIENT_IP_HEADER_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(cached, _)| *cached == ip)
+            .map(|(_, value)| value.clone())
+    }) {
+        return Ok(value);
+    }
+
+    let mut encoded = arrayvec::ArrayString::<46>::new();
+    write!(&mut encoded, "{ip}")
+        .map_err(|error| anyhow!("client IP could not be formatted: {error}"))?;
+    let value = HeaderValue::from_str(&encoded).context("client IP is not a valid header value")?;
+    CLIENT_IP_HEADER_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some((ip, value.clone()));
+    });
+    Ok(value)
+}
+
+fn bounded_tokio_runtime(
+    worker_threads: usize,
+    thread_name: &'static str,
+) -> std::io::Result<tokio::runtime::Runtime> {
+    // A 1 vCPU host already runs Pingora's worker. A second multi-thread
+    // runtime just contends for the same core and pins extra stacks.
+    if worker_threads <= 1 {
+        tokio::runtime::Builder::new_current_thread()
+            .thread_name(thread_name)
+            .enable_all()
+            .build()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .thread_name(thread_name)
+            .enable_all()
+            .build()
+    }
 }
 
 fn forbidden_request_header(name: &HeaderName, value: &[u8]) -> bool {
@@ -773,9 +824,9 @@ mod tests {
             decode_request_headers(
                 &headers,
                 "127.0.0.1:12345".parse().unwrap(),
-                "127.0.0.1:18080".parse().unwrap(),
-                443,
-                HeaderValue::from_static("unit-test-token"),
+                "http://127.0.0.1:18080",
+                &HeaderValue::from_static("443"),
+                &HeaderValue::from_static("unit-test-token"),
             )
             .is_err()
         );
@@ -793,9 +844,9 @@ mod tests {
         let request = decode_request_headers(
             &headers,
             "192.0.2.10:12345".parse().unwrap(),
-            "127.0.0.1:18080".parse().unwrap(),
-            8443,
-            HeaderValue::from_static("unit-test-token"),
+            "http://127.0.0.1:18080",
+            &HeaderValue::from_static("8443"),
+            &HeaderValue::from_static("unit-test-token"),
         )
         .unwrap();
         assert_eq!(request.method, Method::GET);
@@ -808,5 +859,15 @@ mod tests {
         assert_eq!(request.headers["x-forwarded-for"], "192.0.2.10");
         assert_eq!(request.headers["x-forwarded-port"], "8443");
         assert_eq!(request.headers[INTERNAL_PORT], "8443");
+    }
+
+    #[test]
+    fn forwarded_client_ip_header_cache_reuses_the_last_peer() {
+        let ipv4 = "192.0.2.17".parse().unwrap();
+        let ipv6 = "2001:db8::17".parse().unwrap();
+        assert_eq!(forwarded_client_ip_value(ipv4).unwrap(), "192.0.2.17");
+        assert_eq!(forwarded_client_ip_value(ipv4).unwrap(), "192.0.2.17");
+        assert_eq!(forwarded_client_ip_value(ipv6).unwrap(), "2001:db8::17");
+        assert_eq!(forwarded_client_ip_value(ipv4).unwrap(), "192.0.2.17");
     }
 }

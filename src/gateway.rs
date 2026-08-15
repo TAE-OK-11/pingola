@@ -349,6 +349,7 @@ pub struct Gateway {
 }
 
 impl Gateway {
+    #[cfg(test)]
     pub fn new(
         runtime: Arc<RuntimeConfig>,
         upstream_h3: Arc<UpstreamH3Registry>,
