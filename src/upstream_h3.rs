@@ -21,7 +21,6 @@ use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use log::{info, warn};
-use parking_lot::Mutex;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_quiche::quiche;
@@ -246,7 +245,7 @@ fn upstream_server_name(name: &str, upstream: &UpstreamConfig) -> Result<String>
 #[derive(Clone)]
 struct H3Pool {
     commands: mpsc::Sender<Command>,
-    next_id: Arc<AtomicU64>,
+    next_id: AtomicU64,
     request_slots: Arc<Semaphore>,
 }
 
@@ -255,7 +254,7 @@ impl H3Pool {
         let (commands, receiver) = mpsc::channel(MAX_REQUEST_COMMANDS);
         let pool = Arc::new(Self {
             commands,
-            next_id: Arc::new(AtomicU64::new(1)),
+            next_id: AtomicU64::new(1),
             request_slots: Arc::new(Semaphore::new(MAX_PENDING_REQUESTS)),
         });
         tokio::spawn(pool_manager(settings, receiver, available));
@@ -460,12 +459,14 @@ async fn pool_manager(
     mut commands: mpsc::Receiver<Command>,
     available: Arc<AtomicBool>,
 ) {
-    let session = Arc::new(Mutex::new(None::<Vec<u8>>));
+    // The pool manager owns the cached ticket and invokes one QUIC connection
+    // at a time, so this state is never concurrently accessed. Keep it local
+    // instead of paying Arc/Mutex operations during reconnect/session updates.
+    let mut session = None::<Vec<u8>>;
     let mut connected_once = false;
     let mut reconnect_delay = MIN_RECONNECT_DELAY;
     loop {
-        let can_resume_early =
-            connected_once && settings.enable_early_data && session.lock().is_some();
+        let can_resume_early = connected_once && settings.enable_early_data && session.is_some();
         let initial_command = if can_resume_early {
             available.store(true, Ordering::Release);
             match commands.recv().await {
@@ -478,7 +479,7 @@ async fn pool_manager(
 
         let result = run_connection(
             &settings,
-            &session,
+            &mut session,
             &mut commands,
             available.clone(),
             initial_command,
@@ -526,7 +527,7 @@ fn reconnect_delay_from_sample(delay: Duration, sample: u16) -> Duration {
 
 async fn run_connection(
     settings: &BridgeSettings,
-    session: &Arc<Mutex<Option<Vec<u8>>>>,
+    session: &mut Option<Vec<u8>>,
     commands: &mut mpsc::Receiver<Command>,
     available: Arc<AtomicBool>,
     initial_command: Option<Command>,
@@ -600,11 +601,10 @@ async fn run_connection(
     )
     .with_context(|| format!("failed to create QUIC connection for {}", settings.name))?;
 
-    let cached_session = session.lock().clone();
-    if let Some(cached_session) = cached_session.as_deref()
+    if let Some(cached_session) = session.as_deref()
         && let Err(error) = conn.set_session(cached_session)
     {
-        *session.lock() = None;
+        *session = None;
         bail!("cached upstream QUIC session was rejected and invalidated: {error}");
     }
 
@@ -665,27 +665,24 @@ async fn run_connection(
                     );
                     established_logged = true;
                 }
-                if let Some(new_session) = conn.session() {
-                    let mut cache = session.lock();
-                    if cache.as_deref() != Some(new_session) {
-                        *cache = Some(new_session.to_vec());
-                        if !session_logged {
-                            info!(
-                                "upstream HTTP/3 session ticket cached upstream={}",
-                                settings.name
-                            );
-                            session_logged = true;
-                        }
+                if let Some(new_session) = conn.session()
+                    && session.as_deref() != Some(new_session)
+                {
+                    *session = Some(new_session.to_vec());
+                    if !session_logged {
+                        info!(
+                            "upstream HTTP/3 session ticket cached upstream={}",
+                            settings.name
+                        );
+                        session_logged = true;
                     }
                 }
             }
 
             let response_backpressured = if let Some(h3_conn) = h3_conn.as_mut() {
-                cancel_abandoned_responses(
-                    &mut conn,
-                    &mut requests,
-                    &mut stream_to_request,
-                );
+                // Drop paths enqueue explicit Cancel commands. Avoid scanning and
+                // allocating a temporary list of every active request on each
+                // QUIC event-loop turn just to rediscover the same cancellations.
                 dispatch_waiting(
                     h3_conn,
                     &mut conn,
@@ -1147,33 +1144,6 @@ fn process_h3_events(
         }
     }
     Ok(false)
-}
-
-fn cancel_abandoned_responses(
-    conn: &mut quiche::Connection,
-    requests: &mut HashMap<u64, PendingRequest>,
-    stream_to_request: &mut HashMap<u64, u64>,
-) {
-    let abandoned: Vec<_> = requests
-        .iter()
-        .filter_map(|(&id, request)| {
-            let response_dropped = request
-                .response
-                .as_ref()
-                .is_some_and(oneshot::Sender::is_closed);
-            (response_dropped || (request.response_started && request.body_tx.is_closed()))
-                .then_some(id)
-        })
-        .collect();
-    for id in abandoned {
-        cancel_request(
-            id,
-            "downstream dropped HTTP/3 response",
-            conn,
-            requests,
-            stream_to_request,
-        );
-    }
 }
 
 fn cancel_request(
