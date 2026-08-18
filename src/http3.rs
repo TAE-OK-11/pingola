@@ -285,8 +285,8 @@ async fn run(
         // Match the trusted H3→H2c handoff windows. Adaptive windows can
         // grow past the 1 GiB host budget under concurrent audio streams.
         .http2_adaptive_window(false)
-        .http2_initial_stream_window_size(256 * 1024)
-        .http2_initial_connection_window_size(4 * 1024 * 1024)
+        .http2_initial_stream_window_size(2 * 1024 * 1024)
+        .http2_initial_connection_window_size(32 * 1024 * 1024)
         .http2_max_frame_size(64 * 1024)
         .pool_max_idle_per_host(1)
         .build(connector);

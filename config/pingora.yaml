@@ -16,7 +16,7 @@ server:
   certificate: /etc/pingora/cert/live/tae00217.cloud/fullchain.pem
   private_key: /etc/pingora/cert/live/tae00217.cloud/privkey.pem
   threads: 1
-  upstream_keepalive_pool_size: 128
+  upstream_keepalive_pool_size: 512
   downstream_keepalive_requests: 500
   max_retries: 2
   graceful_shutdown_timeout_seconds: 5
@@ -77,13 +77,16 @@ upstreams:
     address: "10.77.0.1:1852"
     tls: true
     protocol: auto
-    http2_max_concurrent_streams: 64
+    http2_max_concurrent_streams: 256
+    http2_stream_window_bytes: 16777216
+    http2_connection_window_bytes: 67108864
+    http2_ping_interval_seconds: 30
     sni: direct.tae00217.cloud
     verify_certificate: true
     connect_timeout_seconds: 2
     read_timeout_seconds: 30
     write_timeout_seconds: 30
-    idle_timeout_seconds: 30
+    idle_timeout_seconds: 300
   adguard_korea:
     address: "127.0.0.1:3333"
     protocol: http1
@@ -91,13 +94,16 @@ upstreams:
     address: "127.0.0.1:1852"
     tls: true
     protocol: auto
-    http2_max_concurrent_streams: 64
+    http2_max_concurrent_streams: 256
+    http2_stream_window_bytes: 16777216
+    http2_connection_window_bytes: 67108864
+    http2_ping_interval_seconds: 30
     sni: direct.tae00217.cloud
     verify_certificate: true
     connect_timeout_seconds: 2
     read_timeout_seconds: 30
     write_timeout_seconds: 30
-    idle_timeout_seconds: 30
+    idle_timeout_seconds: 300
 
 hosts:
   pikky:

@@ -16,7 +16,7 @@ fn default_threads() -> usize {
 }
 
 fn default_keepalive_pool() -> usize {
-    128
+    512
 }
 
 fn default_downstream_keepalive_requests() -> u32 {
@@ -108,11 +108,23 @@ fn default_idle_timeout() -> u64 {
 }
 
 fn default_upstream_http2_streams() -> usize {
-    32
+    128
+}
+
+fn default_upstream_http2_stream_window_bytes() -> u32 {
+    16 * 1024 * 1024
+}
+
+fn default_upstream_http2_connection_window_bytes() -> u32 {
+    64 * 1024 * 1024
+}
+
+fn default_upstream_http2_ping_interval_seconds() -> u64 {
+    30
 }
 
 fn default_upstream_http3_streams() -> usize {
-    64
+    128
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -197,6 +209,12 @@ pub struct UpstreamConfig {
     pub protocol: UpstreamProtocol,
     #[serde(default = "default_upstream_http2_streams")]
     pub http2_max_concurrent_streams: usize,
+    #[serde(default = "default_upstream_http2_stream_window_bytes")]
+    pub http2_stream_window_bytes: u32,
+    #[serde(default = "default_upstream_http2_connection_window_bytes")]
+    pub http2_connection_window_bytes: u32,
+    #[serde(default = "default_upstream_http2_ping_interval_seconds")]
+    pub http2_ping_interval_seconds: u64,
     #[serde(default = "default_upstream_http3_streams")]
     pub http3_max_concurrent_streams: usize,
     #[serde(default)]
@@ -580,6 +598,21 @@ fn validate(config: &Config) -> Result<()> {
         if !(1..=1024).contains(&upstream.http2_max_concurrent_streams) {
             bail!("upstream {name} http2_max_concurrent_streams must be between 1 and 1024");
         }
+        const H2_MAX_WINDOW_SIZE: u32 = (1_u32 << 31) - 1;
+        if !(1..=H2_MAX_WINDOW_SIZE).contains(&upstream.http2_stream_window_bytes) {
+            bail!("upstream {name} http2_stream_window_bytes must be between 1 and 2^31-1");
+        }
+        if !(1..=H2_MAX_WINDOW_SIZE).contains(&upstream.http2_connection_window_bytes) {
+            bail!("upstream {name} http2_connection_window_bytes must be between 1 and 2^31-1");
+        }
+        if upstream.http2_connection_window_bytes < upstream.http2_stream_window_bytes {
+            bail!(
+                "upstream {name} http2_connection_window_bytes must be at least http2_stream_window_bytes"
+            );
+        }
+        if upstream.http2_ping_interval_seconds > 3600 {
+            bail!("upstream {name} http2_ping_interval_seconds must not exceed 3600");
+        }
         if !(1..=1024).contains(&upstream.http3_max_concurrent_streams) {
             bail!("upstream {name} http3_max_concurrent_streams must be between 1 and 1024");
         }
@@ -765,7 +798,10 @@ hosts:
     fn parses_upstream_protocol_policy() {
         let automatic: UpstreamConfig = serde_saphyr::from_str("address: 127.0.0.1:9000").unwrap();
         assert_eq!(automatic.protocol, UpstreamProtocol::Auto);
-        assert_eq!(automatic.http2_max_concurrent_streams, 32);
+        assert_eq!(automatic.http2_max_concurrent_streams, 128);
+        assert_eq!(automatic.http2_stream_window_bytes, 16 * 1024 * 1024);
+        assert_eq!(automatic.http2_connection_window_bytes, 64 * 1024 * 1024);
+        assert_eq!(automatic.http2_ping_interval_seconds, 30);
         assert!(!automatic.http3_bbr2);
 
         let h2c: UpstreamConfig = serde_saphyr::from_str(
