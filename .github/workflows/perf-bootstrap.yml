@@ -1,0 +1,378 @@
+name: upstream-transport-perf-bootstrap
+
+on:
+  push:
+    branches: [perf/simplify-hotpaths-20260818]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: perf/simplify-hotpaths-20260818
+          fetch-depth: 0
+
+      - name: Apply bounded upstream H2/H3 performance tuning
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, found {count}: {old[:80]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          # High-capacity defaults for connection pooling and multiplexing.
+          replace_once('src/config.rs',
+          '''fn default_keepalive_pool() -> usize {
+              128
+          }''',
+          '''fn default_keepalive_pool() -> usize {
+              512
+          }''')
+          replace_once('src/config.rs',
+          '''fn default_upstream_http2_streams() -> usize {
+              32
+          }
+
+          fn default_upstream_http3_streams() -> usize {
+              64
+          }''',
+          '''fn default_upstream_http2_streams() -> usize {
+              128
+          }
+
+          fn default_upstream_http2_stream_window_bytes() -> u32 {
+              16 * 1024 * 1024
+          }
+
+          fn default_upstream_http2_connection_window_bytes() -> u32 {
+              64 * 1024 * 1024
+          }
+
+          fn default_upstream_http2_ping_interval_seconds() -> u64 {
+              30
+          }
+
+          fn default_upstream_http3_streams() -> usize {
+              128
+          }''')
+          replace_once('src/config.rs',
+          '''    #[serde(default = "default_upstream_http2_streams")]
+              pub http2_max_concurrent_streams: usize,
+              #[serde(default = "default_upstream_http3_streams")]''',
+          '''    #[serde(default = "default_upstream_http2_streams")]
+              pub http2_max_concurrent_streams: usize,
+              #[serde(default = "default_upstream_http2_stream_window_bytes")]
+              pub http2_stream_window_bytes: u32,
+              #[serde(default = "default_upstream_http2_connection_window_bytes")]
+              pub http2_connection_window_bytes: u32,
+              #[serde(default = "default_upstream_http2_ping_interval_seconds")]
+              pub http2_ping_interval_seconds: u64,
+              #[serde(default = "default_upstream_http3_streams")]''')
+          replace_once('src/config.rs',
+          '''        if !(1..=1024).contains(&upstream.http2_max_concurrent_streams) {
+                  bail!("upstream {name} http2_max_concurrent_streams must be between 1 and 1024");
+              }
+              if !(1..=1024).contains(&upstream.http3_max_concurrent_streams) {''',
+          '''        if !(1..=1024).contains(&upstream.http2_max_concurrent_streams) {
+                  bail!("upstream {name} http2_max_concurrent_streams must be between 1 and 1024");
+              }
+              const H2_MAX_WINDOW_SIZE: u32 = (1_u32 << 31) - 1;
+              if !(1..=H2_MAX_WINDOW_SIZE).contains(&upstream.http2_stream_window_bytes) {
+                  bail!("upstream {name} http2_stream_window_bytes must be between 1 and 2^31-1");
+              }
+              if !(1..=H2_MAX_WINDOW_SIZE).contains(&upstream.http2_connection_window_bytes) {
+                  bail!("upstream {name} http2_connection_window_bytes must be between 1 and 2^31-1");
+              }
+              if upstream.http2_connection_window_bytes < upstream.http2_stream_window_bytes {
+                  bail!("upstream {name} http2_connection_window_bytes must be at least http2_stream_window_bytes");
+              }
+              if upstream.http2_ping_interval_seconds > 3600 {
+                  bail!("upstream {name} http2_ping_interval_seconds must not exceed 3600");
+              }
+              if !(1..=1024).contains(&upstream.http3_max_concurrent_streams) {''')
+          replace_once('src/config.rs',
+          '''        assert_eq!(automatic.http2_max_concurrent_streams, 32);
+                  assert!(!automatic.http3_bbr2);''',
+          '''        assert_eq!(automatic.http2_max_concurrent_streams, 128);
+                  assert_eq!(automatic.http2_stream_window_bytes, 16 * 1024 * 1024);
+                  assert_eq!(automatic.http2_connection_window_bytes, 64 * 1024 * 1024);
+                  assert_eq!(automatic.http2_ping_interval_seconds, 30);
+                  assert!(!automatic.http3_bbr2);''')
+
+          # Backport Cloudflare main's configurable upstream H2 receive windows.
+          replace_once('vendor/pingora-core-0.8.1/src/upstreams/peer.rs',
+          '''    // how many concurrent h2 stream are allowed in the same connection
+              pub max_h2_streams: usize,
+              /// Allow invalid Content-Length in HTTP/1 responses (non-RFC compliant).''',
+          '''    // how many concurrent h2 stream are allowed in the same connection
+              pub max_h2_streams: usize,
+              /// Initial per-stream H2 receive window size in bytes.
+              /// If `None`, the default of 8MB is used.
+              pub h2_stream_window_size: Option<u32>,
+              /// Initial connection-level H2 receive window size in bytes.
+              /// If `None`, the default of 8MB is used.
+              pub h2_connection_window_size: Option<u32>,
+              /// Allow invalid Content-Length in HTTP/1 responses (non-RFC compliant).''')
+          replace_once('vendor/pingora-core-0.8.1/src/upstreams/peer.rs',
+          '''            max_h2_streams: 1,
+                      allow_h1_response_invalid_content_length: false,''',
+          '''            max_h2_streams: 1,
+                      h2_stream_window_size: None,
+                      h2_connection_window_size: None,
+                      allow_h1_response_invalid_content_length: false,''')
+
+          replace_once('vendor/pingora-core-0.8.1/src/connectors/http/v2.rs',
+          '''        let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
+                  let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval()).await?;''',
+          '''        let peer_options = peer.get_peer_options();
+                  let mut settings = H2HandshakeSettings::new();
+                  settings.max_streams = peer_options.map_or(1, |o| o.max_h2_streams);
+                  settings.ping_interval = peer.h2_ping_interval();
+                  settings.stream_window_size = peer_options.and_then(|o| o.h2_stream_window_size);
+                  settings.connection_window_size =
+                      peer_options.and_then(|o| o.h2_connection_window_size);
+                  let conn = handshake(stream, settings).await?;''')
+          replace_once('vendor/pingora-core-0.8.1/src/connectors/http/v2.rs',
+          '''            #[cfg(unix)]
+                      if !peer.matches_fd(conn.id()) {
+                          return Ok(None);
+                      }''',
+          '''            #[cfg(unix)]
+                      {
+                          let cached_peer_matches = conn
+                              .digest()
+                              .socket_digest
+                              .as_ref()
+                              .is_some_and(|digest| peer.matches_cached_peer_addr(digest.peer_addr()));
+                          if !cached_peer_matches && !peer.matches_fd(conn.id()) {
+                              return Ok(None);
+                          }
+                      }''')
+          replace_once('vendor/pingora-core-0.8.1/src/connectors/http/v2.rs',
+          '''const H2_WINDOW_SIZE: u32 = 1 << 23;
+
+          pub async fn handshake(
+              stream: Stream,
+              max_streams: usize,
+              h2_ping_interval: Option<Duration>,
+          ) -> Result<ConnectionRef> {
+              use h2::client::Builder;
+              use pingora_runtime::current_handle;
+
+              // Safe guard: new_http_session() assumes there should be at least one free stream
+              if max_streams == 0 {
+                  return Error::e_explain(H2Error, "zero max_stream configured");
+              }
+
+              let id = stream.id();''',
+          '''const H2_WINDOW_SIZE: u32 = 1 << 23;
+
+          /// Maximum allowed H2 window size per RFC 9113 section 6.9.1.
+          const H2_MAX_WINDOW_SIZE: u32 = (1_u32 << 31) - 1;
+
+          #[derive(Debug, Clone, Default)]
+          #[non_exhaustive]
+          pub struct H2HandshakeSettings {
+              pub max_streams: usize,
+              pub ping_interval: Option<Duration>,
+              pub stream_window_size: Option<u32>,
+              pub connection_window_size: Option<u32>,
+          }
+
+          impl H2HandshakeSettings {
+              pub fn new() -> Self {
+                  Self::default()
+              }
+          }
+
+          pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<ConnectionRef> {
+              use h2::client::Builder;
+              use pingora_runtime::current_handle;
+
+              let max_streams = settings.max_streams;
+              // Safe guard: new_http_session() assumes there should be at least one free stream
+              if max_streams == 0 {
+                  return Error::e_explain(H2Error, "zero max_stream configured");
+              }
+              if settings
+                  .stream_window_size
+                  .is_some_and(|window| window == 0 || window > H2_MAX_WINDOW_SIZE)
+              {
+                  return Error::e_explain(
+                      H2Error,
+                      format!("stream_window_size must be between 1 and {H2_MAX_WINDOW_SIZE}"),
+                  );
+              }
+              if settings
+                  .connection_window_size
+                  .is_some_and(|window| window == 0 || window > H2_MAX_WINDOW_SIZE)
+              {
+                  return Error::e_explain(
+                      H2Error,
+                      format!("connection_window_size must be between 1 and {H2_MAX_WINDOW_SIZE}"),
+                  );
+              }
+
+              let id = stream.id();''')
+          replace_once('vendor/pingora-core-0.8.1/src/connectors/http/v2.rs',
+          '''    // TODO: make these configurable
+              let (send_req, connection) = Builder::new()
+                  .enable_push(false)
+                  .initial_max_send_streams(max_streams)
+                  // The limit for the server. Server push is not allowed, so this value doesn't matter
+                  .max_concurrent_streams(1)
+                  .max_frame_size(64 * 1024) // advise server to send larger frames
+                  .initial_window_size(H2_WINDOW_SIZE)
+                  // should this be max_streams * H2_WINDOW_SIZE?
+                  .initial_connection_window_size(H2_WINDOW_SIZE)''',
+          '''    let stream_window = settings.stream_window_size.unwrap_or(H2_WINDOW_SIZE);
+              let connection_window = settings.connection_window_size.unwrap_or(H2_WINDOW_SIZE);
+              let (send_req, connection) = Builder::new()
+                  .enable_push(false)
+                  .initial_max_send_streams(max_streams)
+                  // The limit for the server. Server push is not allowed, so this value doesn't matter
+                  .max_concurrent_streams(1)
+                  .max_frame_size(64 * 1024) // advise server to send larger frames
+                  .initial_window_size(stream_window)
+                  .initial_connection_window_size(connection_window)''')
+          replace_once('vendor/pingora-core-0.8.1/src/connectors/http/v2.rs',
+          '''            h2_ping_interval,
+                      ping_timeout_clone,''',
+          '''            settings.ping_interval,
+                      ping_timeout_clone,''')
+
+          # Apply the new H2 controls to immutable prepared upstream peers.
+          replace_once('src/gateway.rs',
+          '''    peer.options.max_h2_streams = upstream.http2_max_concurrent_streams;
+              peer.options.tcp_keepalive = Some(TcpKeepalive {''',
+          '''    peer.options.max_h2_streams = upstream.http2_max_concurrent_streams;
+              peer.options.h2_stream_window_size = Some(upstream.http2_stream_window_bytes);
+              peer.options.h2_connection_window_size = Some(upstream.http2_connection_window_bytes);
+              peer.options.h2_ping_interval = (upstream.http2_ping_interval_seconds > 0)
+                  .then_some(Duration::from_secs(upstream.http2_ping_interval_seconds));
+              peer.options.tcp_keepalive = Some(TcpKeepalive {''')
+          replace_once('src/gateway.rs',
+          '''        peer.options.alpn = ALPN::H2;
+                  peer.options.max_h2_streams = upstream.http3_max_concurrent_streams;
+                  PreparedH3Peer {''',
+          '''        peer.options.alpn = ALPN::H2;
+                  peer.options.max_h2_streams = upstream.http3_max_concurrent_streams;
+                  // This trusted loopback H2c hop must not become the bottleneck for
+                  // a high-bandwidth QUIC upstream response.
+                  peer.options.h2_stream_window_size = Some(2 * 1024 * 1024);
+                  peer.options.h2_connection_window_size = Some(32 * 1024 * 1024);
+                  PreparedH3Peer {''')
+          replace_once('src/gateway.rs',
+          '''        assert_eq!(prepared.peer.options.max_h2_streams, 32);
+          ''',
+          '''        assert_eq!(prepared.peer.options.max_h2_streams, 128);
+                  assert_eq!(prepared.peer.options.h2_stream_window_size, Some(16 * 1024 * 1024));
+                  assert_eq!(
+                      prepared.peer.options.h2_connection_window_size,
+                      Some(64 * 1024 * 1024)
+                  );
+                  assert_eq!(prepared.peer.options.h2_ping_interval, Some(Duration::from_secs(30)));
+          ''')
+
+          # Increase only the trusted H3 -> local H2c handoff windows. Public H2 stays bounded.
+          replace_once('src/main.rs',
+          '''fn handoff_h2_options(max_concurrent_streams: u32) -> H2Options {
+              configure_h2_options(
+                  max_concurrent_streams,
+                  64 * 1024,
+                  256 * 1024,
+                  4 * 1024 * 1024,
+              )
+          }''',
+          '''fn handoff_h2_options(max_concurrent_streams: u32) -> H2Options {
+              configure_h2_options(
+                  max_concurrent_streams,
+                  64 * 1024,
+                  2 * 1024 * 1024,
+                  32 * 1024 * 1024,
+              )
+          }''')
+          replace_once('src/http3.rs',
+          '''        .http2_initial_stream_window_size(256 * 1024)
+                  .http2_initial_connection_window_size(4 * 1024 * 1024)''',
+          '''        .http2_initial_stream_window_size(2 * 1024 * 1024)
+                  .http2_initial_connection_window_size(32 * 1024 * 1024)''')
+
+          # Upstream QUIC gets more connection-level BDP headroom and queue capacity.
+          replace_once('src/upstream_h3.rs',
+          '''const MAX_REQUEST_COMMANDS: usize = 256;
+          const MAX_PENDING_REQUESTS: usize = 256;''',
+          '''const MAX_REQUEST_COMMANDS: usize = 512;
+          const MAX_PENDING_REQUESTS: usize = 512;''')
+          replace_once('src/upstream_h3.rs',
+          '''const INITIAL_MAX_DATA: u64 = 64 * 1024 * 1024;''',
+          '''const INITIAL_MAX_DATA: u64 = 128 * 1024 * 1024;''')
+          replace_once('src/upstream_h3.rs',
+          '''const SEND_CAPACITY_FACTOR: f64 = 2.0;''',
+          '''const SEND_CAPACITY_FACTOR: f64 = 3.0;''')
+
+          # Tune the shipped production profile for the larger proxy host while
+          # keeping services that are explicitly H1 on their current protocol.
+          replace_once('config/pingora.yaml', '  upstream_keepalive_pool_size: 128\n', '  upstream_keepalive_pool_size: 512\n')
+          replace_once('config/pingora.yaml',
+          '''    http2_max_concurrent_streams: 64
+              sni: direct.tae00217.cloud
+              verify_certificate: true
+              connect_timeout_seconds: 2
+              read_timeout_seconds: 30
+              write_timeout_seconds: 30
+              idle_timeout_seconds: 30''',
+          '''    http2_max_concurrent_streams: 256
+              http2_stream_window_bytes: 16777216
+              http2_connection_window_bytes: 67108864
+              http2_ping_interval_seconds: 30
+              sni: direct.tae00217.cloud
+              verify_certificate: true
+              connect_timeout_seconds: 2
+              read_timeout_seconds: 30
+              write_timeout_seconds: 30
+              idle_timeout_seconds: 300''')
+          # There are two DoH upstreams with the same block; replace the second one too.
+          p = Path('config/pingora.yaml')
+          text = p.read_text()
+          old = '''    http2_max_concurrent_streams: 64
+              sni: direct.tae00217.cloud
+              verify_certificate: true
+              connect_timeout_seconds: 2
+              read_timeout_seconds: 30
+              write_timeout_seconds: 30
+              idle_timeout_seconds: 30'''
+          new = '''    http2_max_concurrent_streams: 256
+              http2_stream_window_bytes: 16777216
+              http2_connection_window_bytes: 67108864
+              http2_ping_interval_seconds: 30
+              sni: direct.tae00217.cloud
+              verify_certificate: true
+              connect_timeout_seconds: 2
+              read_timeout_seconds: 30
+              write_timeout_seconds: 30
+              idle_timeout_seconds: 300'''
+          if text.count(old) != 1:
+              raise SystemExit(f'config/pingora.yaml: expected remaining DoH block once, got {text.count(old)}')
+          p.write_text(text.replace(old, new, 1))
+          PY
+
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+          cargo +1.97.1 fmt --all
+          git diff --check
+          git rm .github/workflows/perf-bootstrap.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/config.rs src/gateway.rs src/main.rs src/http3.rs src/upstream_h3.rs config/pingora.yaml vendor/pingora-core-0.8.1/src/upstreams/peer.rs vendor/pingora-core-0.8.1/src/connectors/http/v2.rs .github/workflows/perf-bootstrap.yml
+          git commit -m "perf: raise upstream H2 and H3 transport capacity"
+          git push origin HEAD:perf/simplify-hotpaths-20260818
