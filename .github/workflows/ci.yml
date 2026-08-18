@@ -21,27 +21,13 @@ jobs:
 
       - name: Apply upstream transport performance patch
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          source = Path('.github/workflows/perf-bootstrap.yml').read_text()
-          marker = "          python3 - <<'PY'\n"
-          start = source.index(marker) + len(marker)
-          end = source.index("\n          PY", start)
-          script = source[start:end]
-          lines = []
-          for line in script.splitlines():
-              if line.startswith('          '):
-                  line = line[10:]
-              lines.append(line)
-          exec(compile('\n'.join(lines), 'perf-bootstrap.py', 'exec'))
-          PY
-
+          python3 .github/perf_patch.py
           rustup toolchain install 1.97.1 --profile minimal --component rustfmt
           cargo +1.97.1 fmt --all
           git diff --check
 
-          git rm .github/workflows/perf-bootstrap.yml
-          git checkout HEAD^ -- .github/workflows/ci.yml
+          git rm .github/workflows/perf-bootstrap.yml .github/perf_patch.py
+          git checkout HEAD^^^ -- .github/workflows/ci.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
