@@ -104,9 +104,7 @@ impl PathCache {
             .map(|host| {
                 (
                     host,
-                    Mutex::new(LruCache::new(
-                        NonZeroUsize::new(per_host_capacity).unwrap(),
-                    )),
+                    Mutex::new(LruCache::new(NonZeroUsize::new(per_host_capacity).unwrap())),
                 )
             })
             .collect();
