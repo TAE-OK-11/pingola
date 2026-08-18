@@ -4,7 +4,7 @@ use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use cloudflare_pingora::Result;
@@ -28,6 +28,8 @@ const MAX_BUFFERED_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_ACTIVE_STATIC_REQUESTS: usize = 256;
 const MAX_ACTIVE_STATIC_STREAMS: usize = 32;
+const PATH_CACHE_TTL: Duration = Duration::from_secs(1);
+const MAX_PATH_CACHE_ENTRIES: usize = 256;
 const ZERO: HeaderValue = HeaderValue::from_static("0");
 const ACCEPT_ENCODING_VALUE: HeaderValue = HeaderValue::from_static("Accept-Encoding");
 const NO_CACHE: HeaderValue = HeaderValue::from_static("no-cache");
@@ -67,10 +69,54 @@ impl Encoding {
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct CacheKey {
-    path: PathBuf,
+    path: Arc<Path>,
     modified_nanos: u128,
     length: u64,
     encoding: Encoding,
+}
+
+#[derive(Clone)]
+struct ResolvedAsset {
+    path: Arc<Path>,
+    spa_fallback: bool,
+    length: u64,
+    modified: SystemTime,
+    modified_nanos: u128,
+}
+
+struct CachedPath {
+    asset: ResolvedAsset,
+    expires_at: Instant,
+}
+
+struct PathCache {
+    entries: Mutex<LruCache<(String, String), CachedPath>>,
+}
+
+impl PathCache {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MAX_PATH_CACHE_ENTRIES).unwrap(),
+            )),
+        }
+    }
+
+    fn get(&self, host: &str, uri: &str, now: Instant) -> Option<ResolvedAsset> {
+        let mut entries = self.entries.lock();
+        let cached = entries.get(&(host.to_string(), uri.to_string()))?;
+        (cached.expires_at > now).then(|| cached.asset.clone())
+    }
+
+    fn insert(&self, host: &str, uri: &str, asset: ResolvedAsset, now: Instant) {
+        self.entries.lock().put(
+            (host.to_string(), uri.to_string()),
+            CachedPath {
+                asset,
+                expires_at: now + PATH_CACHE_TTL,
+            },
+        );
+    }
 }
 
 struct CachedAsset {
@@ -128,6 +174,7 @@ impl AssetCache {
 pub struct StaticFiles {
     roots: HashMap<String, PathBuf>,
     cache: AssetCache,
+    paths: PathCache,
     cold_read_slot: Semaphore,
     request_slots: Semaphore,
     stream_slots: Semaphore,
@@ -148,6 +195,7 @@ impl StaticFiles {
         Ok(Self {
             roots: canonical_roots,
             cache: AssetCache::new(cache_bytes),
+            paths: PathCache::new(),
             // Bound whole-file allocations as well as CPU-heavy compression.
             cold_read_slot: Semaphore::new(1),
             // HTTP/2 and HTTP/3 multiplexing means a socket limit alone does
@@ -171,21 +219,13 @@ impl StaticFiles {
             return send_empty(session, 500, &[], tls).await;
         };
         let uri_path = session.req_header().uri.path();
-        let Some((path, spa_fallback)) = resolve_path(root, uri_path).await else {
+        let Some(resolved) = self.resolve_cached(host_name, root, uri_path).await else {
             return send_empty(session, 404, &[], tls).await;
         };
-
-        let metadata = match tokio::fs::metadata(&path).await {
-            Ok(metadata) if metadata.is_file() => metadata,
-            _ => return send_empty(session, 404, &[], tls).await,
-        };
-        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-        let modified_nanos = modified
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
+        let path = resolved.path.as_ref();
+        let spa_fallback = resolved.spa_fallback;
         let negotiation = negotiate(session.req_header().headers.get_all(ACCEPT_ENCODING).iter());
-        if metadata.len() > MAX_BUFFERED_ASSET_BYTES {
+        if resolved.length > MAX_BUFFERED_ASSET_BYTES {
             if !negotiation.identity_acceptable {
                 return send_empty(session, 406, &[], tls).await;
             }
@@ -193,19 +233,10 @@ impl StaticFiles {
                 Ok(permit) => permit,
                 Err(_) => return send_empty(session, 503, &[("retry-after", "1")], tls).await,
             };
-            let content_type = content_type(&path);
-            return serve_streaming_file(
-                session,
-                &path,
-                &metadata,
-                &content_type,
-                &method,
-                spa_fallback,
-                tls,
-            )
-            .await;
+            let content_type = content_type(path);
+            return serve_streaming_file(session, &resolved, &content_type, &method, tls).await;
         }
-        let requested_encoding = if metadata.len() >= 1024 && compressible_path(&path) {
+        let requested_encoding = if resolved.length >= 1024 && compressible_path(path) {
             match negotiation.preferred {
                 ContentCoding::Identity => Encoding::Identity,
                 ContentCoding::Gzip => Encoding::Gzip,
@@ -221,9 +252,9 @@ impl StaticFiles {
             return send_empty(session, 406, &[], tls).await;
         };
         let key = CacheKey {
-            path: path.clone(),
-            modified_nanos,
-            length: metadata.len(),
+            path: resolved.path.clone(),
+            modified_nanos: resolved.modified_nanos,
+            length: resolved.length,
             encoding: requested_encoding,
         };
 
@@ -245,19 +276,22 @@ impl StaticFiles {
                     Some(asset) => asset,
                     _ => {
                         let body = self
-                            .read_representation(root, &path, requested_encoding)
+                            .read_representation(root, path, requested_encoding)
                             .await;
                         let (body, actual_encoding) = match body {
                             Ok(value) => value,
                             Err(_) => return send_empty(session, 500, &[], tls).await,
                         };
-                        let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), modified_nanos);
+                        let etag =
+                            format!("W/\"{:x}-{:x}\"", resolved.length, resolved.modified_nanos);
                         let asset = Arc::new(CachedAsset {
-                            content_type: cached_header_value(&content_type(&path))?,
+                            content_type: cached_header_value(&content_type(path))?,
                             content_length: cached_header_value(&body.len().to_string())?,
                             body,
                             etag: cached_header_value(&etag)?,
-                            last_modified: cached_header_value(&httpdate::fmt_http_date(modified))?,
+                            last_modified: cached_header_value(&httpdate::fmt_http_date(
+                                resolved.modified,
+                            ))?,
                         });
                         let actual_key = CacheKey {
                             encoding: actual_encoding,
@@ -278,7 +312,7 @@ impl StaticFiles {
             response.insert_header(ETAG, asset.etag.clone())?;
             response.insert_header(LAST_MODIFIED, asset.last_modified.clone())?;
             response.insert_header(VARY, ACCEPT_ENCODING_VALUE)?;
-            insert_cache_header(&mut response, &path, spa_fallback)?;
+            insert_cache_header(&mut response, path, spa_fallback)?;
             insert_security_headers(&mut response, tls)?;
             session
                 .write_response_header(Box::new(response), true)
@@ -295,7 +329,7 @@ impl StaticFiles {
         if let Some(encoding) = requested_encoding.header() {
             response.insert_header(CONTENT_ENCODING, encoding)?;
         }
-        insert_cache_header(&mut response, &path, spa_fallback)?;
+        insert_cache_header(&mut response, path, spa_fallback)?;
         insert_security_headers(&mut response, tls)?;
 
         let head = method == Method::HEAD;
@@ -308,6 +342,47 @@ impl StaticFiles {
                 .await?;
         }
         Ok(true)
+    }
+
+    async fn resolve_cached(
+        &self,
+        host_name: &str,
+        root: &Path,
+        uri_path: &str,
+    ) -> Option<ResolvedAsset> {
+        self.resolve_cached_at(host_name, root, uri_path, Instant::now())
+            .await
+    }
+
+    async fn resolve_cached_at(
+        &self,
+        host_name: &str,
+        root: &Path,
+        uri_path: &str,
+        now: Instant,
+    ) -> Option<ResolvedAsset> {
+        if let Some(cached) = self.paths.get(host_name, uri_path, now) {
+            return Some(cached);
+        }
+        let (path, spa_fallback) = resolve_path(root, uri_path).await?;
+        let metadata = tokio::fs::metadata(&path).await.ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let resolved = ResolvedAsset {
+            path: Arc::from(path.into_boxed_path()),
+            spa_fallback,
+            length: metadata.len(),
+            modified,
+            modified_nanos: modified
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        };
+        self.paths
+            .insert(host_name, uri_path, resolved.clone(), now);
+        Some(resolved)
     }
 
     async fn read_representation(
@@ -422,26 +497,22 @@ async fn resolve_path(root: &Path, uri_path: &str) -> Option<(PathBuf, bool)> {
 
 async fn serve_streaming_file(
     session: &mut Session,
-    path: &Path,
-    metadata: &std::fs::Metadata,
+    resolved: &ResolvedAsset,
     content_type: &str,
     method: &Method,
-    spa_fallback: bool,
     tls: bool,
 ) -> Result<bool> {
-    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-    let modified_nanos = modified
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), modified_nanos);
+    let path = resolved.path.as_ref();
+    let length = resolved.length;
+    let modified = resolved.modified;
+    let etag = format!("W/\"{:x}-{:x}\"", length, resolved.modified_nanos);
 
     if if_none_match_matches(&session.req_header().headers, etag.as_bytes()) {
         let mut response = ResponseHeader::build(304, Some(8)).unwrap();
         response.insert_header(ETAG, etag)?;
         response.insert_header(LAST_MODIFIED, httpdate::fmt_http_date(modified))?;
         response.insert_header(VARY, ACCEPT_ENCODING_VALUE)?;
-        insert_cache_header(&mut response, path, spa_fallback)?;
+        insert_cache_header(&mut response, path, resolved.spa_fallback)?;
         insert_security_headers(&mut response, tls)?;
         session
             .write_response_header(Box::new(response), true)
@@ -463,18 +534,18 @@ async fn serve_streaming_file(
     };
     let mut response = ResponseHeader::build(200, Some(10)).unwrap();
     response.insert_header(CONTENT_TYPE, content_type)?;
-    response.insert_header(CONTENT_LENGTH, metadata.len().to_string())?;
+    response.insert_header(CONTENT_LENGTH, length.to_string())?;
     response.insert_header(ETAG, etag)?;
     response.insert_header(LAST_MODIFIED, httpdate::fmt_http_date(modified))?;
     response.insert_header(VARY, ACCEPT_ENCODING_VALUE)?;
-    insert_cache_header(&mut response, path, spa_fallback)?;
+    insert_cache_header(&mut response, path, resolved.spa_fallback)?;
     insert_security_headers(&mut response, tls)?;
     session
-        .write_response_header(Box::new(response), head || metadata.len() == 0)
+        .write_response_header(Box::new(response), head || length == 0)
         .await?;
 
     if let Some(file) = file.as_mut() {
-        let mut remaining = metadata.len();
+        let mut remaining = length;
         let mut buffer = vec![0_u8; FILE_CHUNK_BYTES];
         while remaining > 0 {
             let chunk_length = usize::try_from(remaining.min(FILE_CHUNK_BYTES as u64)).unwrap();
@@ -661,6 +732,47 @@ mod tests {
         assert!(fallback);
     }
 
+    #[tokio::test]
+    async fn path_cache_reuses_resolution_until_ttl_then_sees_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        std::fs::write(root.join("index.html"), "v1").unwrap();
+        let files =
+            StaticFiles::new(HashMap::from([("site".into(), root.clone())]), 1024 * 1024).unwrap();
+
+        let now = Instant::now();
+        let first = files
+            .resolve_cached_at("site", &root, "/", now)
+            .await
+            .unwrap();
+        std::fs::write(root.join("index.html"), "replaced-body").unwrap();
+        let during_ttl = files
+            .resolve_cached_at("site", &root, "/", now)
+            .await
+            .unwrap();
+        assert_eq!(first.modified_nanos, during_ttl.modified_nanos);
+        assert_eq!(first.length, during_ttl.length);
+        assert_eq!(first.path.as_ref(), during_ttl.path.as_ref());
+
+        let after_ttl = files
+            .resolve_cached_at(
+                "site",
+                &root,
+                "/",
+                now + PATH_CACHE_TTL + Duration::from_millis(1),
+            )
+            .await
+            .unwrap();
+        assert_ne!(first.modified_nanos, after_ttl.modified_nanos);
+        assert_eq!(after_ttl.length, b"replaced-body".len() as u64);
+        assert!(
+            files
+                .resolve_cached_at("site", &root, "/../etc/passwd", Instant::now())
+                .await
+                .is_none()
+        );
+    }
+
     #[test]
     fn compressors_round_trip_nonempty_data() {
         use std::io::Read;
@@ -705,7 +817,7 @@ mod tests {
         for index in 0..513_u128 {
             cache.insert(
                 CacheKey {
-                    path: PathBuf::from(format!("asset-{index}")),
+                    path: Arc::from(PathBuf::from(format!("asset-{index}")).into_boxed_path()),
                     modified_nanos: index,
                     length: 1,
                     encoding: Encoding::Identity,

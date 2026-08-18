@@ -158,11 +158,19 @@ pub fn start(runtime: Arc<RuntimeConfig>) -> Result<Arc<UpstreamH3Registry>> {
     thread::Builder::new()
         .name("jbs-upstream-h3".to_string())
         .spawn(move || {
-            let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(runtime.config.server.threads.clamp(1, 8))
-                .thread_name("jbs-upstream-h3-worker")
-                .enable_all()
-                .build();
+            let worker_threads = runtime.config.server.threads.clamp(1, 8);
+            let tokio_runtime = if worker_threads <= 1 {
+                tokio::runtime::Builder::new_current_thread()
+                    .thread_name("jbs-upstream-h3-worker")
+                    .enable_all()
+                    .build()
+            } else {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(worker_threads)
+                    .thread_name("jbs-upstream-h3-worker")
+                    .enable_all()
+                    .build()
+            };
             let tokio_runtime = match tokio_runtime {
                 Ok(runtime) => runtime,
                 Err(error) => {

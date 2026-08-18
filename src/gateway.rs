@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 
 use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_host};
 use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
-use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, RateLimiter};
+use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, LimitZone, RateLimiter};
 use crate::static_files::StaticFiles;
 use crate::upstream_h3::{BridgeRoute, UpstreamH3Registry};
 
@@ -185,6 +185,20 @@ impl RouteClass {
         // per-request duplex channels needed by POST/PUT replication.
         self != Self::VaultwardenHub
     }
+
+    fn limit_zone(self) -> LimitZone {
+        match self {
+            Self::NavidromeStream => LimitZone::NavidromeStream,
+            Self::NavidromeCover => LimitZone::NavidromeCover,
+            Self::NavidromeApi => LimitZone::NavidromeApi,
+            Self::VaultwardenAuth => LimitZone::VaultwardenAuth,
+            Self::VaultwardenHub => LimitZone::VaultwardenHub,
+            Self::Vaultwarden => LimitZone::Vaultwarden,
+            Self::Couchdb => LimitZone::Couchdb,
+            Self::Doh => LimitZone::Doh,
+            Self::AdguardUi => LimitZone::AdguardUi,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -297,20 +311,18 @@ impl Default for RequestContext {
     }
 }
 
-pub struct Gateway {
-    runtime: Arc<RuntimeConfig>,
+/// Process-wide admission and static cache shared by the public listener
+/// and the loopback HTTP/3 → H2c handoff. Separate Gateway instances must
+/// not own their own limiters or LRU, or H2+H3 clients would get 2× quota
+/// and the 1 GiB host would hold two 32 MiB asset caches.
+pub struct GatewayShared {
     static_files: StaticFiles,
-    hosts: AHashMap<Arc<str>, PreparedHost>,
-    plans: Box<[PreparedPlan]>,
     rates: RateLimiter,
     active_requests: ActiveRequestLimiter,
 }
 
-impl Gateway {
-    pub fn new(
-        runtime: Arc<RuntimeConfig>,
-        upstream_h3: Arc<UpstreamH3Registry>,
-    ) -> anyhow::Result<Self> {
+impl GatewayShared {
+    pub fn from_runtime(runtime: &RuntimeConfig) -> anyhow::Result<Self> {
         let roots = runtime
             .config
             .hosts
@@ -321,7 +333,36 @@ impl Gateway {
                     .map(|root| (name.clone(), root.clone()))
             })
             .collect::<HashMap<_, _>>();
-        let static_files = StaticFiles::new(roots, runtime.config.server.static_cache_bytes)?;
+        Ok(Self {
+            static_files: StaticFiles::new(roots, runtime.config.server.static_cache_bytes)?,
+            rates: RateLimiter::new(),
+            active_requests: ActiveRequestLimiter::new(),
+        })
+    }
+}
+
+pub struct Gateway {
+    runtime: Arc<RuntimeConfig>,
+    shared: Arc<GatewayShared>,
+    hosts: AHashMap<Arc<str>, PreparedHost>,
+    plans: Box<[PreparedPlan]>,
+}
+
+impl Gateway {
+    #[cfg(test)]
+    pub fn new(
+        runtime: Arc<RuntimeConfig>,
+        upstream_h3: Arc<UpstreamH3Registry>,
+    ) -> anyhow::Result<Self> {
+        let shared = GatewayShared::from_runtime(&runtime)?;
+        Self::with_shared(runtime, upstream_h3, Arc::new(shared))
+    }
+
+    pub fn with_shared(
+        runtime: Arc<RuntimeConfig>,
+        upstream_h3: Arc<UpstreamH3Registry>,
+        shared: Arc<GatewayShared>,
+    ) -> anyhow::Result<Self> {
         let upstreams = runtime
             .config
             .upstreams
@@ -385,17 +426,21 @@ impl Gateway {
         }
         Ok(Self {
             runtime,
-            static_files,
+            shared,
             hosts,
             plans: prepared_plans.into_boxed_slice(),
-            rates: RateLimiter::new(),
-            active_requests: ActiveRequestLimiter::new(),
         })
     }
 
     fn host(&self, authority: &str) -> Option<&PreparedHost> {
+        if let Some(host) = self.hosts.get(authority) {
+            return Some(host);
+        }
         let domain = normalized_host(authority);
-        self.hosts.get::<str>(domain.as_ref())
+        match domain {
+            std::borrow::Cow::Borrowed(same) if same == authority => None,
+            other => self.hosts.get::<str>(other.as_ref()),
+        }
     }
 
     fn acquire_global_request(&self, ctx: &mut RequestContext) -> bool {
@@ -403,7 +448,11 @@ impl Gateway {
         if limit == 0 {
             return true;
         }
-        let Some(permit) = self.active_requests.acquire("global", ctx.client_ip, limit) else {
+        let Some(permit) =
+            self.shared
+                .active_requests
+                .acquire(LimitZone::Global, ctx.client_ip, limit)
+        else {
             return false;
         };
         ctx._global_request_permit = Some(permit);
@@ -604,8 +653,8 @@ impl ProxyHttp for Gateway {
                 )
                 .await;
             }
-            let Some(permit) = self.active_requests.acquire(
-                "static",
+            let Some(permit) = self.shared.active_requests.acquire(
+                LimitZone::Static,
                 client_ip,
                 self.runtime.config.server.static_active_requests_per_client,
             ) else {
@@ -620,7 +669,11 @@ impl ProxyHttp for Gateway {
                 .await;
             };
             ctx._active_request_permit = Some(permit);
-            return self.static_files.serve(&host.name, session, tls).await;
+            return self
+                .shared
+                .static_files
+                .serve(&host.name, session, tls)
+                .await;
         }
 
         let Some(client_ip) = session_client_ip(&self.runtime, session, http3) else {
@@ -659,7 +712,10 @@ impl ProxyHttp for Gateway {
         }
 
         if let Some((rate, burst)) = plan.rate_limit
-            && !self.rates.allow(plan.route.name(), client_ip, rate, burst)
+            && !self
+                .shared
+                .rates
+                .allow(plan.route.limit_zone(), client_ip, rate, burst)
         {
             return send_empty(
                 &self.runtime,
@@ -685,8 +741,8 @@ impl ProxyHttp for Gateway {
         }
 
         if plan.active_request_limit > 0 {
-            let Some(permit) = self.active_requests.acquire(
-                plan.route.name(),
+            let Some(permit) = self.shared.active_requests.acquire(
+                plan.route.limit_zone(),
                 client_ip,
                 plan.active_request_limit,
             ) else {
@@ -734,9 +790,11 @@ impl ProxyHttp for Gateway {
     }
 
     fn precomputed_upstream_peer<'a>(&'a self, ctx: &Self::CTX) -> Option<&'a HttpPeer> {
-        self.plans
-            .get(ctx.plan_index)
-            .and_then(|plan| plan.h3.is_none().then_some(&plan.peer))
+        let plan = self.plans.get(ctx.plan_index)?;
+        match plan.h3.as_ref() {
+            Some(h3) if h3.route.should_use_h3() => Some(&h3.peer),
+            _ => Some(&plan.peer),
+        }
     }
 
     fn h1_bodyless_fast_path(&self, session: &Session, ctx: &Self::CTX) -> bool {
@@ -754,7 +812,9 @@ impl ProxyHttp for Gateway {
     ) -> Result<()> {
         let plan = self.request_plan(ctx)?;
         strip_request_hop_headers(session.req_header(), upstream_request)?;
-        upstream_request.headers.reserve(6);
+        // Host + X-Real-IP + four X-Forwarded-* fields, plus optional
+        // Accept-Encoding and the Upgrade/Connection pair.
+        upstream_request.headers.reserve(10);
         let client_ip = forwarded_client_ip_value(ctx.client_ip)?;
         let upstream_host = if plan.route == RouteClass::Doh {
             DIRECT_DOH_HOST
@@ -1479,10 +1539,24 @@ fn is_tls(session: &Session) -> bool {
         .is_some()
 }
 
+fn request_has_internal_http3_marker(runtime: &RuntimeConfig, request: &RequestHeader) -> bool {
+    runtime.http3_internal_token().is_some_and(|expected| {
+        request
+            .headers
+            .get(&HTTP3_INTERNAL)
+            .is_some_and(|value| value == expected)
+    })
+}
+
 fn is_internal_http3(runtime: &RuntimeConfig, session: &Session) -> bool {
     let Some(expected) = runtime.http3_internal_addr() else {
         return false;
     };
+    // Public H1/H2 never carries the private marker. Exit before socket
+    // address lookups on the overwhelmingly common path.
+    if !request_has_internal_http3_marker(runtime, session.req_header()) {
+        return false;
+    }
     let server_matches = session
         .server_addr()
         .and_then(|address| address.as_inet())
@@ -1491,14 +1565,7 @@ fn is_internal_http3(runtime: &RuntimeConfig, session: &Session) -> bool {
         .client_addr()
         .and_then(|address| address.as_inet())
         .is_some_and(|address| address.ip().is_loopback());
-    let marker_matches = runtime.http3_internal_token().is_some_and(|expected| {
-        session
-            .req_header()
-            .headers
-            .get(&HTTP3_INTERNAL)
-            .is_some_and(|value| value == expected)
-    });
-    server_matches && peer_is_loopback && marker_matches
+    server_matches && peer_is_loopback
 }
 
 fn session_client_ip(
@@ -1966,10 +2033,78 @@ hosts:
     fn prepared_host_lookup_is_case_insensitive_and_peers_cache_pool_hash() {
         let gateway =
             Gateway::new(Arc::new(runtime()), Arc::new(UpstreamH3Registry::default())).unwrap();
+        assert_eq!(
+            gateway.host("app.example.com").unwrap().domain.as_ref(),
+            "app.example.com"
+        );
         let host = gateway.host("APP.EXAMPLE.COM:443").unwrap();
         assert_eq!(host.domain.as_ref(), "app.example.com");
+        assert_eq!(
+            gateway.host("app.example.com.").unwrap().domain.as_ref(),
+            "app.example.com"
+        );
         let plan = &gateway.plans[host.plan("/rest/stream").unwrap()];
         assert!(plan.peer.cached_reuse_hash.is_some());
+    }
+
+    #[test]
+    fn public_and_handoff_gateways_share_admission() {
+        let runtime = Arc::new(runtime());
+        let shared = Arc::new(GatewayShared::from_runtime(&runtime).unwrap());
+        let public = Gateway::with_shared(
+            runtime.clone(),
+            Arc::new(UpstreamH3Registry::default()),
+            shared.clone(),
+        )
+        .unwrap();
+        let handoff =
+            Gateway::with_shared(runtime, Arc::new(UpstreamH3Registry::default()), shared).unwrap();
+        assert!(Arc::ptr_eq(&public.shared, &handoff.shared));
+
+        let ip = "192.0.2.80".parse().unwrap();
+        let permit = public
+            .shared
+            .active_requests
+            .acquire(LimitZone::NavidromeStream, ip, 1)
+            .unwrap();
+        assert!(
+            handoff
+                .shared
+                .active_requests
+                .acquire(LimitZone::NavidromeStream, ip, 1)
+                .is_none()
+        );
+        drop(permit);
+        assert!(
+            handoff
+                .shared
+                .active_requests
+                .acquire(LimitZone::NavidromeStream, ip, 1)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn precomputed_peer_is_available_for_h1_routes() {
+        let gateway =
+            Gateway::new(Arc::new(runtime()), Arc::new(UpstreamH3Registry::default())).unwrap();
+        let host = gateway.host("app.example.com").unwrap();
+        let ctx = RequestContext {
+            plan_index: host.plan("/rest/stream").unwrap(),
+            ..RequestContext::default()
+        };
+        let peer = gateway
+            .precomputed_upstream_peer(&ctx)
+            .expect("H1 route must expose a prepared peer");
+        assert!(std::ptr::eq(peer, &gateway.plans[ctx.plan_index].peer));
+    }
+
+    #[test]
+    fn public_requests_without_h3_marker_are_not_internal() {
+        let runtime = runtime();
+        let mut request = RequestHeader::build(Method::GET, b"/", None).unwrap();
+        request.insert_header(HOST, "app.example.com").unwrap();
+        assert!(!request_has_internal_http3_marker(&runtime, &request));
     }
 
     #[test]
