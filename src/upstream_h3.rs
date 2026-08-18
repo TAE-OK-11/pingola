@@ -320,7 +320,7 @@ impl RequestHandle {
         let response = self
             .response
             .take()
-            .ok_or_else(|| boxed_error("upstream HTTP/3 response channel was already consumed")?;
+            .ok_or_else(|| boxed_error("upstream HTTP/3 response channel was already consumed"))?;
         let response = response
             .await
             .map_err(|_| boxed_error("upstream HTTP/3 response channel closed"))?
