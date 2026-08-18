@@ -90,27 +90,41 @@ struct CachedPath {
 }
 
 struct PathCache {
-    entries: Mutex<LruCache<(String, String), CachedPath>>,
+    // Static hosts are fixed at startup. Give each host its own bounded LRU so
+    // unrelated sites never contend on one mutex, and use String keys only for
+    // insertion. LruCache's borrowed-key lookup lets cache hits use &str without
+    // allocating a temporary URI String on every request.
+    entries: HashMap<String, Mutex<LruCache<String, CachedPath>>>,
 }
 
 impl PathCache {
-    fn new() -> Self {
-        Self {
-            entries: Mutex::new(LruCache::new(
-                NonZeroUsize::new(MAX_PATH_CACHE_ENTRIES).unwrap(),
-            )),
-        }
+    fn new(hosts: impl Iterator<Item = String>, host_count: usize) -> Self {
+        let per_host_capacity = (MAX_PATH_CACHE_ENTRIES / host_count.max(1)).max(1);
+        let entries = hosts
+            .map(|host| {
+                (
+                    host,
+                    Mutex::new(LruCache::new(
+                        NonZeroUsize::new(per_host_capacity).unwrap(),
+                    )),
+                )
+            })
+            .collect();
+        Self { entries }
     }
 
     fn get(&self, host: &str, uri: &str, now: Instant) -> Option<ResolvedAsset> {
-        let mut entries = self.entries.lock();
-        let cached = entries.get(&(host.to_string(), uri.to_string()))?;
+        let mut entries = self.entries.get(host)?.lock();
+        let cached = entries.get(uri)?;
         (cached.expires_at > now).then(|| cached.asset.clone())
     }
 
     fn insert(&self, host: &str, uri: &str, asset: ResolvedAsset, now: Instant) {
-        self.entries.lock().put(
-            (host.to_string(), uri.to_string()),
+        let Some(entries) = self.entries.get(host) else {
+            return;
+        };
+        entries.lock().put(
+            uri.to_owned(),
             CachedPath {
                 asset,
                 expires_at: now + PATH_CACHE_TTL,
@@ -192,10 +206,11 @@ impl StaticFiles {
             })?;
             canonical_roots.insert(name, canonical);
         }
+        let paths = PathCache::new(canonical_roots.keys().cloned(), canonical_roots.len());
         Ok(Self {
             roots: canonical_roots,
             cache: AssetCache::new(cache_bytes),
-            paths: PathCache::new(),
+            paths,
             // Bound whole-file allocations as well as CPU-heavy compression.
             cold_read_slot: Semaphore::new(1),
             // HTTP/2 and HTTP/3 multiplexing means a socket limit alone does
