@@ -242,7 +242,6 @@ fn upstream_server_name(name: &str, upstream: &UpstreamConfig) -> Result<String>
     Ok(authority.to_string())
 }
 
-#[derive(Clone)]
 struct H3Pool {
     commands: mpsc::Sender<Command>,
     next_id: AtomicU64,
@@ -321,7 +320,7 @@ impl RequestHandle {
         let response = self
             .response
             .take()
-            .ok_or_else(|| boxed_error("upstream HTTP/3 response channel was already consumed"))?;
+            .ok_or_else(|| boxed_error("upstream HTTP/3 response channel was already consumed")?;
         let response = response
             .await
             .map_err(|_| boxed_error("upstream HTTP/3 response channel closed"))?
