@@ -282,8 +282,14 @@ impl Connector {
                 // the caller that the server speaks h2c
             }
         }
-        let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
-        let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval()).await?;
+        let peer_options = peer.get_peer_options();
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = peer_options.map_or(1, |o| o.max_h2_streams);
+        settings.ping_interval = peer.h2_ping_interval();
+        settings.stream_window_size = peer_options.and_then(|o| o.h2_stream_window_size);
+        settings.connection_window_size =
+            peer_options.and_then(|o| o.h2_connection_window_size);
+        let conn = handshake(stream, settings).await?;
         let h2_stream = conn
             .spawn_stream()
             .await?
@@ -325,8 +331,15 @@ impl Connector {
             .or_else(|| self.idle_pool.get(&reuse_hash));
         if let Some(conn) = maybe_conn {
             #[cfg(unix)]
-            if !peer.matches_fd(conn.id()) {
-                return Ok(None);
+            {
+                let cached_peer_matches = conn
+                    .digest()
+                    .socket_digest
+                    .as_ref()
+                    .is_some_and(|digest| peer.matches_cached_peer_addr(digest.peer_addr()));
+                if !cached_peer_matches && !peer.matches_fd(conn.id()) {
+                    return Ok(None);
+                }
             }
             #[cfg(windows)]
             {
@@ -422,14 +435,40 @@ impl Connector {
 // Long term, we should advertising large window but shrink it when a small buffer is full.
 // 8 Mbytes = 80 Mbytes X 100ms, which should be enough for most links.
 const H2_WINDOW_SIZE: u32 = 1 << 23;
+const H2_MAX_WINDOW_SIZE: u32 = (1_u32 << 31) - 1;
 
-pub async fn handshake(
-    stream: Stream,
-    max_streams: usize,
-    h2_ping_interval: Option<Duration>,
-) -> Result<ConnectionRef> {
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct H2HandshakeSettings {
+    pub max_streams: usize,
+    pub ping_interval: Option<Duration>,
+    pub stream_window_size: Option<u32>,
+    pub connection_window_size: Option<u32>,
+}
+
+impl H2HandshakeSettings {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<ConnectionRef> {
     use h2::client::Builder;
     use pingora_runtime::current_handle;
+
+    let max_streams = settings.max_streams;
+    if settings
+        .stream_window_size
+        .is_some_and(|window| window == 0 || window > H2_MAX_WINDOW_SIZE)
+    {
+        return Error::e_explain(H2Error, format!("stream_window_size must be between 1 and {H2_MAX_WINDOW_SIZE}"));
+    }
+    if settings
+        .connection_window_size
+        .is_some_and(|window| window == 0 || window > H2_MAX_WINDOW_SIZE)
+    {
+        return Error::e_explain(H2Error, format!("connection_window_size must be between 1 and {H2_MAX_WINDOW_SIZE}"));
+    }
 
     // Safe guard: new_http_session() assumes there should be at least one free stream
     if max_streams == 0 {
@@ -446,16 +485,16 @@ pub async fn handshake(
         proxy_digest: stream.get_proxy_digest(),
         socket_digest: stream.get_socket_digest(),
     };
-    // TODO: make these configurable
+    let stream_window = settings.stream_window_size.unwrap_or(H2_WINDOW_SIZE);
+    let connection_window = settings.connection_window_size.unwrap_or(H2_WINDOW_SIZE);
     let (send_req, connection) = Builder::new()
         .enable_push(false)
         .initial_max_send_streams(max_streams)
         // The limit for the server. Server push is not allowed, so this value doesn't matter
         .max_concurrent_streams(1)
         .max_frame_size(64 * 1024) // advise server to send larger frames
-        .initial_window_size(H2_WINDOW_SIZE)
-        // should this be max_streams * H2_WINDOW_SIZE?
-        .initial_connection_window_size(H2_WINDOW_SIZE)
+        .initial_window_size(stream_window)
+        .initial_connection_window_size(connection_window)
         .handshake(stream)
         .await
         .or_err(HandshakeError, "during H2 handshake")?;
@@ -477,7 +516,7 @@ pub async fn handshake(
             connection,
             id,
             closed_tx,
-            h2_ping_interval,
+            settings.ping_interval,
             ping_timeout_clone,
         )
         .await;

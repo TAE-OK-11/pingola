@@ -1830,6 +1830,10 @@ fn prepare_upstream(
         UpstreamProtocol::Http3 | UpstreamProtocol::Http3Preferred => ALPN::H1,
     };
     peer.options.max_h2_streams = upstream.http2_max_concurrent_streams;
+    peer.options.h2_stream_window_size = Some(upstream.http2_stream_window_bytes);
+    peer.options.h2_connection_window_size = Some(upstream.http2_connection_window_bytes);
+    peer.options.h2_ping_interval = (upstream.http2_ping_interval_seconds > 0)
+        .then_some(Duration::from_secs(upstream.http2_ping_interval_seconds));
     peer.options.tcp_keepalive = Some(TcpKeepalive {
         idle: Duration::from_secs(60),
         interval: Duration::from_secs(10),
@@ -1846,6 +1850,8 @@ fn prepare_upstream(
         peer.options.idle_timeout = Some(Duration::from_secs(upstream.idle_timeout_seconds));
         peer.options.alpn = ALPN::H2;
         peer.options.max_h2_streams = upstream.http3_max_concurrent_streams;
+        peer.options.h2_stream_window_size = Some(2 * 1024 * 1024);
+        peer.options.h2_connection_window_size = Some(32 * 1024 * 1024);
         PreparedH3Peer {
             peer,
             route: route.clone(),
@@ -2423,7 +2429,19 @@ write_timeout_seconds: 9
                 .unwrap();
         let prepared = prepare_upstream("test", &upstream, &UpstreamH3Registry::default()).unwrap();
         assert_eq!(prepared.peer.options.alpn, ALPN::H2H1);
-        assert_eq!(prepared.peer.options.max_h2_streams, 32);
+        assert_eq!(prepared.peer.options.max_h2_streams, 128);
+        assert_eq!(
+            prepared.peer.options.h2_stream_window_size,
+            Some(16 * 1024 * 1024)
+        );
+        assert_eq!(
+            prepared.peer.options.h2_connection_window_size,
+            Some(64 * 1024 * 1024)
+        );
+        assert_eq!(
+            prepared.peer.options.h2_ping_interval,
+            Some(Duration::from_secs(30))
+        );
 
         let hub = prepare_route_peer(&prepared, RouteClass::VaultwardenHub);
         assert_eq!(hub.options.alpn, ALPN::H1);
