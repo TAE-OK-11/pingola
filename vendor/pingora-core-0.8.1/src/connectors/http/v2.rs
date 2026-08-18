@@ -336,7 +336,8 @@ impl Connector {
                     .digest()
                     .socket_digest
                     .as_ref()
-                    .is_some_and(|digest| peer.matches_cached_peer_addr(digest.peer_addr()));
+                    .and_then(|digest| digest.peer_addr())
+                    .is_some_and(|addr| peer.matches_cached_peer_addr(addr));
                 if !cached_peer_matches && !peer.matches_fd(conn.id()) {
                     return Ok(None);
                 }
