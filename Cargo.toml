@@ -22,7 +22,7 @@ tls-boringssl = ["cloudflare-pingora/boringssl"]
 anyhow = "1.0.104"
 ahash = "0.8.12"
 arrayvec = "0.7.8"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 boring = { version = "=4.22.0", features = ["pq-experimental"] }
 brotli = "8.0.4"
 bytes = "1.12.1"
@@ -30,11 +30,11 @@ clap = { version = "4.6.5", features = ["derive", "env"] }
 dashmap = "6.2.1"
 env_logger = "0.11.11"
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
-futures = "0.3.33"
+futures = "0.3.34"
 getrandom = "0.4.3"
 hex = "0.4.3"
 http = "1.5.0"
-http-body-util = "0.1.4"
+http-body-util = "0.1.5"
 httpdate = "1.0.3"
 hyper = { version = "1.11.0", features = ["client", "server", "http2"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http2", "tokio"] }
@@ -58,7 +58,7 @@ tokio-quiche = { version = "=0.19.1", default-features = false, features = ["gco
 zstd = "0.13.3"
 
 [dev-dependencies]
-h2 = "0.4.15"
+h2 = "0.4.16"
 tempfile = "3.27.0"
 
 # Keep the vendored Pingora HTTP patches while using Pingora's official
