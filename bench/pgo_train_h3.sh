@@ -102,6 +102,9 @@ server:
   http3_internal_listen: "127.0.0.1:${HTTP3_INTERNAL_PORT}"
   http3_max_idle_timeout_seconds: 60
   http3_max_concurrent_streams: 64
+  # Fresh-handshake probes remain active until the QUIC idle timeout expires.
+  # Leave room for readiness and concurrent probes above the production cap.
+  http3_max_connections_per_ip: 128
   certificate: ${RUNTIME_DIR}/cert.pem
   private_key: ${RUNTIME_DIR}/key.pem
   health_socket: ${RUNTIME_DIR}/health.sock
