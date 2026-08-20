@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use cloudflare_pingora::Result;
 use cloudflare_pingora::http::ResponseHeader;
 use cloudflare_pingora::protocols::http::conditional_filter::weak_validate_etag;
@@ -559,11 +559,12 @@ async fn serve_streaming_file(
 
     if let Some(file) = file.as_mut() {
         let mut remaining = length;
-        let mut buffer = vec![0_u8; FILE_CHUNK_BYTES];
         while remaining > 0 {
             let chunk_length = usize::try_from(remaining.min(FILE_CHUNK_BYTES as u64)).unwrap();
-            let bytes = file
-                .read(&mut buffer[..chunk_length])
+            let mut buffer = BytesMut::with_capacity(chunk_length);
+            let bytes = (&mut *file)
+                .take(chunk_length as u64)
+                .read_buf(&mut buffer)
                 .await
                 .map_err(|error| {
                     cloudflare_pingora::Error::because(
@@ -578,10 +579,10 @@ async fn serve_streaming_file(
             }
             remaining -= bytes as u64;
             session
-                .write_response_body(
-                    Some(Bytes::copy_from_slice(&buffer[..bytes])),
-                    remaining == 0,
-                )
+                // Freeze and transfer the file-read allocation directly to
+                // Pingora. The previous reusable Vec required a second 64 KiB
+                // allocation and memcpy for every streamed chunk.
+                .write_response_body(Some(buffer.freeze()), remaining == 0)
                 .await?;
         }
     }
