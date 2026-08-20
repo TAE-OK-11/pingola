@@ -16,7 +16,7 @@ fn default_threads() -> usize {
 }
 
 fn default_keepalive_pool() -> usize {
-    512
+    256
 }
 
 fn default_downstream_keepalive_requests() -> u32 {
@@ -58,11 +58,11 @@ fn default_http3_connection_burst() -> u32 {
 }
 
 fn default_http3_max_connections_per_ip() -> usize {
-    128
+    64
 }
 
 fn default_downstream_max_connections() -> usize {
-    4096
+    2048
 }
 
 fn default_downstream_request_header_timeout() -> u64 {
@@ -92,7 +92,7 @@ fn default_body_limit() -> usize {
 }
 
 fn default_static_cache() -> usize {
-    32 * 1024 * 1024
+    16 * 1024 * 1024
 }
 
 fn default_true() -> bool {
@@ -112,11 +112,11 @@ fn default_upstream_http2_streams() -> usize {
 }
 
 fn default_upstream_http2_stream_window_bytes() -> u32 {
-    16 * 1024 * 1024
+    2 * 1024 * 1024
 }
 
 fn default_upstream_http2_connection_window_bytes() -> u32 {
-    64 * 1024 * 1024
+    16 * 1024 * 1024
 }
 
 fn default_upstream_http2_ping_interval_seconds() -> u64 {
@@ -799,8 +799,8 @@ hosts:
         let automatic: UpstreamConfig = serde_saphyr::from_str("address: 127.0.0.1:9000").unwrap();
         assert_eq!(automatic.protocol, UpstreamProtocol::Auto);
         assert_eq!(automatic.http2_max_concurrent_streams, 128);
-        assert_eq!(automatic.http2_stream_window_bytes, 16 * 1024 * 1024);
-        assert_eq!(automatic.http2_connection_window_bytes, 64 * 1024 * 1024);
+        assert_eq!(automatic.http2_stream_window_bytes, 2 * 1024 * 1024);
+        assert_eq!(automatic.http2_connection_window_bytes, 16 * 1024 * 1024);
         assert_eq!(automatic.http2_ping_interval_seconds, 30);
         assert!(!automatic.http3_bbr2);
 

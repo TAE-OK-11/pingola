@@ -26,7 +26,7 @@ async-trait = "0.1.92"
 boring = { version = "=4.22.0", features = ["pq-experimental"] }
 brotli = "8.0.4"
 bytes = "1.12.1"
-clap = { version = "4.6.5", features = ["derive", "env"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
 dashmap = "6.2.1"
 env_logger = "0.11.11"
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
@@ -48,7 +48,7 @@ cloudflare-pingora = { package = "pingora", version = "=0.8.1", default-features
 rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-serde-saphyr = "1.0.0"
+serde-saphyr = "1.1.0"
 socket2 = "0.6.5"
 tcmalloc-better = { version = "=0.1.19", optional = true }
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats", "use_std"], optional = true }
@@ -58,7 +58,7 @@ tokio-quiche = { version = "=0.19.1", default-features = false, features = ["gco
 zstd = "0.13.3"
 
 [dev-dependencies]
-h2 = "0.4.16"
+h2 = "0.4.17"
 tempfile = "3.27.0"
 
 # Keep the vendored Pingora HTTP patches while using Pingora's official

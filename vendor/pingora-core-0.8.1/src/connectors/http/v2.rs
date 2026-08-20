@@ -20,13 +20,13 @@ use crate::protocols::http::v2::client::{drive_connection, Http2Session};
 use crate::protocols::{Digest, Stream, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
 
+use ahash::AHashMap;
 use bytes::Bytes;
 use h2::client::SendRequest;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,7 +99,8 @@ impl ConnectionRef {
     }
 
     pub fn release_stream(&self) {
-        self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
+        let previous = self.0.current_streams.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "released more HTTP/2 streams than acquired");
     }
 
     pub fn id(&self) -> UniqueIDType {
@@ -130,12 +131,18 @@ impl ConnectionRef {
 
     // spawn a stream if more stream is allowed, otherwise return Ok(None)
     pub async fn spawn_stream(&self) -> Result<Option<Http2Session>> {
-        // Atomically check if the current_stream is over the limit
-        // load(), compare and then fetch_add() cannot guarantee the same
-        let current_streams = self.0.current_streams.fetch_add(1, Ordering::SeqCst);
-        if current_streams >= self.0.max_streams {
-            // already over the limit, reset the counter to the previous value
-            self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
+        // Reserve capacity with one relaxed CAS instead of a sequentially
+        // consistent increment plus compensating decrement on the saturated
+        // hot path. The counter protects only the numeric stream limit; it
+        // does not publish any other state.
+        if self
+            .0
+            .current_streams
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < self.0.max_streams).then_some(current + 1)
+            })
+            .is_err()
+        {
             return Ok(None);
         }
 
@@ -143,7 +150,7 @@ impl ConnectionRef {
             Ok(send_req) => Ok(Some(Http2Session::new(send_req, self.clone()))),
             Err(e) => {
                 // fail to create the stream, reset the counter
-                self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
+                self.0.current_streams.fetch_sub(1, Ordering::Relaxed);
                 // Remote sends GOAWAY(NO_ERROR): graceful shutdown: this connection no longer
                 // accepts new streams. We can still try to create new connection.
                 if e.root_cause()
@@ -164,14 +171,16 @@ impl ConnectionRef {
 }
 
 pub struct InUsePool {
-    // TODO: use pingora hashmap to shard the lock contention
-    pools: RwLock<HashMap<u64, PoolNode<ConnectionRef>>>,
+    // Reuse hashes are trusted u64 values. AHashMap avoids SipHash overhead on
+    // every multiplexed request while the outer lock keeps pool topology
+    // changes infrequent.
+    pools: RwLock<AHashMap<u64, PoolNode<ConnectionRef>>>,
 }
 
 impl InUsePool {
     fn new() -> Self {
         InUsePool {
-            pools: RwLock::new(HashMap::new()),
+            pools: RwLock::new(AHashMap::new()),
         }
     }
 
@@ -184,10 +193,15 @@ impl InUsePool {
             }
         } // drop read lock
 
-        let pool = PoolNode::new();
-        pool.insert(conn.id(), conn);
+        // Another connection can create this reuse bucket between the read
+        // miss above and taking the write lock. Entry preserves both
+        // connections instead of replacing the first PoolNode and temporarily
+        // losing all of its reusable capacity.
         let mut pools = self.pools.write();
-        pools.insert(reuse_hash, pool);
+        pools
+            .entry(reuse_hash)
+            .or_insert_with(PoolNode::new)
+            .insert(conn.id(), conn);
     }
 
     // retrieve a h2 conn ref to create a new stream

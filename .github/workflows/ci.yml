@@ -59,7 +59,6 @@ jobs:
           bash -n bench/pgo_train.sh
           bash -n bench/pgo_train_h3.sh
           bash -n bench/pgo_train_upstream_h3.sh
-          bash -n bench/pgo_compare_three.sh
           rustc --edition=2024 -D warnings bench/backend.rs -o /tmp/pgo-backend
           rustc --edition=2024 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
           cargo fmt --all --check
@@ -115,14 +114,6 @@ jobs:
           - target_cpu: x86-64-v2
             pgo_mode: train
             native_pgo: on
-            runtime: true
-          # A GitHub-hosted runner is not guaranteed to execute znver1-only
-          # instructions safely. Compile it here without PGO; real znver1 PGO
-          # training/publishing is handled by znver1-pgo.yml on an AMD runner.
-          - target_cpu: znver1
-            pgo_mode: off
-            native_pgo: off
-            runtime: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
@@ -167,15 +158,8 @@ jobs:
         run: |
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo-train-target-cpu"]')" = "${{ matrix.target_cpu }}"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.native.pgo"]')" = "${{ matrix.native_pgo }}"
-          if [[ "${{ matrix.runtime }}" == "true" ]]; then
-            tests/docker_runtime.sh
-            test -f <(docker run --rm --entrypoint sh "${IMAGE}" -c 'test -s /usr/share/doc/pingora/pgo-profile-summary.txt && echo ok') || true
-          else
-            test "$(docker image inspect --format '{{.Config.User}}' "${IMAGE}")" = "10001:10001"
-            test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.target-cpu"]')" = "znver1"
-            test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator"]')" = "tcmalloc"
-            test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.http3.provider"]')" = "quiche"
-          fi
+          tests/docker_runtime.sh
+          test -f <(docker run --rm --entrypoint sh "${IMAGE}" -c 'test -s /usr/share/doc/pingora/pgo-profile-summary.txt && echo ok') || true
 
   publish:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_images)

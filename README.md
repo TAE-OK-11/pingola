@@ -1,8 +1,8 @@
 # Pingora
 
 Cloudflare [Pingora](https://github.com/cloudflare/pingora)를 기반으로 Cloudflare BoringSSL,
-HTTP/1.1, HTTP/2를 지원하는 JBS 리버스 프록시입니다. 기본 설정은 PiKKY 정적
-사이트, Navidrome, Vaultwarden, CouchDB, AdGuard Home/DoH를 1 vCPU / 1 GB Linux
+HTTP/1.1, HTTP/2를 지원하는 JBS 리버스 프록시입니다. 기본 설정은 Navidrome,
+Vaultwarden, CouchDB, AdGuard Home/DoH를 1 vCPU / 1 GB Linux
 호스트에서 운영하도록 bounded cache·buffer·limiter를 사용합니다.
 
 이 프로젝트의 이전 이름은 Pingola였습니다. Cargo package는 upstream `pingora`
@@ -17,21 +17,21 @@ HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항�
 
 - Cloudflare BoringSSL를 사용하는 rustls와 다운스트림 TLS 1.3 전용 정책
 - HTTP/1.1 및 HTTP/2, 기본 최대 32개 동시 H2 stream(설정으로 1~1024 override), stream window 256 KiB / connection window 2 MiB / frame 64 KiB
-- 다운스트림 QUIC은 BBRv2, 2 MiB stream / 8 MiB connection window, 1 스레드 호스트에서는 current-thread runtime
+- 다운스트림 QUIC은 BBRv2, 초기 1 MiB stream / 4 MiB connection window(최대 2/8 MiB), 1 스레드 호스트에서는 current-thread runtime
 - upstream HTTP/3/QUIC (`http3`/`http3-preferred`) + connection reuse + replay-safe 0-RTT session resumption
 - QUIC Stateless Retry defaults ON; only a trusted private H3 origin should set `server.http3_stateless_retry: false` when accepted 0-RTT is required
 - IPv4/IPv6 listener와 IPv6 socket의 명시적 `IPV6_V6ONLY=true`
 - Host allowlist, trusted proxy 기반 `X-Forwarded-For`, body 크기 제한
 - 서비스·route별 rate limit 및 active request/H2 stream limit (H1/H2와 H3 handoff가 같은 process-wide 한도 공유)
 - Navidrome audio 무압축 streaming, Vaultwarden/CouchDB route 압축, DoH 정책
-- PiKKY 정적 파일 gzip/Brotli/Zstd 동적·사전 압축, bounded asset LRU cache, URI path 1초 TTL 캐시
+- 선택적 정적 호스트의 gzip/Brotli/Zstd 동적·사전 압축, bounded asset LRU cache, URI path 1초 TTL 캐시
 - Cloudflare BoringSSL TLS 파일 사전 검사와 UID/GID/mode/symlink 대상 진단
 - Rust global allocator로 정적 링크된 Google TCMalloc(8 KiB logical page)
 - UID/GID `10001:10001`, read-only root filesystem, 최소 capability
 
 Pingora 0.8.1은 다운스트림 HTTP/3/QUIC server를 제공하지 않으므로 HTTP/3와
-`Alt-Svc`는 지원하지 않습니다. gzip/Brotli/Zstd 동적 압축은 PiKKY 정적 파일에만
-직접 적용합니다. Navidrome API/cover는 client의 `Accept-Encoding`을 origin에 전달하고 gateway
+`Alt-Svc`는 지원하지 않습니다. gzip/Brotli/Zstd 동적 압축은 명시적으로 설정한 정적
+호스트에만 직접 적용합니다. Navidrome API/cover는 client의 `Accept-Encoding`을 origin에 전달하고 gateway
 압축은 적용하지 않습니다. 그 외 압축 가능한 프록시 응답(Vaultwarden, CouchDB,
 AdGuard UI)은 client의 `Accept-Encoding`을 정확히 협상해 같은 q-value에서는
 `zstd` → `br` → `gzip` 순으로 선택하고 level 1 streaming 압축을 적용합니다.
@@ -251,14 +251,15 @@ upstreams:
 ```
 
 `http2_max_concurrent_streams`는 upstream H2 connection 하나에서 Pingora가 허용하는
-동시 stream 상한이며 1~1024만 허용합니다. 기본값은 32이고 DoH 기본 설정은 짧은
-요청의 multiplexing을 위해 64입니다. WebSocket Upgrade origin과 H2를 지원하지 않는
+동시 stream 상한이며 1~1024만 허용합니다. 기본값은 128이고 DoH 운영 설정은 짧은
+요청의 multiplexing을 위해 256입니다. 기본 receive window는 stream 2 MiB / connection
+16 MiB입니다. WebSocket Upgrade origin과 H2를 지원하지 않는
 Navidrome/Vaultwarden/CouchDB/AdGuard UI 기본 upstream은 명시적으로 `http1`을
 유지합니다. 설정 변경은 재시작 후 적용됩니다.
 
 다운스트림 H2 receive window는 설정 키 없이 고정합니다. 공개 리스너는 stream
-256 KiB / connection 2 MiB / frame 64 KiB이고, 신뢰 루프백 H3→H2c handoff만
-connection window 4 MiB입니다. 동시 stream 기본값 32는 그대로입니다.
+256 KiB / connection 2 MiB / frame 64 KiB이고, 신뢰 루프백 H3→H2c handoff는
+stream 1 MiB / connection 16 MiB입니다. 동시 stream 기본값 32는 그대로입니다.
 
 `server.downstream_keepalive_requests`는 downstream HTTP/1.1 connection을 주기적으로
 닫아 connection별 allocation을 회수하는 상한입니다. NGINX와 같은 방식으로 첫 요청을
@@ -267,7 +268,7 @@ connection window 4 MiB입니다. 동시 stream 기본값 32는 그대로입니�
 닫지 않도록 두 프록시에 동일하게 1,000,000을 사용합니다.
 
 `server.downstream_max_connections`는 handshake/HTTP 처리 중인 전체 downstream
-connection 수를 제한하며 기본값은 4096입니다.
+connection 수를 제한하며 기본값은 2048입니다.
 `server.downstream_request_header_timeout_seconds`는 HTTP/1 header 전체와 HTTP/2
 preface를 받는 총시간 제한이며 기본값은 15초입니다. 두 값 모두 Slowloris와 socket
 고갈 방어이므로 비활성화할 수 없습니다.
@@ -316,8 +317,9 @@ benchmark 전용이며 운영에 사용하면 안 됩니다.
 배포 binary는 `tcmalloc-better` 0.1.19가 포함한 Google TCMalloc/Abseil 소스를
 8 KiB logical page 설정으로 빌드하고 Rust global allocator로 명시적으로
 등록합니다. 빌드 중 별도 Git 저장소나 tarball을 받지 않으며 `LD_PRELOAD`에도
-의존하지 않습니다. 1 vCPU 환경에서 확인되지 않은 background thread, huge-page,
-arena 튜닝은 image에 강제하지 않습니다.
+의존하지 않습니다. 컨테이너가 CPU quota보다 많은 host CPU를 보는 경우에도 RSS가
+커지지 않도록 per-CPU cache를 256 KiB로 제한하고, idle page는 초당 8 MiB 속도로
+background release합니다. huge-page 정책은 image에서 변경하지 않습니다.
 
 ```bash
 pingora --allocator-info
@@ -379,11 +381,9 @@ capability를 설정할 때만 mount layer 안에 설치했다가 제거하므�
 남지 않습니다. `RUST_LTO`, `RUST_CODEGEN_UNITS`, `RUST_TARGET_CPU`는 label로 기록되어
 실행 image의 build policy를 inspect할 수 있습니다.
 
-모든 배포 image는 GitHub Actions에서 재현 가능하게 빌드합니다. Generic image는
-`RUST_TARGET_CPU=x86-64-v2`, Oracle image는 EPYC 7551의 Zen 1에 맞춘
-`RUST_TARGET_CPU=znver1`을 사용하며 둘 다 Fat LTO와 Rust/LLVM instrumentation
-PGO를 적용합니다. `native`는 hosted runner CPU에 따라 산출물이 달라지므로 배포
-build에서 허용하지 않습니다.
+모든 배포 image는 GitHub Actions에서 `RUST_TARGET_CPU=x86-64-v2`로 재현 가능하게
+빌드하고 Fat LTO와 Rust/LLVM instrumentation PGO를 적용합니다. `native`는 hosted
+runner CPU에 따라 산출물이 달라지므로 배포 build에서 허용하지 않습니다.
 학습 workload는 동일한 synthetic backend를 대상으로 64 B/4096 B H1
 keepalive, 작은/큰 JSON API, 정적 파일 cold miss/hot hit, 1/10 MiB chunked stream,
 예상된 404/500, TLS 신규 연결, 검증된 TLS 1.3 session resumption, H2 다중 stream을
@@ -394,9 +394,8 @@ upstream keepalive가 실제로 재사용됐음을 검증합니다. curl/h2load/
 `org.opencontainers.image.rust.pgo=train`,
 `org.opencontainers.image.rust.pgo-train-target-cpu=x86-64-v2`,
 `org.opencontainers.image.rust.target-cpu` label로 적용 여부를 확인할 수 있습니다.
-PGO 훈련 바이너리는 GitHub hosted runner 호환성을 위해 x86-64-v2로 실행하되 최종
-code generation은 각 image의 target CPU를 사용합니다. BOLT는 build와 runtime에서
-사용하지 않습니다.
+PGO 훈련과 최종 code generation은 모두 x86-64-v2를 사용합니다. BOLT는 build와
+runtime에서 사용하지 않습니다.
 
 ```bash
 # 동일 commit/allocator/TLS/CPU/LTO의 exact digest 두 개만 허용하는 3-round PGO A/B
@@ -426,14 +425,6 @@ docker build --build-arg ALLOCATOR=tcmalloc \
   --build-arg RUST_CODEGEN_UNITS=1 \
   -t pingora:local .
 
-# GitHub Actions와 동일한 AMD Zen 1 PGO image를 로컬에서 재현하는 경우
-docker build --build-arg ALLOCATOR=tcmalloc \
-  --build-arg TLS_PROVIDER=boringssl \
-  --build-arg PGO_MODE=train \
-  --build-arg PGO_TRAIN_TARGET_CPU=x86-64-v2 \
-  --build-arg RUST_TARGET_CPU=znver1 \
-  --build-arg RUST_LTO=fat \
-  -t pingora:oracle-zen1 .
 ```
 
 `tests/http2_matrix.sh`는 HTTP/1.1/H2 fixed length, chunked, trailer, 204, HEAD,
@@ -517,16 +508,9 @@ source symbol이 제한될 수 있어 `perf.data`와 `perf script` 입력을 모
 SHA-256을 먼저 비교합니다. `OVERHEAD_HANDLER`, `OVERHEAD_PATH`,
 `OVERHEAD_ACTIVE_LIMIT`으로 route와 limiter 비용을 분리할 수 있습니다.
 
-공식 generic image는 `x86-64-v2`이고 `latest` tag로 게시됩니다. GitHub Actions가
-동시에 게시하는 Oracle 전용 image는 `oracle-zen1` 및 호환 tag `pgo-znver1`입니다.
-검증은
-`PINGORA_TEST_IMAGE=ghcr.io/tae-ok-11/pingora:oracle-zen1
-PINGORA_EXPECTED_TARGET_CPU=znver1 PINGORA_EXPECTED_PGO=train
-tests/docker_runtime.sh`로 수행합니다. 이 tag는
-`lscpu`에서 AMD Zen 계열과 AVX2/BMI2 지원을 확인한 호스트에서만 사용하고, 호환 여부가
-불명확하면 반드시 `latest`를 사용하십시오. `oracle-zen1`을 공식 비교에 사용하려면
-대상 host에서 위 runtime test까지 통과시킨 뒤 tag가 아니라 같은 방식으로 구한
-`ghcr.io/tae-ok-11/pingora@sha256:...` digest를 `PINGORA_IMAGE`에 전달하십시오.
+공식 image는 `x86-64-v2` 하나이며 `latest`, commit SHA, release tag로 게시됩니다.
+운영 배포에서는 tag 대신 검증된 `ghcr.io/tae-ok-11/pingora@sha256:...` digest를
+`PINGORA_IMAGE`에 전달하십시오.
 
 ## 배포와 rollback
 
@@ -537,8 +521,6 @@ bind 검사와 기동을 수행합니다.
 ```bash
 cd /opt/pingora
 git pull --ff-only
-# Zen 1 이상 운영 서버에서는 검증한 oracle-zen1 content digest를 고정합니다.
-export PINGORA_IMAGE=ghcr.io/tae-ok-11/pingora@sha256:...
 # 원격 production 이미지를 사용할 때는 반드시 immutable digest를 지정합니다.
 export PINGORA_IMAGE='ghcr.io/tae-ok-11/pingora@sha256:<release-digest>'
 docker compose pull pingora

@@ -9,6 +9,7 @@ use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ahash::AHashMap;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use futures::stream;
@@ -32,19 +33,22 @@ use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(100);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
-const H3_RESPONSE_BACKPRESSURE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const MAX_UDP_PAYLOAD: usize = 1452;
 const MAX_H3_HEADER_BYTES: u64 = 64 * 1024;
-const MAX_REQUEST_COMMANDS: usize = 512;
-const MAX_PENDING_REQUESTS: usize = 512;
-const MAX_BODY_FRAMES: usize = 64;
+const MAX_REQUEST_COMMANDS: usize = 128;
+const MAX_PENDING_REQUESTS: usize = 128;
+const MAX_BODY_FRAMES: usize = 8;
 const H3_BODY_RECV_BUFFER: usize = 16 * 1024;
-const INITIAL_MAX_DATA: u64 = 128 * 1024 * 1024;
-const INITIAL_STREAM_WINDOW: u64 = 16 * 1024 * 1024;
+const INITIAL_MAX_DATA: u64 = 16 * 1024 * 1024;
+const INITIAL_STREAM_WINDOW: u64 = 1024 * 1024;
 const H3_CONTROL_STREAMS: u64 = 8;
 const SEND_CAPACITY_FACTOR: f64 = 3.0;
 const CC_CUBIC: &str = "cubic";
 const CC_BBR2: &str = "bbr2";
+const BRIDGE_H2_STREAM_WINDOW: u32 = 1024 * 1024;
+const BRIDGE_H2_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+const BRIDGE_H2_MAX_FRAME: u32 = 64 * 1024;
+const BRIDGE_H2_MAX_STREAMS: u32 = MAX_PENDING_REQUESTS as u32;
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 type BridgeBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -250,11 +254,15 @@ struct H3Pool {
 
 impl H3Pool {
     fn new(settings: BridgeSettings, available: Arc<AtomicBool>) -> Arc<Self> {
-        let (commands, receiver) = mpsc::channel(MAX_REQUEST_COMMANDS);
+        let request_capacity = usize::try_from(settings.max_streams)
+            .unwrap_or(MAX_PENDING_REQUESTS)
+            .clamp(1, MAX_PENDING_REQUESTS);
+        let command_capacity = request_capacity.saturating_mul(2).min(MAX_REQUEST_COMMANDS);
+        let (commands, receiver) = mpsc::channel(command_capacity);
         let pool = Arc::new(Self {
             commands,
             next_id: AtomicU64::new(1),
-            request_slots: Arc::new(Semaphore::new(MAX_PENDING_REQUESTS)),
+            request_slots: Arc::new(Semaphore::new(request_capacity)),
         });
         tokio::spawn(pool_manager(settings, receiver, available));
         pool
@@ -434,6 +442,7 @@ struct PendingRequest {
     stream_id: Option<u64>,
     response_started: bool,
     pending_write: Option<PendingWrite>,
+    pending_response: Option<Frame<Bytes>>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -610,14 +619,16 @@ async fn run_connection(
     let mut h3_config = h3::Config::new().context("failed to create H3 config")?;
     h3_config.set_max_field_section_size(MAX_H3_HEADER_BYTES);
     let mut h3_conn = None;
-    let mut requests = HashMap::<u64, PendingRequest>::new();
-    let mut stream_to_request = HashMap::<u64, u64>::new();
+    let mut requests = AHashMap::<u64, PendingRequest>::new();
+    let mut stream_to_request = AHashMap::<u64, u64>::new();
     let mut waiting = VecDeque::<u64>::new();
     let mut pending_writes = VecDeque::<u64>::new();
     let mut recv_buf = vec![0_u8; MAX_UDP_PAYLOAD];
     let mut send_buf = vec![0_u8; MAX_UDP_PAYLOAD];
     let mut body_buf = vec![0_u8; H3_BODY_RECV_BUFFER];
     let mut pending_send = None;
+    let mut response_blocked = None;
+    let mut draining = false;
     let handshake_deadline = Instant::now() + settings.connect_timeout;
     let mut established_logged = false;
     let mut session_logged = false;
@@ -630,6 +641,7 @@ async fn run_connection(
             &mut stream_to_request,
             &mut waiting,
             &mut pending_writes,
+            true,
         );
     }
 
@@ -651,7 +663,9 @@ async fn run_connection(
                 );
             }
             if conn.is_established() {
-                available.store(true, Ordering::Release);
+                if !draining {
+                    available.store(true, Ordering::Release);
+                }
                 if !established_logged {
                     info!(
                         "upstream HTTP/3 established upstream={} peer={} resumed={} early_data_enabled={} cc={} hybrid_pq={}",
@@ -678,17 +692,19 @@ async fn run_connection(
                 }
             }
 
-            let response_backpressured = if let Some(h3_conn) = h3_conn.as_mut() {
+            if let Some(h3_conn) = h3_conn.as_mut() {
                 // Drop paths enqueue explicit Cancel commands. Avoid scanning and
                 // allocating a temporary list of every active request on each
                 // QUIC event-loop turn just to rediscover the same cancellations.
-                dispatch_waiting(
-                    h3_conn,
-                    &mut conn,
-                    &mut requests,
-                    &mut stream_to_request,
-                    &mut waiting,
-                )?;
+                if !draining {
+                    dispatch_waiting(
+                        h3_conn,
+                        &mut conn,
+                        &mut requests,
+                        &mut stream_to_request,
+                        &mut waiting,
+                    )?;
+                }
                 drive_pending_writes(
                     h3_conn,
                     &mut conn,
@@ -702,10 +718,16 @@ async fn run_connection(
                     &mut requests,
                     &mut stream_to_request,
                     &mut body_buf,
-                )?
-            } else {
-                false
-            };
+                    &mut response_blocked,
+                    &mut draining,
+                )?;
+            }
+            if draining {
+                available.store(false, Ordering::Release);
+                if stream_to_request.is_empty() {
+                    return Ok(());
+                }
+            }
             flush_ready_quic(&socket, &mut conn, &mut send_buf, &mut pending_send).await?;
 
             let timeout = conn.timeout().unwrap_or(Duration::from_secs(1));
@@ -713,8 +735,12 @@ async fn run_connection(
                 .as_ref()
                 .map(|send: &ScheduledSend| send.at.saturating_duration_since(Instant::now()))
                 .unwrap_or_default();
+            let response_waiter = response_blocked
+                .and_then(|id| requests.get(&id))
+                .map(|request| request.body_tx.clone());
+            let response_waiter_enabled = response_waiter.is_some();
             tokio::select! {
-                recv = socket.recv_from(&mut recv_buf), if !response_backpressured => {
+                recv = socket.recv_from(&mut recv_buf) => {
                     let (len, from) = recv.context("upstream QUIC UDP receive failed")?;
                     let info = quiche::RecvInfo { from, to: local };
                     match conn.recv(&mut recv_buf[..len], info) {
@@ -734,9 +760,20 @@ async fn run_connection(
                         &mut stream_to_request,
                         &mut waiting,
                         &mut pending_writes,
+                        !draining,
                     );
                 }
-                _ = tokio::time::sleep(H3_RESPONSE_BACKPRESSURE_RETRY_DELAY), if response_backpressured => {}
+                permit = async move {
+                    response_waiter
+                        .expect("response capacity waiter is guarded")
+                        .reserve_owned()
+                        .await
+                }, if response_waiter_enabled => {
+                    // Capacity is re-checked synchronously at the start of the
+                    // next H3 event pass. Dropping this permit transfers no
+                    // data and merely wakes the connection without polling.
+                    drop(permit);
+                }
                 _ = tokio::time::sleep(timeout) => {
                     conn.on_timeout();
                 }
@@ -764,10 +801,11 @@ async fn run_connection(
 fn handle_command(
     command: Command,
     conn: &mut quiche::Connection,
-    requests: &mut HashMap<u64, PendingRequest>,
-    stream_to_request: &mut HashMap<u64, u64>,
+    requests: &mut AHashMap<u64, PendingRequest>,
+    stream_to_request: &mut AHashMap<u64, u64>,
     waiting: &mut VecDeque<u64>,
     pending_writes: &mut VecDeque<u64>,
+    accept_new_requests: bool,
 ) {
     match command {
         Command::Open {
@@ -780,6 +818,12 @@ fn handle_command(
             response,
             permit,
         } => {
+            if !accept_new_requests {
+                let _ = opened.send(Err(
+                    "upstream HTTP/3 connection is draining after GOAWAY".to_string()
+                ));
+                return;
+            }
             let (body_tx, body_rx) = mpsc::channel(MAX_BODY_FRAMES);
             let response_finished = Arc::new(AtomicBool::new(false));
             requests.insert(
@@ -797,6 +841,7 @@ fn handle_command(
                     stream_id: None,
                     response_started: false,
                     pending_write: None,
+                    pending_response: None,
                     _permit: permit,
                 },
             );
@@ -847,7 +892,7 @@ fn handle_command(
 fn enqueue_write(
     id: u64,
     write: PendingWrite,
-    requests: &mut HashMap<u64, PendingRequest>,
+    requests: &mut AHashMap<u64, PendingRequest>,
     pending_writes: &mut VecDeque<u64>,
 ) {
     let Some(request) = requests.get_mut(&id) else {
@@ -869,8 +914,8 @@ fn enqueue_write(
 fn drive_pending_writes(
     h3_conn: &mut h3::Connection,
     conn: &mut quiche::Connection,
-    requests: &mut HashMap<u64, PendingRequest>,
-    stream_to_request: &mut HashMap<u64, u64>,
+    requests: &mut AHashMap<u64, PendingRequest>,
+    stream_to_request: &mut AHashMap<u64, u64>,
     pending_writes: &mut VecDeque<u64>,
 ) {
     let count = pending_writes.len();
@@ -935,8 +980,8 @@ fn drive_pending_writes(
 fn dispatch_waiting(
     h3_conn: &mut h3::Connection,
     conn: &mut quiche::Connection,
-    requests: &mut HashMap<u64, PendingRequest>,
-    stream_to_request: &mut HashMap<u64, u64>,
+    requests: &mut AHashMap<u64, PendingRequest>,
+    stream_to_request: &mut AHashMap<u64, u64>,
     waiting: &mut VecDeque<u64>,
 ) -> Result<()> {
     let count = waiting.len();
@@ -988,10 +1033,54 @@ fn dispatch_waiting(
 fn process_h3_events(
     h3_conn: &mut h3::Connection,
     conn: &mut quiche::Connection,
-    requests: &mut HashMap<u64, PendingRequest>,
-    stream_to_request: &mut HashMap<u64, u64>,
+    requests: &mut AHashMap<u64, PendingRequest>,
+    stream_to_request: &mut AHashMap<u64, u64>,
     body_buf: &mut [u8],
-) -> Result<bool> {
+    response_blocked: &mut Option<u64>,
+    draining: &mut bool,
+) -> Result<()> {
+    // A full downstream channel must apply QUIC flow control without polling
+    // every millisecond or stopping UDP receives for the whole connection.
+    // Retry the single H3 event that could not be delivered once Tokio wakes
+    // us for channel capacity; other QUIC packets can still be acknowledged.
+    if let Some(request_id) = response_blocked.take() {
+        let pending_frame = requests
+            .get_mut(&request_id)
+            .and_then(|request| request.pending_response.take());
+        let retry = if !requests.contains_key(&request_id) {
+            DeliveryRetry::Ready
+        } else if let Some(frame) = pending_frame {
+            let request = requests
+                .get_mut(&request_id)
+                .ok_or_else(|| anyhow!("HTTP/3 response has no request state"))?;
+            match request.body_tx.try_send(Ok(frame)) {
+                Ok(()) => DeliveryRetry::Ready,
+                Err(mpsc::error::TrySendError::Full(Ok(frame))) => {
+                    request.pending_response = Some(frame);
+                    DeliveryRetry::Blocked
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    DeliveryRetry::Closed("downstream dropped HTTP/3 response trailers")
+                }
+                Err(mpsc::error::TrySendError::Full(Err(_))) => {
+                    unreachable!("only successful response frames are buffered")
+                }
+            }
+        } else {
+            drain_response_body(h3_conn, conn, request_id, requests, body_buf)?
+        };
+        match retry {
+            DeliveryRetry::Ready => {}
+            DeliveryRetry::Blocked => {
+                *response_blocked = Some(request_id);
+                return Ok(());
+            }
+            DeliveryRetry::Closed(message) => {
+                cancel_request(request_id, message, conn, requests, stream_to_request)
+            }
+        }
+    }
+
     loop {
         let (stream_id, event) = match h3_conn.poll(conn) {
             Ok(event) => event,
@@ -1002,6 +1091,17 @@ fn process_h3_events(
                 ));
             }
         };
+        // GOAWAY carries a connection-level stream threshold and is not
+        // guaranteed to identify an entry in stream_to_request. Handle it
+        // before the per-request lookup so a graceful peer restart cannot be
+        // silently ignored.
+        if matches!(&event, h3::Event::GoAway) {
+            if !*draining {
+                info!("upstream HTTP/3 peer started graceful drain id={stream_id}");
+                *draining = true;
+            }
+            continue;
+        }
         let Some(request_id) = stream_to_request.get(&stream_id).copied() else {
             continue;
         };
@@ -1076,48 +1176,43 @@ fn process_h3_events(
                         .body_tx
                         .try_send(Ok(Frame::trailers(trailers)));
                     if let Err(error) = send_result {
-                        let message = match error {
-                            mpsc::error::TrySendError::Full(_) => {
-                                "HTTP/3 response buffer limit exceeded while sending trailers"
+                        match error {
+                            mpsc::error::TrySendError::Full(Ok(frame)) => {
+                                let request = requests.get_mut(&request_id).ok_or_else(|| {
+                                    anyhow!("HTTP/3 response has no request state")
+                                })?;
+                                request.pending_response = Some(frame);
+                                *response_blocked = Some(request_id);
+                                return Ok(());
                             }
                             mpsc::error::TrySendError::Closed(_) => {
-                                "downstream dropped HTTP/3 response trailers"
+                                cancel_request(
+                                    request_id,
+                                    "downstream dropped HTTP/3 response trailers",
+                                    conn,
+                                    requests,
+                                    stream_to_request,
+                                );
                             }
-                        };
+                            mpsc::error::TrySendError::Full(Err(_)) => {
+                                unreachable!("only successful response frames are queued")
+                            }
+                        }
+                    }
+                }
+            }
+            h3::Event::Data => {
+                match drain_response_body(h3_conn, conn, request_id, requests, body_buf)? {
+                    DeliveryRetry::Ready => {}
+                    DeliveryRetry::Blocked => {
+                        *response_blocked = Some(request_id);
+                        return Ok(());
+                    }
+                    DeliveryRetry::Closed(message) => {
                         cancel_request(request_id, message, conn, requests, stream_to_request);
                     }
                 }
             }
-            h3::Event::Data => loop {
-                let body_tx = requests
-                    .get(&request_id)
-                    .ok_or_else(|| anyhow!("HTTP/3 data has no request state"))?
-                    .body_tx
-                    .clone();
-                let permit = match body_tx.try_reserve() {
-                    Ok(permit) => permit,
-                    Err(mpsc::error::TrySendError::Full(_)) => return Ok(true),
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        cancel_request(
-                            request_id,
-                            "downstream dropped HTTP/3 response body",
-                            conn,
-                            requests,
-                            stream_to_request,
-                        );
-                        break;
-                    }
-                };
-                match h3_conn.recv_body(conn, stream_id, body_buf) {
-                    Ok(read) if read > 0 => {
-                        permit.send(Ok(Frame::data(Bytes::copy_from_slice(&body_buf[..read]))));
-                    }
-                    Ok(_) | Err(h3::Error::Done) => break,
-                    Err(error) => {
-                        return Err(anyhow!("HTTP/3 response body receive failed: {error:?}"));
-                    }
-                }
-            },
             h3::Event::Finished => {
                 stream_to_request.remove(&stream_id);
                 if let Some(mut request) = requests.remove(&request_id) {
@@ -1136,21 +1231,64 @@ fn process_h3_events(
                 let message = format!("HTTP/3 stream reset by upstream code={code}");
                 cancel_request(request_id, &message, conn, requests, stream_to_request);
             }
-            h3::Event::GoAway => {
-                return Err(anyhow!("upstream HTTP/3 peer sent GOAWAY id={stream_id}"));
-            }
+            h3::Event::GoAway => unreachable!("GOAWAY is handled before request lookup"),
             h3::Event::PriorityUpdate => {}
         }
     }
-    Ok(false)
+    Ok(())
+}
+
+enum DeliveryRetry {
+    Ready,
+    Blocked,
+    Closed(&'static str),
+}
+
+fn drain_response_body(
+    h3_conn: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    request_id: u64,
+    requests: &AHashMap<u64, PendingRequest>,
+    body_buf: &mut [u8],
+) -> Result<DeliveryRetry> {
+    let (stream_id, body_tx) = {
+        let request = requests
+            .get(&request_id)
+            .ok_or_else(|| anyhow!("HTTP/3 data has no request state"))?;
+        let stream_id = request
+            .stream_id
+            .ok_or_else(|| anyhow!("HTTP/3 data arrived before the request stream opened"))?;
+        (stream_id, request.body_tx.clone())
+    };
+
+    loop {
+        let permit = match body_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => return Ok(DeliveryRetry::Blocked),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Ok(DeliveryRetry::Closed(
+                    "downstream dropped HTTP/3 response body",
+                ));
+            }
+        };
+        match h3_conn.recv_body(conn, stream_id, body_buf) {
+            Ok(read) if read > 0 => {
+                permit.send(Ok(Frame::data(Bytes::copy_from_slice(&body_buf[..read]))));
+            }
+            Ok(_) | Err(h3::Error::Done) => return Ok(DeliveryRetry::Ready),
+            Err(error) => {
+                return Err(anyhow!("HTTP/3 response body receive failed: {error:?}"));
+            }
+        }
+    }
 }
 
 fn cancel_request(
     id: u64,
     message: &str,
     conn: &mut quiche::Connection,
-    requests: &mut HashMap<u64, PendingRequest>,
-    stream_to_request: &mut HashMap<u64, u64>,
+    requests: &mut AHashMap<u64, PendingRequest>,
+    stream_to_request: &mut AHashMap<u64, u64>,
 ) {
     let Some(request) = requests.remove(&id) else {
         return;
@@ -1210,7 +1348,7 @@ async fn send_quic_datagram(socket: &UdpSocket, packet: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn fail_all(requests: &mut HashMap<u64, PendingRequest>, message: &str) {
+fn fail_all(requests: &mut AHashMap<u64, PendingRequest>, message: &str) {
     for (_, request) in requests.drain() {
         request.fail(message);
     }
@@ -1229,11 +1367,20 @@ async fn serve_bridge(listener: TcpListener, pool: Arc<H3Pool>) {
             warn!("upstream HTTP/3 bridge rejected non-loopback peer={peer}");
             continue;
         }
+        if let Err(error) = stream.set_nodelay(true) {
+            warn!("upstream HTTP/3 h2c bridge could not enable TCP_NODELAY: {error}");
+            continue;
+        }
         let pool = pool.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let service = service_fn(move |request| proxy_bridge_request(request, pool.clone()));
             if let Err(error) = http2::Builder::new(TokioExecutor::new())
+                .adaptive_window(false)
+                .initial_stream_window_size(BRIDGE_H2_STREAM_WINDOW)
+                .initial_connection_window_size(BRIDGE_H2_CONNECTION_WINDOW)
+                .max_frame_size(BRIDGE_H2_MAX_FRAME)
+                .max_concurrent_streams(BRIDGE_H2_MAX_STREAMS)
                 .serve_connection(io, service)
                 .await
             {
