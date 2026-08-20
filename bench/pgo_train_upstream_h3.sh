@@ -141,7 +141,9 @@ upstreams:
     connect_timeout_seconds: 3
     read_timeout_seconds: 60
     write_timeout_seconds: 60
-    idle_timeout_seconds: 3
+    # Allow serialized bulk responses to remain flow-controlled by the H2
+    # consumer without mistaking downstream backpressure for an idle peer.
+    idle_timeout_seconds: 10
 hosts:
   profile: { domains: ["pgo.test"], handler: vaultwarden, upstream: origin_h3 }
 route_limits:
@@ -198,12 +200,12 @@ run_h2load chunked-128k -n 256 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/131072"
 
-# The target uses a deliberately short three-second upstream QUIC idle timeout
+# The target uses a deliberately short ten-second upstream QUIC idle timeout
 # only for this training fixture. Waiting past it repeatedly exercises reconnect,
-# ticket caching/resumption, and replay-safe early-data paths without risking
-# spurious idle expiry during the transfer workload above.
+# ticket caching/resumption, and replay-safe early-data paths after the transfer
+# workloads have completed.
 for index in $(seq 1 8); do
-  sleep 3.3
+  sleep 10.3
   run_h2load "resume-${index}" -n 32 -c 1 -m 1 --sni pgo.test \
     -H 'host: pgo.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${TARGET_HTTPS_PORT}/json/512"
