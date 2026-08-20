@@ -73,6 +73,7 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    allocator::configure_for_proxy();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
 
@@ -393,8 +394,8 @@ fn handoff_h2_options(max_concurrent_streams: u32) -> H2Options {
     configure_h2_options(
         max_concurrent_streams,
         64 * 1024,
-        2 * 1024 * 1024,
-        32 * 1024 * 1024,
+        1024 * 1024,
+        16 * 1024 * 1024,
     )
 }
 

@@ -17,7 +17,7 @@ HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항�
 
 - Cloudflare BoringSSL를 사용하는 rustls와 다운스트림 TLS 1.3 전용 정책
 - HTTP/1.1 및 HTTP/2, 기본 최대 32개 동시 H2 stream(설정으로 1~1024 override), stream window 256 KiB / connection window 2 MiB / frame 64 KiB
-- 다운스트림 QUIC은 BBRv2, 2 MiB stream / 8 MiB connection window, 1 스레드 호스트에서는 current-thread runtime
+- 다운스트림 QUIC은 BBRv2, 초기 1 MiB stream / 4 MiB connection window(최대 2/8 MiB), 1 스레드 호스트에서는 current-thread runtime
 - upstream HTTP/3/QUIC (`http3`/`http3-preferred`) + connection reuse + replay-safe 0-RTT session resumption
 - QUIC Stateless Retry defaults ON; only a trusted private H3 origin should set `server.http3_stateless_retry: false` when accepted 0-RTT is required
 - IPv4/IPv6 listener와 IPv6 socket의 명시적 `IPV6_V6ONLY=true`
@@ -251,14 +251,15 @@ upstreams:
 ```
 
 `http2_max_concurrent_streams`는 upstream H2 connection 하나에서 Pingora가 허용하는
-동시 stream 상한이며 1~1024만 허용합니다. 기본값은 32이고 DoH 기본 설정은 짧은
-요청의 multiplexing을 위해 64입니다. WebSocket Upgrade origin과 H2를 지원하지 않는
+동시 stream 상한이며 1~1024만 허용합니다. 기본값은 128이고 DoH 운영 설정은 짧은
+요청의 multiplexing을 위해 256입니다. 기본 receive window는 stream 2 MiB / connection
+16 MiB입니다. WebSocket Upgrade origin과 H2를 지원하지 않는
 Navidrome/Vaultwarden/CouchDB/AdGuard UI 기본 upstream은 명시적으로 `http1`을
 유지합니다. 설정 변경은 재시작 후 적용됩니다.
 
 다운스트림 H2 receive window는 설정 키 없이 고정합니다. 공개 리스너는 stream
-256 KiB / connection 2 MiB / frame 64 KiB이고, 신뢰 루프백 H3→H2c handoff만
-connection window 4 MiB입니다. 동시 stream 기본값 32는 그대로입니다.
+256 KiB / connection 2 MiB / frame 64 KiB이고, 신뢰 루프백 H3→H2c handoff는
+stream 1 MiB / connection 16 MiB입니다. 동시 stream 기본값 32는 그대로입니다.
 
 `server.downstream_keepalive_requests`는 downstream HTTP/1.1 connection을 주기적으로
 닫아 connection별 allocation을 회수하는 상한입니다. NGINX와 같은 방식으로 첫 요청을
@@ -267,7 +268,7 @@ connection window 4 MiB입니다. 동시 stream 기본값 32는 그대로입니�
 닫지 않도록 두 프록시에 동일하게 1,000,000을 사용합니다.
 
 `server.downstream_max_connections`는 handshake/HTTP 처리 중인 전체 downstream
-connection 수를 제한하며 기본값은 4096입니다.
+connection 수를 제한하며 기본값은 2048입니다.
 `server.downstream_request_header_timeout_seconds`는 HTTP/1 header 전체와 HTTP/2
 preface를 받는 총시간 제한이며 기본값은 15초입니다. 두 값 모두 Slowloris와 socket
 고갈 방어이므로 비활성화할 수 없습니다.
@@ -316,8 +317,9 @@ benchmark 전용이며 운영에 사용하면 안 됩니다.
 배포 binary는 `tcmalloc-better` 0.1.19가 포함한 Google TCMalloc/Abseil 소스를
 8 KiB logical page 설정으로 빌드하고 Rust global allocator로 명시적으로
 등록합니다. 빌드 중 별도 Git 저장소나 tarball을 받지 않으며 `LD_PRELOAD`에도
-의존하지 않습니다. 1 vCPU 환경에서 확인되지 않은 background thread, huge-page,
-arena 튜닝은 image에 강제하지 않습니다.
+의존하지 않습니다. 컨테이너가 CPU quota보다 많은 host CPU를 보는 경우에도 RSS가
+커지지 않도록 per-CPU cache를 256 KiB로 제한하고, idle page는 초당 8 MiB 속도로
+background release합니다. huge-page 정책은 image에서 변경하지 않습니다.
 
 ```bash
 pingora --allocator-info

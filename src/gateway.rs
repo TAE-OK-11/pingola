@@ -314,7 +314,7 @@ impl Default for RequestContext {
 /// Process-wide admission and static cache shared by the public listener
 /// and the loopback HTTP/3 → H2c handoff. Separate Gateway instances must
 /// not own their own limiters or LRU, or H2+H3 clients would get 2× quota
-/// and the 1 GiB host would hold two 32 MiB asset caches.
+/// and the 1 GiB host would hold two 16 MiB asset caches.
 pub struct GatewayShared {
     static_files: StaticFiles,
     rates: RateLimiter,
@@ -1850,8 +1850,8 @@ fn prepare_upstream(
         peer.options.idle_timeout = Some(Duration::from_secs(upstream.idle_timeout_seconds));
         peer.options.alpn = ALPN::H2;
         peer.options.max_h2_streams = upstream.http3_max_concurrent_streams;
-        peer.options.h2_stream_window_size = Some(2 * 1024 * 1024);
-        peer.options.h2_connection_window_size = Some(32 * 1024 * 1024);
+        peer.options.h2_stream_window_size = Some(1024 * 1024);
+        peer.options.h2_connection_window_size = Some(16 * 1024 * 1024);
         PreparedH3Peer {
             peer,
             route: route.clone(),
@@ -2432,11 +2432,11 @@ write_timeout_seconds: 9
         assert_eq!(prepared.peer.options.max_h2_streams, 128);
         assert_eq!(
             prepared.peer.options.h2_stream_window_size,
-            Some(16 * 1024 * 1024)
+            Some(2 * 1024 * 1024)
         );
         assert_eq!(
             prepared.peer.options.h2_connection_window_size,
-            Some(64 * 1024 * 1024)
+            Some(16 * 1024 * 1024)
         );
         assert_eq!(
             prepared.peer.options.h2_ping_interval,

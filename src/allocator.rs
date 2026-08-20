@@ -28,6 +28,25 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tcmalloc_better::TCMalloc = tcmalloc_better::TCMalloc;
 
+#[cfg(feature = "tcmalloc")]
+const TCMALLOC_MAX_PER_CPU_CACHE_BYTES: i32 = 256 * 1024;
+#[cfg(feature = "tcmalloc")]
+const TCMALLOC_BACKGROUND_RELEASE_BYTES_PER_SECOND: usize = 8 * 1024 * 1024;
+
+/// Bound allocator-side retention before worker threads begin serving.
+///
+/// Google TCMalloc defaults to as much as 1.5 MiB of cache per visible CPU.
+/// Containers can see far more host CPUs than their CPU quota, so the default
+/// can retain disproportionate RSS on a 1 GiB service. A 256 KiB cache keeps
+/// the fast per-CPU path while background release steadily returns idle pages.
+pub fn configure_for_proxy() {
+    #[cfg(feature = "tcmalloc")]
+    unsafe {
+        tcmalloc_set_max_per_cpu_cache_size(TCMALLOC_MAX_PER_CPU_CACHE_BYTES);
+        tcmalloc_set_background_release_rate(TCMALLOC_BACKGROUND_RELEASE_BYTES_PER_SECOND);
+    }
+}
+
 #[cfg(feature = "jemalloc")]
 pub fn summary(include_stats: bool) -> Result<String> {
     let version = jemalloc_version::read()
@@ -56,8 +75,10 @@ pub fn summary(include_stats: bool) -> Result<String> {
 #[cfg(feature = "tcmalloc")]
 pub fn summary(include_stats: bool) -> Result<String> {
     let base = format!(
-        "allocator=tcmalloc implementation=google-tcmalloc logical_page_size=8192 background_actions_needed={}",
-        tcmalloc_better::TCMalloc::needs_process_background_actions()
+        "allocator=tcmalloc implementation=google-tcmalloc logical_page_size=8192 per_cpu_cache_limit={} background_release_bytes_per_second={} background_actions_needed={}",
+        TCMALLOC_MAX_PER_CPU_CACHE_BYTES,
+        TCMALLOC_BACKGROUND_RELEASE_BYTES_PER_SECOND,
+        tcmalloc_better::TCMalloc::needs_process_background_actions(),
     );
     if !include_stats {
         return Ok(base);
@@ -113,6 +134,8 @@ pub fn detailed_stats() -> Result<serde_json::Value> {
         "allocator": "tcmalloc",
         "implementation": "google-tcmalloc",
         "logical_page_size": 8192,
+        "per_cpu_cache_limit": TCMALLOC_MAX_PER_CPU_CACHE_BYTES,
+        "background_release_bytes_per_second": TCMALLOC_BACKGROUND_RELEASE_BYTES_PER_SECOND,
         "background_actions_needed": tcmalloc_better::TCMalloc::needs_process_background_actions(),
         "current_allocated_bytes": stats.current_allocated_bytes,
         "heap_size": stats.heap_size,
@@ -174,6 +197,12 @@ unsafe extern "C" {
         name_length: usize,
         value: *mut usize,
     ) -> bool;
+
+    #[link_name = "TCMalloc_Internal_SetMaxPerCpuCacheSize"]
+    fn tcmalloc_set_max_per_cpu_cache_size(value: i32);
+
+    #[link_name = "TCMalloc_Internal_SetBackgroundReleaseRate"]
+    fn tcmalloc_set_background_release_rate(bytes_per_second: usize);
 }
 
 #[cfg(feature = "system-allocator")]

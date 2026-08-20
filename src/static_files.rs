@@ -154,7 +154,7 @@ impl AssetCache {
         Self {
             max_bytes,
             state: Mutex::new(CacheState {
-                assets: LruCache::new(NonZeroUsize::new(512).unwrap()),
+                assets: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 bytes: 0,
             }),
         }
@@ -852,7 +852,7 @@ mod tests {
             .iter()
             .map(|(_, asset)| asset.body.len())
             .sum::<usize>();
-        assert_eq!(state.assets.len(), 512);
+        assert_eq!(state.assets.len(), 256);
         assert_eq!(state.bytes, actual_bytes);
     }
 

@@ -46,12 +46,12 @@ const HTTP3_MAX_UDP_PAYLOAD_SIZE: usize = 1452;
 const HTTP3_CONTROL_STREAM_LIMIT: u64 = 8;
 const HTTP3_SEND_CAPACITY_FACTOR: f64 = 2.0;
 const HTTP3_MAX_AMPLIFICATION_FACTOR: usize = 3;
-// 1 vCPU / 1 GiB host: enough for Navidrome streams without the crate's
-// 24 MiB connection / 16 MiB stream receive windows.
-const HTTP3_INITIAL_MAX_DATA: u64 = 8 * 1024 * 1024;
-const HTTP3_STREAM_WINDOW: u64 = 2 * 1024 * 1024;
+// 1 vCPU / 1 GiB host: enough bandwidth-delay product for Navidrome streams
+// without allowing slow consumers to retain multi-megabyte buffers per stream.
+const HTTP3_INITIAL_MAX_DATA: u64 = 4 * 1024 * 1024;
+const HTTP3_STREAM_WINDOW: u64 = 1024 * 1024;
 const HTTP3_MAX_CONNECTION_WINDOW: u64 = 8 * 1024 * 1024;
-const HTTP3_MAX_STREAM_WINDOW: u64 = 4 * 1024 * 1024;
+const HTTP3_MAX_STREAM_WINDOW: u64 = 2 * 1024 * 1024;
 const HTTP3_CC_BBR2: &str = "bbr2";
 
 thread_local! {
@@ -285,8 +285,8 @@ async fn run(
         // Match the trusted H3→H2c handoff windows. Adaptive windows can
         // grow past the 1 GiB host budget under concurrent audio streams.
         .http2_adaptive_window(false)
-        .http2_initial_stream_window_size(2 * 1024 * 1024)
-        .http2_initial_connection_window_size(32 * 1024 * 1024)
+        .http2_initial_stream_window_size(1024 * 1024)
+        .http2_initial_connection_window_size(16 * 1024 * 1024)
         .http2_max_frame_size(64 * 1024)
         .pool_max_idle_per_host(1)
         .build(connector);
