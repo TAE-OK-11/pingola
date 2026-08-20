@@ -1043,46 +1043,51 @@ fn process_h3_events(
     // every millisecond or stopping UDP receives for the whole connection.
     // Retry the single H3 event that could not be delivered once Tokio wakes
     // us for channel capacity; other QUIC packets can still be acknowledged.
-    if let Some(request_id) = response_blocked.take()
-        && let Some(request) = requests.get_mut(&request_id)
-    {
-        if let Some(frame) = request.pending_response.take() {
-            match request.body_tx.try_send(Ok(frame)) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(Ok(frame))) => {
-                    request.pending_response = Some(frame);
-                    *response_blocked = Some(request_id);
-                    return Ok(());
+    if let Some(request_id) = response_blocked.take() {
+        enum DeliveryRetry {
+            Ready,
+            Blocked,
+            Closed(&'static str),
+        }
+
+        let retry = requests
+            .get_mut(&request_id)
+            .map_or(DeliveryRetry::Ready, |request| {
+                if let Some(frame) = request.pending_response.take() {
+                    match request.body_tx.try_send(Ok(frame)) {
+                        Ok(()) => DeliveryRetry::Ready,
+                        Err(mpsc::error::TrySendError::Full(Ok(frame))) => {
+                            request.pending_response = Some(frame);
+                            DeliveryRetry::Blocked
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            DeliveryRetry::Closed("downstream dropped HTTP/3 response trailers")
+                        }
+                        Err(mpsc::error::TrySendError::Full(Err(_))) => {
+                            unreachable!("only successful response frames are buffered")
+                        }
+                    }
+                } else {
+                    match request.body_tx.try_reserve() {
+                        Ok(permit) => {
+                            drop(permit);
+                            DeliveryRetry::Ready
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => DeliveryRetry::Blocked,
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            DeliveryRetry::Closed("downstream dropped HTTP/3 response body")
+                        }
+                    }
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    cancel_request(
-                        request_id,
-                        "downstream dropped HTTP/3 response trailers",
-                        conn,
-                        requests,
-                        stream_to_request,
-                    );
-                }
-                Err(mpsc::error::TrySendError::Full(Err(_))) => {
-                    unreachable!("only successful response frames are buffered")
-                }
+            });
+        match retry {
+            DeliveryRetry::Ready => {}
+            DeliveryRetry::Blocked => {
+                *response_blocked = Some(request_id);
+                return Ok(());
             }
-        } else {
-            match request.body_tx.try_reserve() {
-                Ok(permit) => drop(permit),
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    *response_blocked = Some(request_id);
-                    return Ok(());
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    cancel_request(
-                        request_id,
-                        "downstream dropped HTTP/3 response body",
-                        conn,
-                        requests,
-                        stream_to_request,
-                    );
-                }
+            DeliveryRetry::Closed(message) => {
+                cancel_request(request_id, message, conn, requests, stream_to_request)
             }
         }
     }
