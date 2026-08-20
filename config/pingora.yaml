@@ -106,13 +106,6 @@ upstreams:
     idle_timeout_seconds: 300
 
 hosts:
-  pikky:
-    domains:
-      - pikky.site
-      - www.pikky.site
-    handler: static
-    static_root: /var/www/pikky
-    redirect_http: false
   navidrome_cdn:
     domains:
       - cdn.music.tae00217.cloud

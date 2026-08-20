@@ -27,11 +27,11 @@ set -Eeuo pipefail
 : "${RUSTFLAGS_COMMON:?}"
 
 case "${RUST_TARGET_CPU}" in
-  x86-64-v2|znver1|znver2|znver3|znver4) ;;
+  x86-64-v2) ;;
   *) echo "unsupported Rust target CPU: ${RUST_TARGET_CPU}" >&2; exit 2 ;;
 esac
 case "${PGO_TRAIN_TARGET_CPU}" in
-  x86-64-v2|znver1|znver2|znver3|znver4) ;;
+  x86-64-v2) ;;
   *) echo "unsupported PGO training target: ${PGO_TRAIN_TARGET_CPU}" >&2; exit 2 ;;
 esac
 if [[ "${RUST_TARGET_CPU}" != "${PGO_TRAIN_TARGET_CPU}" ]]; then
@@ -51,10 +51,7 @@ for value in \
   [[ "${value}" =~ ^[1-9][0-9]*$ ]] || { echo "PGO weights/rounds must be positive integers: ${value}" >&2; exit 2; }
 done
 
-case "${RUST_TARGET_CPU}" in
-  x86-64-v2) TARGET_NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic' ;;
-  *) TARGET_NATIVE_FLAGS="-O3 -march=${RUST_TARGET_CPU} -mtune=${RUST_TARGET_CPU}" ;;
-esac
+TARGET_NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic'
 TRAIN_NATIVE_FLAGS="${TARGET_NATIVE_FLAGS}"
 
 rustup component add llvm-tools-preview

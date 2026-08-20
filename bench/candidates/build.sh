@@ -59,9 +59,9 @@ export CARGO_PROFILE_RELEASE_LTO=fat
 export CARGO_PROFILE_RELEASE_PANIC=abort
 export CARGO_PROFILE_RELEASE_STRIP=symbols
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang
-export CFLAGS='-O3 -march=znver1 -mtune=znver1'
-export CXXFLAGS='-O3 -march=znver1 -mtune=znver1'
-export RUSTFLAGS='-C target-cpu=znver1 -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections'
+export CFLAGS='-O3 -march=x86-64-v2 -mtune=generic'
+export CXXFLAGS='-O3 -march=x86-64-v2 -mtune=generic'
+export RUSTFLAGS='-C target-cpu=x86-64-v2 -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections'
 
 started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 /usr/bin/time -v -o "${OUTPUT_DIR}/build-time.txt" \
@@ -83,7 +83,7 @@ readelf -n "${OUTPUT_DIR}/${binary}" >"${OUTPUT_DIR}/readelf-notes.txt" || true
   echo "finished=${finished}"
   echo "rustc=$(rustc --version)"
   echo "cargo=$(cargo --version)"
-  echo "target_cpu=znver1"
+  echo "target_cpu=x86-64-v2"
   echo "lto=fat"
   echo "codegen_units=1"
   echo "cflags=${CFLAGS}"

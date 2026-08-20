@@ -29,4 +29,3 @@ services:
     volumes:
       - ${PINGORA_CONFIG_FILE:-./config/pingora.yaml}:/etc/pingora/pingora.yaml:ro
       - ${PINGORA_CERT_ROOT:-/etc/letsencrypt}:/etc/pingora/cert:ro
-      - /var/www/pikky:/var/www/pikky:ro

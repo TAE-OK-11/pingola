@@ -117,7 +117,6 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
     if [ "${PGO_MODE}" = off ]; then \
       case "${RUST_TARGET_CPU}" in \
         x86-64-v2) NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic' ;; \
-        znver1|znver2|znver3|znver4) NATIVE_FLAGS="-O3 -march=${RUST_TARGET_CPU} -mtune=${RUST_TARGET_CPU}" ;; \
         *) echo "unsupported Rust target CPU: ${RUST_TARGET_CPU}" >&2; exit 2 ;; \
       esac; \
       CARGO_TARGET_DIR=/src/target/release \
@@ -198,7 +197,7 @@ RUN --mount=from=builder,source=/out,target=/out,ro \
     && apt-get install --yes --no-install-recommends ca-certificates libcap2-bin libstdc++6 \
     && groupadd --gid 10001 pingora \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin pingora \
-    && install -d -o 10001 -g 10001 /etc/pingora /var/www/pikky /tmp/pingora \
+    && install -d -o 10001 -g 10001 /etc/pingora /tmp/pingora \
     && install -Dm755 /out/pingora /usr/local/bin/pingora \
     && if [ -f /out/pgo-profile-summary.txt ]; then \
          install -Dm644 /out/pgo-profile-summary.txt /usr/share/doc/pingora/pgo-profile-summary.txt; \

@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   build:
-    name: znver1 benchmark tools
+    name: x86-64-v2 benchmark tools
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -32,7 +32,7 @@ jobs:
             rustc \
               --edition=2024 \
               -C opt-level=3 \
-              -C target-cpu=znver1 \
+              -C target-cpu=x86-64-v2 \
               -C lto=fat \
               -C codegen-units=1 \
               -C panic=abort \
@@ -47,7 +47,7 @@ jobs:
           {
             echo "revision=$GITHUB_SHA"
             echo "rustc=$(rustc --version)"
-            echo "target_cpu=znver1"
+            echo "target_cpu=x86-64-v2"
             echo "lto=fat"
             echo "codegen_units=1"
           } > "$RUNNER_TEMP/artifact/build-manifest.txt"
@@ -70,7 +70,7 @@ jobs:
       - name: Upload benchmark tools and provenance
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: benchmark-tools-znver1-fat
+          name: benchmark-tools-x86-64-v2-fat
           path: ${{ runner.temp }}/artifact/
           if-no-files-found: error
           retention-days: 14
