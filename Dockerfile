@@ -34,7 +34,7 @@ ARG BORING_PGO_WEIGHT_UPSTREAM_H3_CUBIC=5
 ARG BORING_PGO_WEIGHT_TLS=20
 ARG DEBIAN_SUITE=13
 
-FROM rust:1.97.1-slim-trixie@sha256:69153971349358535be9821190190f026a761f690c6b58c68a914d14ab2d610a AS builder
+FROM rust:1.97.1-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS builder
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
