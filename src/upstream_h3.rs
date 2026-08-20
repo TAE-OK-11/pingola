@@ -1044,42 +1044,31 @@ fn process_h3_events(
     // Retry the single H3 event that could not be delivered once Tokio wakes
     // us for channel capacity; other QUIC packets can still be acknowledged.
     if let Some(request_id) = response_blocked.take() {
-        enum DeliveryRetry {
-            Ready,
-            Blocked,
-            Closed(&'static str),
-        }
-
-        let retry = requests
+        let pending_frame = requests
             .get_mut(&request_id)
-            .map_or(DeliveryRetry::Ready, |request| {
-                if let Some(frame) = request.pending_response.take() {
-                    match request.body_tx.try_send(Ok(frame)) {
-                        Ok(()) => DeliveryRetry::Ready,
-                        Err(mpsc::error::TrySendError::Full(Ok(frame))) => {
-                            request.pending_response = Some(frame);
-                            DeliveryRetry::Blocked
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            DeliveryRetry::Closed("downstream dropped HTTP/3 response trailers")
-                        }
-                        Err(mpsc::error::TrySendError::Full(Err(_))) => {
-                            unreachable!("only successful response frames are buffered")
-                        }
-                    }
-                } else {
-                    match request.body_tx.try_reserve() {
-                        Ok(permit) => {
-                            drop(permit);
-                            DeliveryRetry::Ready
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => DeliveryRetry::Blocked,
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            DeliveryRetry::Closed("downstream dropped HTTP/3 response body")
-                        }
-                    }
+            .and_then(|request| request.pending_response.take());
+        let retry = if !requests.contains_key(&request_id) {
+            DeliveryRetry::Ready
+        } else if let Some(frame) = pending_frame {
+            let request = requests
+                .get_mut(&request_id)
+                .ok_or_else(|| anyhow!("HTTP/3 response has no request state"))?;
+            match request.body_tx.try_send(Ok(frame)) {
+                Ok(()) => DeliveryRetry::Ready,
+                Err(mpsc::error::TrySendError::Full(Ok(frame))) => {
+                    request.pending_response = Some(frame);
+                    DeliveryRetry::Blocked
                 }
-            });
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    DeliveryRetry::Closed("downstream dropped HTTP/3 response trailers")
+                }
+                Err(mpsc::error::TrySendError::Full(Err(_))) => {
+                    unreachable!("only successful response frames are buffered")
+                }
+            }
+        } else {
+            drain_response_body(h3_conn, conn, request_id, requests, body_buf)?
+        };
         match retry {
             DeliveryRetry::Ready => {}
             DeliveryRetry::Blocked => {
@@ -1212,39 +1201,18 @@ fn process_h3_events(
                     }
                 }
             }
-            h3::Event::Data => loop {
-                let body_tx = requests
-                    .get(&request_id)
-                    .ok_or_else(|| anyhow!("HTTP/3 data has no request state"))?
-                    .body_tx
-                    .clone();
-                let permit = match body_tx.try_reserve() {
-                    Ok(permit) => permit,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
+            h3::Event::Data => {
+                match drain_response_body(h3_conn, conn, request_id, requests, body_buf)? {
+                    DeliveryRetry::Ready => {}
+                    DeliveryRetry::Blocked => {
                         *response_blocked = Some(request_id);
                         return Ok(());
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        cancel_request(
-                            request_id,
-                            "downstream dropped HTTP/3 response body",
-                            conn,
-                            requests,
-                            stream_to_request,
-                        );
-                        break;
-                    }
-                };
-                match h3_conn.recv_body(conn, stream_id, body_buf) {
-                    Ok(read) if read > 0 => {
-                        permit.send(Ok(Frame::data(Bytes::copy_from_slice(&body_buf[..read]))));
-                    }
-                    Ok(_) | Err(h3::Error::Done) => break,
-                    Err(error) => {
-                        return Err(anyhow!("HTTP/3 response body receive failed: {error:?}"));
+                    DeliveryRetry::Closed(message) => {
+                        cancel_request(request_id, message, conn, requests, stream_to_request);
                     }
                 }
-            },
+            }
             h3::Event::Finished => {
                 stream_to_request.remove(&stream_id);
                 if let Some(mut request) = requests.remove(&request_id) {
@@ -1268,6 +1236,51 @@ fn process_h3_events(
         }
     }
     Ok(())
+}
+
+enum DeliveryRetry {
+    Ready,
+    Blocked,
+    Closed(&'static str),
+}
+
+fn drain_response_body(
+    h3_conn: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    request_id: u64,
+    requests: &AHashMap<u64, PendingRequest>,
+    body_buf: &mut [u8],
+) -> Result<DeliveryRetry> {
+    let (stream_id, body_tx) = {
+        let request = requests
+            .get(&request_id)
+            .ok_or_else(|| anyhow!("HTTP/3 data has no request state"))?;
+        let stream_id = request
+            .stream_id
+            .ok_or_else(|| anyhow!("HTTP/3 data arrived before the request stream opened"))?;
+        (stream_id, request.body_tx.clone())
+    };
+
+    loop {
+        let permit = match body_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => return Ok(DeliveryRetry::Blocked),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Ok(DeliveryRetry::Closed(
+                    "downstream dropped HTTP/3 response body",
+                ));
+            }
+        };
+        match h3_conn.recv_body(conn, stream_id, body_buf) {
+            Ok(read) if read > 0 => {
+                permit.send(Ok(Frame::data(Bytes::copy_from_slice(&body_buf[..read]))));
+            }
+            Ok(_) | Err(h3::Error::Done) => return Ok(DeliveryRetry::Ready),
+            Err(error) => {
+                return Err(anyhow!("HTTP/3 response body receive failed: {error:?}"));
+            }
+        }
+    }
 }
 
 fn cancel_request(
