@@ -2,7 +2,7 @@
 name = "jbs-pingora"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97.1"
+rust-version = "1.98.0"
 license = "Apache-2.0"
 description = "A production-oriented Pingora reverse proxy replacing the JBS Nginx gateway"
 repository = "https://github.com/TAE-OK-11/pingora"
@@ -58,7 +58,7 @@ tokio-quiche = { version = "=0.19.1", default-features = false, features = ["gco
 zstd = "0.13.3"
 
 [dev-dependencies]
-h2 = "0.4.17"
+h2 = "0.4.18"
 tempfile = "3.27.0"
 
 # Keep the vendored Pingora HTTP patches while using Pingora's official
