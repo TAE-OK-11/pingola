@@ -356,7 +356,7 @@ ALLOCATOR_BENCH_CPUS=0.5 ALLOCATOR_BENCH_MEMORY=1g \
 
 ## 빌드와 검증
 
-Rust toolchain은 1.97.1이며 Cargo lockfile은 직접 의존성의 최신 호환 버전을
+Rust toolchain은 1.98.0이며 Cargo lockfile은 직접 의존성의 최신 호환 버전을
 고정합니다. GitHub Actions는 RustSec audit를 image 게시 전 실행하고, Dependabot이
 Cargo, Docker base image, Actions를 매주 확인합니다. Deprecated `serde_yaml`은
 typed YAML parser인 `serde-saphyr`로 교체했으며, 직접 코드와 vendored Pingora core가

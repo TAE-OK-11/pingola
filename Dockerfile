@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.25@sha256:0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12
 # check=error=true
 
-ARG RUST_VERSION=1.97.1
+ARG RUST_VERSION=1.98.0
 ARG RUST_TARGET_TRIPLE=x86_64-unknown-linux-gnu
 ARG RUST_TARGET_CPU=x86-64-v2
 ARG RUST_LTO=fat
@@ -34,9 +34,15 @@ ARG BORING_PGO_WEIGHT_UPSTREAM_H3_CUBIC=5
 ARG BORING_PGO_WEIGHT_TLS=20
 ARG DEBIAN_SUITE=13
 
-FROM rust:1.97.1-slim-trixie@sha256:69153971349358535be9821190190f026a761f690c6b58c68a914d14ab2d610a AS builder
+FROM rust:${RUST_VERSION}-slim-trixie@sha256:cc0448b41c3b7b7fea44f5dc50eacba729a56db365b65b7bd5e8a82d5b3db078 AS builder
 
-RUN apt-get update \
+ARG DEBIAN_SUITE
+ARG RUST_VERSION
+
+RUN --mount=type=cache,id=pingora-apt-builder-${DEBIAN_SUITE},target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=pingora-apt-lists-builder-${DEBIAN_SUITE},target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && apt-get update -o Acquire::Retries=3 \
     && apt-get install --yes --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -52,7 +58,6 @@ RUN apt-get update \
         openssl \
         perl \
         pkg-config \
-    && rm -rf /var/lib/apt/lists/* \
     && git --version \
     && rustc --version \
     && cargo --version \
@@ -63,11 +68,6 @@ WORKDIR /src
 
 COPY --link Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY --link vendor ./vendor
-COPY --link src ./src
-COPY --link examples/http3_probe.rs ./examples/
-COPY --link bench/backend.rs bench/pgo_client.rs bench/pgo_train.sh bench/pgo_train_h3.sh \
-    bench/pgo_train_upstream_h3.sh bench/build_pgo.sh bench/clang_rust_pgo_filter.sh \
-    bench/clangxx_rust_pgo_filter.sh ./bench/
 
 ARG RUST_TARGET_TRIPLE
 ARG RUST_TARGET_CPU
@@ -96,16 +96,31 @@ ARG BORING_PGO_WEIGHT_TLS
 
 ENV CC=/src/bench/clang_rust_pgo_filter.sh \
     CXX=/src/bench/clangxx_rust_pgo_filter.sh \
+    CARGO_HTTP_MULTIPLEXING=true \
+    CARGO_HTTP_TIMEOUT=120 \
     CARGO_INCREMENTAL=0 \
+    CARGO_NET_RETRY=10 \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${RUST_CODEGEN_UNITS} \
     CARGO_PROFILE_RELEASE_LTO=${RUST_LTO} \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang \
     CMAKE_GENERATOR=Ninja \
     RUSTFLAGS_COMMON="-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections"
 
+# Keep dependency downloads in a source-independent layer. BuildKit exports
+# these caches to GitHub Actions, so source-only changes avoid registry churn.
 RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=pingora-target-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR}-${TLS_PROVIDER}-${PGO_MODE}-${PGO_TRAIN_TARGET_CPU}-${PGO_NATIVE_BORING},target=/src/target,sharing=locked \
+    cargo fetch --locked --target "${RUST_TARGET_TRIPLE}"
+
+COPY --link src ./src
+COPY --link examples/http3_probe.rs ./examples/
+COPY --link bench/backend.rs bench/pgo_client.rs bench/pgo_train.sh bench/pgo_train_h3.sh \
+    bench/pgo_train_upstream_h3.sh bench/build_pgo.sh bench/clang_rust_pgo_filter.sh \
+    bench/clangxx_rust_pgo_filter.sh ./bench/
+
+RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=pingora-target-rust-${RUST_VERSION}-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR}-${TLS_PROVIDER}-${PGO_MODE}-${PGO_TRAIN_TARGET_CPU}-${PGO_NATIVE_BORING},target=/src/target,sharing=locked \
     set -eux; \
     case "${ALLOCATOR}" in jemalloc|tcmalloc|system-allocator) ;; *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; esac; \
     case "${TLS_PROVIDER}" in boringssl) ;; *) echo "unsupported TLS provider: ${TLS_PROVIDER}" >&2; exit 2 ;; esac; \
@@ -135,7 +150,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       bench/build_pgo.sh; \
     fi
 
-FROM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS runtime
+FROM debian:${DEBIAN_SUITE}-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS runtime
 
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=unknown
@@ -193,7 +208,10 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 RUN --mount=from=builder,source=/out,target=/out,ro \
-    apt-get update \
+    --mount=type=cache,id=pingora-apt-runtime-${DEBIAN_SUITE},target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=pingora-apt-lists-runtime-${DEBIAN_SUITE},target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && apt-get update -o Acquire::Retries=3 \
     && apt-get install --yes --no-install-recommends ca-certificates libcap2-bin libstdc++6 \
     && groupadd --gid 10001 pingora \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin pingora \
@@ -206,8 +224,7 @@ RUN --mount=from=builder,source=/out,target=/out,ro \
          install -Dm644 /out/pgo-native-profile-summary.txt /usr/share/doc/pingora/pgo-native-profile-summary.txt; \
        fi \
     && setcap cap_net_bind_service=+ep /usr/local/bin/pingora \
-    && apt-get purge --yes --auto-remove libcap2-bin \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get purge --yes --auto-remove libcap2-bin
 
 COPY --link --chown=10001:10001 config/pingora.yaml /etc/pingora/pingora.yaml
 
