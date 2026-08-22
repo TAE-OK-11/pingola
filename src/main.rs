@@ -2,6 +2,7 @@ mod allocator;
 mod config;
 mod content_encoding;
 mod gateway;
+mod h3_runtime;
 mod http3;
 mod limits;
 mod preflight;
@@ -276,8 +277,18 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     let mut server = Server::new_with_opt_and_conf(None, pingora_config);
     server.bootstrap();
 
-    let upstream_h3 =
-        upstream_h3::start(runtime.clone()).context("upstream HTTP/3 bridge startup failed")?;
+    let needs_h3_runtime = !server_config.http3_listen.is_empty()
+        || runtime
+            .config
+            .upstreams
+            .values()
+            .any(|upstream| upstream.protocol.uses_http3());
+    let h3_runtime = needs_h3_runtime
+        .then(|| h3_runtime::start(server_config.threads))
+        .transpose()
+        .context("shared HTTP/3 runtime startup failed")?;
+    let upstream_h3 = upstream_h3::start(runtime.clone(), h3_runtime.as_ref())
+        .context("upstream HTTP/3 bridge startup failed")?;
     let shared = Arc::new(
         GatewayShared::from_runtime(&runtime).context("shared gateway state bootstrap failed")?,
     );
@@ -364,7 +375,12 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         server.add_service(h2c_service);
     }
 
-    http3::start(runtime.clone()).context("HTTP/3 frontend startup failed")?;
+    if !server_config.http3_listen.is_empty() {
+        let h3_runtime = h3_runtime
+            .as_ref()
+            .expect("HTTP/3 listeners require the shared HTTP/3 runtime");
+        http3::start(runtime.clone(), h3_runtime).context("HTTP/3 frontend startup failed")?;
+    }
 
     info!(
         "starting Pingora with {} TLS 1.3 hybrid_pq={}: http={:?} https={:?} http3_udp={:?} http3_internal={} health_socket={} threads={}",

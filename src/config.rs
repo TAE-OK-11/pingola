@@ -1,15 +1,32 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use http::HeaderValue;
 use ipnet::IpNet;
 use serde::Deserialize;
+
+const TRUSTED_PROXY_CACHE_SLOTS: usize = 4;
+static NEXT_RUNTIME_CONFIG_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+struct TrustedProxyCacheEntry {
+    config_id: u64,
+    ip: IpAddr,
+    trusted: bool,
+}
+
+thread_local! {
+    static TRUSTED_PROXY_CACHE: RefCell<[Option<TrustedProxyCacheEntry>; TRUSTED_PROXY_CACHE_SLOTS]> =
+        const { RefCell::new([None; TRUSTED_PROXY_CACHE_SLOTS]) };
+}
 
 fn default_threads() -> usize {
     1
@@ -318,6 +335,7 @@ impl fmt::Debug for Http3InternalToken {
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub config: Arc<Config>,
+    trusted_proxy_cache_id: u64,
     http3_internal_token: Option<Http3InternalToken>,
     http3_public_port: Option<u16>,
     http3_alt_svc_header: Option<HeaderValue>,
@@ -361,6 +379,7 @@ impl RuntimeConfig {
 
         Ok(Self {
             config: Arc::new(config),
+            trusted_proxy_cache_id: NEXT_RUNTIME_CONFIG_ID.fetch_add(1, Ordering::Relaxed),
             http3_internal_token,
             http3_public_port,
             http3_alt_svc_header,
@@ -384,12 +403,39 @@ impl RuntimeConfig {
         self.http3_alt_svc_header.as_ref()
     }
 
-    pub fn is_trusted_proxy(&self, ip: std::net::IpAddr) -> bool {
-        self.config
+    pub fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
+        let slot = trusted_proxy_cache_slot(ip);
+        if let Some(trusted) = TRUSTED_PROXY_CACHE.with(|cache| {
+            cache.borrow()[slot]
+                .filter(|entry| entry.config_id == self.trusted_proxy_cache_id && entry.ip == ip)
+                .map(|entry| entry.trusted)
+        }) {
+            return trusted;
+        }
+        let trusted = self
+            .config
             .trusted_proxies
             .iter()
-            .any(|network| network.contains(&ip))
+            .any(|network| network.contains(&ip));
+        TRUSTED_PROXY_CACHE.with(|cache| {
+            cache.borrow_mut()[slot] = Some(TrustedProxyCacheEntry {
+                config_id: self.trusted_proxy_cache_id,
+                ip,
+                trusted,
+            });
+        });
+        trusted
     }
+}
+
+#[inline]
+fn trusted_proxy_cache_slot(ip: IpAddr) -> usize {
+    let value = match ip {
+        IpAddr::V4(ip) => u32::from(ip) as u128,
+        IpAddr::V6(ip) => u128::from(ip),
+    };
+    let folded = value ^ (value >> 64) ^ (value >> 32);
+    folded as usize & (TRUSTED_PROXY_CACHE_SLOTS - 1)
 }
 
 pub fn normalize_host(authority: &str) -> String {
@@ -732,6 +778,18 @@ hosts:
             runtime.http3_alt_svc_header().unwrap(),
             "h3=\":443\"; ma=86400"
         );
+    }
+
+    #[test]
+    fn trusted_proxy_cache_is_scoped_to_runtime_config() {
+        let trusted = RuntimeConfig::new(sample_config()).unwrap();
+        assert!(trusted.is_trusted_proxy("127.0.0.1".parse().unwrap()));
+
+        let mut config = sample_config();
+        config.trusted_proxies.clear();
+        let untrusted = RuntimeConfig::new(config).unwrap();
+        assert!(!untrusted.is_trusted_proxy("127.0.0.1".parse().unwrap()));
+        assert!(trusted.is_trusted_proxy("127.0.0.1".parse().unwrap()));
     }
 
     #[test]
