@@ -6,7 +6,6 @@ use std::net::{
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
@@ -100,7 +99,10 @@ struct BridgeSpec {
     available: Arc<AtomicBool>,
 }
 
-pub fn start(runtime: Arc<RuntimeConfig>) -> Result<Arc<UpstreamH3Registry>> {
+pub fn start(
+    runtime: Arc<RuntimeConfig>,
+    h3_runtime: Option<&tokio::runtime::Handle>,
+) -> Result<Arc<UpstreamH3Registry>> {
     let mut routes = HashMap::new();
     let mut specs = Vec::new();
 
@@ -156,52 +158,26 @@ pub fn start(runtime: Arc<RuntimeConfig>) -> Result<Arc<UpstreamH3Registry>> {
     if specs.is_empty() {
         return Ok(registry);
     }
+    let h3_runtime = h3_runtime
+        .ok_or_else(|| anyhow!("upstream HTTP/3 routes require the shared HTTP/3 runtime"))?;
 
     let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<(), String>>(1);
-    thread::Builder::new()
-        .name("jbs-upstream-h3".to_string())
-        .spawn(move || {
-            let worker_threads = runtime.config.server.threads.clamp(1, 8);
-            let tokio_runtime = if worker_threads <= 1 {
-                tokio::runtime::Builder::new_current_thread()
-                    .thread_name("jbs-upstream-h3-worker")
-                    .enable_all()
-                    .build()
-            } else {
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(worker_threads)
-                    .thread_name("jbs-upstream-h3-worker")
-                    .enable_all()
-                    .build()
-            };
-            let tokio_runtime = match tokio_runtime {
-                Ok(runtime) => runtime,
+    h3_runtime.spawn(async move {
+        for spec in specs {
+            let listener = match TcpListener::from_std(spec.listener) {
+                Ok(listener) => listener,
                 Err(error) => {
                     let _ = ready_tx.send(Err(format!(
-                        "upstream HTTP/3 runtime creation failed: {error}"
+                        "upstream HTTP/3 bridge listener conversion failed: {error}"
                     )));
                     return;
                 }
             };
-            tokio_runtime.block_on(async move {
-                for spec in specs {
-                    let listener = match TcpListener::from_std(spec.listener) {
-                        Ok(listener) => listener,
-                        Err(error) => {
-                            let _ = ready_tx.send(Err(format!(
-                                "upstream HTTP/3 bridge listener conversion failed: {error}"
-                            )));
-                            return;
-                        }
-                    };
-                    let pool = H3Pool::new(spec.settings.clone(), spec.available.clone());
-                    tokio::spawn(serve_bridge(listener, pool));
-                }
-                let _ = ready_tx.send(Ok(()));
-                std::future::pending::<()>().await;
-            });
-        })
-        .context("failed to spawn upstream HTTP/3 runtime thread")?;
+            let pool = H3Pool::new(spec.settings.clone(), spec.available.clone());
+            tokio::spawn(serve_bridge(listener, pool));
+        }
+        let _ = ready_tx.send(Ok(()));
+    });
 
     ready_rx
         .recv_timeout(STARTUP_TIMEOUT)
@@ -280,7 +256,16 @@ impl H3Pool {
             .try_acquire_owned()
             .map_err(|_| boxed_error("upstream HTTP/3 request capacity is exhausted"))?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (opened_tx, opened_rx) = oneshot::channel();
+        // Bodyless requests can wait directly on the response. Only streaming
+        // uploads need a separate acknowledgement before body frames may be
+        // queued, so avoid one allocation and wakeup on the common GET/HEAD/DoH
+        // path.
+        let (opened_tx, opened_rx) = if has_body {
+            let (sender, receiver) = oneshot::channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
         let (response_tx, response_rx) = oneshot::channel();
         self.commands
             .send(Command::Open {
@@ -298,7 +283,7 @@ impl H3Pool {
         Ok(RequestHandle {
             id,
             commands: self.commands.clone(),
-            opened: Some(opened_rx),
+            opened: opened_rx,
             response: Some(response_rx),
             cancel_on_drop: true,
         })
@@ -387,7 +372,7 @@ enum Command {
         has_body: bool,
         allow_early_data: bool,
         cancel: mpsc::Sender<Command>,
-        opened: oneshot::Sender<Result<(), String>>,
+        opened: Option<oneshot::Sender<Result<(), String>>>,
         response: oneshot::Sender<Result<ResponseHead, String>>,
         permit: OwnedSemaphorePermit,
     },
@@ -646,6 +631,13 @@ async fn run_connection(
     }
 
     let result: Result<()> = async {
+        // QUIC packet activity wakes this loop frequently. Reuse the two timer
+        // futures instead of constructing and dropping new Sleep objects on
+        // every socket, command, or response-capacity event.
+        let timeout_timer = tokio::time::sleep(Duration::ZERO);
+        let pacing_timer = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(timeout_timer);
+        tokio::pin!(pacing_timer);
         loop {
             if conn.is_closed() {
                 bail!("upstream QUIC connection closed");
@@ -731,18 +723,25 @@ async fn run_connection(
             flush_ready_quic(&socket, &mut conn, &mut send_buf, &mut pending_send).await?;
 
             let timeout = conn.timeout().unwrap_or(Duration::from_secs(1));
-            let pacing_delay = pending_send
-                .as_ref()
-                .map(|send: &ScheduledSend| send.at.saturating_duration_since(Instant::now()))
-                .unwrap_or_default();
+            timeout_timer
+                .as_mut()
+                .reset(tokio::time::Instant::now() + timeout);
+            if let Some(send) = pending_send.as_ref() {
+                pacing_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::from_std(send.at));
+            }
             let response_waiter = response_blocked
                 .and_then(|id| requests.get(&id))
                 .map(|request| request.body_tx.clone());
             let response_waiter_enabled = response_waiter.is_some();
             tokio::select! {
-                recv = socket.recv_from(&mut recv_buf) => {
-                    let (len, from) = recv.context("upstream QUIC UDP receive failed")?;
-                    let info = quiche::RecvInfo { from, to: local };
+                recv = socket.recv(&mut recv_buf) => {
+                    let len = recv.context("upstream QUIC UDP receive failed")?;
+                    // The UDP socket is connected to exactly one origin, so the
+                    // source address is invariant and recv_from() only repeats
+                    // sockaddr extraction on every datagram.
+                    let info = quiche::RecvInfo { from: settings.origin, to: local };
                     match conn.recv(&mut recv_buf[..len], info) {
                         Ok(_) | Err(quiche::Error::Done) => {}
                         Err(error) => return Err(anyhow!("upstream QUIC packet processing failed: {error:?}")),
@@ -774,10 +773,10 @@ async fn run_connection(
                     // data and merely wakes the connection without polling.
                     drop(permit);
                 }
-                _ = tokio::time::sleep(timeout) => {
+                _ = &mut timeout_timer => {
                     conn.on_timeout();
                 }
-                _ = tokio::time::sleep(pacing_delay), if pending_send.is_some() => {
+                _ = &mut pacing_timer, if pending_send.is_some() => {
                     let send = pending_send
                         .take()
                         .expect("pacing branch requires a scheduled QUIC packet");
@@ -819,9 +818,11 @@ fn handle_command(
             permit,
         } => {
             if !accept_new_requests {
-                let _ = opened.send(Err(
-                    "upstream HTTP/3 connection is draining after GOAWAY".to_string()
-                ));
+                let message = "upstream HTTP/3 connection is draining after GOAWAY".to_string();
+                if let Some(opened) = opened {
+                    let _ = opened.send(Err(message.clone()));
+                }
+                let _ = response.send(Err(message));
                 return;
             }
             let (body_tx, body_rx) = mpsc::channel(MAX_BODY_FRAMES);
@@ -833,7 +834,7 @@ fn handle_command(
                     has_body,
                     allow_early_data,
                     cancel,
-                    opened: Some(opened),
+                    opened,
                     response: Some(response),
                     body_tx,
                     body_rx: Some(body_rx),
@@ -1399,9 +1400,9 @@ async fn proxy_bridge_request(
     let allow_early_data = !has_body && matches!(parts.method, Method::GET | Method::HEAD);
     let headers = encode_request_headers(&parts)?;
     let mut handle = pool.open(headers, has_body, allow_early_data).await?;
-    handle.wait_opened().await?;
 
     if has_body {
+        handle.wait_opened().await?;
         let id = handle.id;
         let commands = handle.commands.clone();
         tokio::spawn(async move {

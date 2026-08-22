@@ -1695,7 +1695,6 @@ dependencies = [
  "ahash",
  "anyhow",
  "arrayvec",
- "async-trait",
  "boring",
  "brotli",
  "bytes",

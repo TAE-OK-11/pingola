@@ -5,7 +5,6 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -135,30 +134,20 @@ impl Http3Admission {
     }
 }
 
-pub fn start(runtime: Arc<RuntimeConfig>) -> Result<()> {
+pub fn start(runtime: Arc<RuntimeConfig>, h3_runtime: &tokio::runtime::Handle) -> Result<()> {
     let server = &runtime.config.server;
     if server.http3_listen.is_empty() {
         return Ok(());
     }
 
-    let worker_threads = server.threads.clamp(1, 8);
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
-    thread::Builder::new()
-        .name("jbs-http3".to_string())
-        .spawn(move || {
-            let tokio_runtime = bounded_tokio_runtime(worker_threads, "jbs-h3-worker");
-            let result = match tokio_runtime {
-                Ok(tokio_runtime) => tokio_runtime.block_on(run(runtime, ready_tx)),
-                Err(error) => {
-                    let _ = ready_tx.send(Err(format!("HTTP/3 runtime creation failed: {error}")));
-                    return;
-                }
-            };
-            if let Err(error) = result {
-                error!("HTTP/3 frontend stopped: {error:#}");
-            }
-        })
-        .context("failed to spawn HTTP/3 runtime thread")?;
+    h3_runtime.spawn(async move {
+        let failure_tx = ready_tx.clone();
+        if let Err(error) = run(runtime, ready_tx).await {
+            let _ = failure_tx.send(Err(format!("HTTP/3 frontend startup failed: {error:#}")));
+            error!("HTTP/3 frontend stopped: {error:#}");
+        }
+    });
 
     ready_rx
         .recv_timeout(STARTUP_TIMEOUT)
@@ -640,26 +629,6 @@ fn forwarded_client_ip_value(ip: IpAddr) -> Result<HeaderValue> {
         *cache.borrow_mut() = Some((ip, value.clone()));
     });
     Ok(value)
-}
-
-fn bounded_tokio_runtime(
-    worker_threads: usize,
-    thread_name: &'static str,
-) -> std::io::Result<tokio::runtime::Runtime> {
-    // A 1 vCPU host already runs Pingora's worker. A second multi-thread
-    // runtime just contends for the same core and pins extra stacks.
-    if worker_threads <= 1 {
-        tokio::runtime::Builder::new_current_thread()
-            .thread_name(thread_name)
-            .enable_all()
-            .build()
-    } else {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .thread_name(thread_name)
-            .enable_all()
-            .build()
-    }
 }
 
 fn forbidden_request_header(name: &HeaderName, value: &[u8]) -> bool {
