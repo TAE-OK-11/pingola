@@ -87,7 +87,14 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        let mut req = session.req_header().clone();
+        let send_end_stream_flag = session.req_header().send_end_stream();
+        // Header field names are case-insensitive on HTTP/2. Clone only the
+        // semantic request parts so hop-by-hop mutations do not maintain a
+        // second case map for every upstream request.
+        let mut req = RequestHeader::from(session.req_header().as_owned_parts());
+        if let Some(send_end_stream) = send_end_stream_flag {
+            req.set_send_end_stream(send_end_stream);
+        }
 
         if req.version != Version::HTTP_2 {
             /* remove H1 specific headers */
@@ -165,6 +172,27 @@ where
         }
 
         client_session.read_timeout = peer.options.read_timeout;
+
+        let use_bodyless_fast_path = matches!(session.req_header().method, Method::GET | Method::HEAD)
+            && body_empty
+            && !session.cache.enabled()
+            && !session.cache.bypassing()
+            && !session.is_upgrade_req()
+            && self.inner.h1_bodyless_fast_path(session, ctx);
+
+        if use_bodyless_fast_path {
+            return match self.proxy_bodyless_h2(session, client_session, ctx).await {
+                Ok(reuse_downstream) => (reuse_downstream, None),
+                Err(e) => {
+                    if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
+                        if let Some(mut client_body) = client_session.take_request_body_writer() {
+                            client_body.send_reset(h2::Reason::CANCEL);
+                        }
+                    }
+                    (false, Some(e))
+                }
+            };
+        }
 
         let mut downstream_custom_message_writer = session
             .downstream_session
@@ -260,6 +288,210 @@ where
         // Note: upstream_write_pending_time is not tracked for HTTP/2 (multiplexed streams).
 
         (server_session_reuse, error)
+    }
+
+    /// Proxy a non-upgraded, cache-disabled HTTP/2 GET/HEAD without per-request channels.
+    async fn proxy_bodyless_h2(
+        &self,
+        session: &mut Session,
+        client_session: &mut Http2Session,
+        ctx: &mut SV::CTX,
+    ) -> Result<bool>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        client_session
+            .read_response_header()
+            .await
+            .map_err(|e| e.into_up())?;
+
+        let resp_header = Box::new(client_session.response_header().expect("just read").clone());
+        let header_eos = match client_session.check_response_end_or_error() {
+            Ok(eos) => {
+                let req_header = client_session.request_header().expect("must have sent req");
+                if eos
+                    && req_header.method != Method::HEAD
+                    && resp_header.status != StatusCode::NO_CONTENT
+                    && resp_header.status != StatusCode::NOT_MODIFIED
+                    && resp_header
+                        .headers
+                        .get(CONTENT_LENGTH)
+                        .is_some_and(|cl| cl.as_bytes().iter().any(|b| *b != b'0'))
+                {
+                    return Err(Error::explain(
+                        H2Error,
+                        "non-zero content-length on EOS headers frame",
+                    )
+                    .into_up());
+                }
+                eos
+            }
+            Err(e) => {
+                let _ = self
+                    .write_filtered_h2_task(
+                        session,
+                        HttpTask::Header(resp_header, false),
+                        ctx,
+                    )
+                    .await;
+                return Err(e.into_up());
+            }
+        };
+
+        if self
+            .write_filtered_h2_task(session, HttpTask::Header(resp_header, header_eos), ctx)
+            .await?
+        {
+            session
+                .as_mut()
+                .finish_body()
+                .await
+                .map_err(|e| e.into_down())?;
+            return Ok(true);
+        }
+
+        if !header_eos {
+            loop {
+                tokio::select! {
+                    biased;
+                    chunk = client_session.read_response_body() => {
+                        match chunk.map_err(|e| e.into_up())? {
+                            Some(data) => {
+                                let eos = client_session
+                                    .check_response_end_or_error()
+                                    .map_err(|e| e.into_up())?;
+                                if data.is_empty() && !eos {
+                                    continue;
+                                }
+                                let done = self
+                                    .write_filtered_h2_task(
+                                        session,
+                                        HttpTask::Body(Some(data), eos),
+                                        ctx,
+                                    )
+                                    .await?;
+                                if done || eos {
+                                    break;
+                                }
+                            }
+                            None => {
+                                let trailers = client_session
+                                    .read_trailers()
+                                    .await
+                                    .map_err(|e| e.into_up())?;
+                                if let Some(trailers) = trailers {
+                                    let done = self
+                                        .write_filtered_h2_task(
+                                            session,
+                                            HttpTask::Trailer(Some(Box::new(trailers))),
+                                            ctx,
+                                        )
+                                        .await?;
+                                    if done {
+                                        break;
+                                    }
+                                }
+                                let _ = self
+                                    .write_filtered_h2_task(session, HttpTask::Done, ctx)
+                                    .await?;
+                                break;
+                            }
+                        }
+                    }
+                    downstream = session.downstream_session.read_body_or_idle(true) => {
+                        match downstream {
+                            Err(e) => return Err(e.into_down()),
+                            Ok(_) => {
+                                return Error::explain(
+                                    ReadError,
+                                    "unexpected downstream body on an empty HTTP/2 request",
+                                ).into_err();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        session
+            .as_mut()
+            .finish_body()
+            .await
+            .map_err(|e| e.into_down())?;
+        Ok(true)
+    }
+
+    async fn write_filtered_h2_task(
+        &self,
+        session: &mut Session,
+        mut task: HttpTask,
+        ctx: &mut SV::CTX,
+    ) -> Result<bool>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        session.upstream_compression.response_filter(&mut task);
+        let task = self.h2_uncached_response_filter(session, task, ctx).await?;
+        session.write_response_task(task).await
+    }
+
+    async fn h2_uncached_response_filter(
+        &self,
+        session: &mut Session,
+        mut task: HttpTask,
+        ctx: &mut SV::CTX,
+    ) -> Result<HttpTask>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        if let Some(duration) = self.upstream_filter(session, &mut task, ctx).await? {
+            trace!("delaying upstream response for {duration:?}");
+            time::sleep(duration).await;
+        }
+
+        match task {
+            HttpTask::Header(mut header, end) => {
+                self.inner.response_filter(session, &mut header, ctx).await?;
+                // write_response_header panics on HTTP/2 versions for H1 downstream.
+                header.set_version(Version::HTTP_11);
+                let no_body = session.req_header().method == Method::HEAD
+                    || matches!(header.status.as_u16(), 204 | 304);
+                if !no_body
+                    && !header.status.is_informational()
+                    && header.headers.get(CONTENT_LENGTH).is_none()
+                    && header.headers.get(header::TRANSFER_ENCODING).is_none()
+                {
+                    header.insert_header(header::TRANSFER_ENCODING, "chunked")?;
+                }
+                Ok(HttpTask::Header(header, end))
+            }
+            HttpTask::Body(mut data, end) => {
+                if let Some(duration) = self
+                    .inner
+                    .response_body_filter(session, &mut data, end, ctx)?
+                {
+                    trace!("delaying downstream response for {duration:?}");
+                    time::sleep(duration).await;
+                }
+                Ok(HttpTask::Body(data, end))
+            }
+            HttpTask::UpgradedBody(mut data, end) => {
+                if let Some(duration) = self
+                    .inner
+                    .response_body_filter(session, &mut data, end, ctx)?
+                {
+                    trace!("delaying downstream upgraded response for {duration:?}");
+                    time::sleep(duration).await;
+                }
+                Ok(HttpTask::UpgradedBody(data, end))
+            }
+            HttpTask::Trailer(trailers) => Ok(HttpTask::Trailer(trailers)),
+            HttpTask::Done => Ok(HttpTask::Done),
+            HttpTask::Failed(error) => Ok(HttpTask::Failed(error)),
+        }
     }
 
     // returns whether server (downstream) session can be reused

@@ -11,8 +11,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use boring::ssl::{SslContextBuilder, SslFiletype};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt, stream};
-use http::header::{CONNECTION, HOST, TE, TRAILER, TRANSFER_ENCODING, UPGRADE};
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version};
+use http::header::{CONNECTION, HOST, HeaderName, TE, TRAILER, TRANSFER_ENCODING, UPGRADE};
+use http::uri::{Authority, PathAndQuery, Scheme};
+use http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, Version};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, StreamBody};
 use hyper::body::Frame;
@@ -38,8 +39,11 @@ use crate::config::RuntimeConfig;
 use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, LimitZone, RateLimiter};
 use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
 
-const INTERNAL_MARKER: &str = "x-jbs-http3-internal";
-const INTERNAL_PORT: &str = "x-jbs-http3-port";
+const INTERNAL_MARKER: HeaderName = HeaderName::from_static("x-jbs-http3-internal");
+const INTERNAL_PORT: HeaderName = HeaderName::from_static("x-jbs-http3-port");
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
+const X_FORWARDED_PORT: HeaderName = HeaderName::from_static("x-forwarded-port");
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP3_MAX_UDP_PAYLOAD_SIZE: usize = 1452;
 const HTTP3_CONTROL_STREAM_LIMIT: u64 = 8;
@@ -290,9 +294,12 @@ async fn run(
         .cloned()
         .ok_or_else(|| anyhow!("HTTP/3 internal token was not initialized"))?;
     let alt_svc = runtime.http3_alt_svc_header().cloned();
-    let internal_uri_prefix = format!("http://{internal}");
+    let internal_authority: Authority = internal
+        .to_string()
+        .parse()
+        .context("HTTP/3 internal listen address is not a valid URI authority")?;
     let shared = Arc::new(Http3Shared {
-        internal_uri_prefix,
+        internal_authority,
         public_port: public_port_header,
         internal_token,
         client,
@@ -389,7 +396,7 @@ async fn run(
 }
 
 struct Http3Shared {
-    internal_uri_prefix: String,
+    internal_authority: Authority,
     public_port: HeaderValue,
     internal_token: HeaderValue,
     client: ProxyClient,
@@ -485,7 +492,7 @@ async fn proxy_request_inner(
     let decoded = match decode_request_headers(
         &headers,
         context.peer,
-        &context.shared.internal_uri_prefix,
+        &context.shared.internal_authority,
         &context.shared.public_port,
         &context.shared.internal_token,
     ) {
@@ -533,7 +540,7 @@ struct DecodedRequest {
 fn decode_request_headers(
     headers: &[h3::Header],
     peer: SocketAddr,
-    internal_uri_prefix: &str,
+    internal_authority: &Authority,
     public_port: &HeaderValue,
     internal_token: &HeaderValue,
 ) -> Result<DecodedRequest> {
@@ -591,15 +598,18 @@ fn decode_request_headers(
     if !path.starts_with('/') {
         bail!("HTTP/3 :path must be origin-form");
     }
-    let mut uri = String::with_capacity(internal_uri_prefix.len() + path.len());
-    uri.push_str(internal_uri_prefix);
-    uri.push_str(path);
-    let uri: Uri = uri.parse().context("failed to construct internal URI")?;
+    let path = PathAndQuery::try_from(path).context("invalid HTTP/3 :path")?;
+    let uri = Uri::builder()
+        .scheme(Scheme::HTTP)
+        .authority(internal_authority.clone())
+        .path_and_query(path)
+        .build()
+        .context("failed to construct internal URI")?;
 
     output.insert(HOST, authority);
-    output.insert("x-forwarded-for", forwarded_client_ip_value(peer.ip())?);
-    output.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-    output.insert("x-forwarded-port", public_port.clone());
+    output.insert(X_FORWARDED_FOR, forwarded_client_ip_value(peer.ip())?);
+    output.insert(X_FORWARDED_PROTO, HeaderValue::from_static("https"));
+    output.insert(X_FORWARDED_PORT, public_port.clone());
     output.insert(INTERNAL_MARKER, internal_token.clone());
     output.insert(INTERNAL_PORT, public_port.clone());
 
@@ -793,7 +803,7 @@ mod tests {
             decode_request_headers(
                 &headers,
                 "127.0.0.1:12345".parse().unwrap(),
-                "http://127.0.0.1:18080",
+                &"127.0.0.1:18080".parse::<Authority>().unwrap(),
                 &HeaderValue::from_static("443"),
                 &HeaderValue::from_static("unit-test-token"),
             )
@@ -813,12 +823,13 @@ mod tests {
         let request = decode_request_headers(
             &headers,
             "192.0.2.10:12345".parse().unwrap(),
-            "http://127.0.0.1:18080",
+            &"127.0.0.1:18080".parse::<Authority>().unwrap(),
             &HeaderValue::from_static("8443"),
             &HeaderValue::from_static("unit-test-token"),
         )
         .unwrap();
         assert_eq!(request.method, Method::GET);
+        assert_eq!(request.uri.authority().unwrap().as_str(), "127.0.0.1:18080");
         assert_eq!(
             request.uri.path_and_query().unwrap().as_str(),
             "/rest/ping?x=1"

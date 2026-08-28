@@ -184,6 +184,20 @@ impl RequestHeader {
         )
     }
 
+    /// Insert an already-parsed header without re-validating the name from bytes.
+    ///
+    /// Hot proxy paths that already hold a [`HeaderName`] and [`HeaderValue`]
+    /// skip `CaseHeaderName` round-trips. When this header has no case map the
+    /// insert is a single `HeaderMap` operation.
+    pub fn insert_typed_header(&mut self, name: HeaderName, value: HeaderValue) {
+        insert_typed_header_value(
+            self.header_name_map.as_mut(),
+            &mut self.base.headers,
+            name,
+            value,
+        );
+    }
+
     /// Remove all headers under the name
     pub fn remove_header<'a, N: ?Sized>(&mut self, name: &'a N) -> Option<HeaderValue>
     where
@@ -508,6 +522,16 @@ impl ResponseHeader {
         )
     }
 
+    /// Insert an already-parsed header without re-validating the name from bytes.
+    pub fn insert_typed_header(&mut self, name: HeaderName, value: HeaderValue) {
+        insert_typed_header_value(
+            self.header_name_map.as_mut(),
+            &mut self.base.headers,
+            name,
+            value,
+        );
+    }
+
     /// Remove all headers under the name
     pub fn remove_header<'a, N: ?Sized>(&mut self, name: &'a N) -> Option<HeaderValue>
     where
@@ -679,6 +703,19 @@ fn insert_header_value<T>(
     Ok(())
 }
 
+#[inline]
+fn insert_typed_header_value(
+    name_map: Option<&mut CaseMap>,
+    value_map: &mut HMap<HeaderValue>,
+    name: HeaderName,
+    value: HeaderValue,
+) {
+    if let Some(name_map) = name_map {
+        name_map.insert(name.clone(), (&name).into_case_header_name());
+    }
+    value_map.insert(name, value);
+}
+
 // the &N here is to avoid clone(). None Copy type like String can impl AsHeaderName
 #[inline]
 fn remove_header<'a, T, N: ?Sized>(
@@ -787,6 +824,23 @@ mod tests {
                 _ => panic!("too many headers"),
             }
         });
+    }
+
+    #[test]
+    fn test_insert_typed_header_skips_name_reparse() {
+        let mut req = RequestHeader::build_no_case("GET", b"/", None).unwrap();
+        req.insert_typed_header(header::HOST, HeaderValue::from_static("example.com"));
+        assert_eq!(req.headers.get(header::HOST).unwrap(), "example.com");
+
+        let mut resp = ResponseHeader::new(None);
+        resp.insert_typed_header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain"),
+        );
+        assert_eq!(
+            resp.headers.get(header::CONTENT_TYPE).unwrap(),
+            "text/plain"
+        );
     }
 
     #[test]

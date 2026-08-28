@@ -76,7 +76,7 @@ impl IntoCaseHeaderName for Bytes {
     }
 }
 
-fn titled_header_name(header_name: &HeaderName) -> Bytes {
+pub(crate) fn titled_header_name(header_name: &HeaderName) -> Bytes {
     titled_header_name_str(header_name).map_or_else(
         || Bytes::copy_from_slice(header_name.as_str().as_bytes()),
         |s| Bytes::from_static(s.as_bytes()),
