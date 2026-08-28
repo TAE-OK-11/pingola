@@ -19,6 +19,7 @@ system-allocator = []
 tls-boringssl = ["cloudflare-pingora/boringssl"]
 
 [dependencies]
+async-trait = "0.1.92"
 anyhow = "1.0.104"
 ahash = "0.8.12"
 arrayvec = "0.7.8"

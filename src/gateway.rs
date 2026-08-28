@@ -27,7 +27,7 @@ use cloudflare_pingora::proxy::{
 use http::header::{
     ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
     CONTENT_TYPE, EXPIRES, FORWARDED, HOST, HeaderName, HeaderValue, LAST_MODIFIED, PRAGMA,
-    TRANSFER_ENCODING, UPGRADE,
+    STRICT_TRANSPORT_SECURITY, TRANSFER_ENCODING, UPGRADE,
 };
 use http::{Method, Version};
 use log::{info, warn};
@@ -70,6 +70,15 @@ const REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_REQUEST_BODY_RATE: usize = 64 * 1024;
 const MAX_REQUEST_BODY_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
+const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
+const X_FORWARDED_PORT: HeaderName = HeaderName::from_static("x-forwarded-port");
+const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
+const X_FORWARDED_SSL: HeaderName = HeaderName::from_static("x-forwarded-ssl");
+const ALT_SVC: HeaderName = HeaderName::from_static("alt-svc");
+const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
+const X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
+const REFERRER_POLICY: HeaderName = HeaderName::from_static("referrer-policy");
 const HTTP3_INTERNAL: HeaderName = HeaderName::from_static("x-jbs-http3-internal");
 const HTTP3_PORT: HeaderName = HeaderName::from_static("x-jbs-http3-port");
 #[cfg(test)]
@@ -80,8 +89,6 @@ const MAX_CONNECTION_NOMINATIONS: usize = 10;
 const PROXY_AUTHENTICATE: HeaderName = HeaderName::from_static("proxy-authenticate");
 #[cfg(test)]
 const PROXY_AUTHORIZATION: HeaderName = HeaderName::from_static("proxy-authorization");
-#[cfg(test)]
-const STRICT_TRANSPORT_SECURITY: HeaderName = HeaderName::from_static("strict-transport-security");
 const DIRECT_DOH_HOST: HeaderValue = HeaderValue::from_static("direct.tae00217.cloud");
 const PORT_443: HeaderValue = HeaderValue::from_static("443");
 const PORT_80: HeaderValue = HeaderValue::from_static("80");
@@ -178,11 +185,12 @@ impl RouteClass {
     }
 
     fn supports_h1_bodyless_fast_path(self) -> bool {
-        // The proxy core independently requires an H1 GET/HEAD with an empty
-        // request body and no Upgrade. Response streaming remains bounded to
-        // one awaited chunk, so Navidrome streams and bodyless CouchDB reads
-        // retain backpressure and prompt disconnect propagation without the
-        // per-request duplex channels needed by POST/PUT replication.
+        // The proxy core independently requires a GET/HEAD with an empty
+        // request body and no Upgrade. HTTP/1 and HTTP/2 share this opt-in.
+        // Response streaming remains bounded to one awaited chunk, so
+        // Navidrome streams and bodyless CouchDB reads retain backpressure
+        // and prompt disconnect propagation without the per-request duplex
+        // channels needed by POST/PUT replication.
         self != Self::VaultwardenHub
     }
 
@@ -346,6 +354,7 @@ pub struct Gateway {
     shared: Arc<GatewayShared>,
     hosts: AHashMap<Arc<str>, PreparedHost>,
     plans: Box<[PreparedPlan]>,
+    compression_modules: HttpModules,
 }
 
 impl Gateway {
@@ -429,6 +438,11 @@ impl Gateway {
             shared,
             hosts,
             plans: prepared_plans.into_boxed_slice(),
+            compression_modules: {
+                let mut modules = HttpModules::new();
+                modules.add_module(ResponseCompressionBuilder::enable(1));
+                modules
+            },
         })
     }
 
@@ -511,9 +525,11 @@ impl ProxyHttp for Gateway {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        let http3 = is_internal_http3(&self.runtime, session);
+        let internal_http3 = is_internal_http3(&self.runtime, session);
+        let http3 = internal_http3 || is_direct_http3(session);
         let tls = is_tls(session) || http3;
         ctx.http3 = http3;
+        ctx.tls = tls;
         ctx.forwarded_port = http3
             .then(|| {
                 session
@@ -637,7 +653,7 @@ impl ProxyHttp for Gateway {
             session.set_read_timeout(Some(Duration::from_secs(30)));
             session.set_write_timeout(Some(Duration::from_secs(30)));
             session.set_keepalive(Some(30));
-            let Some(client_ip) = session_client_ip(&self.runtime, session, http3) else {
+            let Some(client_ip) = session_client_ip(&self.runtime, session, internal_http3) else {
                 session.set_keepalive(None);
                 return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
             };
@@ -676,7 +692,7 @@ impl ProxyHttp for Gateway {
                 .await;
         }
 
-        let Some(client_ip) = session_client_ip(&self.runtime, session, http3) else {
+        let Some(client_ip) = session_client_ip(&self.runtime, session, internal_http3) else {
             session.set_keepalive(None);
             return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
         };
@@ -699,13 +715,13 @@ impl ProxyHttp for Gateway {
             return send_empty(&self.runtime, session, 500, Some(host.handler), tls, &[]).await;
         };
         let plan = &self.plans[plan_index];
-        let encoding = configure_downstream_compression(session, plan.route)?;
+        let encoding =
+            configure_downstream_compression(session, plan.route, &self.compression_modules)?;
         if encoding.preferred == ContentCoding::NotAcceptable {
             return send_empty(&self.runtime, session, 406, Some(plan.handler), tls, &[]).await;
         }
         ctx.identity_acceptable = encoding.identity_acceptable;
         ctx.compression_selected = encoding.preferred.as_str().is_some();
-        ctx.tls = tls;
 
         if declared_content_length.is_some_and(|length| length > plan.max_body_bytes) {
             return send_empty(&self.runtime, session, 413, Some(plan.handler), tls, &[]).await;
@@ -826,26 +842,26 @@ impl ProxyHttp for Gateway {
         upstream_request.remove_header(&X_FORWARDED_FOR);
         upstream_request.remove_header(&HTTP3_INTERNAL);
         upstream_request.remove_header(&HTTP3_PORT);
-        upstream_request.insert_header(HOST, upstream_host)?;
-        upstream_request.insert_header("x-real-ip", client_ip.clone())?;
-        upstream_request.insert_header("x-forwarded-for", client_ip)?;
-        upstream_request.insert_header("x-forwarded-host", plan.domain.clone())?;
+        upstream_request.insert_typed_header(HOST, upstream_host);
+        upstream_request.insert_typed_header(X_REAL_IP, client_ip.clone());
+        upstream_request.insert_typed_header(X_FORWARDED_FOR, client_ip);
+        upstream_request.insert_typed_header(X_FORWARDED_HOST, plan.domain.clone());
         let listener_port = ctx.forwarded_port.or_else(|| {
             session
                 .server_addr()
                 .and_then(|address| address.as_inet())
                 .map(|address| address.port())
         });
-        upstream_request.insert_header(
-            "x-forwarded-port",
+        upstream_request.insert_typed_header(
+            X_FORWARDED_PORT,
             forwarded_port_value(listener_port, ctx.tls)?,
-        )?;
-        upstream_request.insert_header("x-forwarded-proto", if ctx.tls { HTTPS } else { HTTP })?;
-        upstream_request.insert_header("x-forwarded-ssl", if ctx.tls { ON } else { OFF })?;
+        );
+        upstream_request.insert_typed_header(X_FORWARDED_PROTO, if ctx.tls { HTTPS } else { HTTP });
+        upstream_request.insert_typed_header(X_FORWARDED_SSL, if ctx.tls { ON } else { OFF });
 
         if forwards_accept_encoding(plan.route) {
             if let Some(value) = session.req_header().headers.get(ACCEPT_ENCODING) {
-                upstream_request.insert_header(ACCEPT_ENCODING, value.clone())?;
+                upstream_request.insert_typed_header(ACCEPT_ENCODING, value.clone());
             } else {
                 upstream_request.remove_header(&ACCEPT_ENCODING);
             }
@@ -863,8 +879,8 @@ impl ProxyHttp for Gateway {
                     "upgrade request is missing its Upgrade header",
                 )
             })?;
-            upstream_request.insert_header(UPGRADE, upgrade.clone())?;
-            upstream_request.insert_header(CONNECTION, UPGRADE_VALUE)?;
+            upstream_request.insert_typed_header(UPGRADE, upgrade.clone());
+            upstream_request.insert_typed_header(CONNECTION, UPGRADE_VALUE);
         }
         Ok(())
     }
@@ -961,7 +977,7 @@ impl ProxyHttp for Gateway {
         if ctx.tls
             && let Some(alt_svc) = self.runtime.http3_alt_svc_header()
         {
-            response.insert_header("alt-svc", alt_svc.clone())?;
+            response.insert_typed_header(ALT_SVC, alt_svc.clone());
         }
         if ctx.compression_selected && response_status_is_interim(response.status.as_u16()) {
             // 100/103 are interim headers. Do not permanently disable the
@@ -992,7 +1008,7 @@ impl ProxyHttp for Gateway {
             response.remove_header(&PRAGMA);
             response.remove_header(&http::header::ETAG);
             response.remove_header(&LAST_MODIFIED);
-            response.insert_header(CACHE_CONTROL, NO_STORE)?;
+            response.insert_typed_header(CACHE_CONTROL, NO_STORE);
         }
         Ok(())
     }
@@ -1150,6 +1166,7 @@ fn uses_downstream_compression(route: RouteClass) -> bool {
 fn configure_downstream_compression(
     session: &mut Session,
     route: RouteClass,
+    compression_modules: &HttpModules,
 ) -> Result<EncodingNegotiation> {
     if !uses_downstream_compression(route) {
         return Ok(EncodingNegotiation {
@@ -1166,14 +1183,12 @@ fn configure_downstream_compression(
     // The default Pingora module starts disabled, so it skipped its earlier
     // request-header hook. Normalize all q-values and duplicate fields to one
     // accepted coding before feeding Pingora's parser, which currently ignores
-    // q-values itself.
+    // q-values itself. The compressor module list is built once at startup.
     session
         .downstream_session
         .req_header_mut()
-        .insert_header(ACCEPT_ENCODING, encoding)?;
-    let mut modules = HttpModules::new();
-    modules.add_module(ResponseCompressionBuilder::enable(1));
-    session.downstream_modules_ctx = modules.build_ctx();
+        .insert_typed_header(ACCEPT_ENCODING, HeaderValue::from_static(encoding));
+    session.downstream_modules_ctx = compression_modules.build_ctx();
     let request = session.downstream_session.req_header();
     let Some(compression) = session
         .downstream_modules_ctx
@@ -1530,6 +1545,12 @@ fn request_header_is_replay_safe(request: &RequestHeader) -> bool {
             validated_request_content_length(request),
             Ok(None | Some(0))
         )
+}
+
+fn is_direct_http3(session: &Session) -> bool {
+    // QUIC streams enter Gateway as a custom Pingora session, not via the
+    // private loopback h2c listener.
+    session.downstream_session.is_custom()
 }
 
 fn is_tls(session: &Session) -> bool {
@@ -1899,16 +1920,16 @@ fn insert_security_headers(
     tls: bool,
 ) -> Result<()> {
     response.headers.reserve(4);
-    response.insert_header("x-content-type-options", NOSNIFF)?;
+    response.insert_typed_header(X_CONTENT_TYPE_OPTIONS, NOSNIFF);
     if tls {
-        response.insert_header("strict-transport-security", HSTS_VALUE)?;
+        response.insert_typed_header(STRICT_TRANSPORT_SECURITY, HSTS_VALUE);
     }
     if matches!(
         handler,
         HandlerKind::Static | HandlerKind::Vaultwarden | HandlerKind::Couchdb
     ) {
-        response.insert_header("x-frame-options", SAMEORIGIN)?;
-        response.insert_header("referrer-policy", REFERRER_POLICY_VALUE)?;
+        response.insert_typed_header(X_FRAME_OPTIONS, SAMEORIGIN);
+        response.insert_typed_header(REFERRER_POLICY, REFERRER_POLICY_VALUE);
     }
     Ok(())
 }
@@ -1922,7 +1943,7 @@ async fn send_empty(
     headers: &[(&'static str, &str)],
 ) -> Result<bool> {
     let mut response = ResponseHeader::build(status, Some(headers.len() + 8)).unwrap();
-    response.insert_header(CONTENT_LENGTH, "0")?;
+    response.insert_typed_header(CONTENT_LENGTH, HeaderValue::from_static("0"));
     for (name, value) in headers {
         response.insert_header(*name, *value)?;
     }
@@ -1930,7 +1951,7 @@ async fn send_empty(
         insert_security_headers(&mut response, handler, tls)?;
     }
     if tls && let Some(alt_svc) = runtime.http3_alt_svc_header() {
-        response.insert_header("alt-svc", alt_svc.clone())?;
+        response.insert_typed_header(ALT_SVC, alt_svc.clone());
     }
     session
         .write_response_header(Box::new(response), true)

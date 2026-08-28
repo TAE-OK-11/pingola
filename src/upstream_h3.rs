@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
 use anyhow::{Context, Result, anyhow, bail};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::stream;
 use http::header::{CONNECTION, HOST, TE, TRANSFER_ENCODING, UPGRADE};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
@@ -610,7 +610,7 @@ async fn run_connection(
     let mut pending_writes = VecDeque::<u64>::new();
     let mut recv_buf = vec![0_u8; MAX_UDP_PAYLOAD];
     let mut send_buf = vec![0_u8; MAX_UDP_PAYLOAD];
-    let mut body_buf = vec![0_u8; H3_BODY_RECV_BUFFER];
+    let mut body_buf = BytesMut::with_capacity(H3_BODY_RECV_BUFFER);
     let mut pending_send = None;
     let mut response_blocked = None;
     let mut draining = false;
@@ -1036,7 +1036,7 @@ fn process_h3_events(
     conn: &mut quiche::Connection,
     requests: &mut AHashMap<u64, PendingRequest>,
     stream_to_request: &mut AHashMap<u64, u64>,
-    body_buf: &mut [u8],
+    body_buf: &mut BytesMut,
     response_blocked: &mut Option<u64>,
     draining: &mut bool,
 ) -> Result<()> {
@@ -1250,7 +1250,7 @@ fn drain_response_body(
     conn: &mut quiche::Connection,
     request_id: u64,
     requests: &AHashMap<u64, PendingRequest>,
-    body_buf: &mut [u8],
+    body_buf: &mut BytesMut,
 ) -> Result<DeliveryRetry> {
     let (stream_id, body_tx) = {
         let request = requests
@@ -1272,9 +1272,25 @@ fn drain_response_body(
                 ));
             }
         };
-        match h3_conn.recv_body(conn, stream_id, body_buf) {
+        if body_buf.capacity() < H3_BODY_RECV_BUFFER {
+            body_buf.reserve(H3_BODY_RECV_BUFFER);
+        }
+        let spare = body_buf.spare_capacity_mut();
+        let spare_len = spare.len().min(H3_BODY_RECV_BUFFER);
+        if spare_len == 0 {
+            body_buf.reserve(H3_BODY_RECV_BUFFER);
+            continue;
+        }
+        // recv_body only writes into this spare region. Promote exactly the
+        // bytes it filled so the Bytes freeze has no extra copy.
+        let dest =
+            unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), spare_len) };
+        match h3_conn.recv_body(conn, stream_id, dest) {
             Ok(read) if read > 0 => {
-                permit.send(Ok(Frame::data(Bytes::copy_from_slice(&body_buf[..read]))));
+                unsafe {
+                    body_buf.set_len(body_buf.len() + read);
+                }
+                permit.send(Ok(Frame::data(body_buf.split().freeze())));
             }
             Ok(_) | Err(h3::Error::Done) => return Ok(DeliveryRetry::Ready),
             Err(error) => {

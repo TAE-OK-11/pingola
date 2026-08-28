@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ahash::AHasher;
 use bytes::{Bytes, BytesMut};
 use cloudflare_pingora::Result;
 use cloudflare_pingora::http::ResponseHeader;
@@ -13,7 +15,7 @@ use cloudflare_pingora::protocols::http::conditional_filter::weak_validate_etag;
 use cloudflare_pingora::proxy::Session;
 use http::header::{
     ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
-    IF_NONE_MATCH, LAST_MODIFIED, VARY,
+    HeaderName, IF_NONE_MATCH, LAST_MODIFIED, STRICT_TRANSPORT_SECURITY, VARY,
 };
 use http::{HeaderValue, Method};
 use lru::LruCache;
@@ -30,6 +32,7 @@ const MAX_ACTIVE_STATIC_REQUESTS: usize = 256;
 const MAX_ACTIVE_STATIC_STREAMS: usize = 32;
 const PATH_CACHE_TTL: Duration = Duration::from_secs(1);
 const MAX_PATH_CACHE_ENTRIES: usize = 256;
+const ASSET_CACHE_SHARDS: usize = 8;
 const ZERO: HeaderValue = HeaderValue::from_static("0");
 const ACCEPT_ENCODING_VALUE: HeaderValue = HeaderValue::from_static("Accept-Encoding");
 const NO_CACHE: HeaderValue = HeaderValue::from_static("no-cache");
@@ -38,6 +41,9 @@ const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 const SAMEORIGIN: HeaderValue = HeaderValue::from_static("SAMEORIGIN");
 const STRICT_REFERRER: HeaderValue = HeaderValue::from_static("strict-origin-when-cross-origin");
 const HSTS: HeaderValue = HeaderValue::from_static("max-age=63072000; includeSubDomains; preload");
+const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
+const X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
+const REFERRER_POLICY: HeaderName = HeaderName::from_static("referrer-policy");
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Encoding {
@@ -146,22 +152,33 @@ struct CacheState {
 
 struct AssetCache {
     max_bytes: usize,
-    state: Mutex<CacheState>,
+    shards: Box<[Mutex<CacheState>]>,
 }
 
 impl AssetCache {
     fn new(max_bytes: usize) -> Self {
+        let per_shard = (max_bytes / ASSET_CACHE_SHARDS).max(1);
         Self {
-            max_bytes,
-            state: Mutex::new(CacheState {
-                assets: LruCache::new(NonZeroUsize::new(256).unwrap()),
-                bytes: 0,
-            }),
+            max_bytes: per_shard,
+            shards: (0..ASSET_CACHE_SHARDS)
+                .map(|_| {
+                    Mutex::new(CacheState {
+                        assets: LruCache::new(NonZeroUsize::new(32).unwrap()),
+                        bytes: 0,
+                    })
+                })
+                .collect(),
         }
     }
 
+    fn shard(&self, key: &CacheKey) -> &Mutex<CacheState> {
+        let mut hasher = AHasher::default();
+        key.hash(&mut hasher);
+        &self.shards[(hasher.finish() as usize) & (ASSET_CACHE_SHARDS - 1)]
+    }
+
     fn get(&self, key: &CacheKey) -> Option<Arc<CachedAsset>> {
-        self.state.lock().assets.get(key).cloned()
+        self.shard(key).lock().assets.get(key).cloned()
     }
 
     fn insert(&self, key: CacheKey, asset: Arc<CachedAsset>) {
@@ -169,7 +186,7 @@ impl AssetCache {
             return;
         }
 
-        let mut state = self.state.lock();
+        let mut state = self.shard(&key).lock();
         if let Some((_, previous)) = state.assets.push(key, asset.clone()) {
             state.bytes = state.bytes.saturating_sub(previous.body.len());
         }
@@ -223,10 +240,10 @@ impl StaticFiles {
             Ok(permit) => permit,
             Err(_) => return send_empty(session, 503, &[("retry-after", "1")], tls).await,
         };
-        let method = session.req_header().method.clone();
-        if method != Method::GET && method != Method::HEAD {
+        if !matches!(session.req_header().method, Method::GET | Method::HEAD) {
             return send_empty(session, 405, &[("allow", "GET, HEAD")], tls).await;
         }
+        let is_head = session.req_header().method == Method::HEAD;
 
         let Some(root) = self.roots.get(host_name) else {
             return send_empty(session, 500, &[], tls).await;
@@ -247,7 +264,7 @@ impl StaticFiles {
                 Err(_) => return send_empty(session, 503, &[("retry-after", "1")], tls).await,
             };
             let content_type = content_type(path);
-            return serve_streaming_file(session, &resolved, &content_type, &method, tls).await;
+            return serve_streaming_file(session, &resolved, &content_type, is_head, tls).await;
         }
         let requested_encoding = if resolved.length >= 1024 && compressible_path(path) {
             match negotiation.preferred {
@@ -345,7 +362,7 @@ impl StaticFiles {
         insert_cache_header(&mut response, path, spa_fallback)?;
         insert_security_headers(&mut response, tls)?;
 
-        let head = method == Method::HEAD;
+        let head = is_head;
         session
             .write_response_header(Box::new(response), head || asset.body.is_empty())
             .await?;
@@ -512,7 +529,7 @@ async fn serve_streaming_file(
     session: &mut Session,
     resolved: &ResolvedAsset,
     content_type: &str,
-    method: &Method,
+    is_head: bool,
     tls: bool,
 ) -> Result<bool> {
     let path = resolved.path.as_ref();
@@ -533,7 +550,7 @@ async fn serve_streaming_file(
         return Ok(true);
     }
 
-    let head = *method == Method::HEAD;
+    let head = is_head;
     let mut file = if head {
         None
     } else {
@@ -696,11 +713,11 @@ fn insert_cache_header(
 }
 
 fn insert_security_headers(response: &mut ResponseHeader, tls: bool) -> Result<()> {
-    response.insert_header("x-content-type-options", NOSNIFF)?;
-    response.insert_header("x-frame-options", SAMEORIGIN)?;
-    response.insert_header("referrer-policy", STRICT_REFERRER)?;
+    response.insert_typed_header(X_CONTENT_TYPE_OPTIONS, NOSNIFF);
+    response.insert_typed_header(X_FRAME_OPTIONS, SAMEORIGIN);
+    response.insert_typed_header(REFERRER_POLICY, STRICT_REFERRER);
     if tls {
-        response.insert_header("strict-transport-security", HSTS)?;
+        response.insert_typed_header(STRICT_TRANSPORT_SECURITY, HSTS);
     }
     Ok(())
 }
@@ -760,6 +777,14 @@ mod tests {
             .await
             .unwrap();
         std::fs::write(root.join("index.html"), "replaced-body").unwrap();
+        let replaced = std::fs::File::options()
+            .write(true)
+            .open(root.join("index.html"))
+            .unwrap();
+        replaced
+            .set_modified(SystemTime::now() + Duration::from_secs(2))
+            .unwrap();
+        drop(replaced);
         let during_ttl = files
             .resolve_cached_at("site", &root, "/", now)
             .await
@@ -846,14 +871,30 @@ mod tests {
             );
         }
 
-        let state = cache.state.lock();
-        let actual_bytes = state
-            .assets
+        let actual_bytes = cache
+            .shards
             .iter()
-            .map(|(_, asset)| asset.body.len())
+            .map(|shard| {
+                shard
+                    .lock()
+                    .assets
+                    .iter()
+                    .map(|(_, asset)| asset.body.len())
+                    .sum::<usize>()
+            })
             .sum::<usize>();
-        assert_eq!(state.assets.len(), 256);
-        assert_eq!(state.bytes, actual_bytes);
+        let total_entries = cache
+            .shards
+            .iter()
+            .map(|shard| shard.lock().assets.len())
+            .sum::<usize>();
+        let tracked_bytes = cache
+            .shards
+            .iter()
+            .map(|shard| shard.lock().bytes)
+            .sum::<usize>();
+        assert_eq!(total_entries, 32 * ASSET_CACHE_SHARDS);
+        assert_eq!(tracked_bytes, actual_bytes);
     }
 
     #[tokio::test]

@@ -1,8 +1,3 @@
-use std::cell::RefCell;
-use std::convert::Infallible;
-use std::error::Error as StdError;
-use std::fmt::Write as _;
-use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -10,21 +5,22 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use boring::ssl::{SslContextBuilder, SslFiletype};
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt, stream};
-use http::header::{CONNECTION, HOST, TE, TRAILER, TRANSFER_ENCODING, UPGRADE};
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version};
-use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Empty, StreamBody};
-use hyper::body::Frame;
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
+use cloudflare_pingora::apps::HttpServerApp;
+use cloudflare_pingora::http::RequestHeader;
+use cloudflare_pingora::protocols::http::server::Session as ServerSession;
+use cloudflare_pingora::proxy::{HttpProxy, http_proxy};
+use cloudflare_pingora::server::ShutdownWatch;
+use cloudflare_pingora::server::configuration::ServerConf;
+use futures::{SinkExt, StreamExt};
+use http::header::{CONNECTION, HOST, HeaderName, TE, TRANSFER_ENCODING, UPGRADE};
+use http::uri::{PathAndQuery, Scheme};
+use http::{HeaderValue, Method, StatusCode, Uri, Version};
 use log::{error, info, warn};
 use tokio::net::UdpSocket;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio_quiche::http3::driver::{
-    H3Event, InboundFrame, IncomingH3Headers, OutboundFrame, OutboundFrameSender,
-    ServerH3Controller, ServerH3Event,
+    H3Event, IncomingH3Headers, OutboundFrame, OutboundFrameSender, ServerH3Controller,
+    ServerH3Event,
 };
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::metrics::DefaultMetrics;
@@ -35,11 +31,11 @@ use tokio_quiche::socket::QuicListener;
 use tokio_quiche::{ConnectionParams, ServerH3Driver, listen_with_capabilities};
 
 use crate::config::RuntimeConfig;
+use crate::gateway::Gateway;
+use crate::h3_session::H3Session;
 use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, LimitZone, RateLimiter};
 use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
 
-const INTERNAL_MARKER: &str = "x-jbs-http3-internal";
-const INTERNAL_PORT: &str = "x-jbs-http3-port";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP3_MAX_UDP_PAYLOAD_SIZE: usize = 1452;
 const HTTP3_CONTROL_STREAM_LIMIT: u64 = 8;
@@ -52,16 +48,6 @@ const HTTP3_STREAM_WINDOW: u64 = 1024 * 1024;
 const HTTP3_MAX_CONNECTION_WINDOW: u64 = 8 * 1024 * 1024;
 const HTTP3_MAX_STREAM_WINDOW: u64 = 2 * 1024 * 1024;
 const HTTP3_CC_BBR2: &str = "bbr2";
-
-thread_local! {
-    static CLIENT_IP_HEADER_CACHE: RefCell<Option<(IpAddr, HeaderValue)>> = const {
-        RefCell::new(None)
-    };
-}
-
-type BoxError = Box<dyn StdError + Send + Sync>;
-type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
-type ProxyClient = Client<HttpConnector, ProxyBody>;
 
 #[derive(Debug)]
 struct HybridPqQuicTlsHook;
@@ -119,7 +105,10 @@ impl Http3Admission {
         }
     }
 
-    fn admit(&self, peer: SocketAddr) -> Result<ActiveRequestPermit, Http3AdmissionRejection> {
+    fn admit(
+        &self,
+        peer: std::net::SocketAddr,
+    ) -> Result<ActiveRequestPermit, Http3AdmissionRejection> {
         if !self.rate.allow(
             LimitZone::Http3Connection,
             peer.ip(),
@@ -134,7 +123,12 @@ impl Http3Admission {
     }
 }
 
-pub fn start(runtime: Arc<RuntimeConfig>, h3_runtime: &tokio::runtime::Handle) -> Result<()> {
+pub fn start(
+    runtime: Arc<RuntimeConfig>,
+    h3_runtime: &tokio::runtime::Handle,
+    gateway: Gateway,
+    server_conf: Arc<ServerConf>,
+) -> Result<()> {
     let server = &runtime.config.server;
     if server.http3_listen.is_empty() {
         return Ok(());
@@ -143,7 +137,7 @@ pub fn start(runtime: Arc<RuntimeConfig>, h3_runtime: &tokio::runtime::Handle) -
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     h3_runtime.spawn(async move {
         let failure_tx = ready_tx.clone();
-        if let Err(error) = run(runtime, ready_tx).await {
+        if let Err(error) = run(runtime, gateway, server_conf, ready_tx).await {
             let _ = failure_tx.send(Err(format!("HTTP/3 frontend startup failed: {error:#}")));
             error!("HTTP/3 frontend stopped: {error:#}");
         }
@@ -157,6 +151,8 @@ pub fn start(runtime: Arc<RuntimeConfig>, h3_runtime: &tokio::runtime::Handle) -
 
 async fn run(
     runtime: Arc<RuntimeConfig>,
+    gateway: Gateway,
+    server_conf: Arc<ServerConf>,
     ready: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<()> {
     let server = &runtime.config.server;
@@ -262,40 +258,16 @@ async fn run(
     let listeners = listen_with_capabilities(quic_listeners, params, DefaultMetrics)
         .context("failed to create quiche HTTP/3 listeners with UDP offload capabilities")?;
 
-    let mut connector = HttpConnector::new();
-    connector.enforce_http(true);
-    connector.set_connect_timeout(Some(Duration::from_secs(2)));
-    // A single cleartext HTTP/2 connection multiplexes all concurrent H3
-    // streams for this internal authority. There is intentionally no H1
-    // fallback, so a protocol regression fails fast instead of becoming a
-    // silent performance regression.
-    let client: ProxyClient = Client::builder(TokioExecutor::new())
-        .http2_only(true)
-        // Match the trusted H3→H2c handoff windows. Adaptive windows can
-        // grow past the 1 GiB host budget under concurrent audio streams.
-        .http2_adaptive_window(false)
-        .http2_initial_stream_window_size(1024 * 1024)
-        .http2_initial_connection_window_size(16 * 1024 * 1024)
-        .http2_max_frame_size(64 * 1024)
-        .pool_max_idle_per_host(1)
-        .build(connector);
-    let internal = server.http3_internal_listen;
-    let public_port = runtime
-        .http3_public_port()
-        .ok_or_else(|| anyhow!("HTTP/3 public port was not configured"))?;
-    let public_port_header = HeaderValue::from_str(&public_port.to_string())
-        .context("HTTP/3 public port is not a valid header value")?;
-    let internal_token = runtime
-        .http3_internal_token()
-        .cloned()
-        .ok_or_else(|| anyhow!("HTTP/3 internal token was not initialized"))?;
+    let public_listen: std::net::SocketAddr = server.http3_listen[0]
+        .parse()
+        .context("HTTP/3 public listen address is not a valid socket address")?;
     let alt_svc = runtime.http3_alt_svc_header().cloned();
-    let internal_uri_prefix = format!("http://{internal}");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let proxy = Arc::new(http_proxy(&server_conf, gateway));
     let shared = Arc::new(Http3Shared {
-        internal_uri_prefix,
-        public_port: public_port_header,
-        internal_token,
-        client,
+        proxy,
+        shutdown: shutdown_rx,
+        public_listen,
         alt_svc,
         allow_early_data,
     });
@@ -366,9 +338,8 @@ async fn run(
     }
 
     info!(
-        "HTTP/3 frontend started: udp={:?} internal=h2c://{} quiche={} hybrid_pq={} cc={} stateless_retry={} max_amplification={} early_data={} migration=false pmtud=true pacing=true socket_offload=auto[gso,gro,so_txtime,rxq_ovfl,pmtu_probe] max_udp_payload={} send_capacity_factor={} stream_window={} admission_rate={}/s burst={} max_connections_per_ip={} handshake_timeout={}s",
+        "HTTP/3 frontend started: udp={:?} internal=direct-gateway quiche={} hybrid_pq={} cc={} stateless_retry={} max_amplification={} early_data={} migration=false pmtud=true pacing=true socket_offload=auto[gso,gro,so_txtime,rxq_ovfl,pmtu_probe] max_udp_payload={} send_capacity_factor={} stream_window={} admission_rate={}/s burst={} max_connections_per_ip={} handshake_timeout={}s",
         server.http3_listen,
-        internal,
         tokio_quiche::quiche::PROTOCOL_VERSION,
         HYBRID_PQ_GROUPS,
         HTTP3_CC_BBR2,
@@ -389,17 +360,16 @@ async fn run(
 }
 
 struct Http3Shared {
-    internal_uri_prefix: String,
-    public_port: HeaderValue,
-    internal_token: HeaderValue,
-    client: ProxyClient,
-    alt_svc: Option<HeaderValue>,
+    proxy: Arc<HttpProxy<Gateway>>,
+    shutdown: ShutdownWatch,
+    public_listen: std::net::SocketAddr,
+    alt_svc: Option<http::HeaderValue>,
     allow_early_data: bool,
 }
 
 #[derive(Clone)]
 struct Http3ConnectionContext {
-    peer: SocketAddr,
+    peer: std::net::SocketAddr,
     shared: Arc<Http3Shared>,
 }
 
@@ -470,79 +440,59 @@ async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionCont
         read_fin,
         ..
     } = incoming;
-    if let Err(error) = proxy_request_inner(headers, send, recv, read_fin, context).await {
-        warn!("HTTP/3 stream proxy failed peer={peer}: {error:#}");
-    }
-}
-
-async fn proxy_request_inner(
-    headers: Vec<h3::Header>,
-    mut send: OutboundFrameSender,
-    recv: tokio_quiche::http3::driver::InboundFrameStream,
-    read_fin: bool,
-    context: Http3ConnectionContext,
-) -> Result<()> {
-    let decoded = match decode_request_headers(
-        &headers,
-        context.peer,
-        &context.shared.internal_uri_prefix,
-        &context.shared.public_port,
-        &context.shared.internal_token,
-    ) {
-        Ok(decoded) => decoded,
+    let request = match decode_request_headers(&headers) {
+        Ok(request) => request,
         Err(error) => {
-            send_error(&mut send, StatusCode::BAD_REQUEST, "invalid HTTP/3 request").await?;
-            return Err(error);
+            let mut send = send;
+            if let Err(send_error) =
+                send_error(&mut send, StatusCode::BAD_REQUEST, "invalid HTTP/3 request").await
+            {
+                warn!(
+                    "HTTP/3 invalid request peer={peer}: {error:#}; failed to send 400: {send_error:#}"
+                );
+            } else {
+                warn!("HTTP/3 invalid request peer={peer}: {error:#}");
+            }
+            return;
         }
     };
-    if decoded.method == Method::CONNECT {
-        send_error(
+    if request.method == Method::CONNECT {
+        let mut send = send;
+        if let Err(error) = send_error(
             &mut send,
             StatusCode::NOT_IMPLEMENTED,
             "HTTP/3 CONNECT is not supported",
         )
-        .await?;
-        return Ok(());
+        .await
+        {
+            warn!("failed to reject HTTP/3 CONNECT peer={peer}: {error:#}");
+        }
+        return;
     }
 
-    let body = request_body(recv, read_fin);
-    let mut request = Request::builder()
-        .method(decoded.method)
-        .uri(decoded.uri)
-        .version(Version::HTTP_2)
-        .body(body)
-        .context("failed to build internal HTTP/3 proxy request")?;
-    *request.headers_mut() = decoded.headers;
-
-    let response = tokio::time::timeout(
-        Duration::from_secs(3600),
-        context.shared.client.request(request),
-    )
-    .await
-    .map_err(|_| anyhow!("internal Pingora h2c request timed out"))?
-    .context("internal Pingora h2c request failed")?;
-    forward_response(response, &mut send, context.shared.alt_svc.clone()).await
+    let session = ServerSession::new_custom(Box::new(H3Session::new(
+        request,
+        send,
+        recv,
+        read_fin,
+        peer,
+        context.shared.public_listen,
+        context.shared.alt_svc.clone(),
+    )));
+    context
+        .shared
+        .proxy
+        .process_new_http(session, &context.shared.shutdown)
+        .await;
 }
 
-struct DecodedRequest {
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-}
-
-fn decode_request_headers(
-    headers: &[h3::Header],
-    peer: SocketAddr,
-    internal_uri_prefix: &str,
-    public_port: &HeaderValue,
-    internal_token: &HeaderValue,
-) -> Result<DecodedRequest> {
+fn decode_request_headers(headers: &[h3::Header]) -> Result<RequestHeader> {
     let mut method = None;
     let mut scheme = None;
     let mut authority = None;
     let mut path = None;
     let mut regular_seen = false;
-    let mut output = HeaderMap::with_capacity(headers.len() + 6);
+    let mut regular = Vec::with_capacity(headers.len());
 
     for header in headers {
         let name = header.name();
@@ -573,10 +523,10 @@ fn decode_request_headers(
         if name == HOST {
             continue;
         }
-        output.append(
+        regular.push((
             name,
             HeaderValue::from_bytes(value).context("invalid HTTP/3 field value")?,
-        );
+        ));
     }
 
     let method = method.ok_or_else(|| anyhow!("missing :method"))?;
@@ -585,50 +535,34 @@ fn decode_request_headers(
         bail!("HTTP/3 :scheme must be https");
     }
     let authority = authority.ok_or_else(|| anyhow!("missing :authority"))?;
-    let authority = HeaderValue::from_bytes(authority).context("invalid :authority")?;
+    let authority = std::str::from_utf8(authority).context(":authority is not UTF-8")?;
+    let host = HeaderValue::from_str(authority).context("invalid :authority")?;
     let path = path.ok_or_else(|| anyhow!("missing :path"))?;
     let path = std::str::from_utf8(path).context(":path is not UTF-8")?;
     if !path.starts_with('/') {
         bail!("HTTP/3 :path must be origin-form");
     }
-    let mut uri = String::with_capacity(internal_uri_prefix.len() + path.len());
-    uri.push_str(internal_uri_prefix);
-    uri.push_str(path);
-    let uri: Uri = uri.parse().context("failed to construct internal URI")?;
+    let path = PathAndQuery::try_from(path).context("invalid HTTP/3 :path")?;
+    let uri = Uri::builder()
+        .scheme(Scheme::HTTPS)
+        .authority(authority)
+        .path_and_query(path.clone())
+        .build()
+        .context("failed to construct HTTP/3 request URI")?;
 
-    output.insert(HOST, authority);
-    output.insert("x-forwarded-for", forwarded_client_ip_value(peer.ip())?);
-    output.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-    output.insert("x-forwarded-port", public_port.clone());
-    output.insert(INTERNAL_MARKER, internal_token.clone());
-    output.insert(INTERNAL_PORT, public_port.clone());
-
-    Ok(DecodedRequest {
-        method,
-        uri,
-        headers: output,
-    })
-}
-
-fn forwarded_client_ip_value(ip: IpAddr) -> Result<HeaderValue> {
-    if let Some(value) = CLIENT_IP_HEADER_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .as_ref()
-            .filter(|(cached, _)| *cached == ip)
-            .map(|(_, value)| value.clone())
-    }) {
-        return Ok(value);
+    let mut request =
+        RequestHeader::build_no_case(method, path.as_str().as_bytes(), Some(regular.len() + 1))
+            .map_err(|error| anyhow!("failed to build HTTP/3 request header: {error}"))?;
+    // Pingora's HTTP/1 client can serialize HTTP/2 as HTTP/1.1 but panics on
+    // HTTP/3. Direct QUIC sessions are identified with `is_custom()`, not the
+    // wire version.
+    request.set_version(Version::HTTP_2);
+    request.set_uri(uri);
+    request.insert_typed_header(HOST, host);
+    for (name, value) in regular {
+        request.insert_typed_header(name, value);
     }
-
-    let mut encoded = arrayvec::ArrayString::<46>::new();
-    write!(&mut encoded, "{ip}")
-        .map_err(|error| anyhow!("client IP could not be formatted: {error}"))?;
-    let value = HeaderValue::from_str(&encoded).context("client IP is not a valid header value")?;
-    CLIENT_IP_HEADER_CACHE.with(|cache| {
-        *cache.borrow_mut() = Some((ip, value.clone()));
-    });
-    Ok(value)
+    Ok(request)
 }
 
 fn forbidden_request_header(name: &HeaderName, value: &[u8]) -> bool {
@@ -638,91 +572,6 @@ fn forbidden_request_header(name: &HeaderName, value: &[u8]) -> bool {
         || name == TRANSFER_ENCODING
         || name == UPGRADE
         || (name == TE && !value.eq_ignore_ascii_case(b"trailers"))
-}
-
-fn request_body(
-    recv: tokio_quiche::http3::driver::InboundFrameStream,
-    read_fin: bool,
-) -> ProxyBody {
-    if read_fin {
-        return Empty::<Bytes>::new()
-            .map_err(infallible_to_box_error)
-            .boxed_unsync();
-    }
-
-    let stream = stream::unfold((recv, false), |(mut recv, finished)| async move {
-        if finished {
-            return None;
-        }
-        loop {
-            match recv.recv().await {
-                Some(InboundFrame::Body(data, fin)) => {
-                    // InboundFrame owns the BytesMut allocation. Freeze it into
-                    // Bytes and transfer ownership into Hyper without copying.
-                    let frame = Frame::data(data.freeze());
-                    return Some((Ok::<_, BoxError>(frame), (recv, fin)));
-                }
-                Some(InboundFrame::Datagram(_)) => continue,
-                None => return None,
-            }
-        }
-    });
-    StreamBody::new(stream).boxed_unsync()
-}
-
-fn infallible_to_box_error(error: Infallible) -> BoxError {
-    match error {}
-}
-
-async fn forward_response(
-    response: hyper::Response<hyper::body::Incoming>,
-    send: &mut OutboundFrameSender,
-    alt_svc: Option<HeaderValue>,
-) -> Result<()> {
-    let (parts, mut body) = response.into_parts();
-    let mut headers = Vec::with_capacity(parts.headers.len() + 2);
-    headers.push(h3::Header::new(
-        b":status",
-        parts.status.as_str().as_bytes(),
-    ));
-    let mut has_alt_svc = false;
-    for (name, value) in &parts.headers {
-        if forbidden_response_header(name) {
-            continue;
-        }
-        has_alt_svc |= name.as_str() == "alt-svc";
-        headers.push(h3::Header::new(name.as_str().as_bytes(), value.as_bytes()));
-    }
-    if !has_alt_svc && let Some(value) = alt_svc.as_ref() {
-        headers.push(h3::Header::new(b"alt-svc", value.as_bytes()));
-    }
-    send.send(OutboundFrame::Headers(headers, None))
-        .await
-        .context("failed to send HTTP/3 response headers")?;
-
-    while let Some(frame) = body.frame().await {
-        let frame = frame.context("failed to read internal Pingora response body")?;
-        if let Ok(data) = frame.into_data()
-            && !data.is_empty()
-        {
-            send.send(OutboundFrame::Body(data, false))
-                .await
-                .context("failed to send HTTP/3 response body")?;
-        }
-    }
-    send.send(OutboundFrame::Body(Bytes::new(), true))
-        .await
-        .context("failed to finish HTTP/3 response")?;
-    Ok(())
-}
-
-fn forbidden_response_header(name: &HeaderName) -> bool {
-    name == CONNECTION
-        || name.as_str() == "keep-alive"
-        || name.as_str() == "proxy-connection"
-        || name == TRANSFER_ENCODING
-        || name == UPGRADE
-        || name == TRAILER
 }
 
 async fn send_error(
@@ -762,7 +611,7 @@ mod tests {
 
     #[test]
     fn http3_admission_limits_rate_and_active_connections() {
-        let peer: SocketAddr = "192.0.2.44:443".parse().unwrap();
+        let peer: std::net::SocketAddr = "192.0.2.44:443".parse().unwrap();
 
         let active = Http3Admission::new(10_000.0, 8, 1);
         let permit = active.admit(peer).unwrap();
@@ -789,20 +638,11 @@ mod tests {
             h3::Header::new(b":path", b"/rest/ping"),
             h3::Header::new(b"connection", b"close"),
         ];
-        assert!(
-            decode_request_headers(
-                &headers,
-                "127.0.0.1:12345".parse().unwrap(),
-                "http://127.0.0.1:18080",
-                &HeaderValue::from_static("443"),
-                &HeaderValue::from_static("unit-test-token"),
-            )
-            .is_err()
-        );
+        assert!(decode_request_headers(&headers).is_err());
     }
 
     #[test]
-    fn request_header_decoder_builds_internal_request() {
+    fn request_header_decoder_builds_public_https_request() {
         let headers = vec![
             h3::Header::new(b":method", b"GET"),
             h3::Header::new(b":scheme", b"https"),
@@ -810,33 +650,18 @@ mod tests {
             h3::Header::new(b":path", b"/rest/ping?x=1"),
             h3::Header::new(b"accept", b"application/json"),
         ];
-        let request = decode_request_headers(
-            &headers,
-            "192.0.2.10:12345".parse().unwrap(),
-            "http://127.0.0.1:18080",
-            &HeaderValue::from_static("8443"),
-            &HeaderValue::from_static("unit-test-token"),
-        )
-        .unwrap();
+        let request = decode_request_headers(&headers).unwrap();
         assert_eq!(request.method, Method::GET);
+        assert_eq!(request.version, Version::HTTP_2);
+        assert_eq!(request.uri.scheme_str(), Some("https"));
+        assert_eq!(request.uri.authority().unwrap().as_str(), "music.example");
         assert_eq!(
             request.uri.path_and_query().unwrap().as_str(),
             "/rest/ping?x=1"
         );
         assert_eq!(request.headers[HOST], "music.example");
-        assert_eq!(request.headers[INTERNAL_MARKER], "unit-test-token");
-        assert_eq!(request.headers["x-forwarded-for"], "192.0.2.10");
-        assert_eq!(request.headers["x-forwarded-port"], "8443");
-        assert_eq!(request.headers[INTERNAL_PORT], "8443");
-    }
-
-    #[test]
-    fn forwarded_client_ip_header_cache_reuses_the_last_peer() {
-        let ipv4 = "192.0.2.17".parse().unwrap();
-        let ipv6 = "2001:db8::17".parse().unwrap();
-        assert_eq!(forwarded_client_ip_value(ipv4).unwrap(), "192.0.2.17");
-        assert_eq!(forwarded_client_ip_value(ipv4).unwrap(), "192.0.2.17");
-        assert_eq!(forwarded_client_ip_value(ipv6).unwrap(), "2001:db8::17");
-        assert_eq!(forwarded_client_ip_value(ipv4).unwrap(), "192.0.2.17");
+        assert_eq!(request.headers["accept"], "application/json");
+        assert!(request.headers.get("x-jbs-http3-internal").is_none());
+        assert!(request.headers.get("x-forwarded-for").is_none());
     }
 }

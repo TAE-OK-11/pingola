@@ -60,12 +60,12 @@ pub trait LocalProxyHttp {
         None
     }
 
-    /// Opt in to the allocation-light HTTP/1 response path for an empty GET or HEAD request.
+    /// Opt in to the allocation-light HTTP/1 or HTTP/2 response path for an empty GET or HEAD request.
     ///
-    /// The proxy core still verifies that the downstream is HTTP/1, the request has no body or
-    /// upgrade, and caching is inactive. Implementations must only return `true` when their body
-    /// filters neither synthesize a request body nor require an end-of-stream callback, and the
-    /// route does not require full-duplex I/O.
+    /// The proxy core still verifies that the request has no body or upgrade, caching is inactive,
+    /// and the downstream protocol matches the selected path. Implementations must only return
+    /// `true` when their body filters neither synthesize a request body nor require an
+    /// end-of-stream callback, and the route does not require full-duplex I/O.
     fn h1_bodyless_fast_path(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
         false
     }

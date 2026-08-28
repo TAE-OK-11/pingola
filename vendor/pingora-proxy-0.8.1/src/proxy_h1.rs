@@ -67,7 +67,11 @@ where
             if session.get_header(header::HOST).is_none() {
                 // H2 is required to set :authority, but no necessarily header
                 // most H1 server expect host header, so convert
-                let host = req.uri.authority().map_or("", |a| a.as_str()).to_owned();
+                let host = req
+                    .uri
+                    .authority()
+                    .and_then(|authority| http::HeaderValue::try_from(authority.as_str()).ok())
+                    .unwrap_or_else(|| http::HeaderValue::from_static(""));
                 req.insert_header(header::HOST, host).unwrap();
             }
             // TODO: Add keepalive header for connection reuse, but this is not required per RFC
@@ -103,7 +107,8 @@ where
             }
         }
 
-        let use_bodyless_fast_path = session.downstream_session.as_http1().is_some()
+        let use_bodyless_fast_path = (session.downstream_session.as_http1().is_some()
+            || session.downstream_session.is_custom())
             && matches!(session.req_header().method, Method::GET | Method::HEAD)
             && session.as_mut().is_body_empty()
             && !session.cache.enabled()
