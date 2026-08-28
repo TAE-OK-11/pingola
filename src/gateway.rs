@@ -529,6 +529,7 @@ impl ProxyHttp for Gateway {
         let http3 = internal_http3 || is_direct_http3(session);
         let tls = is_tls(session) || http3;
         ctx.http3 = http3;
+        ctx.tls = tls;
         ctx.forwarded_port = http3
             .then(|| {
                 session
@@ -721,7 +722,6 @@ impl ProxyHttp for Gateway {
         }
         ctx.identity_acceptable = encoding.identity_acceptable;
         ctx.compression_selected = encoding.preferred.as_str().is_some();
-        ctx.tls = tls;
 
         if declared_content_length.is_some_and(|length| length > plan.max_body_bytes) {
             return send_empty(&self.runtime, session, 413, Some(plan.handler), tls, &[]).await;

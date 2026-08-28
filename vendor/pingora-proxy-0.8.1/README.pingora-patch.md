@@ -11,6 +11,10 @@ small set of documented local changes.
 - Local change: HTTP/1 bodyless GET/HEAD fast path.
 - Reason: empty GET/HEAD requests do not need per-request mpsc channels, retry
   buffers, or cache/range state.
+- Local change: HTTP/1 bodyless GET/HEAD fast path also applies to custom
+  downstream sessions (HTTP/3).
+- Reason: QUIC streams talk to HTTP/1 origins through the same proxy_1to1
+  path; requiring an HTTP/1 downstream would skip the fast path for H3.
 - Local change: HTTP/2 bodyless GET/HEAD fast path using the same opt-in.
 - Reason: public TLS traffic is dominated by HTTP/2 GET/HEAD. Skipping the
   duplex channel pair and retry buffer matches the HTTP/1 fast path.

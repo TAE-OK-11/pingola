@@ -11,16 +11,17 @@ use cloudflare_pingora::protocols::http::date::get_cached_date;
 use cloudflare_pingora::protocols::l4::socket::SocketAddr as PingoraAddr;
 use cloudflare_pingora::{Error, ErrorType, Result};
 use futures::{SinkExt, Stream};
-use http::HeaderMap;
 use http::header::{
     CONNECTION, CONTENT_LENGTH, DATE, HeaderName, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
+use http::{HeaderMap, HeaderValue};
 use tokio_quiche::http3::driver::{
     InboundFrame, InboundFrameStream, OutboundFrame, OutboundFrameSender,
 };
 use tokio_quiche::quiche::h3;
 
 const RETRY_BODY_LIMIT: usize = 64 * 1024;
+const ALT_SVC: HeaderName = HeaderName::from_static("alt-svc");
 
 pub struct H3Session {
     request_header: RequestHeader,
@@ -39,6 +40,7 @@ pub struct H3Session {
     client_addr: PingoraAddr,
     server_addr: PingoraAddr,
     digest: Digest,
+    alt_svc: Option<HeaderValue>,
 }
 
 impl H3Session {
@@ -49,6 +51,7 @@ impl H3Session {
         request_fin: bool,
         client_addr: std::net::SocketAddr,
         server_addr: std::net::SocketAddr,
+        alt_svc: Option<HeaderValue>,
     ) -> Self {
         Self {
             request_header,
@@ -67,6 +70,7 @@ impl H3Session {
             client_addr: PingoraAddr::Inet(client_addr),
             server_addr: PingoraAddr::Inet(server_addr),
             digest: Digest::default(),
+            alt_svc,
         }
     }
 
@@ -114,6 +118,11 @@ impl H3Session {
 
         let mut header = header;
         header.insert_typed_header(DATE, get_cached_date());
+        if !header.headers.contains_key(&ALT_SVC)
+            && let Some(value) = self.alt_svc.clone()
+        {
+            header.insert_typed_header(ALT_SVC, value);
+        }
         let mut headers = Vec::with_capacity(header.headers.len() + 1);
         headers.push(h3::Header::new(
             b":status",

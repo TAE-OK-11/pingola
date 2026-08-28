@@ -107,7 +107,8 @@ where
             }
         }
 
-        let use_bodyless_fast_path = session.downstream_session.as_http1().is_some()
+        let use_bodyless_fast_path = (session.downstream_session.as_http1().is_some()
+            || session.downstream_session.is_custom())
             && matches!(session.req_header().method, Method::GET | Method::HEAD)
             && session.as_mut().is_body_empty()
             && !session.cache.enabled()

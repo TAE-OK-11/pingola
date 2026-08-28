@@ -261,12 +261,14 @@ async fn run(
     let public_listen: std::net::SocketAddr = server.http3_listen[0]
         .parse()
         .context("HTTP/3 public listen address is not a valid socket address")?;
+    let alt_svc = runtime.http3_alt_svc_header().cloned();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let proxy = Arc::new(http_proxy(&server_conf, gateway));
     let shared = Arc::new(Http3Shared {
         proxy,
         shutdown: shutdown_rx,
         public_listen,
+        alt_svc,
         allow_early_data,
     });
     let max_requests_per_connection = u64::from(server.downstream_keepalive_requests);
@@ -361,6 +363,7 @@ struct Http3Shared {
     proxy: Arc<HttpProxy<Gateway>>,
     shutdown: ShutdownWatch,
     public_listen: std::net::SocketAddr,
+    alt_svc: Option<http::HeaderValue>,
     allow_early_data: bool,
 }
 
@@ -474,6 +477,7 @@ async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionCont
         read_fin,
         peer,
         context.shared.public_listen,
+        context.shared.alt_svc.clone(),
     )));
     context
         .shared
