@@ -526,7 +526,7 @@ impl ProxyHttp for Gateway {
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let internal_http3 = is_internal_http3(&self.runtime, session);
-        let http3 = internal_http3 || request_advertises_http3(session.req_header());
+        let http3 = internal_http3 || is_direct_http3(session);
         let tls = is_tls(session) || http3;
         ctx.http3 = http3;
         ctx.forwarded_port = http3
@@ -1547,8 +1547,10 @@ fn request_header_is_replay_safe(request: &RequestHeader) -> bool {
         )
 }
 
-fn request_advertises_http3(request: &RequestHeader) -> bool {
-    request.version == Version::HTTP_3
+fn is_direct_http3(session: &Session) -> bool {
+    // QUIC streams enter Gateway as a custom Pingora session, not via the
+    // private loopback h2c listener.
+    session.downstream_session.is_custom()
 }
 
 fn is_tls(session: &Session) -> bool {
@@ -2125,14 +2127,10 @@ hosts:
     }
 
     #[test]
-    fn public_http3_requests_are_https_without_the_private_handoff_marker() {
+    fn public_requests_without_h3_marker_are_not_internal() {
         let runtime = runtime();
         let mut request = RequestHeader::build(Method::GET, b"/", None).unwrap();
         request.insert_header(HOST, "app.example.com").unwrap();
-        assert!(!request_has_internal_http3_marker(&runtime, &request));
-        assert!(!request_advertises_http3(&request));
-        request.set_version(Version::HTTP_3);
-        assert!(request_advertises_http3(&request));
         assert!(!request_has_internal_http3_marker(&runtime, &request));
     }
 

@@ -549,7 +549,10 @@ fn decode_request_headers(headers: &[h3::Header]) -> Result<RequestHeader> {
     let mut request =
         RequestHeader::build_no_case(method, path.as_str().as_bytes(), Some(regular.len() + 1))
             .map_err(|error| anyhow!("failed to build HTTP/3 request header: {error}"))?;
-    request.set_version(Version::HTTP_3);
+    // Pingora's HTTP/1 client can serialize HTTP/2 as HTTP/1.1 but panics on
+    // HTTP/3. Direct QUIC sessions are identified with `is_custom()`, not the
+    // wire version.
+    request.set_version(Version::HTTP_2);
     request.set_uri(uri);
     request.insert_typed_header(HOST, host);
     for (name, value) in regular {
@@ -645,7 +648,7 @@ mod tests {
         ];
         let request = decode_request_headers(&headers).unwrap();
         assert_eq!(request.method, Method::GET);
-        assert_eq!(request.version, Version::HTTP_3);
+        assert_eq!(request.version, Version::HTTP_2);
         assert_eq!(request.uri.scheme_str(), Some("https"));
         assert_eq!(request.uri.authority().unwrap().as_str(), "music.example");
         assert_eq!(
