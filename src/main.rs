@@ -3,6 +3,7 @@ mod config;
 mod content_encoding;
 mod gateway;
 mod h3_runtime;
+mod h3_session;
 mod http3;
 mod limits;
 mod preflight;
@@ -353,8 +354,9 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     );
 
     if !server_config.http3_listen.is_empty() {
-        let h2c_gateway = Gateway::with_shared(runtime.clone(), upstream_h3.clone(), shared)
-            .context("HTTP/3 h2c service bootstrap failed")?;
+        let h2c_gateway =
+            Gateway::with_shared(runtime.clone(), upstream_h3.clone(), shared.clone())
+                .context("HTTP/3 h2c service bootstrap failed")?;
         let mut h2c_options = HttpServerOptions::default();
         h2c_options.h2c = true;
         h2c_options.request_header_timeout = Some(Duration::from_secs(
@@ -379,7 +381,15 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         let h3_runtime = h3_runtime
             .as_ref()
             .expect("HTTP/3 listeners require the shared HTTP/3 runtime");
-        http3::start(runtime.clone(), h3_runtime).context("HTTP/3 frontend startup failed")?;
+        let h3_gateway = Gateway::with_shared(runtime.clone(), upstream_h3.clone(), shared.clone())
+            .context("HTTP/3 gateway bootstrap failed")?;
+        http3::start(
+            runtime.clone(),
+            h3_runtime,
+            h3_gateway,
+            server.configuration.clone(),
+        )
+        .context("HTTP/3 frontend startup failed")?;
     }
 
     info!(

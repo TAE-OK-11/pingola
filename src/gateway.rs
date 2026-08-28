@@ -525,7 +525,8 @@ impl ProxyHttp for Gateway {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        let http3 = is_internal_http3(&self.runtime, session);
+        let internal_http3 = is_internal_http3(&self.runtime, session);
+        let http3 = internal_http3 || request_advertises_http3(session.req_header());
         let tls = is_tls(session) || http3;
         ctx.http3 = http3;
         ctx.forwarded_port = http3
@@ -651,7 +652,7 @@ impl ProxyHttp for Gateway {
             session.set_read_timeout(Some(Duration::from_secs(30)));
             session.set_write_timeout(Some(Duration::from_secs(30)));
             session.set_keepalive(Some(30));
-            let Some(client_ip) = session_client_ip(&self.runtime, session, http3) else {
+            let Some(client_ip) = session_client_ip(&self.runtime, session, internal_http3) else {
                 session.set_keepalive(None);
                 return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
             };
@@ -690,7 +691,7 @@ impl ProxyHttp for Gateway {
                 .await;
         }
 
-        let Some(client_ip) = session_client_ip(&self.runtime, session, http3) else {
+        let Some(client_ip) = session_client_ip(&self.runtime, session, internal_http3) else {
             session.set_keepalive(None);
             return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
         };
@@ -1546,6 +1547,10 @@ fn request_header_is_replay_safe(request: &RequestHeader) -> bool {
         )
 }
 
+fn request_advertises_http3(request: &RequestHeader) -> bool {
+    request.version == Version::HTTP_3
+}
+
 fn is_tls(session: &Session) -> bool {
     session
         .digest()
@@ -2120,10 +2125,14 @@ hosts:
     }
 
     #[test]
-    fn public_requests_without_h3_marker_are_not_internal() {
+    fn public_http3_requests_are_https_without_the_private_handoff_marker() {
         let runtime = runtime();
         let mut request = RequestHeader::build(Method::GET, b"/", None).unwrap();
         request.insert_header(HOST, "app.example.com").unwrap();
+        assert!(!request_has_internal_http3_marker(&runtime, &request));
+        assert!(!request_advertises_http3(&request));
+        request.set_version(Version::HTTP_3);
+        assert!(request_advertises_http3(&request));
         assert!(!request_has_internal_http3_marker(&runtime, &request));
     }
 

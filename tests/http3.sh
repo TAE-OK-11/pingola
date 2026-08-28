@@ -107,7 +107,7 @@ spoof_location=$(curl --noproxy '*' -sSI -H 'host: app.test' \
   'tolower($1) == "location" {gsub("\r", "", $2); print $2}')
 [[ "${spoof_location}" == "https://app.test/headers" ]]
 
-grep -q 'HTTP/3 frontend started:.*internal=h2c://' "${GATEWAY_LOG}"
+grep -q 'HTTP/3 frontend started:.*internal=direct-gateway' "${GATEWAY_LOG}"
 grep -q 'HTTP/3 frontend started:.*hybrid_pq=X25519MLKEM768:X25519:P-256.*stateless_retry=true.*max_amplification=3' "${GATEWAY_LOG}"
 grep -q 'http3_udp=\["127.0.0.1:18443"\]' "${GATEWAY_LOG}"
 
