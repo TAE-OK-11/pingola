@@ -116,14 +116,56 @@ fi
 
 # --check deliberately does not bind, while --check-bind reports the exact
 # occupied address and continues printing all other check results.
-python3 -c 'import socket,time; s=socket.socket(); s.bind(("127.0.0.1",443)); s.listen(); time.sleep(30)' &
+: >"${RUNTIME}/occupier.log"
+python3 -c '
+import socket, sys, time
+log_path = sys.argv[1]
+with open(log_path, "w", encoding="utf-8") as log:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 443))
+    sock.listen()
+    log.write("ready\n")
+    log.flush()
+    time.sleep(30)
+' "${RUNTIME}/occupier.log" &
 OCCUPIER_PID=$!
 trap 'kill "${OCCUPIER_PID}" 2>/dev/null || true' EXIT
-sleep 0.1
+OCCUPIER_READY=0
+for _ in $(seq 1 50); do
+  if grep -qx ready "${RUNTIME}/occupier.log" 2>/dev/null; then
+    OCCUPIER_READY=1
+    break
+  fi
+  if ! kill -0 "${OCCUPIER_PID}" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
 write_config "${RUNTIME}/occupied.yaml" "${RUNTIME}/a.crt" "${RUNTIME}/a.key" 443
 "${BIN}" --config "${RUNTIME}/occupied.yaml" --check >"${RUNTIME}/occupied-no-bind.log" 2>&1
-expect_failure occupied_bind 'listener bind HTTPS 127.0.0.1:443.*conflicting address 127.0.0.1:443' \
-  "${BIN}" --config "${RUNTIME}/occupied.yaml" --check-bind
+if [[ "${OCCUPIER_READY}" -ne 1 ]]; then
+  echo "occupied_bind: occupier never bound 127.0.0.1:443" >&2
+  cat "${RUNTIME}/occupier.log" >&2 || true
+  ss -ltnp | grep ':443' >&2 || true
+  FAILURES=$((FAILURES + 1))
+elif "${BIN}" --config "${RUNTIME}/occupied.yaml" --check-bind \
+  >"${RUNTIME}/occupied_bind.log" 2>&1; then
+  echo "occupied_bind: unexpectedly succeeded" >&2
+  echo "occupier log:" >&2
+  cat "${RUNTIME}/occupier.log" >&2 || true
+  echo "listeners:" >&2
+  ss -ltnp | grep ':443' >&2 || true
+  echo "check-bind output:" >&2
+  cat "${RUNTIME}/occupied_bind.log" >&2 || true
+  FAILURES=$((FAILURES + 1))
+elif ! grep -Eq 'listener bind HTTPS 127.0.0.1:443.*conflicting address 127.0.0.1:443' \
+  "${RUNTIME}/occupied_bind.log"; then
+  echo "occupied_bind: failed without expected bind conflict" >&2
+  cat "${RUNTIME}/occupied_bind.log" >&2
+  FAILURES=$((FAILURES + 1))
+else
+  echo "occupied_bind: ok"
+fi
 kill "${OCCUPIER_PID}" 2>/dev/null || true
 wait "${OCCUPIER_PID}" 2>/dev/null || true
 trap - EXIT
