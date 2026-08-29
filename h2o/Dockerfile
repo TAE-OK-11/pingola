@@ -119,7 +119,7 @@ RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
       *) echo "unsupported LTO mode: ${LTO_MODE}" >&2; exit 2 ;; \
     esac; \
     ALLOCATOR_LINK="$(tr -d '\n' </opt/allocator/linker.flags)"; \
-    LINK_FLAGS="-fuse-ld=lld -Wl,--gc-sections ${LTO_FLAGS} ${ALLOCATOR_LINK}"; \
+    LINK_FLAGS="-fuse-ld=lld -Wl,--gc-sections ${LTO_FLAGS} ${ALLOCATOR_LINK} -lstdc++ -lpthread -ldl -lm"; \
     COMMON_FLAGS="-O3 ${ARCH_FLAGS} ${LTO_FLAGS} -fno-strict-aliasing"; \
     cmake -G Ninja -S h2o -B h2o/build \
       -DCMAKE_BUILD_TYPE=Release \

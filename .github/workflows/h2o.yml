@@ -133,7 +133,7 @@ jobs:
             type=match,pattern=h2o-v(.*),group=1
           labels: |
             org.opencontainers.image.title=JBS H2O
-            org.opencontainers.image.description=Debian 13 H2O with BoringSSL, jemalloc, fusion, kTLS, and io_uring
+            org.opencontainers.image.description=Debian 13 H2O with BoringSSL, jemalloc, kTLS, and io_uring
             org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
             org.opencontainers.image.h2o.version=${{ env.H2O_VERSION }}
             org.opencontainers.image.tls.provider=boringssl
