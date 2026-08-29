@@ -41,7 +41,6 @@ jobs:
           bash -n h2o/scripts/healthcheck.sh
           bash -n h2o/scripts/build-tls.sh
           bash -n h2o/scripts/build-allocator.sh
-          bash -n h2o/scripts/build-aegis.sh
           bash -n h2o/scripts/allocator-info.sh
           bash -n h2o/tests/docker_runtime.sh
           grep -q 'num-threads: 1' h2o/config/h2o.conf

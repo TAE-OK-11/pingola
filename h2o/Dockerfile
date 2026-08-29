@@ -83,18 +83,6 @@ RUN --mount=type=cache,id=h2o-allocator-${ALLOCATOR},target=/tmp/h2o-allocator-c
     esac; \
     WORK_ROOT=/tmp/h2o-allocator-cache /usr/local/bin/build-allocator.sh /opt/allocator "${ALLOCATOR}" "${ARCH_FLAGS}"
 
-FROM toolchain AS aegis-builder
-
-ARG TARGET_CPU
-
-WORKDIR /build
-COPY --link scripts/build-aegis.sh /usr/local/bin/build-aegis.sh
-
-RUN --mount=type=cache,id=h2o-aegis,target=/tmp/h2o-aegis-cache,sharing=locked \
-    chmod 755 /usr/local/bin/build-aegis.sh \
-    && ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' \
-    && WORK_ROOT=/tmp/h2o-aegis-cache /usr/local/bin/build-aegis.sh /opt/aegis "${ARCH_FLAGS}"
-
 FROM toolchain AS builder
 
 ARG DEBIAN_SUITE
@@ -107,7 +95,7 @@ ARG ALLOCATOR
 
 WORKDIR /src
 
-COPY --link scripts/build-tls.sh scripts/build-allocator.sh scripts/build-aegis.sh /usr/local/bin/
+COPY --link scripts/build-tls.sh scripts/build-allocator.sh /usr/local/bin/
 
 RUN git init h2o \
     && git -C h2o remote add origin "${H2O_REPOSITORY}" \
@@ -118,7 +106,6 @@ RUN git init h2o \
 
 RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
     --mount=from=allocator-builder,source=/opt/allocator,target=/opt/allocator,ro \
-    --mount=from=aegis-builder,source=/opt/aegis,target=/opt/aegis,ro \
     --mount=type=cache,id=h2o-cmake-build-${H2O_VERSION}-${TARGET_CPU}-${LTO_MODE}-${TLS_PROVIDER}-${ALLOCATOR},target=/src/h2o/build,sharing=locked \
     set -eux; \
     case "${TARGET_CPU}" in \
@@ -143,7 +130,6 @@ RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
       -DCMAKE_CXX_FLAGS="${COMMON_FLAGS}" \
       -DCMAKE_EXE_LINKER_FLAGS="${LINK_FLAGS}" \
       -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--gc-sections ${LTO_FLAGS}" \
-      -DCMAKE_PREFIX_PATH="/opt/aegis" \
       -DZLIB_LIBRARY=/usr/lib/x86_64-linux-gnu/libz.so \
       -DZLIB_INCLUDE_DIR=/usr/include \
       -DOPENSSL_ROOT_DIR=/opt/tls \
@@ -152,7 +138,7 @@ RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
       -DWITH_MRUBY=OFF \
       -DWITH_DTRACE=OFF \
       -DWITH_CCACHE=OFF \
-      -DWITH_FUSION=ON \
+      -DWITH_FUSION=OFF \
       -DWITH_KTLS=ON \
       -DWITH_IO_URING=ON; \
     cmake --build h2o/build --target h2o -j "$(nproc)"; \

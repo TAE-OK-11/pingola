@@ -92,7 +92,7 @@ assert_container_hardening() {
   docker exec "${name}" grep -q "tls_provider=${EXPECTED_TLS_PROVIDER}" /usr/share/doc/h2o/tls-provider.txt
   docker exec "${name}" grep -q "allocator=${EXPECTED_ALLOCATOR}" /usr/share/doc/h2o/allocator.txt
   docker exec "${name}" /usr/local/bin/h2o-allocator-info | grep -q "allocator=${EXPECTED_ALLOCATOR}"
-  docker exec "${name}" /usr/local/bin/h2o --version | grep -qi 'fusion: YES'
+  docker exec "${name}" /usr/local/bin/h2o --version | grep -qi 'OpenSSL'
 
   if docker exec "${name}" sh -c 'command -v setcap >/dev/null || dpkg-query -W libcap2-bin >/dev/null 2>&1'; then
     echo "runtime image unexpectedly contains libcap2-bin" >&2
