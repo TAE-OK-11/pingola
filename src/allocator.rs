@@ -54,9 +54,11 @@ pub fn start_background_reclaimer() {
     if tcmalloc_better::TCMalloc::needs_process_background_actions() {
         std::thread::Builder::new()
             .name("tcmalloc-reclaim".into())
-            .spawn(|| loop {
-                tcmalloc_better::TCMalloc::process_background_actions();
-                std::thread::sleep(std::time::Duration::from_secs(1));
+            .spawn(|| {
+                loop {
+                    tcmalloc_better::TCMalloc::process_background_actions();
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
             })
             .ok();
     }

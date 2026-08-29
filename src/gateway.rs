@@ -953,9 +953,10 @@ impl ProxyHttp for Gateway {
         let client_ip = ctx.upstream_forwarded_for.as_ref().ok_or_else(|| {
             Error::explain(HTTPStatus(500), "upstream forwarded client IP is missing")
         })?;
-        let forwarded_port = ctx.upstream_forwarded_port.as_ref().ok_or_else(|| {
-            Error::explain(HTTPStatus(500), "upstream forwarded port is missing")
-        })?;
+        let forwarded_port = ctx
+            .upstream_forwarded_port
+            .as_ref()
+            .ok_or_else(|| Error::explain(HTTPStatus(500), "upstream forwarded port is missing"))?;
         let domain = if plan.route == RouteClass::Doh {
             DIRECT_DOH_HOST.clone()
         } else {
@@ -1328,11 +1329,7 @@ fn negotiate_downstream_compression(
         });
     }
 
-    let mut values = session
-        .req_header()
-        .headers
-        .get_all(ACCEPT_ENCODING)
-        .iter();
+    let mut values = session.req_header().headers.get_all(ACCEPT_ENCODING).iter();
     if let Some(first) = values.next()
         && values.next().is_none()
         && first.as_bytes().eq_ignore_ascii_case(b"identity")
