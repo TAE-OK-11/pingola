@@ -143,16 +143,18 @@ impl H3Session {
             return Ok(());
         }
 
-        header.insert_typed_header(DATE, get_cached_date());
+        self.encode_response_headers(&header);
+        let wire_headers = std::mem::take(&mut self.wire_headers);
+        self.send_frame(OutboundFrame::Headers(wire_headers, None))
+            .await?;
+        if !header.headers.contains_key(&DATE) {
+            header.insert_typed_header(DATE, get_cached_date());
+        }
         if !header.headers.contains_key(&ALT_SVC)
             && let Some(value) = self.alt_svc.as_deref()
         {
             header.insert_typed_header(ALT_SVC, value.clone());
         }
-        self.encode_response_headers(&header);
-        let wire_headers = std::mem::take(&mut self.wire_headers);
-        self.send_frame(OutboundFrame::Headers(wire_headers, None))
-            .await?;
         self.response_written = Some(header);
         self.ended = end;
         if end {

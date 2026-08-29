@@ -294,6 +294,7 @@ pub struct RequestContext {
     retries: usize,
     identity_acceptable: bool,
     compression_selected: bool,
+    compression_install_pending: bool,
     started_at: Option<Instant>,
     _active_request_permit: Option<ActiveRequestPermit>,
     _global_request_permit: Option<ActiveRequestPermit>,
@@ -312,6 +313,7 @@ impl Default for RequestContext {
             retries: 0,
             identity_acceptable: true,
             compression_selected: false,
+            compression_install_pending: false,
             started_at: None,
             _active_request_permit: None,
             _global_request_permit: None,
@@ -530,26 +532,28 @@ impl ProxyHttp for Gateway {
         let tls = is_tls(session) || http3;
         ctx.http3 = http3;
         ctx.tls = tls;
-        ctx.forwarded_port = http3
-            .then(|| {
-                session
-                    .req_header()
-                    .headers
-                    .get(&HTTP3_PORT)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<u16>().ok())
-                    .or_else(|| self.runtime.http3_public_port())
-            })
-            .flatten();
+        ctx.forwarded_port = if internal_http3 {
+            session
+                .req_header()
+                .headers
+                .get(&HTTP3_PORT)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u16>().ok())
+                .or_else(|| self.runtime.http3_public_port())
+        } else if is_direct_http3(session) {
+            self.runtime.http3_public_port()
+        } else {
+            None
+        };
         if request_target_has_forbidden_bytes(session.req_header()) {
             session.set_keepalive(None);
-            return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
+            return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
         }
         let declared_content_length = match validated_request_content_length(session.req_header()) {
             Ok(length) => length,
             Err(()) => {
                 session.set_keepalive(None);
-                return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
+                return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
             }
         };
         let path = session.req_header().uri.path();
@@ -561,6 +565,7 @@ impl ProxyHttp for Gateway {
                 204,
                 None,
                 tls,
+                http3,
                 &[("x-proxy-product", "Pingora")],
             )
             .await;
@@ -578,6 +583,7 @@ impl ProxyHttp for Gateway {
                     204,
                     None,
                     tls,
+                    http3,
                     &[("x-proxy-product", "Pingora"), ("deprecation", "true")],
                 )
                 .await;
@@ -588,6 +594,7 @@ impl ProxyHttp for Gateway {
                 404,
                 None,
                 tls,
+                http3,
                 &[("x-proxy-product", "Pingora")],
             )
             .await;
@@ -599,6 +606,7 @@ impl ProxyHttp for Gateway {
                 404,
                 None,
                 tls,
+                http3,
                 &[("x-proxy-product", "Pingora")],
             )
             .await;
@@ -615,6 +623,7 @@ impl ProxyHttp for Gateway {
                     404,
                     None,
                     tls,
+                    http3,
                     &[("x-proxy-product", "Pingora")],
                 )
                 .await;
@@ -623,11 +632,11 @@ impl ProxyHttp for Gateway {
         }
 
         let Some(authority) = request_authority(session.req_header()) else {
-            return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
+            return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
         };
         let Some(host) = self.host(authority) else {
             session.set_keepalive(None);
-            return send_empty(&self.runtime, session, 421, None, tls, &[]).await;
+            return send_empty(&self.runtime, session, 421, None, tls, http3, &[]).await;
         };
 
         if !tls && host.redirect_http {
@@ -643,6 +652,7 @@ impl ProxyHttp for Gateway {
                 308,
                 Some(host.handler),
                 false,
+                http3,
                 &[("location", location.as_str())],
             )
             .await;
@@ -655,7 +665,7 @@ impl ProxyHttp for Gateway {
             session.set_keepalive(Some(30));
             let Some(client_ip) = session_client_ip(&self.runtime, session, internal_http3) else {
                 session.set_keepalive(None);
-                return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
+                return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
             };
             ctx.client_ip = client_ip;
             if !self.acquire_global_request(ctx) {
@@ -665,6 +675,7 @@ impl ProxyHttp for Gateway {
                     429,
                     Some(host.handler),
                     tls,
+                    http3,
                     &[("retry-after", "1")],
                 )
                 .await;
@@ -680,6 +691,7 @@ impl ProxyHttp for Gateway {
                     429,
                     Some(host.handler),
                     tls,
+                    http3,
                     &[("retry-after", "1")],
                 )
                 .await;
@@ -694,7 +706,7 @@ impl ProxyHttp for Gateway {
 
         let Some(client_ip) = session_client_ip(&self.runtime, session, internal_http3) else {
             session.set_keepalive(None);
-            return send_empty(&self.runtime, session, 400, None, tls, &[]).await;
+            return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
         };
         ctx.client_ip = client_ip;
 
@@ -706,25 +718,54 @@ impl ProxyHttp for Gateway {
                 308,
                 Some(host.handler),
                 tls,
+                http3,
                 &[("location", location.as_str())],
             )
             .await;
         }
 
         let Some(plan_index) = host.plan(path) else {
-            return send_empty(&self.runtime, session, 500, Some(host.handler), tls, &[]).await;
+            return send_empty(
+                &self.runtime,
+                session,
+                500,
+                Some(host.handler),
+                tls,
+                http3,
+                &[],
+            )
+            .await;
         };
         let plan = &self.plans[plan_index];
-        let encoding =
-            configure_downstream_compression(session, plan.route, &self.compression_modules)?;
+        let encoding = negotiate_downstream_compression(session, plan.route)?;
         if encoding.preferred == ContentCoding::NotAcceptable {
-            return send_empty(&self.runtime, session, 406, Some(plan.handler), tls, &[]).await;
+            return send_empty(
+                &self.runtime,
+                session,
+                406,
+                Some(plan.handler),
+                tls,
+                http3,
+                &[],
+            )
+            .await;
         }
         ctx.identity_acceptable = encoding.identity_acceptable;
         ctx.compression_selected = encoding.preferred.as_str().is_some();
+        ctx.compression_install_pending =
+            uses_downstream_compression(plan.route) && ctx.compression_selected;
 
         if declared_content_length.is_some_and(|length| length > plan.max_body_bytes) {
-            return send_empty(&self.runtime, session, 413, Some(plan.handler), tls, &[]).await;
+            return send_empty(
+                &self.runtime,
+                session,
+                413,
+                Some(plan.handler),
+                tls,
+                http3,
+                &[],
+            )
+            .await;
         }
 
         if let Some((rate, burst)) = plan.rate_limit
@@ -739,6 +780,7 @@ impl ProxyHttp for Gateway {
                 429,
                 Some(plan.handler),
                 tls,
+                http3,
                 &[("retry-after", "1")],
             )
             .await;
@@ -751,6 +793,7 @@ impl ProxyHttp for Gateway {
                 429,
                 Some(plan.handler),
                 tls,
+                http3,
                 &[("retry-after", "1")],
             )
             .await;
@@ -768,6 +811,7 @@ impl ProxyHttp for Gateway {
                     429,
                     Some(plan.handler),
                     tls,
+                    http3,
                     &[("retry-after", "1")],
                 )
                 .await;
@@ -975,9 +1019,30 @@ impl ProxyHttp for Gateway {
         strip_response_hop_headers(response, forwards_upgrade)?;
         insert_security_headers(response, plan.handler, ctx.tls)?;
         if ctx.tls
+            && !ctx.http3
             && let Some(alt_svc) = self.runtime.http3_alt_svc_header()
         {
             response.insert_typed_header(ALT_SVC, alt_svc.clone());
+        }
+        let bodyless = response_status_has_no_body(response.status.as_u16());
+        if ctx.compression_install_pending && !response_status_is_interim(response.status.as_u16())
+        {
+            if bodyless || !response_allows_compression(response) {
+                ctx.compression_install_pending = false;
+                if ctx.compression_selected && !bodyless && !ctx.identity_acceptable {
+                    return Err(Error::explain(
+                        HTTPStatus(406),
+                        "upstream response cannot use an acceptable content coding",
+                    ));
+                }
+            } else if let Some(encoding) =
+                negotiate(session.req_header().headers.get_all(ACCEPT_ENCODING).iter())
+                    .preferred
+                    .as_str()
+            {
+                install_downstream_compression(session, encoding, &self.compression_modules)?;
+                ctx.compression_install_pending = false;
+            }
         }
         if ctx.compression_selected && response_status_is_interim(response.status.as_u16()) {
             // 100/103 are interim headers. Do not permanently disable the
@@ -987,7 +1052,6 @@ impl ProxyHttp for Gateway {
         // Status-defined no-content responses carry no selected representation.
         // HEAD still describes the corresponding GET representation, so it
         // must follow the same content-coding acceptability decision as GET.
-        let bodyless = response_status_has_no_body(response.status.as_u16());
         if ctx.compression_selected && (bodyless || !response_allows_compression(response)) {
             if let Some(compression) = session
                 .downstream_modules_ctx
@@ -1163,10 +1227,9 @@ fn uses_downstream_compression(route: RouteClass) -> bool {
     )
 }
 
-fn configure_downstream_compression(
-    session: &mut Session,
+fn negotiate_downstream_compression(
+    session: &Session,
     route: RouteClass,
-    compression_modules: &HttpModules,
 ) -> Result<EncodingNegotiation> {
     if !uses_downstream_compression(route) {
         return Ok(EncodingNegotiation {
@@ -1175,19 +1238,23 @@ fn configure_downstream_compression(
         });
     }
 
-    let negotiation = negotiate(session.req_header().headers.get_all(ACCEPT_ENCODING).iter());
-    let Some(encoding) = negotiation.preferred.as_str() else {
-        return Ok(negotiation);
-    };
+    Ok(negotiate(
+        session.req_header().headers.get_all(ACCEPT_ENCODING).iter(),
+    ))
+}
 
-    // The default Pingora module starts disabled, so it skipped its earlier
-    // request-header hook. Normalize all q-values and duplicate fields to one
-    // accepted coding before feeding Pingora's parser, which currently ignores
-    // q-values itself. The compressor module list is built once at startup.
+fn install_downstream_compression(
+    session: &mut Session,
+    preferred_encoding: &'static str,
+    compression_modules: &HttpModules,
+) -> Result<()> {
     session
         .downstream_session
         .req_header_mut()
-        .insert_typed_header(ACCEPT_ENCODING, HeaderValue::from_static(encoding));
+        .insert_typed_header(
+            ACCEPT_ENCODING,
+            HeaderValue::from_static(preferred_encoding),
+        );
     session.downstream_modules_ctx = compression_modules.build_ctx();
     let request = session.downstream_session.req_header();
     let Some(compression) = session
@@ -1200,9 +1267,8 @@ fn configure_downstream_compression(
         );
     };
     compression.request_filter(request);
-    Ok(negotiation)
+    Ok(())
 }
-
 fn response_allows_compression(response: &ResponseHeader) -> bool {
     if response_status_has_no_body(response.status.as_u16())
         || response.status.as_u16() == 206
@@ -1319,35 +1385,36 @@ fn strip_request_hop_headers(
     downstream: &RequestHeader,
     upstream: &mut RequestHeader,
 ) -> Result<()> {
-    // The downstream and upstream maps are distinct here, so remove dynamic
-    // Connection options as they are parsed. This preserves the full RFC
-    // validation while avoiding a per-request Vec allocation on HTTP/1
-    // keep-alive traffic.
-    let mut nominations = 0;
-    for field in [&CONNECTION, &PROXY_CONNECTION] {
-        for value in downstream.headers.get_all(field).iter() {
-            for token in value.as_bytes().split(|byte| *byte == b',') {
-                let token = token.trim_ascii();
-                if token.is_empty() {
-                    continue;
+    // HTTP/3 requests do not carry HTTP/1-style Connection options.
+    if downstream.headers.contains_key(CONNECTION)
+        || downstream.headers.contains_key(PROXY_CONNECTION)
+    {
+        let mut nominations = 0;
+        for field in [&CONNECTION, &PROXY_CONNECTION] {
+            for value in downstream.headers.get_all(field).iter() {
+                for token in value.as_bytes().split(|byte| *byte == b',') {
+                    let token = token.trim_ascii();
+                    if token.is_empty() {
+                        continue;
+                    }
+                    nominations += 1;
+                    if nominations > MAX_CONNECTION_NOMINATIONS {
+                        return Err(Error::explain(
+                            HTTPStatus(400),
+                            "too many Connection header options",
+                        ));
+                    }
+                    let name = HeaderName::from_bytes(token).map_err(|error| {
+                        Error::because(HTTPStatus(400), "invalid Connection header option", error)
+                    })?;
+                    if name == CONTENT_LENGTH || name == TRANSFER_ENCODING || name == HOST {
+                        return Err(Error::explain(
+                            HTTPStatus(400),
+                            format!("Connection header names critical framing field {name}"),
+                        ));
+                    }
+                    upstream.remove_header(&name);
                 }
-                nominations += 1;
-                if nominations > MAX_CONNECTION_NOMINATIONS {
-                    return Err(Error::explain(
-                        HTTPStatus(400),
-                        "too many Connection header options",
-                    ));
-                }
-                let name = HeaderName::from_bytes(token).map_err(|error| {
-                    Error::because(HTTPStatus(400), "invalid Connection header option", error)
-                })?;
-                if name == CONTENT_LENGTH || name == TRANSFER_ENCODING || name == HOST {
-                    return Err(Error::explain(
-                        HTTPStatus(400),
-                        format!("Connection header names critical framing field {name}"),
-                    ));
-                }
-                upstream.remove_header(&name);
             }
         }
     }
@@ -1940,6 +2007,7 @@ async fn send_empty(
     status: u16,
     handler: Option<HandlerKind>,
     tls: bool,
+    http3: bool,
     headers: &[(&'static str, &str)],
 ) -> Result<bool> {
     let mut response = ResponseHeader::build(status, Some(headers.len() + 8)).unwrap();
@@ -1950,7 +2018,10 @@ async fn send_empty(
     if let Some(handler) = handler {
         insert_security_headers(&mut response, handler, tls)?;
     }
-    if tls && let Some(alt_svc) = runtime.http3_alt_svc_header() {
+    if tls
+        && !http3
+        && let Some(alt_svc) = runtime.http3_alt_svc_header()
+    {
         response.insert_typed_header(ALT_SVC, alt_svc.clone());
     }
     session

@@ -135,7 +135,9 @@ where
         // 2. the filter code needs to be aware of the host vs :authority across http versions otherwise
         let host = req.remove_header(&http::header::HOST);
 
-        session.upstream_compression.request_filter(&req);
+        if session.upstream_compression.is_enabled() {
+            session.upstream_compression.request_filter(&req);
+        }
         let body_empty = session.as_mut().is_body_empty();
 
         // whether we support sending END_STREAM on HEADERS if body is empty

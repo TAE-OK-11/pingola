@@ -96,7 +96,9 @@ where
             }
         }
 
-        session.upstream_compression.request_filter(&req);
+        if session.upstream_compression.is_enabled() {
+            session.upstream_compression.request_filter(&req);
+        }
 
         debug!("sending HTTP/1 request header upstream");
 
