@@ -25,3 +25,7 @@ small set of documented local changes.
   downstream session is custom (HTTP/3).
 - Reason: QUIC responses do not use HTTP/1 framing; adding and then stripping
   hop-by-hop headers wasted work on the bodyless and duplex proxy paths.
+- Local change: skip upstream compression `request_filter()` when the ctx is
+  disabled (level 0).
+- Reason: bodyless proxy traffic pays for accept-encoding parsing on every
+  upstream request even when compression is off.

@@ -101,7 +101,9 @@ where
             }
         }
 
-        session.upstream_compression.request_filter(&req);
+        if session.upstream_compression.is_enabled() {
+            session.upstream_compression.request_filter(&req);
+        }
         let body_empty = session.as_mut().is_body_empty();
 
         debug!("Request to custom: {req:?}");

@@ -489,6 +489,91 @@ async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionCont
 }
 
 fn decode_request_headers(headers: &[h3::Header]) -> Result<RequestHeader> {
+    if let Some(result) = decode_request_headers_fast(headers) {
+        return result;
+    }
+    decode_request_headers_slow(headers)
+}
+
+fn decode_request_headers_fast(headers: &[h3::Header]) -> Option<Result<RequestHeader>> {
+    if headers.is_empty() || headers.len() > 16 {
+        return None;
+    }
+    let mut method = None;
+    let mut scheme = false;
+    let mut authority = None;
+    let mut path = None;
+    let mut regular_capacity = 0usize;
+    for header in headers {
+        let name = header.name();
+        if name.starts_with(b":") {
+            match name {
+                b":method" if method.is_none() => method = Some(header.value()),
+                b":scheme" if !scheme => {
+                    if !header.value().eq_ignore_ascii_case(b"https") {
+                        return Some(Err(anyhow!("HTTP/3 :scheme must be https")));
+                    }
+                    scheme = true;
+                }
+                b":authority" if authority.is_none() => authority = Some(header.value()),
+                b":path" if path.is_none() => path = Some(header.value()),
+                _ => return None,
+            }
+            continue;
+        }
+        if name.iter().any(u8::is_ascii_uppercase) {
+            return None;
+        }
+        if name == b"host" {
+            continue;
+        }
+        if name == b"connection"
+            || name == b"keep-alive"
+            || name == b"proxy-connection"
+            || name == b"transfer-encoding"
+            || name == b"upgrade"
+            || (name == b"te" && !header.value().eq_ignore_ascii_case(b"trailers"))
+        {
+            return Some(Err(anyhow!(
+                "HTTP/3 request contains a connection-specific field"
+            )));
+        }
+        regular_capacity += 1;
+    }
+    let method = Method::from_bytes(method?).ok()?;
+    if !scheme {
+        return None;
+    }
+    let authority = std::str::from_utf8(authority?).ok()?;
+    let path = std::str::from_utf8(path?).ok()?;
+    if !path.starts_with('/') {
+        return Some(Err(anyhow!("HTTP/3 :path must be origin-form")));
+    }
+    let host = HeaderValue::from_str(authority).ok()?;
+    let uri = Uri::builder()
+        .scheme(Scheme::HTTPS)
+        .authority(authority)
+        .path_and_query(path)
+        .build()
+        .ok()?;
+    let mut request =
+        RequestHeader::build_no_case(method, path.as_bytes(), Some(regular_capacity + 1)).ok()?;
+    request.set_version(Version::HTTP_2);
+    request.set_uri(uri);
+    request.insert_typed_header(HOST, host);
+    for header in headers {
+        let name = header.name();
+        if name.starts_with(b":") || name == b"host" {
+            continue;
+        }
+        let name = HeaderName::from_bytes(name).ok()?;
+        let value = HeaderValue::from_bytes(header.value()).ok()?;
+        request.insert_typed_header(name, value);
+    }
+    Some(Ok(request))
+}
+
+fn decode_request_headers_slow(headers: &[h3::Header]) -> Result<RequestHeader> {
     let mut method = None;
     let mut scheme = None;
     let mut authority = None;
