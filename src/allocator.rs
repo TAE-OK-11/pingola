@@ -47,6 +47,31 @@ pub fn configure_for_proxy() {
     }
 }
 
+/// Start a lightweight background thread that returns idle TCMalloc pages to the
+/// OS. Without this, RSS can remain elevated long after QUIC/H3 load subsides.
+pub fn start_background_reclaimer() {
+    #[cfg(feature = "tcmalloc")]
+    if tcmalloc_better::TCMalloc::needs_process_background_actions() {
+        std::thread::Builder::new()
+            .name("tcmalloc-reclaim".into())
+            .spawn(|| {
+                loop {
+                    tcmalloc_better::TCMalloc::process_background_actions();
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            })
+            .ok();
+    }
+}
+
+/// Nudge the allocator to release free pages after a QUIC connection closes.
+pub fn hint_release_idle_pages() {
+    #[cfg(feature = "tcmalloc")]
+    if tcmalloc_better::TCMalloc::needs_process_background_actions() {
+        tcmalloc_better::TCMalloc::process_background_actions();
+    }
+}
+
 #[cfg(feature = "jemalloc")]
 pub fn summary(include_stats: bool) -> Result<String> {
     let version = jemalloc_version::read()

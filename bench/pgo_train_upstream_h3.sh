@@ -98,6 +98,7 @@ server:
   threads: 2
   access_log: false
   downstream_keepalive_requests: 1000000
+  http3_max_requests_per_connection: 1000000
   downstream_max_connections: 4096
   static_active_requests_per_client: 1000000
   graceful_shutdown_timeout_seconds: 2

@@ -185,28 +185,40 @@ where
         // empty body.
         client_session.finish_body().await.map_err(|e| e.into_up())?;
 
-        loop {
-            tokio::select! {
-                biased;
-                task = client_session.read_response_task() => {
-                    let mut task = task.map_err(|e| e.into_up())?;
-                    session.upstream_compression.response_filter(&mut task);
-                    let task = self.h1_uncached_response_filter(session, task, ctx).await?;
-                    let done = session.write_response_task(task).await?;
-                    if done {
-                        break;
-                    }
-                }
-                downstream = session.downstream_session.read_body_or_idle(true) => {
-                    match downstream {
-                        Err(e) => return Err(e.into_down()),
-                        Ok(_) => {
-                            return Error::explain(
-                                ReadError,
-                                "unexpected downstream body on an empty HTTP/1 request",
-                            ).into_err();
+        if self.inner.h1_bodyless_poll_downstream(session, ctx) {
+            loop {
+                tokio::select! {
+                    biased;
+                    task = client_session.read_response_task() => {
+                        let mut task = task.map_err(|e| e.into_up())?;
+                        session.upstream_compression.response_filter(&mut task);
+                        let task = self.h1_uncached_response_filter(session, task, ctx).await?;
+                        let done = session.write_response_task(task).await?;
+                        if done {
+                            break;
                         }
                     }
+                    downstream = session.downstream_session.read_body_or_idle(true) => {
+                        match downstream {
+                            Err(e) => return Err(e.into_down()),
+                            Ok(_) => {
+                                return Error::explain(
+                                    ReadError,
+                                    "unexpected downstream body on an empty HTTP/1 request",
+                                ).into_err();
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            loop {
+                let mut task = client_session.read_response_task().await.map_err(|e| e.into_up())?;
+                session.upstream_compression.response_filter(&mut task);
+                let task = self.h1_uncached_response_filter(session, task, ctx).await?;
+                let done = session.write_response_task(task).await?;
+                if done {
+                    break;
                 }
             }
         }

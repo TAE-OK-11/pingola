@@ -31,7 +31,7 @@ use crate::upstreams::peer::{Peer, ALPN};
 
 pub use l4::Connect as L4Connect;
 use l4::{connect as l4_connect, BindTo};
-use log::{debug, error, warn};
+use log::{debug, warn};
 use offload::OffloadRuntime;
 use parking_lot::RwLock;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
@@ -270,7 +270,7 @@ impl TransportConnector {
                         }
                     }
                     Err(_) => {
-                        error!("failed to acquire reusable stream");
+                        debug!("failed to acquire reusable stream");
                         None
                     }
                 }

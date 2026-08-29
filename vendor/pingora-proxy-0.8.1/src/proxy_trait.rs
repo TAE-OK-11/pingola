@@ -70,6 +70,13 @@ pub trait LocalProxyHttp {
         false
     }
 
+    /// When `true`, the HTTP/1 bodyless fast path polls the downstream session
+    /// while upstream body chunks arrive so client disconnects abort promptly.
+    /// Short proxy responses can opt out to avoid a `select!` branch per chunk.
+    fn h1_bodyless_poll_downstream(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
+        true
+    }
+
     /// Set up downstream modules.
     ///
     /// In this phase, users can add or configure [HttpModules] before the server starts up.

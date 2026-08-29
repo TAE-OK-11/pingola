@@ -31,7 +31,7 @@ use http::header::{
     STRICT_TRANSPORT_SECURITY, TRANSFER_ENCODING, UPGRADE,
 };
 use http::{Method, Version};
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -290,12 +290,13 @@ pub struct RequestContext {
     tls: bool,
     http3: bool,
     forwarded_port: Option<u16>,
+    upstream_forwarded_for: Option<HeaderValue>,
+    upstream_forwarded_port: Option<HeaderValue>,
     body_bytes: usize,
     body_deadline: Option<Instant>,
     retries: usize,
     identity_acceptable: bool,
     compression_selected: bool,
-    compression_install_pending: bool,
     started_at: Option<Instant>,
     _active_request_permit: Option<ActiveRequestPermit>,
     _global_request_permit: Option<ActiveRequestPermit>,
@@ -309,12 +310,13 @@ impl Default for RequestContext {
             tls: false,
             http3: false,
             forwarded_port: None,
+            upstream_forwarded_for: None,
+            upstream_forwarded_port: None,
             body_bytes: 0,
             body_deadline: None,
             retries: 0,
             identity_acceptable: true,
             compression_selected: false,
-            compression_install_pending: false,
             started_at: None,
             _active_request_permit: None,
             _global_request_permit: None,
@@ -354,6 +356,7 @@ impl GatewayShared {
 
 pub struct Gateway {
     runtime: Arc<RuntimeConfig>,
+    upstream_h3: Arc<UpstreamH3Registry>,
     shared: Arc<GatewayShared>,
     hosts: AHashMap<Arc<str>, PreparedHost>,
     plans: Box<[PreparedPlan]>,
@@ -438,6 +441,7 @@ impl Gateway {
         }
         Ok(Self {
             runtime,
+            upstream_h3,
             shared,
             hosts,
             plans: prepared_plans.into_boxed_slice(),
@@ -480,6 +484,52 @@ impl Gateway {
         self.plans
             .get(ctx.plan_index)
             .ok_or_else(|| Error::explain(HTTPStatus(500), "request plan is missing"))
+    }
+
+    fn prepare_upstream_forwarded_headers(
+        &self,
+        session: &Session,
+        ctx: &mut RequestContext,
+    ) -> Result<()> {
+        ctx.upstream_forwarded_for = Some(forwarded_client_ip_value(ctx.client_ip)?);
+        let listener_port = ctx.forwarded_port.or_else(|| {
+            session
+                .server_addr()
+                .and_then(|address| address.as_inet())
+                .map(|address| address.port())
+        });
+        ctx.upstream_forwarded_port = Some(forwarded_port_value(listener_port, ctx.tls)?);
+        Ok(())
+    }
+
+    fn is_benign_stream_disconnect(
+        &self,
+        session: &Session,
+        ctx: &RequestContext,
+        error: &Error,
+    ) -> bool {
+        if !ctx.http3 && !is_direct_http3(session) {
+            return false;
+        }
+        if !matches!(error.etype(), ErrorType::WriteError | ErrorType::ReadError) {
+            return false;
+        }
+        let message = error.to_string();
+        if !message.contains("response stream closed")
+            && !message.contains("response write timed out")
+            && !message.contains("downstream error while idling")
+            && !message.contains("stream closed because of a broken pipe")
+            && !message.contains("inactive stream")
+        {
+            return false;
+        }
+        session.response_written().is_some()
+            || self.plans.get(ctx.plan_index).is_some_and(|plan| {
+                matches!(
+                    plan.route,
+                    RouteClass::NavidromeStream | RouteClass::NavidromeCover
+                )
+            })
     }
 }
 
@@ -528,9 +578,22 @@ impl ProxyHttp for Gateway {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        let internal_http3 = is_internal_http3(&self.runtime, session);
-        let http3 = internal_http3 || is_direct_http3(session);
-        let tls = is_tls(session) || http3;
+        let plain_h1 = session.downstream_session.as_http1().is_some() && !is_tls(session);
+        let internal_http3 = if plain_h1 {
+            false
+        } else {
+            is_internal_http3(&self.runtime, session)
+        };
+        let http3 = if plain_h1 {
+            false
+        } else {
+            internal_http3 || is_direct_http3(session)
+        };
+        let tls = if plain_h1 {
+            false
+        } else {
+            is_tls(session) || http3
+        };
         ctx.http3 = http3;
         ctx.tls = tls;
         ctx.forwarded_port = if internal_http3 {
@@ -629,7 +692,7 @@ impl ProxyHttp for Gateway {
                 )
                 .await;
             }
-            return send_health_details(session, &self.runtime).await;
+            return send_health_details(session, &self.runtime, &self.upstream_h3).await;
         }
 
         let Some(authority) = request_authority(session.req_header()) else {
@@ -710,6 +773,7 @@ impl ProxyHttp for Gateway {
             return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
         };
         ctx.client_ip = client_ip;
+        self.prepare_upstream_forwarded_headers(session, ctx)?;
 
         if host.handler == HandlerKind::NavidromeMain && path == "/" {
             let location = format!("https://{}/app/", host.domain.as_ref());
@@ -738,7 +802,8 @@ impl ProxyHttp for Gateway {
             .await;
         };
         let plan = &self.plans[plan_index];
-        let encoding = negotiate_downstream_compression(session, plan.route)?;
+        let encoding =
+            configure_downstream_compression(session, plan.route, &self.compression_modules)?;
         if encoding.preferred == ContentCoding::NotAcceptable {
             return send_empty(
                 &self.runtime,
@@ -753,8 +818,6 @@ impl ProxyHttp for Gateway {
         }
         ctx.identity_acceptable = encoding.identity_acceptable;
         ctx.compression_selected = encoding.preferred.as_str().is_some();
-        ctx.compression_install_pending =
-            uses_downstream_compression(plan.route) && ctx.compression_selected;
 
         if declared_content_length.is_some_and(|length| length > plan.max_body_bytes) {
             return send_empty(
@@ -865,6 +928,19 @@ impl ProxyHttp for Gateway {
         plan.route.supports_h1_bodyless_fast_path() && !session.is_upgrade_req()
     }
 
+    fn h1_bodyless_poll_downstream(&self, session: &Session, ctx: &Self::CTX) -> bool {
+        if is_direct_http3(session) {
+            // QUIC custom sessions never detect disconnect via read_body_or_idle().
+            return false;
+        }
+        self.plans.get(ctx.plan_index).is_some_and(|plan| {
+            matches!(
+                plan.route,
+                RouteClass::NavidromeStream | RouteClass::NavidromeCover
+            )
+        })
+    }
+
     async fn upstream_request_filter(
         &self,
         session: &mut Session,
@@ -873,12 +949,16 @@ impl ProxyHttp for Gateway {
     ) -> Result<()> {
         let plan = self.request_plan(ctx)?;
         strip_request_hop_headers(session.req_header(), upstream_request)?;
-        // Host + X-Real-IP + four X-Forwarded-* fields, plus optional
-        // Accept-Encoding and the Upgrade/Connection pair.
         upstream_request.headers.reserve(10);
-        let client_ip = forwarded_client_ip_value(ctx.client_ip)?;
-        let upstream_host = if plan.route == RouteClass::Doh {
-            DIRECT_DOH_HOST
+        let client_ip = ctx.upstream_forwarded_for.as_ref().ok_or_else(|| {
+            Error::explain(HTTPStatus(500), "upstream forwarded client IP is missing")
+        })?;
+        let forwarded_port = ctx
+            .upstream_forwarded_port
+            .as_ref()
+            .ok_or_else(|| Error::explain(HTTPStatus(500), "upstream forwarded port is missing"))?;
+        let domain = if plan.route == RouteClass::Doh {
+            DIRECT_DOH_HOST.clone()
         } else {
             plan.domain.clone()
         };
@@ -887,20 +967,11 @@ impl ProxyHttp for Gateway {
         upstream_request.remove_header(&X_FORWARDED_FOR);
         upstream_request.remove_header(&HTTP3_INTERNAL);
         upstream_request.remove_header(&HTTP3_PORT);
-        upstream_request.insert_typed_header(HOST, upstream_host);
+        upstream_request.insert_typed_header(HOST, domain.clone());
         upstream_request.insert_typed_header(X_REAL_IP, client_ip.clone());
-        upstream_request.insert_typed_header(X_FORWARDED_FOR, client_ip);
-        upstream_request.insert_typed_header(X_FORWARDED_HOST, plan.domain.clone());
-        let listener_port = ctx.forwarded_port.or_else(|| {
-            session
-                .server_addr()
-                .and_then(|address| address.as_inet())
-                .map(|address| address.port())
-        });
-        upstream_request.insert_typed_header(
-            X_FORWARDED_PORT,
-            forwarded_port_value(listener_port, ctx.tls)?,
-        );
+        upstream_request.insert_typed_header(X_FORWARDED_FOR, client_ip.clone());
+        upstream_request.insert_typed_header(X_FORWARDED_HOST, domain);
+        upstream_request.insert_typed_header(X_FORWARDED_PORT, forwarded_port.clone());
         upstream_request.insert_typed_header(X_FORWARDED_PROTO, if ctx.tls { HTTPS } else { HTTP });
         upstream_request.insert_typed_header(X_FORWARDED_SSL, if ctx.tls { ON } else { OFF });
 
@@ -1026,25 +1097,6 @@ impl ProxyHttp for Gateway {
             response.insert_typed_header(ALT_SVC, alt_svc.clone());
         }
         let bodyless = response_status_has_no_body(response.status.as_u16());
-        if ctx.compression_install_pending && !response_status_is_interim(response.status.as_u16())
-        {
-            if bodyless || !response_allows_compression(response) {
-                ctx.compression_install_pending = false;
-                if ctx.compression_selected && !bodyless && !ctx.identity_acceptable {
-                    return Err(Error::explain(
-                        HTTPStatus(406),
-                        "upstream response cannot use an acceptable content coding",
-                    ));
-                }
-            } else if let Some(encoding) =
-                negotiate(session.req_header().headers.get_all(ACCEPT_ENCODING).iter())
-                    .preferred
-                    .as_str()
-            {
-                install_downstream_compression(session, encoding, &self.compression_modules)?;
-                ctx.compression_install_pending = false;
-            }
-        }
         if ctx.compression_selected && response_status_is_interim(response.status.as_u16()) {
             // 100/103 are interim headers. Do not permanently disable the
             // compressor before the final response arrives.
@@ -1091,9 +1143,19 @@ impl ProxyHttp for Gateway {
         &self,
         session: &mut Session,
         error: &Error,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> FailToProxy {
+        if self.is_benign_stream_disconnect(session, ctx, error) {
+            return FailToProxy {
+                error_code: 0,
+                can_reuse_downstream: true,
+            };
+        }
         default_fail_to_proxy(session, error).await
+    }
+
+    fn suppress_error_log(&self, session: &Session, ctx: &Self::CTX, error: &Error) -> bool {
+        self.is_benign_stream_disconnect(session, ctx, error)
     }
 
     async fn connected_to_upstream(
@@ -1151,6 +1213,14 @@ impl ProxyHttp for Gateway {
         ctx: &mut Self::CTX,
         client_reused: bool,
     ) -> Box<Error> {
+        if self.is_benign_stream_disconnect(session, ctx, &error) {
+            error.set_retry(false);
+            return error;
+        }
+        if session.response_written().is_some() {
+            error.set_retry(false);
+            return error;
+        }
         let can_retry = client_reused
             && request_is_replay_safe(session)
             && session.response_written().is_none()
@@ -1181,7 +1251,12 @@ impl ProxyHttp for Gateway {
             .response_written()
             .map_or(0, |response| response.status.as_u16());
         if let Some(error) = error {
-            if let Some(started_at) = ctx.started_at {
+            if self.is_benign_stream_disconnect(session, ctx, error) {
+                debug!(
+                    "stream disconnect client={} status={} error={}",
+                    ctx.client_ip, status, error
+                );
+            } else if let Some(started_at) = ctx.started_at {
                 warn!(
                     "proxy error client={} status={} retries={} elapsed_ms={} error={}",
                     ctx.client_ip,
@@ -1228,11 +1303,37 @@ fn uses_downstream_compression(route: RouteClass) -> bool {
     )
 }
 
+fn configure_downstream_compression(
+    session: &mut Session,
+    route: RouteClass,
+    compression_modules: &HttpModules,
+) -> Result<EncodingNegotiation> {
+    let encoding = negotiate_downstream_compression(session, route)?;
+    if encoding.preferred == ContentCoding::NotAcceptable {
+        return Ok(encoding);
+    }
+    if let Some(preferred) = encoding.preferred.as_str() {
+        install_downstream_compression(session, preferred, compression_modules)?;
+    }
+    Ok(encoding)
+}
+
 fn negotiate_downstream_compression(
     session: &Session,
     route: RouteClass,
 ) -> Result<EncodingNegotiation> {
     if !uses_downstream_compression(route) {
+        return Ok(EncodingNegotiation {
+            preferred: ContentCoding::Identity,
+            identity_acceptable: true,
+        });
+    }
+
+    let mut values = session.req_header().headers.get_all(ACCEPT_ENCODING).iter();
+    if let Some(first) = values.next()
+        && values.next().is_none()
+        && first.as_bytes().eq_ignore_ascii_case(b"identity")
+    {
         return Ok(EncodingNegotiation {
             preferred: ContentCoding::Identity,
             identity_acceptable: true,
@@ -2029,7 +2130,20 @@ async fn send_empty(
     Ok(true)
 }
 
-async fn send_health_details(session: &mut Session, runtime: &RuntimeConfig) -> Result<bool> {
+async fn upstream_tcp_reachable(address: &str) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::net::TcpStream::connect(address),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+async fn send_health_details(
+    session: &mut Session,
+    runtime: &RuntimeConfig,
+    upstream_h3: &UpstreamH3Registry,
+) -> Result<bool> {
     let query = session.req_header().uri.query().unwrap_or_default();
     let check_upstreams = query.split('&').any(|value| value == "upstreams=1");
     let allocator = if query.split('&').any(|value| value == "allocator=1")
@@ -2049,12 +2163,19 @@ async fn send_health_details(session: &mut Session, runtime: &RuntimeConfig) -> 
     let mut ready = true;
     if check_upstreams {
         for (name, upstream) in &runtime.config.upstreams {
-            let connected = tokio::time::timeout(
-                Duration::from_millis(500),
-                tokio::net::TcpStream::connect(upstream.address.as_str()),
-            )
-            .await
-            .is_ok_and(|result| result.is_ok());
+            let connected = if upstream.protocol.uses_http3() {
+                match upstream_h3.route(name) {
+                    Some(route) if upstream.protocol == UpstreamProtocol::Http3 => {
+                        route.is_available()
+                    }
+                    Some(route) => {
+                        route.is_available() || upstream_tcp_reachable(&upstream.address).await
+                    }
+                    None => false,
+                }
+            } else {
+                upstream_tcp_reachable(&upstream.address).await
+            };
             ready &= connected;
             upstreams.insert(name.as_str(), connected);
         }
@@ -2608,5 +2729,33 @@ write_timeout_seconds: 9
         ] {
             assert!(route.supports_h1_bodyless_fast_path(), "{route:?}");
         }
+    }
+
+    #[test]
+    fn h1_bodyless_poll_downstream_only_for_streaming_routes() {
+        for (route, expected) in [
+            (RouteClass::NavidromeStream, true),
+            (RouteClass::NavidromeCover, true),
+            (RouteClass::Vaultwarden, false),
+            (RouteClass::NavidromeApi, false),
+        ] {
+            assert_eq!(
+                matches!(
+                    route,
+                    RouteClass::NavidromeStream | RouteClass::NavidromeCover
+                ),
+                expected,
+                "{route:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_only_accept_encoding_short_circuits() {
+        let header = HeaderValue::from_static("identity");
+        let mut values = [header].into_iter();
+        let first = values.next().expect("accept-encoding value");
+        assert!(values.next().is_none());
+        assert!(first.as_bytes().eq_ignore_ascii_case(b"identity"));
     }
 }
