@@ -42,3 +42,8 @@ hosts:
     upstream: backend
     redirect_http: false
     max_body_bytes: 1048576
+
+route_limits:
+  navidrome_api:
+    rate_per_second: 0
+    active_requests: 0

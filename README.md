@@ -29,8 +29,9 @@ HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항�
 - Rust global allocator로 정적 링크된 Google TCMalloc(8 KiB logical page)
 - UID/GID `10001:10001`, read-only root filesystem, 최소 capability
 
-Pingora 0.8.1은 다운스트림 HTTP/3/QUIC server를 제공하지 않으므로 HTTP/3와
-`Alt-Svc`는 지원하지 않습니다. gzip/Brotli/Zstd 동적 압축은 명시적으로 설정한 정적
+Pingora 0.8.1 core에는 다운스트림 HTTP/3/QUIC server가 없지만, JBS Pingora는
+`quiche` 기반 downstream HTTP/3, `Alt-Svc` discovery, upstream HTTP/3 pool을
+제공합니다. gzip/Brotli/Zstd 동적 압축은 명시적으로 설정한 정적
 호스트에만 직접 적용합니다. Navidrome API/cover는 client의 `Accept-Encoding`을 origin에 전달하고 gateway
 압축은 적용하지 않습니다. 그 외 압축 가능한 프록시 응답(Vaultwarden, CouchDB,
 AdGuard UI)은 client의 `Accept-Encoding`을 정확히 협상해 같은 q-value에서는
@@ -546,7 +547,9 @@ curl --fail http://127.0.0.1/nginx-health
 ## NGINX 대비 동작 차이
 
 - 알 수 없는 Host는 비표준 444 대신 `421 Misdirected Request`로 거부합니다.
-- HTTP/3는 지원하지 않습니다.
+- downstream HTTP/3/QUIC(`Alt-Svc` discovery 포함)와 upstream HTTP/3 pool을
+  지원합니다. NGINX와의 차이는 QUIC admission, hybrid PQ TLS, upstream 0-RTT
+  정책에 있습니다.
 - Navidrome audio는 전체 buffering하거나 동적 압축하지 않습니다.
 - 기본 config의 DoH TLS upstream은 인증서와 hostname을 검증합니다. 사설 CA를
   사용한다면 해당 CA를 container의 신뢰 저장소에 배포하십시오.
