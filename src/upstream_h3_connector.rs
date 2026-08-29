@@ -315,11 +315,11 @@ impl cloudflare_pingora::protocols::http::custom::client::Session for H3Upstream
     }
 
     fn response_finished(&self) -> bool {
+        // The pool sets `finished` when the QUIC stream ends, but bodied responses
+        // may still have frames queued in the body channel. Treating the stream as
+        // finished before `body_done` makes custom_pipe_up_to_down_response send
+        // premature EOS to the downstream H2 client.
         self.body_done
-            || self
-                .finished
-                .as_ref()
-                .is_some_and(|finished| finished.load(Ordering::Acquire))
     }
 
     async fn shutdown(&mut self, _code: u32, _ctx: &str) {}
