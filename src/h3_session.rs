@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -40,7 +41,8 @@ pub struct H3Session {
     client_addr: PingoraAddr,
     server_addr: PingoraAddr,
     digest: Digest,
-    alt_svc: Option<HeaderValue>,
+    alt_svc: Option<Arc<HeaderValue>>,
+    wire_headers: Vec<h3::Header>,
 }
 
 impl H3Session {
@@ -51,7 +53,7 @@ impl H3Session {
         request_fin: bool,
         client_addr: std::net::SocketAddr,
         server_addr: std::net::SocketAddr,
-        alt_svc: Option<HeaderValue>,
+        alt_svc: Option<Arc<HeaderValue>>,
     ) -> Self {
         Self {
             request_header,
@@ -71,6 +73,7 @@ impl H3Session {
             server_addr: PingoraAddr::Inet(server_addr),
             digest: Digest::default(),
             alt_svc,
+            wire_headers: Vec::with_capacity(16),
         }
     }
 
@@ -105,7 +108,31 @@ impl H3Session {
             || name.as_str() == "proxy-connection"
     }
 
-    async fn send_headers(&mut self, header: Box<ResponseHeader>, end: bool) -> Result<()> {
+    fn encode_response_headers(&mut self, header: &ResponseHeader) {
+        self.wire_headers.clear();
+        self.wire_headers.push(h3::Header::new(
+            b":status",
+            header.status.as_str().as_bytes(),
+        ));
+        let date = get_cached_date();
+        self.wire_headers
+            .push(h3::Header::new(b"date", date.as_bytes()));
+        if !header.headers.contains_key(&ALT_SVC)
+            && let Some(value) = self.alt_svc.as_deref()
+        {
+            self.wire_headers
+                .push(h3::Header::new(b"alt-svc", value.as_bytes()));
+        }
+        for (name, value) in &header.headers {
+            if Self::hop_by_hop(name) || name == DATE {
+                continue;
+            }
+            self.wire_headers
+                .push(h3::Header::new(name.as_str().as_bytes(), value.as_bytes()));
+        }
+    }
+
+    async fn send_headers_box(&mut self, mut header: Box<ResponseHeader>, end: bool) -> Result<()> {
         if self.ended {
             return Ok(());
         }
@@ -116,27 +143,41 @@ impl H3Session {
             return Ok(());
         }
 
-        let mut header = header;
         header.insert_typed_header(DATE, get_cached_date());
         if !header.headers.contains_key(&ALT_SVC)
-            && let Some(value) = self.alt_svc.clone()
+            && let Some(value) = self.alt_svc.as_deref()
         {
-            header.insert_typed_header(ALT_SVC, value);
+            header.insert_typed_header(ALT_SVC, value.clone());
         }
-        let mut headers = Vec::with_capacity(header.headers.len() + 1);
-        headers.push(h3::Header::new(
-            b":status",
-            header.status.as_str().as_bytes(),
-        ));
-        for (name, value) in &header.headers {
-            if Self::hop_by_hop(name) {
-                continue;
-            }
-            headers.push(h3::Header::new(name.as_str().as_bytes(), value.as_bytes()));
-        }
-        self.send_frame(OutboundFrame::Headers(headers, None))
+        self.encode_response_headers(&header);
+        let wire_headers = std::mem::take(&mut self.wire_headers);
+        self.send_frame(OutboundFrame::Headers(wire_headers, None))
             .await?;
         self.response_written = Some(header);
+        self.ended = end;
+        if end {
+            self.send_frame(OutboundFrame::Body(Bytes::new(), true))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn send_headers_ref(&mut self, header: &ResponseHeader, end: bool) -> Result<()> {
+        if self.ended {
+            return Ok(());
+        }
+        if header.status.is_informational() {
+            return Ok(());
+        }
+        if self.response_written.is_some() {
+            return Ok(());
+        }
+
+        self.encode_response_headers(header);
+        let wire_headers = std::mem::take(&mut self.wire_headers);
+        self.send_frame(OutboundFrame::Headers(wire_headers, None))
+            .await?;
+        self.response_written = Some(Box::new(header.clone()));
         self.ended = end;
         if end {
             self.send_frame(OutboundFrame::Body(Bytes::new(), true))
@@ -160,6 +201,35 @@ impl H3Session {
         self.body_sent += len;
         self.ended |= end;
         Ok(())
+    }
+
+    async fn apply_task(&mut self, task: HttpTask) -> Result<bool> {
+        match task {
+            HttpTask::Header(header, end) => {
+                self.send_headers_box(header, end).await?;
+                Ok(end)
+            }
+            HttpTask::Body(data, end) => {
+                if let Some(data) = data
+                    && !data.is_empty()
+                {
+                    self.send_body(data, end).await?;
+                } else if end {
+                    self.send_body(Bytes::new(), true).await?;
+                }
+                Ok(end)
+            }
+            HttpTask::UpgradedBody(..) => Err(Error::explain(
+                ErrorType::InternalError,
+                "upgraded body on HTTP/3 session",
+            )),
+            HttpTask::Trailer(Some(trailers)) => {
+                self.write_trailers(*trailers).await?;
+                Ok(true)
+            }
+            HttpTask::Trailer(None) | HttpTask::Done => Ok(true),
+            HttpTask::Failed(error) => Err(error),
+        }
     }
 }
 
@@ -232,11 +302,11 @@ impl CustomSession for H3Session {
     }
 
     async fn write_response_header(&mut self, resp: Box<ResponseHeader>, end: bool) -> Result<()> {
-        self.send_headers(resp, end).await
+        self.send_headers_box(resp, end).await
     }
 
     async fn write_response_header_ref(&mut self, resp: &ResponseHeader, end: bool) -> Result<()> {
-        self.send_headers(Box::new(resp.clone()), end).await
+        self.send_headers_ref(resp, end).await
     }
 
     async fn write_body(&mut self, data: Bytes, end: bool) -> Result<()> {
@@ -252,15 +322,17 @@ impl CustomSession for H3Session {
                 "HTTP/3 trailers sent before response headers",
             ));
         }
-        let mut headers = Vec::with_capacity(trailers.len());
+        self.wire_headers.clear();
         for (name, value) in &trailers {
             if Self::hop_by_hop(name) {
                 continue;
             }
-            headers.push(h3::Header::new(name.as_str().as_bytes(), value.as_bytes()));
+            self.wire_headers
+                .push(h3::Header::new(name.as_str().as_bytes(), value.as_bytes()));
         }
-        if !headers.is_empty() {
-            self.send_frame(OutboundFrame::Headers(headers, None))
+        if !self.wire_headers.is_empty() {
+            let wire_headers = std::mem::take(&mut self.wire_headers);
+            self.send_frame(OutboundFrame::Headers(wire_headers, None))
                 .await?;
         }
         self.send_frame(OutboundFrame::Body(Bytes::new(), true))
@@ -269,37 +341,18 @@ impl CustomSession for H3Session {
         Ok(())
     }
 
+    async fn response_duplex_one(&mut self, task: HttpTask) -> Result<bool> {
+        let end_stream = self.apply_task(task).await?;
+        if end_stream {
+            self.finish().await?;
+        }
+        Ok(end_stream)
+    }
+
     async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool> {
         let mut end_stream = false;
         for task in tasks {
-            end_stream = match task {
-                HttpTask::Header(header, end) => {
-                    self.send_headers(header, end).await?;
-                    end
-                }
-                HttpTask::Body(data, end) => {
-                    if let Some(data) = data
-                        && !data.is_empty()
-                    {
-                        self.send_body(data, end).await?;
-                    } else if end {
-                        self.send_body(Bytes::new(), true).await?;
-                    }
-                    end
-                }
-                HttpTask::UpgradedBody(..) => {
-                    return Err(Error::explain(
-                        ErrorType::InternalError,
-                        "upgraded body on HTTP/3 session",
-                    ));
-                }
-                HttpTask::Trailer(Some(trailers)) => {
-                    self.write_trailers(*trailers).await?;
-                    true
-                }
-                HttpTask::Trailer(None) | HttpTask::Done => true,
-                HttpTask::Failed(error) => return Err(error),
-            } || end_stream;
+            end_stream = self.apply_task(task).await? || end_stream;
         }
         if end_stream {
             self.finish().await?;
@@ -452,7 +505,7 @@ impl CustomSession for H3Session {
             self.retry_buffer
                 .as_ref()
                 .filter(|buffer| !buffer.is_empty())
-                .map(|buffer| Bytes::copy_from_slice(buffer))
+                .map(|buffer| buffer.clone().freeze())
         }
     }
 

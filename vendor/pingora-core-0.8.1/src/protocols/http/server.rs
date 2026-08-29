@@ -282,7 +282,7 @@ impl Session {
             Self::H1(s) => s.response_duplex(task).await,
             Self::H2(s) => s.response_duplex_vec(vec![task]).await,
             Self::Subrequest(s) => s.response_duplex_vec(vec![task]).await,
-            Self::Custom(s) => s.response_duplex_vec(vec![task]).await,
+            Self::Custom(s) => s.response_duplex_one(task).await,
         }
     }
 

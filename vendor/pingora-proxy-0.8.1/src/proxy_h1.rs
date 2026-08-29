@@ -235,7 +235,8 @@ where
             HttpTask::Header(mut header, end) => {
                 let no_body = session.req_header().method == Method::HEAD
                     || matches!(header.status.as_u16(), 204 | 304);
-                if !no_body
+                if !session.downstream_session.is_custom()
+                    && !no_body
                     && !header.status.is_informational()
                     && header.headers.get(header::TRANSFER_ENCODING).is_none()
                     && header.headers.get(header::CONTENT_LENGTH).is_none()
