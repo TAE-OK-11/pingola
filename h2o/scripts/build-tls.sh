@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+clone_ref() {
+  local dest=$1
+  local url=$2
+  local ref=$3
+  rm -rf "${dest}"
+  git clone --depth=1 --branch "${ref}" "${url}" "${dest}"
+}
+
 OUTPUT_DIR=${1:?usage: build-tls.sh OUTPUT_DIR TLS_PROVIDER ARCH_FLAGS}
 TLS_PROVIDER=${2:?usage: build-tls.sh OUTPUT_DIR TLS_PROVIDER ARCH_FLAGS}
 ARCH_FLAGS=${3:?missing ARCH_FLAGS}
 
-# Crypto libraries are built without LTO. H2O's own strict-aliasing/LTO profile is
-# kept separate so TLS rebuilds stay fast and link failures stay rare.
 COMMON_CMAKE_FLAGS=(
   -DCMAKE_BUILD_TYPE=Release
   -DCMAKE_C_COMPILER=clang
@@ -19,16 +25,13 @@ COMMON_CMAKE_FLAGS=(
 )
 
 install -d "${OUTPUT_DIR}"
+ROOT=${WORK_ROOT:-/tmp}/h2o-tls-src
 
 case "${TLS_PROVIDER}" in
   boringssl)
-    BORINGSSL_VERSION=${BORINGSSL_VERSION:-b9dd520e22aad0001a31962dd277b6540fc9f1e4}
-    SRC_DIR=${WORK_ROOT:-/tmp}/h2o-tls-boringssl
-    rm -rf "${SRC_DIR}"
-    git init "${SRC_DIR}"
-    git -C "${SRC_DIR}" remote add origin https://github.com/google/boringssl.git
-    git -C "${SRC_DIR}" fetch --depth=1 origin "${BORINGSSL_VERSION}"
-    git -C "${SRC_DIR}" checkout --detach FETCH_HEAD
+    BORINGSSL_REF=${BORINGSSL_REF:-main}
+    SRC_DIR="${ROOT}/boringssl"
+    clone_ref "${SRC_DIR}" https://github.com/google/boringssl.git "${BORINGSSL_REF}"
     cmake -G Ninja -S "${SRC_DIR}" -B "${SRC_DIR}/build" \
       "${COMMON_CMAKE_FLAGS[@]}" \
       -DCMAKE_INSTALL_PREFIX="${OUTPUT_DIR}"
@@ -39,13 +42,9 @@ case "${TLS_PROVIDER}" in
     test -f "${OUTPUT_DIR}/lib/libdecrepit.a"
     ;;
   aws-lc)
-    AWS_LC_VERSION=${AWS_LC_VERSION:-v1.62.0}
-    SRC_DIR=${WORK_ROOT:-/tmp}/h2o-tls-aws-lc
-    rm -rf "${SRC_DIR}"
-    git init "${SRC_DIR}"
-    git -C "${SRC_DIR}" remote add origin https://github.com/aws/aws-lc.git
-    git -C "${SRC_DIR}" fetch --depth=1 origin "${AWS_LC_VERSION}"
-    git -C "${SRC_DIR}" checkout --detach FETCH_HEAD
+    AWS_LC_REF=${AWS_LC_REF:-v1.62.0}
+    SRC_DIR="${ROOT}/aws-lc"
+    clone_ref "${SRC_DIR}" https://github.com/aws/aws-lc.git "${AWS_LC_REF}"
     cmake -G Ninja -S "${SRC_DIR}" -B "${SRC_DIR}/build" \
       "${COMMON_CMAKE_FLAGS[@]}" \
       -DCMAKE_INSTALL_PREFIX="${OUTPUT_DIR}" \

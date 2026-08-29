@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+clone_ref() {
+  local dest=$1
+  local url=$2
+  local ref=$3
+  rm -rf "${dest}"
+  git clone --depth=1 --branch "${ref}" "${url}" "${dest}"
+}
+
 OUTPUT_DIR=${1:?usage: build-allocator.sh OUTPUT_DIR ALLOCATOR ARCH_FLAGS}
 ALLOCATOR=${2:?usage: build-allocator.sh OUTPUT_DIR ALLOCATOR ARCH_FLAGS}
 ARCH_FLAGS=${3:?missing ARCH_FLAGS}
 
 install -d "${OUTPUT_DIR}"
+ROOT=${WORK_ROOT:-/tmp}/h2o-allocator-src
 
 case "${ALLOCATOR}" in
   system)
@@ -14,13 +23,9 @@ case "${ALLOCATOR}" in
     exit 0
     ;;
   jemalloc)
-    JEMALLOC_VERSION=${JEMALLOC_VERSION:-5.3.0}
-    SRC_DIR=${WORK_ROOT:-/tmp}/h2o-allocator-jemalloc
-    rm -rf "${SRC_DIR}"
-    git init "${SRC_DIR}"
-    git -C "${SRC_DIR}" remote add origin https://github.com/jemalloc/jemalloc.git
-    git -C "${SRC_DIR}" fetch --depth=1 origin "${JEMALLOC_VERSION}"
-    git -C "${SRC_DIR}" checkout --detach FETCH_HEAD
+    JEMALLOC_REF=${JEMALLOC_REF:-5.3.0}
+    SRC_DIR="${ROOT}/jemalloc"
+    clone_ref "${SRC_DIR}" https://github.com/jemalloc/jemalloc.git "${JEMALLOC_REF}"
     (
       cd "${SRC_DIR}"
       ./autogen.sh
@@ -38,13 +43,9 @@ case "${ALLOCATOR}" in
       >"${OUTPUT_DIR}/linker.flags"
     ;;
   tcmalloc)
-    GPERFTOOLS_VERSION=${GPERFTOOLS_VERSION:-gperftools-2.16}
-    SRC_DIR=${WORK_ROOT:-/tmp}/h2o-allocator-tcmalloc
-    rm -rf "${SRC_DIR}"
-    git init "${SRC_DIR}"
-    git -C "${SRC_DIR}" remote add origin https://github.com/gperftools/gperftools.git
-    git -C "${SRC_DIR}" fetch --depth=1 origin "${GPERFTOOLS_VERSION}"
-    git -C "${SRC_DIR}" checkout --detach FETCH_HEAD
+    GPERFTOOLS_REF=${GPERFTOOLS_REF:-gperftools-2.16}
+    SRC_DIR="${ROOT}/gperftools"
+    clone_ref "${SRC_DIR}" https://github.com/gperftools/gperftools.git "${GPERFTOOLS_REF}"
     (
       cd "${SRC_DIR}"
       CC=clang CXX=clang++ CFLAGS="-O3 ${ARCH_FLAGS} -fno-strict-aliasing" \
@@ -59,13 +60,9 @@ case "${ALLOCATOR}" in
       >"${OUTPUT_DIR}/linker.flags"
     ;;
   mimalloc)
-    MIMALLOC_VERSION=${MIMALLOC_VERSION:-v3.1.5}
-    SRC_DIR=${WORK_ROOT:-/tmp}/h2o-allocator-mimalloc
-    rm -rf "${SRC_DIR}"
-    git init "${SRC_DIR}"
-    git -C "${SRC_DIR}" remote add origin https://github.com/microsoft/mimalloc.git
-    git -C "${SRC_DIR}" fetch --depth=1 origin "${MIMALLOC_VERSION}"
-    git -C "${SRC_DIR}" checkout --detach FETCH_HEAD
+    MIMALLOC_REF=${MIMALLOC_REF:-v3.1.5}
+    SRC_DIR="${ROOT}/mimalloc"
+    clone_ref "${SRC_DIR}" https://github.com/microsoft/mimalloc.git "${MIMALLOC_REF}"
     cmake -G Ninja -S "${SRC_DIR}" -B "${SRC_DIR}/build" \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_C_COMPILER=clang \
