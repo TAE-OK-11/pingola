@@ -1,0 +1,32 @@
+services:
+  h2o:
+    container_name: h2o
+    image: ${H2O_IMAGE:-h2o:local}
+    build:
+      context: .
+      args:
+        TARGET_CPU: x86-64-v2
+        LTO_MODE: fat
+    network_mode: host
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 8s
+    pids_limit: 256
+    read_only: true
+    ulimits:
+      nofile:
+        soft: 32768
+        hard: 32768
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp/h2o:size=16m,mode=0700,uid=10001,gid=10001
+    environment:
+      H2O_CONFIG: /etc/h2o/h2o.conf
+    volumes:
+      - ${H2O_CONFIG_FILE:-./config/h2o.conf}:/etc/h2o/h2o.conf:ro
+      - ${H2O_CERT_ROOT:-/etc/letsencrypt}:/etc/h2o/cert:ro
