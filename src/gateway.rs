@@ -20,6 +20,7 @@ use cloudflare_pingora::modules::http::compression::{
 };
 use cloudflare_pingora::prelude::HttpPeer;
 use cloudflare_pingora::protocols::{ALPN, Digest, TcpKeepalive};
+use cloudflare_pingora::protocols::tls::CustomALPN;
 use cloudflare_pingora::proxy::{
     CacheMeta, FailToProxy, ForcedFreshness, HitHandler, ProxyHttp, RawSocketHandle, Session,
     default_fail_to_proxy,
@@ -38,7 +39,7 @@ use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_hos
 use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
 use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, LimitZone, RateLimiter};
 use crate::static_files::StaticFiles;
-use crate::upstream_h3::{BridgeRoute, UpstreamH3Registry};
+use crate::upstream_h3::{H3Route, H3_UPSTREAM_ALPN, UpstreamH3Registry};
 
 const STREAM_PREFIXES: &[&str] = &[
     "/rest/stream",
@@ -212,7 +213,7 @@ impl RouteClass {
 #[derive(Clone, Debug)]
 struct PreparedH3Peer {
     peer: HttpPeer,
-    route: BridgeRoute,
+    route: H3Route,
 }
 
 #[derive(Clone, Debug)]
@@ -1930,16 +1931,14 @@ fn prepare_upstream(
         user_timeout: Duration::from_secs(90),
     });
     let h3 = upstream_h3.route(name).map(|route| {
-        let mut peer = HttpPeer::new(route.address(), false, String::new());
+        let mut peer = HttpPeer::new(address, false, name.to_string());
         peer.options.connection_timeout =
             Some(Duration::from_secs(upstream.connect_timeout_seconds));
         peer.options.total_connection_timeout =
             Some(Duration::from_secs(upstream.connect_timeout_seconds));
         peer.options.idle_timeout = Some(Duration::from_secs(upstream.idle_timeout_seconds));
-        peer.options.alpn = ALPN::H2;
+        peer.options.alpn = ALPN::Custom(CustomALPN::new(H3_UPSTREAM_ALPN.to_vec()));
         peer.options.max_h2_streams = upstream.http3_max_concurrent_streams;
-        peer.options.h2_stream_window_size = Some(1024 * 1024);
-        peer.options.h2_connection_window_size = Some(16 * 1024 * 1024);
         PreparedH3Peer {
             peer,
             route: route.clone(),
