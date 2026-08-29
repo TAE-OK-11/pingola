@@ -354,6 +354,7 @@ impl GatewayShared {
 
 pub struct Gateway {
     runtime: Arc<RuntimeConfig>,
+    upstream_h3: Arc<UpstreamH3Registry>,
     shared: Arc<GatewayShared>,
     hosts: AHashMap<Arc<str>, PreparedHost>,
     plans: Box<[PreparedPlan]>,
@@ -438,6 +439,7 @@ impl Gateway {
         }
         Ok(Self {
             runtime,
+            upstream_h3,
             shared,
             hosts,
             plans: prepared_plans.into_boxed_slice(),
@@ -629,7 +631,7 @@ impl ProxyHttp for Gateway {
                 )
                 .await;
             }
-            return send_health_details(session, &self.runtime).await;
+            return send_health_details(session, &self.runtime, &self.upstream_h3).await;
         }
 
         let Some(authority) = request_authority(session.req_header()) else {
@@ -2009,7 +2011,13 @@ async fn send_empty(
     http3: bool,
     headers: &[(&'static str, &str)],
 ) -> Result<bool> {
-    let mut response = ResponseHeader::build(status, Some(headers.len() + 8)).unwrap();
+    let mut response = ResponseHeader::build(status, Some(headers.len() + 8)).map_err(|error| {
+        Error::because(
+            HTTPStatus(500),
+            "failed to build empty response header",
+            error,
+        )
+    })?;
     response.insert_typed_header(CONTENT_LENGTH, HeaderValue::from_static("0"));
     for (name, value) in headers {
         response.insert_header(*name, *value)?;
@@ -2029,7 +2037,20 @@ async fn send_empty(
     Ok(true)
 }
 
-async fn send_health_details(session: &mut Session, runtime: &RuntimeConfig) -> Result<bool> {
+async fn upstream_tcp_reachable(address: &str) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::net::TcpStream::connect(address),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+async fn send_health_details(
+    session: &mut Session,
+    runtime: &RuntimeConfig,
+    upstream_h3: &UpstreamH3Registry,
+) -> Result<bool> {
     let query = session.req_header().uri.query().unwrap_or_default();
     let check_upstreams = query.split('&').any(|value| value == "upstreams=1");
     let allocator = if query.split('&').any(|value| value == "allocator=1")
@@ -2049,12 +2070,19 @@ async fn send_health_details(session: &mut Session, runtime: &RuntimeConfig) -> 
     let mut ready = true;
     if check_upstreams {
         for (name, upstream) in &runtime.config.upstreams {
-            let connected = tokio::time::timeout(
-                Duration::from_millis(500),
-                tokio::net::TcpStream::connect(upstream.address.as_str()),
-            )
-            .await
-            .is_ok_and(|result| result.is_ok());
+            let connected = if upstream.protocol.uses_http3() {
+                match upstream_h3.route(name) {
+                    Some(route) if upstream.protocol == UpstreamProtocol::Http3 => {
+                        route.is_available()
+                    }
+                    Some(route) => {
+                        route.is_available() || upstream_tcp_reachable(&upstream.address).await
+                    }
+                    None => false,
+                }
+            } else {
+                upstream_tcp_reachable(&upstream.address).await
+            };
             ready &= connected;
             upstreams.insert(name.as_str(), connected);
         }
@@ -2073,7 +2101,14 @@ async fn send_health_details(session: &mut Session, runtime: &RuntimeConfig) -> 
         "allocator": allocator,
     }))
     .map_err(|error| Error::because(HTTPStatus(500), "health JSON serialization failed", error))?;
-    let mut response = ResponseHeader::build(if ready { 200 } else { 503 }, Some(8)).unwrap();
+    let mut response =
+        ResponseHeader::build(if ready { 200 } else { 503 }, Some(8)).map_err(|error| {
+            Error::because(
+                HTTPStatus(500),
+                "failed to build health response header",
+                error,
+            )
+        })?;
     response.insert_header("content-type", "application/json")?;
     response.insert_header(CONTENT_LENGTH, body.len().to_string())?;
     response.insert_header("cache-control", "no-store")?;

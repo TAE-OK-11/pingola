@@ -33,6 +33,22 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
 
     def do_GET(self):
+        if self.path.startswith("/bytes/"):
+            try:
+                size = int(self.path.removeprefix("/bytes/"))
+            except ValueError:
+                self.send_error(404)
+                return
+            if size < 0 or size > 16 * 1024 * 1024:
+                self.send_error(414)
+                return
+            payload = b"x" * size
+            self.send_response(200)
+            self.send_header("content-type", "application/octet-stream")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         self._respond()
 
     def do_HEAD(self):

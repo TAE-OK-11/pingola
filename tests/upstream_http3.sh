@@ -110,6 +110,39 @@ grep -q 'upstream HTTP/3 session ticket cached upstream=origin' "${FRONT_LOG}"
 # All three warm requests above should share the first H3 connection.
 [[ $(grep -c 'upstream HTTP/3 established upstream=origin peer=127.0.0.1:28443' "${FRONT_LOG}") -eq 1 ]]
 
+# Regression for concurrent bodied upstream H3 responses while the first pool
+# connection is still hot. The release/PGO medium h2load workload failed when
+# the custom upstream session marked EOS before the body channel was drained.
+expected=$(python3 - <<'PY'
+import hashlib
+print(hashlib.sha256(b"x" * 4096).hexdigest())
+PY
+)
+concurrent_fail=0
+set +e
+seq 32 | xargs -P 4 -I{} curl --noproxy '*' -fsS -H 'host: front.test' \
+  -H 'accept-encoding: identity' \
+  -o "${RUNTIME}/bytes-4096-{}" \
+  "http://127.0.0.1:38081/bytes/4096" \
+  || concurrent_fail=1
+set -e
+for file in "${RUNTIME}"/bytes-4096-*; do
+  actual=$(sha256sum "${file}" | cut -d' ' -f1)
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "concurrent upstream H3 body mismatch: ${file}" >&2
+    concurrent_fail=1
+  fi
+done
+rm -f "${RUNTIME}"/bytes-4096-*
+if grep -q 'Try to write body after end of stream' "${FRONT_LOG}"; then
+  echo 'concurrent upstream H3 test saw premature downstream EOS' >&2
+  concurrent_fail=1
+fi
+if [[ "${concurrent_fail}" -ne 0 ]]; then
+  echo 'concurrent upstream H3 bodied-response regression failed' >&2
+  exit 1
+fi
+
 # The origin and front use a 1-second QUIC idle timeout. After the warm
 # connection expires, the pool deliberately waits for the next replay-safe
 # request before reconnecting so that the cached ticket and GET can be emitted

@@ -51,6 +51,10 @@ impl H3Route {
     pub fn should_use_h3(&self) -> bool {
         self.forced || self.available.load(Ordering::Acquire)
     }
+
+    pub fn is_available(&self) -> bool {
+        self.available.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Default)]
@@ -1210,7 +1214,7 @@ fn drain_response_body(
         let stream_id = request
             .stream_id
             .ok_or_else(|| anyhow!("HTTP/3 data arrived before the request stream opened"))?;
-        (stream_id, request.body_tx.clone())
+        (stream_id, &request.body_tx)
     };
 
     loop {
@@ -1493,6 +1497,20 @@ mod tests {
             reconnect_delay_from_sample(Duration::from_secs(5), 40),
             Duration::from_secs(6)
         );
+    }
+
+    #[test]
+    fn h3_route_availability_tracks_pool_state() {
+        let available = Arc::new(AtomicBool::new(false));
+        let route = H3Route {
+            origin: "127.0.0.1:443".parse().unwrap(),
+            available: available.clone(),
+            forced: true,
+        };
+        assert!(!route.is_available());
+        assert!(route.should_use_h3());
+        available.store(true, Ordering::Release);
+        assert!(route.is_available());
     }
 
     #[test]

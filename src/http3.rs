@@ -58,11 +58,13 @@ impl ConnectionHook for HybridPqQuicTlsHook {
         &self,
         settings: TlsCertificatePaths<'_>,
     ) -> Option<SslContextBuilder> {
-        Some(
-            build_hybrid_pq_quic_context(settings.cert, settings.private_key).unwrap_or_else(
-                |error| panic!("validated HTTP/3 hybrid PQ TLS context became invalid: {error:#}"),
-            ),
-        )
+        match build_hybrid_pq_quic_context(settings.cert, settings.private_key) {
+            Ok(builder) => Some(builder),
+            Err(error) => {
+                error!("validated HTTP/3 hybrid PQ TLS context became invalid: {error:#}");
+                None
+            }
+        }
     }
 }
 
