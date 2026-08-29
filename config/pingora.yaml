@@ -9,7 +9,9 @@ server:
     - "0.0.0.0:443"
     - "[::]:443"
   http3_internal_listen: "127.0.0.1:18080"
-  http3_max_idle_timeout_seconds: 60
+  http3_internal_handoff_enabled: false
+  http3_max_idle_timeout_seconds: 300
+  http3_max_requests_per_connection: 128
   http3_max_concurrent_streams: 64
   http3_enable_early_data: false
   http3_stateless_retry: true
@@ -59,7 +61,9 @@ upstreams:
   navidrome:
     address: "10.77.0.1:4533"
     protocol: http1
-    idle_timeout_seconds: 15
+    idle_timeout_seconds: 300
+    read_timeout_seconds: 3600
+    write_timeout_seconds: 3600
   vaultwarden:
     address: "10.77.0.1:8081"
     protocol: http1

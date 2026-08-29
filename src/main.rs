@@ -78,6 +78,7 @@ struct Cli {
 
 fn main() -> Result<()> {
     allocator::configure_for_proxy();
+    allocator::start_background_reclaimer();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
 
@@ -357,7 +358,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         Some(Permissions::from_mode(0o600)),
     );
 
-    if !server_config.http3_listen.is_empty() {
+    if !server_config.http3_listen.is_empty() && server_config.http3_internal_handoff_enabled {
         let h2c_gateway =
             Gateway::with_shared(runtime.clone(), upstream_h3.clone(), shared.clone())
                 .context("HTTP/3 h2c service bootstrap failed")?;

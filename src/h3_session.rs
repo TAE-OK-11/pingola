@@ -235,6 +235,15 @@ impl H3Session {
     }
 }
 
+impl Drop for H3Session {
+    fn drop(&mut self) {
+        self.retry_buffer = None;
+        self.wire_headers.clear();
+        self.response_written = None;
+        crate::allocator::hint_release_idle_pages();
+    }
+}
+
 #[async_trait]
 impl CustomSession for H3Session {
     fn req_header(&self) -> &RequestHeader {

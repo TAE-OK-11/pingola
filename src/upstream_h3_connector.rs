@@ -191,10 +191,10 @@ impl BodyWrite for H3RequestBodyWriter {
         if data.is_empty() {
             return Ok(());
         }
-        send_body_command(&self.commands, self.id, data.clone(), false)
+        let chunk = std::mem::take(data);
+        send_body_command(&self.commands, self.id, chunk, false)
             .await
             .map_err(Self::write_err)?;
-        data.clear();
         Ok(())
     }
 
@@ -282,18 +282,17 @@ impl cloudflare_pingora::protocols::http::custom::client::Session for H3Upstream
             .ok_or_else(|| Self::read_err("upstream HTTP/3 response body is unavailable"))?;
         loop {
             match body_rx.recv().await {
-                Some(Ok(frame)) => {
-                    if let Some(data) = frame.data_ref()
-                        && !data.is_empty()
-                    {
-                        return Ok(Some(data.clone()));
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) if !data.is_empty() => return Ok(Some(data)),
+                    Ok(_) => {}
+                    Err(frame) => {
+                        if let Some(trailers) = frame.trailers_ref() {
+                            self.pending_trailers = Some(trailers.clone());
+                            self.body_done = true;
+                            return Ok(None);
+                        }
                     }
-                    if let Some(trailers) = frame.trailers_ref() {
-                        self.pending_trailers = Some(trailers.clone());
-                        self.body_done = true;
-                        return Ok(None);
-                    }
-                }
+                },
                 Some(Err(error)) => {
                     return Err(Self::read_err(error));
                 }

@@ -55,7 +55,11 @@ fn default_http3_internal_listen() -> SocketAddr {
 }
 
 fn default_http3_max_idle_timeout() -> u64 {
-    60
+    300
+}
+
+fn default_http3_max_requests_per_connection() -> u32 {
+    128
 }
 
 fn default_http3_max_concurrent_streams() -> u32 {
@@ -166,6 +170,8 @@ pub struct ServerConfig {
     pub http3_internal_listen: SocketAddr,
     #[serde(default = "default_http3_max_idle_timeout")]
     pub http3_max_idle_timeout_seconds: u64,
+    #[serde(default = "default_http3_max_requests_per_connection")]
+    pub http3_max_requests_per_connection: u32,
     #[serde(default = "default_http3_max_concurrent_streams")]
     pub http3_max_concurrent_streams: u32,
     #[serde(default = "default_http3_handshake_timeout")]
@@ -180,6 +186,11 @@ pub struct ServerConfig {
     pub http3_connection_burst: u32,
     #[serde(default = "default_http3_max_connections_per_ip")]
     pub http3_max_connections_per_ip: usize,
+    /// Legacy loopback h2c handoff listener. The HTTP/3 frontend uses direct
+    /// Gateway integration; keep this disabled in production to avoid retaining
+    /// an extra TCP/H2 service and connection pool.
+    #[serde(default = "default_true")]
+    pub http3_internal_handoff_enabled: bool,
     #[serde(default)]
     pub certificate: Option<PathBuf>,
     #[serde(default)]
@@ -483,6 +494,9 @@ fn validate(config: &Config) -> Result<()> {
     }
     if !(1..=1024).contains(&config.server.http3_max_concurrent_streams) {
         bail!("server.http3_max_concurrent_streams must be between 1 and 1024");
+    }
+    if !(1..=1_000_000).contains(&config.server.http3_max_requests_per_connection) {
+        bail!("server.http3_max_requests_per_connection must be between 1 and 1000000");
     }
     if !(1..=600).contains(&config.server.http3_max_idle_timeout_seconds) {
         bail!("server.http3_max_idle_timeout_seconds must be between 1 and 600");

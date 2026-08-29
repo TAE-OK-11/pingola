@@ -31,7 +31,7 @@ use http::header::{
     STRICT_TRANSPORT_SECURITY, TRANSFER_ENCODING, UPGRADE,
 };
 use http::{Method, Version};
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -354,6 +354,7 @@ impl GatewayShared {
 
 pub struct Gateway {
     runtime: Arc<RuntimeConfig>,
+    upstream_h3: Arc<UpstreamH3Registry>,
     shared: Arc<GatewayShared>,
     hosts: AHashMap<Arc<str>, PreparedHost>,
     plans: Box<[PreparedPlan]>,
@@ -438,6 +439,7 @@ impl Gateway {
         }
         Ok(Self {
             runtime,
+            upstream_h3,
             shared,
             hosts,
             plans: prepared_plans.into_boxed_slice(),
@@ -480,6 +482,36 @@ impl Gateway {
         self.plans
             .get(ctx.plan_index)
             .ok_or_else(|| Error::explain(HTTPStatus(500), "request plan is missing"))
+    }
+
+    fn is_benign_stream_disconnect(
+        &self,
+        session: &Session,
+        ctx: &RequestContext,
+        error: &Error,
+    ) -> bool {
+        if !ctx.http3 && !is_direct_http3(session) {
+            return false;
+        }
+        if !matches!(error.etype(), ErrorType::WriteError | ErrorType::ReadError) {
+            return false;
+        }
+        let message = error.to_string();
+        if !message.contains("response stream closed")
+            && !message.contains("response write timed out")
+            && !message.contains("downstream error while idling")
+            && !message.contains("stream closed because of a broken pipe")
+            && !message.contains("inactive stream")
+        {
+            return false;
+        }
+        session.response_written().is_some()
+            || self.plans.get(ctx.plan_index).is_some_and(|plan| {
+                matches!(
+                    plan.route,
+                    RouteClass::NavidromeStream | RouteClass::NavidromeCover
+                )
+            })
     }
 }
 
@@ -629,7 +661,7 @@ impl ProxyHttp for Gateway {
                 )
                 .await;
             }
-            return send_health_details(session, &self.runtime).await;
+            return send_health_details(session, &self.runtime, &self.upstream_h3).await;
         }
 
         let Some(authority) = request_authority(session.req_header()) else {
@@ -1091,9 +1123,19 @@ impl ProxyHttp for Gateway {
         &self,
         session: &mut Session,
         error: &Error,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> FailToProxy {
+        if self.is_benign_stream_disconnect(session, ctx, error) {
+            return FailToProxy {
+                error_code: 0,
+                can_reuse_downstream: true,
+            };
+        }
         default_fail_to_proxy(session, error).await
+    }
+
+    fn suppress_error_log(&self, session: &Session, ctx: &Self::CTX, error: &Error) -> bool {
+        self.is_benign_stream_disconnect(session, ctx, error)
     }
 
     async fn connected_to_upstream(
@@ -1151,6 +1193,14 @@ impl ProxyHttp for Gateway {
         ctx: &mut Self::CTX,
         client_reused: bool,
     ) -> Box<Error> {
+        if self.is_benign_stream_disconnect(session, ctx, &error) {
+            error.set_retry(false);
+            return error;
+        }
+        if session.response_written().is_some() {
+            error.set_retry(false);
+            return error;
+        }
         let can_retry = client_reused
             && request_is_replay_safe(session)
             && session.response_written().is_none()
@@ -1181,7 +1231,12 @@ impl ProxyHttp for Gateway {
             .response_written()
             .map_or(0, |response| response.status.as_u16());
         if let Some(error) = error {
-            if let Some(started_at) = ctx.started_at {
+            if self.is_benign_stream_disconnect(session, ctx, error) {
+                debug!(
+                    "stream disconnect client={} status={} error={}",
+                    ctx.client_ip, status, error
+                );
+            } else if let Some(started_at) = ctx.started_at {
                 warn!(
                     "proxy error client={} status={} retries={} elapsed_ms={} error={}",
                     ctx.client_ip,
@@ -2029,7 +2084,20 @@ async fn send_empty(
     Ok(true)
 }
 
-async fn send_health_details(session: &mut Session, runtime: &RuntimeConfig) -> Result<bool> {
+async fn upstream_tcp_reachable(address: &str) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::net::TcpStream::connect(address),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+async fn send_health_details(
+    session: &mut Session,
+    runtime: &RuntimeConfig,
+    upstream_h3: &UpstreamH3Registry,
+) -> Result<bool> {
     let query = session.req_header().uri.query().unwrap_or_default();
     let check_upstreams = query.split('&').any(|value| value == "upstreams=1");
     let allocator = if query.split('&').any(|value| value == "allocator=1")
@@ -2049,12 +2117,19 @@ async fn send_health_details(session: &mut Session, runtime: &RuntimeConfig) -> 
     let mut ready = true;
     if check_upstreams {
         for (name, upstream) in &runtime.config.upstreams {
-            let connected = tokio::time::timeout(
-                Duration::from_millis(500),
-                tokio::net::TcpStream::connect(upstream.address.as_str()),
-            )
-            .await
-            .is_ok_and(|result| result.is_ok());
+            let connected = if upstream.protocol.uses_http3() {
+                match upstream_h3.route(name) {
+                    Some(route) if upstream.protocol == UpstreamProtocol::Http3 => {
+                        route.is_available()
+                    }
+                    Some(route) => {
+                        route.is_available() || upstream_tcp_reachable(&upstream.address).await
+                    }
+                    None => false,
+                }
+            } else {
+                upstream_tcp_reachable(&upstream.address).await
+            };
             ready &= connected;
             upstreams.insert(name.as_str(), connected);
         }

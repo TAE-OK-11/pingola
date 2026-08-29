@@ -44,6 +44,7 @@ const HTTP3_SEND_CAPACITY_FACTOR: f64 = 2.0;
 const HTTP3_MAX_AMPLIFICATION_FACTOR: usize = 3;
 // 1 vCPU / 1 GiB host: enough bandwidth-delay product for Navidrome streams
 // without allowing slow consumers to retain multi-megabyte buffers per stream.
+// Idle RSS is reclaimed via TCMalloc background release and per-stream hints.
 const HTTP3_INITIAL_MAX_DATA: u64 = 4 * 1024 * 1024;
 const HTTP3_STREAM_WINDOW: u64 = 1024 * 1024;
 const HTTP3_MAX_CONNECTION_WINDOW: u64 = 8 * 1024 * 1024;
@@ -58,11 +59,15 @@ impl ConnectionHook for HybridPqQuicTlsHook {
         &self,
         settings: TlsCertificatePaths<'_>,
     ) -> Option<SslContextBuilder> {
-        Some(
-            build_hybrid_pq_quic_context(settings.cert, settings.private_key).unwrap_or_else(
-                |error| panic!("validated HTTP/3 hybrid PQ TLS context became invalid: {error:#}"),
-            ),
-        )
+        match build_hybrid_pq_quic_context(settings.cert, settings.private_key) {
+            Ok(builder) => Some(builder),
+            Err(error) => {
+                error!(
+                    "validated HTTP/3 hybrid PQ TLS context became invalid: {error:#}"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -277,7 +282,8 @@ async fn run(
         alt_svc,
         allow_early_data,
     });
-    let max_requests_per_connection = u64::from(server.downstream_keepalive_requests);
+    let max_requests_per_connection = server.http3_max_requests_per_connection;
+    let max_streams_per_connection = server.http3_max_concurrent_streams as usize;
     let post_accept_timeout = Duration::from_secs(server.downstream_request_header_timeout_seconds);
     let connection_limit = Arc::new(Semaphore::new(server.downstream_max_connections));
     let admission = Arc::new(Http3Admission::new(
@@ -320,7 +326,9 @@ async fn run(
                             }
                         };
                         let settings = Http3Settings {
-                            max_requests_per_connection: Some(max_requests_per_connection),
+                            max_requests_per_connection: Some(u64::from(
+                                max_requests_per_connection,
+                            )),
                             max_header_list_size: Some(64 * 1024),
                             post_accept_timeout: Some(post_accept_timeout),
                             ..Http3Settings::default()
@@ -332,6 +340,7 @@ async fn run(
                             Http3ConnectionContext {
                                 peer,
                                 shared: shared.clone(),
+                                stream_slots: Arc::new(Semaphore::new(max_streams_per_connection)),
                             },
                             permit,
                             client_permit,
@@ -377,6 +386,7 @@ struct Http3Shared {
 struct Http3ConnectionContext {
     peer: std::net::SocketAddr,
     shared: Arc<Http3Shared>,
+    stream_slots: Arc<Semaphore>,
 }
 
 async fn handle_connection(
@@ -413,7 +423,28 @@ async fn handle_connection(
                 if *is_in_early_data {
                     info!("HTTP/3 early-data request accepted peer={peer}");
                 }
-                tokio::spawn(proxy_request(incoming_headers, context.clone()));
+                let stream_slots = context.stream_slots.clone();
+                let Ok(stream_permit) = stream_slots.try_acquire_owned() else {
+                    warn!("HTTP/3 stream rejected: concurrent stream limit reached peer={peer}");
+                    let IncomingH3Headers { mut send, .. } = incoming_headers;
+                    if let Err(error) = send_error(
+                        &mut send,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "HTTP/3 concurrent stream limit reached",
+                    )
+                    .await
+                    {
+                        warn!(
+                            "failed to reject HTTP/3 stream-limit request peer={peer}: {error:#}"
+                        );
+                    }
+                    continue;
+                };
+                let task_context = context.clone();
+                tokio::spawn(async move {
+                    let _stream_permit = stream_permit;
+                    proxy_request(incoming_headers, task_context).await;
+                });
             }
             ServerH3Event::Core(H3Event::BodyBytesReceived { .. }) => {}
             ServerH3Event::Core(event) => {
@@ -421,6 +452,8 @@ async fn handle_connection(
             }
         }
     }
+    drop(context);
+    crate::allocator::hint_release_idle_pages();
 }
 
 fn early_data_request_is_replay_safe(incoming: &IncomingH3Headers) -> bool {
@@ -490,6 +523,7 @@ async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionCont
         .proxy
         .process_new_http(session, &context.shared.shutdown)
         .await;
+    crate::allocator::hint_release_idle_pages();
 }
 
 fn decode_request_headers(headers: &[h3::Header]) -> Result<RequestHeader> {
