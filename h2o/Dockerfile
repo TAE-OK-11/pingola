@@ -5,39 +5,108 @@ ARG H2O_VERSION=706842c0f8c0d9422efb97a4d8ef7d6ec9df87b7
 ARG H2O_REPOSITORY=https://github.com/h2o/h2o.git
 ARG TARGET_CPU=x86-64-v2
 ARG LTO_MODE=fat
+ARG TLS_PROVIDER=boringssl
+ARG ALLOCATOR=jemalloc
 ARG DEBIAN_SUITE=13
 
-FROM debian:${DEBIAN_SUITE}-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS builder
+FROM debian:${DEBIAN_SUITE}-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS toolchain
+
+ARG DEBIAN_SUITE
+
+RUN --mount=type=cache,id=h2o-apt-toolchain-${DEBIAN_SUITE},target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=h2o-apt-lists-toolchain-${DEBIAN_SUITE},target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && apt-get update -o Acquire::Retries=3 \
+    && apt-get install --yes --no-install-recommends \
+        autoconf \
+        automake \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        git \
+        golang-go \
+        g++ \
+        libtool \
+        lld \
+        llvm \
+        ninja-build \
+        perl \
+        pkg-config \
+        zlib1g-dev
+
+FROM toolchain AS tls-builder
+
+ARG TARGET_CPU
+ARG LTO_MODE
+ARG TLS_PROVIDER
+
+WORKDIR /build
+COPY --link scripts/build-tls.sh /usr/local/bin/build-tls.sh
+
+RUN --mount=type=cache,id=h2o-tls-${TLS_PROVIDER},target=/tmp/h2o-tls-cache,sharing=locked \
+    chmod 755 /usr/local/bin/build-tls.sh \
+    && set -eux; \
+    case "${TARGET_CPU}" in \
+      x86-64-v2) ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' ;; \
+      *) echo "unsupported target CPU: ${TARGET_CPU}" >&2; exit 2 ;; \
+    esac; \
+    case "${LTO_MODE}" in \
+      fat) LTO_FLAGS='-flto' ;; \
+      thin) LTO_FLAGS='-flto=thin' ;; \
+      off) LTO_FLAGS='' ;; \
+      *) echo "unsupported LTO mode: ${LTO_MODE}" >&2; exit 2 ;; \
+    esac; \
+    case "${TLS_PROVIDER}" in boringssl|aws-lc) ;; \
+      *) echo "unsupported TLS provider: ${TLS_PROVIDER}" >&2; exit 2 ;; \
+    esac; \
+    WORK_ROOT=/tmp/h2o-tls-cache /usr/local/bin/build-tls.sh /opt/tls "${TLS_PROVIDER}" "${ARCH_FLAGS}"
+
+FROM toolchain AS allocator-builder
+
+ARG TARGET_CPU
+ARG ALLOCATOR
+
+WORKDIR /build
+COPY --link scripts/build-allocator.sh /usr/local/bin/build-allocator.sh
+
+RUN --mount=type=cache,id=h2o-allocator-${ALLOCATOR},target=/tmp/h2o-allocator-cache,sharing=locked \
+    chmod 755 /usr/local/bin/build-allocator.sh \
+    && set -eux; \
+    case "${TARGET_CPU}" in \
+      x86-64-v2) ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' ;; \
+      *) echo "unsupported target CPU: ${TARGET_CPU}" >&2; exit 2 ;; \
+    esac; \
+    case "${ALLOCATOR}" in system|jemalloc|tcmalloc|mimalloc) ;; \
+      *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; \
+    esac; \
+    WORK_ROOT=/tmp/h2o-allocator-cache /usr/local/bin/build-allocator.sh /opt/allocator "${ALLOCATOR}" "${ARCH_FLAGS}"
+
+FROM toolchain AS aegis-builder
+
+ARG TARGET_CPU
+
+WORKDIR /build
+COPY --link scripts/build-aegis.sh /usr/local/bin/build-aegis.sh
+
+RUN --mount=type=cache,id=h2o-aegis,target=/tmp/h2o-aegis-cache,sharing=locked \
+    chmod 755 /usr/local/bin/build-aegis.sh \
+    && ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' \
+    && WORK_ROOT=/tmp/h2o-aegis-cache /usr/local/bin/build-aegis.sh /opt/aegis "${ARCH_FLAGS}"
+
+FROM toolchain AS builder
 
 ARG DEBIAN_SUITE
 ARG H2O_VERSION
 ARG H2O_REPOSITORY
 ARG TARGET_CPU
 ARG LTO_MODE
-
-RUN --mount=type=cache,id=h2o-apt-builder-${DEBIAN_SUITE},target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,id=h2o-apt-lists-builder-${DEBIAN_SUITE},target=/var/lib/apt/lists,sharing=locked \
-    rm -f /etc/apt/apt.conf.d/docker-clean \
-    && apt-get update -o Acquire::Retries=3 \
-    && apt-get install --yes --no-install-recommends \
-        build-essential \
-        ca-certificates \
-        clang \
-        cmake \
-        git \
-        g++ \
-        libssl-dev \
-        lld \
-        llvm \
-        ninja-build \
-        perl \
-        pkg-config \
-        zlib1g-dev \
-    && git --version \
-    && clang --version | head -n1 \
-    && cmake --version | head -n1
+ARG TLS_PROVIDER
+ARG ALLOCATOR
 
 WORKDIR /src
+
+COPY --link scripts/build-tls.sh scripts/build-allocator.sh scripts/build-aegis.sh /usr/local/bin/
 
 RUN git init h2o \
     && git -C h2o remote add origin "${H2O_REPOSITORY}" \
@@ -46,7 +115,10 @@ RUN git init h2o \
     && test "$(git -C h2o rev-parse HEAD)" = "${H2O_VERSION}" \
     && git -C h2o submodule update --init --recursive --depth=1
 
-RUN --mount=type=cache,id=h2o-cmake-build-${H2O_VERSION}-${TARGET_CPU}-${LTO_MODE},target=/src/h2o/build,sharing=locked \
+RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
+    --mount=from=allocator-builder,source=/opt/allocator,target=/opt/allocator,ro \
+    --mount=from=aegis-builder,source=/opt/aegis,target=/opt/aegis,ro \
+    --mount=type=cache,id=h2o-cmake-build-${H2O_VERSION}-${TARGET_CPU}-${LTO_MODE}-${TLS_PROVIDER}-${ALLOCATOR},target=/src/h2o/build,sharing=locked \
     set -eux; \
     case "${TARGET_CPU}" in \
       x86-64-v2) ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' ;; \
@@ -58,11 +130,9 @@ RUN --mount=type=cache,id=h2o-cmake-build-${H2O_VERSION}-${TARGET_CPU}-${LTO_MOD
       off) LTO_FLAGS='' ;; \
       *) echo "unsupported LTO mode: ${LTO_MODE}" >&2; exit 2 ;; \
     esac; \
+    ALLOCATOR_LINK="$(tr -d '\n' </opt/allocator/linker.flags)"; \
+    LINK_FLAGS="-fuse-ld=lld -Wl,--gc-sections ${LTO_FLAGS} ${ALLOCATOR_LINK}"; \
     COMMON_FLAGS="-O3 ${ARCH_FLAGS} ${LTO_FLAGS} -fno-strict-aliasing"; \
-    LINK_FLAGS="-fuse-ld=lld -Wl,--gc-sections"; \
-    if [ -n "${LTO_FLAGS}" ]; then \
-      LINK_FLAGS="${LINK_FLAGS} ${LTO_FLAGS}"; \
-    fi; \
     cmake -G Ninja -S h2o -B h2o/build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_C_COMPILER=clang \
@@ -70,13 +140,23 @@ RUN --mount=type=cache,id=h2o-cmake-build-${H2O_VERSION}-${TARGET_CPU}-${LTO_MOD
       -DCMAKE_C_FLAGS="${COMMON_FLAGS}" \
       -DCMAKE_CXX_FLAGS="${COMMON_FLAGS}" \
       -DCMAKE_EXE_LINKER_FLAGS="${LINK_FLAGS}" \
-      -DCMAKE_SHARED_LINKER_FLAGS="${LINK_FLAGS}" \
+      -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--gc-sections ${LTO_FLAGS}" \
+      -DCMAKE_PREFIX_PATH="/opt/aegis" \
+      -DOPENSSL_ROOT_DIR=/opt/tls \
+      -DOPENSSL_USE_STATIC_LIBS=ON \
+      -DEXTERNALPROJECT_SSL_ROOT_DIR=/opt/tls \
       -DWITH_MRUBY=OFF \
       -DWITH_DTRACE=OFF \
-      -DWITH_CCACHE=OFF; \
+      -DWITH_CCACHE=OFF \
+      -DWITH_FUSION=ON \
+      -DWITH_KTLS=ON \
+      -DWITH_IO_URING=ON; \
     cmake --build h2o/build --target h2o -j "$(nproc)"; \
+    install -d /out; \
     install -Dm755 h2o/build/h2o /out/h2o; \
-    h2o/build/h2o --version | tee /out/h2o-version.txt
+    h2o/build/h2o --version | tee /out/h2o-version.txt; \
+    cp /opt/tls/tls-provider.txt /out/tls-provider.txt; \
+    cp /opt/allocator/allocator.txt /out/allocator.txt
 
 FROM debian:${DEBIAN_SUITE}-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS runtime
 
@@ -85,6 +165,8 @@ ARG BUILD_REVISION=unknown
 ARG H2O_VERSION
 ARG TARGET_CPU
 ARG LTO_MODE
+ARG TLS_PROVIDER
+ARG ALLOCATOR
 ARG DEBIAN_SUITE
 
 LABEL org.opencontainers.image.title="H2O" \
@@ -97,6 +179,8 @@ LABEL org.opencontainers.image.title="H2O" \
       org.opencontainers.image.h2o.target-cpu="${TARGET_CPU}" \
       org.opencontainers.image.h2o.lto="${LTO_MODE}" \
       org.opencontainers.image.h2o.linker="lld" \
+      org.opencontainers.image.tls.provider="${TLS_PROVIDER}" \
+      org.opencontainers.image.allocator="${ALLOCATOR}" \
       org.opencontainers.image.licenses="MIT"
 
 RUN --mount=from=builder,source=/out,target=/out,ro \
@@ -110,6 +194,8 @@ RUN --mount=from=builder,source=/out,target=/out,ro \
     && install -d -o 10001 -g 10001 /etc/h2o /tmp/h2o /usr/share/h2o/health \
     && install -Dm755 /out/h2o /usr/local/bin/h2o \
     && install -Dm644 /out/h2o-version.txt /usr/share/doc/h2o/version.txt \
+    && install -Dm644 /out/tls-provider.txt /usr/share/doc/h2o/tls-provider.txt \
+    && install -Dm644 /out/allocator.txt /usr/share/doc/h2o/allocator.txt \
     && install -d -o 10001 -g 10001 /usr/local/share/h2o \
     && ln -sf /etc/ssl/certs/ca-certificates.crt /usr/local/share/h2o/ca-bundle.crt \
     && setcap cap_net_bind_service=+ep /usr/local/bin/h2o \
@@ -118,6 +204,7 @@ RUN --mount=from=builder,source=/out,target=/out,ro \
 COPY --link --chown=10001:10001 config/h2o.conf /etc/h2o/h2o.conf
 COPY --link --chown=10001:10001 health/index.txt /usr/share/h2o/health/index.txt
 COPY --link --chmod=755 scripts/healthcheck.sh /usr/local/bin/h2o-healthcheck
+COPY --link --chmod=755 scripts/allocator-info.sh /usr/local/bin/h2o-allocator-info
 
 USER 10001:10001
 WORKDIR /tmp/h2o

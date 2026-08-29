@@ -5,6 +5,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGE=${H2O_TEST_IMAGE:-ghcr.io/tae-ok-11/pingora/h2o:local}
 EXPECTED_TARGET_CPU=${H2O_EXPECTED_TARGET_CPU:-x86-64-v2}
 EXPECTED_LTO=${H2O_EXPECTED_LTO:-fat}
+EXPECTED_TLS_PROVIDER=${H2O_EXPECTED_TLS_PROVIDER:-boringssl}
+EXPECTED_ALLOCATOR=${H2O_EXPECTED_ALLOCATOR:-jemalloc}
+EXPECTED_TLS_PROVIDER=${H2O_EXPECTED_TLS_PROVIDER:-boringssl}
+EXPECTED_ALLOCATOR=${H2O_EXPECTED_ALLOCATOR:-tcmalloc}
 RUNTIME=${H2O_DOCKER_TEST_RUNTIME:-/tmp/h2o-docker-runtime}
 CONTAINERS=()
 
@@ -81,8 +85,14 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.h2o.target-cpu"}}' "${name}") == "${EXPECTED_TARGET_CPU}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.h2o.lto"}}' "${name}") == "${EXPECTED_LTO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.h2o.linker"}}' "${name}") == lld ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.tls.provider"}}' "${name}") == "${EXPECTED_TLS_PROVIDER}" ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.allocator"}}' "${name}") == "${EXPECTED_ALLOCATOR}" ]]
   docker image inspect "${IMAGE}" | jq -e '.[0].Config.ExposedPorts["443/udp"] != null' >/dev/null
   docker exec "${name}" test -s /usr/share/doc/h2o/version.txt
+  docker exec "${name}" grep -q "tls_provider=${EXPECTED_TLS_PROVIDER}" /usr/share/doc/h2o/tls-provider.txt
+  docker exec "${name}" grep -q "allocator=${EXPECTED_ALLOCATOR}" /usr/share/doc/h2o/allocator.txt
+  docker exec "${name}" /usr/local/bin/h2o-allocator-info | grep -q "allocator=${EXPECTED_ALLOCATOR}"
+  docker exec "${name}" /usr/local/bin/h2o --version | grep -qi 'fusion: YES'
 
   if docker exec "${name}" sh -c 'command -v setcap >/dev/null || dpkg-query -W libcap2-bin >/dev/null 2>&1'; then
     echo "runtime image unexpectedly contains libcap2-bin" >&2
@@ -99,4 +109,4 @@ curl --noproxy '*' -fsS -H 'host: health.invalid' \
   http://127.0.0.1:80/pingora-health -o /dev/null
 docker exec h2o-test-http /usr/local/bin/h2o -c /etc/h2o/h2o.conf -m test >/dev/null
 
-echo "Docker UID 10001, read-only filesystem, healthcheck, ${EXPECTED_LTO} LTO, and config validation tests passed"
+echo "Docker UID 10001, read-only filesystem, ${EXPECTED_TLS_PROVIDER}, ${EXPECTED_ALLOCATOR}, fusion, healthcheck, and config validation tests passed"
