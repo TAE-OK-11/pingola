@@ -1,0 +1,147 @@
+name: h2o-verify-and-publish
+
+concurrency:
+  group: h2o-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_images:
+        description: Publish production images
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - h2o/**
+      - .github/workflows/h2o.yml
+    tags: ["h2o-v*"]
+  pull_request:
+    paths:
+      - h2o/**
+      - .github/workflows/h2o.yml
+
+permissions:
+  contents: read
+
+env:
+  H2O_VERSION: 706842c0f8c0d9422efb97a4d8ef7d6ec9df87b7
+
+jobs:
+  verify-config:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Static checks
+        run: |
+          bash -n h2o/scripts/healthcheck.sh
+          bash -n h2o/tests/docker_runtime.sh
+          grep -q 'num-threads: 1' h2o/config/h2o.conf
+          grep -q 'proxy.reverse.url: http://10.77.0.1:4533' h2o/config/h2o.conf
+          grep -q 'type: quic' h2o/config/h2o.conf
+
+  image-test:
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.publish_images != true)
+    needs: verify-config
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_cpu: x86-64-v2
+            lto_mode: fat
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build image once
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: h2o
+          load: true
+          tags: h2o:ci-${{ matrix.target_cpu }}
+          pull: true
+          build-args: |
+            H2O_VERSION=${{ env.H2O_VERSION }}
+            TARGET_CPU=${{ matrix.target_cpu }}
+            LTO_MODE=${{ matrix.lto_mode }}
+            BUILD_VERSION=ci
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=h2o-image-test-${{ matrix.target_cpu }}-${{ matrix.lto_mode }}
+          cache-to: type=gha,mode=max,scope=h2o-image-test-${{ matrix.target_cpu }}-${{ matrix.lto_mode }}
+
+      - name: Verify image
+        env:
+          IMAGE: h2o:ci-${{ matrix.target_cpu }}
+          H2O_TEST_IMAGE: h2o:ci-${{ matrix.target_cpu }}
+          H2O_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
+          H2O_EXPECTED_LTO: ${{ matrix.lto_mode }}
+        run: |
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.h2o.target-cpu"]')" = "${{ matrix.target_cpu }}"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.h2o.lto"]')" = "${{ matrix.lto_mode }}"
+          bash h2o/tests/docker_runtime.sh
+
+  publish:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_images)
+    needs: verify-config
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Sign in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: |
+            ghcr.io/tae-ok-11/pingora/h2o
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=match,pattern=h2o-v(.*),group=1
+          labels: |
+            org.opencontainers.image.title=JBS H2O
+            org.opencontainers.image.description=Debian 13 H2O reverse proxy with HTTP/1, HTTP/2, and HTTP/3
+            org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
+            org.opencontainers.image.h2o.version=${{ env.H2O_VERSION }}
+
+      - name: Build and publish x86-64-v2 fat-LTO image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: h2o
+          platforms: linux/amd64
+          push: true
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            H2O_VERSION=${{ env.H2O_VERSION }}
+            TARGET_CPU=x86-64-v2
+            LTO_MODE=fat
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: |
+            type=gha,scope=h2o-image-x86-64-v2-fat
+            type=gha,scope=h2o-image-test-x86-64-v2-fat
+          cache-to: type=gha,mode=max,scope=h2o-image-x86-64-v2-fat
+          provenance: mode=max
+          sbom: true
