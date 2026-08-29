@@ -33,6 +33,7 @@ RUN --mount=type=cache,id=h2o-apt-toolchain-${DEBIAN_SUITE},target=/var/cache/ap
         ninja-build \
         perl \
         pkg-config \
+        liburing-dev \
         zlib1g-dev
 
 FROM toolchain AS tls-builder
@@ -143,6 +144,8 @@ RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
       -DCMAKE_EXE_LINKER_FLAGS="${LINK_FLAGS}" \
       -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--gc-sections ${LTO_FLAGS}" \
       -DCMAKE_PREFIX_PATH="/opt/aegis" \
+      -DZLIB_LIBRARY=/usr/lib/x86_64-linux-gnu/libz.so \
+      -DZLIB_INCLUDE_DIR=/usr/include \
       -DOPENSSL_ROOT_DIR=/opt/tls \
       -DOPENSSL_USE_STATIC_LIBS=ON \
       -DEXTERNALPROJECT_SSL_ROOT_DIR=/opt/tls \
