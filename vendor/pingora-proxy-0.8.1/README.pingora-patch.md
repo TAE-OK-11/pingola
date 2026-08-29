@@ -32,3 +32,5 @@ small set of documented local changes.
 - Local change: optional downstream polling in the HTTP/1 bodyless fast path.
 - Reason: long-lived streams need disconnect propagation; short fixed-size proxy
   responses can skip a `select!` branch on every upstream body chunk.
+- Local change: HTTP/2 bodyless fast path reuses the same downstream poll opt-in
+  and skips HTTP/1 chunked framing when the client is already HTTP/2.

@@ -354,62 +354,106 @@ where
         }
 
         if !header_eos {
-            loop {
-                tokio::select! {
-                    biased;
-                    chunk = client_session.read_response_body() => {
-                        match chunk.map_err(|e| e.into_up())? {
-                            Some(data) => {
-                                let eos = client_session
-                                    .check_response_end_or_error()
-                                    .map_err(|e| e.into_up())?;
-                                if data.is_empty() && !eos {
-                                    continue;
-                                }
-                                let done = self
-                                    .write_filtered_h2_task(
-                                        session,
-                                        HttpTask::Body(Some(data), eos),
-                                        ctx,
-                                    )
-                                    .await?;
-                                if done || eos {
-                                    break;
-                                }
-                            }
-                            None => {
-                                let trailers = client_session
-                                    .read_trailers()
-                                    .await
-                                    .map_err(|e| e.into_up())?;
-                                if let Some(trailers) = trailers {
+            if self.inner.h1_bodyless_poll_downstream(session, ctx) {
+                loop {
+                    tokio::select! {
+                        biased;
+                        chunk = client_session.read_response_body() => {
+                            match chunk.map_err(|e| e.into_up())? {
+                                Some(data) => {
+                                    let eos = client_session
+                                        .check_response_end_or_error()
+                                        .map_err(|e| e.into_up())?;
+                                    if data.is_empty() && !eos {
+                                        continue;
+                                    }
                                     let done = self
                                         .write_filtered_h2_task(
                                             session,
-                                            HttpTask::Trailer(Some(Box::new(trailers))),
+                                            HttpTask::Body(Some(data), eos),
                                             ctx,
                                         )
                                         .await?;
-                                    if done {
+                                    if done || eos {
                                         break;
                                     }
                                 }
-                                let _ = self
-                                    .write_filtered_h2_task(session, HttpTask::Done, ctx)
-                                    .await?;
-                                break;
+                                None => {
+                                    let trailers = client_session
+                                        .read_trailers()
+                                        .await
+                                        .map_err(|e| e.into_up())?;
+                                    if let Some(trailers) = trailers {
+                                        let done = self
+                                            .write_filtered_h2_task(
+                                                session,
+                                                HttpTask::Trailer(Some(Box::new(trailers))),
+                                                ctx,
+                                            )
+                                            .await?;
+                                        if done {
+                                            break;
+                                        }
+                                    }
+                                    let _ = self
+                                        .write_filtered_h2_task(session, HttpTask::Done, ctx)
+                                        .await?;
+                                    break;
+                                }
+                            }
+                        }
+                        downstream = session.downstream_session.read_body_or_idle(true) => {
+                            match downstream {
+                                Err(e) => return Err(e.into_down()),
+                                Ok(_) => {
+                                    return Error::explain(
+                                        ReadError,
+                                        "unexpected downstream body on an empty HTTP/2 request",
+                                    ).into_err();
+                                }
                             }
                         }
                     }
-                    downstream = session.downstream_session.read_body_or_idle(true) => {
-                        match downstream {
-                            Err(e) => return Err(e.into_down()),
-                            Ok(_) => {
-                                return Error::explain(
-                                    ReadError,
-                                    "unexpected downstream body on an empty HTTP/2 request",
-                                ).into_err();
+                }
+            } else {
+                loop {
+                    match client_session.read_response_body().await.map_err(|e| e.into_up())? {
+                        Some(data) => {
+                            let eos = client_session
+                                .check_response_end_or_error()
+                                .map_err(|e| e.into_up())?;
+                            if data.is_empty() && !eos {
+                                continue;
                             }
+                            let done = self
+                                .write_filtered_h2_task(
+                                    session,
+                                    HttpTask::Body(Some(data), eos),
+                                    ctx,
+                                )
+                                .await?;
+                            if done || eos {
+                                break;
+                            }
+                        }
+                        None => {
+                            let trailers = client_session
+                                .read_trailers()
+                                .await
+                                .map_err(|e| e.into_up())?;
+                            if let Some(trailers) = trailers {
+                                let _ = self
+                                    .write_filtered_h2_task(
+                                        session,
+                                        HttpTask::Trailer(Some(Box::new(trailers))),
+                                        ctx,
+                                    )
+                                    .await?;
+                            }
+                            let _ = self
+                                .write_filtered_h2_task(session, HttpTask::Done, ctx)
+                                .await?;
+                            break;
                         }
                     }
                 }
@@ -457,16 +501,19 @@ where
         match task {
             HttpTask::Header(mut header, end) => {
                 self.inner.response_filter(session, &mut header, ctx).await?;
-                // write_response_header panics on HTTP/2 versions for H1 downstream.
-                header.set_version(Version::HTTP_11);
-                let no_body = session.req_header().method == Method::HEAD
-                    || matches!(header.status.as_u16(), 204 | 304);
-                if !no_body
-                    && !header.status.is_informational()
-                    && header.headers.get(CONTENT_LENGTH).is_none()
-                    && header.headers.get(header::TRANSFER_ENCODING).is_none()
-                {
-                    header.insert_header(header::TRANSFER_ENCODING, "chunked")?;
+                let h2_downstream = session.downstream_session.as_http2().is_some();
+                if !h2_downstream {
+                    // write_response_header panics on HTTP/2 versions for H1 downstream.
+                    header.set_version(Version::HTTP_11);
+                    let no_body = session.req_header().method == Method::HEAD
+                        || matches!(header.status.as_u16(), 204 | 304);
+                    if !no_body
+                        && !header.status.is_informational()
+                        && header.headers.get(CONTENT_LENGTH).is_none()
+                        && header.headers.get(header::TRANSFER_ENCODING).is_none()
+                    {
+                        header.insert_header(header::TRANSFER_ENCODING, "chunked")?;
+                    }
                 }
                 Ok(HttpTask::Header(header, end))
             }
