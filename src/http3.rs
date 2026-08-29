@@ -261,7 +261,9 @@ async fn run(
     let public_listen: std::net::SocketAddr = server.http3_listen[0]
         .parse()
         .context("HTTP/3 public listen address is not a valid socket address")?;
-    let alt_svc = runtime.http3_alt_svc_header().cloned();
+    let alt_svc = runtime
+        .http3_alt_svc_header()
+        .map(|value| Arc::new(value.clone()));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let proxy = Arc::new(http_proxy(&server_conf, gateway));
     let shared = Arc::new(Http3Shared {
@@ -363,7 +365,7 @@ struct Http3Shared {
     proxy: Arc<HttpProxy<Gateway>>,
     shutdown: ShutdownWatch,
     public_listen: std::net::SocketAddr,
-    alt_svc: Option<http::HeaderValue>,
+    alt_svc: Option<Arc<HeaderValue>>,
     allow_early_data: bool,
 }
 
@@ -546,12 +548,13 @@ fn decode_request_headers(headers: &[h3::Header]) -> Result<RequestHeader> {
     let uri = Uri::builder()
         .scheme(Scheme::HTTPS)
         .authority(authority)
-        .path_and_query(path.clone())
+        .path_and_query(path.as_str())
         .build()
         .context("failed to construct HTTP/3 request URI")?;
 
+    let header_count = regular.len() + 1;
     let mut request =
-        RequestHeader::build_no_case(method, path.as_str().as_bytes(), Some(regular.len() + 1))
+        RequestHeader::build_no_case(method, path.as_str().as_bytes(), Some(header_count))
             .map_err(|error| anyhow!("failed to build HTTP/3 request header: {error}"))?;
     // Pingora's HTTP/1 client can serialize HTTP/2 as HTTP/1.1 but panics on
     // HTTP/3. Direct QUIC sessions are identified with `is_custom()`, not the

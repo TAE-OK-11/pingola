@@ -596,7 +596,8 @@ where
 
                 /* Add chunked header to tell downstream to use chunked encoding
                  * during the absent of content-length */
-                if !no_body
+                if !session.downstream_session.is_custom()
+                    && !no_body
                     && !header.status.is_informational()
                     && header.headers.get(http::header::CONTENT_LENGTH).is_none()
                 {

@@ -46,6 +46,11 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool>;
 
+    /// Write one response task without constructing a temporary task vector.
+    async fn response_duplex_one(&mut self, task: HttpTask) -> Result<bool> {
+        self.response_duplex_vec(vec![task]).await
+    }
+
     fn set_read_timeout(&mut self, timeout: Option<Duration>);
 
     fn get_read_timeout(&self) -> Option<Duration>;

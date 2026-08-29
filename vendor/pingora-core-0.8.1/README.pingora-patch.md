@@ -45,6 +45,10 @@ small set of documented local changes.
   for every request and response even though most traffic uses only a handful.
   The upstream `patched_http1` feature retains its initialized buffer because
   its separate unchecked parser does not expose the uninitialized-header API.
+- Local change: `response_duplex_one()` on custom downstream sessions.
+- Reason: HTTP/3 bodyless responses use the same single-task write path as
+  HTTP/1. Avoid constructing a temporary `Vec<HttpTask>` on every response
+  chunk for custom sessions.
 - Local change: initialize HTTP/1 body read slices before passing them to
   `AsyncReadExt::read`.
 - Reason: extending `BytesMut` with `set_len` exposed uninitialized allocation

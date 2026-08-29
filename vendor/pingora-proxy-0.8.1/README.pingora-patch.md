@@ -21,8 +21,7 @@ small set of documented local changes.
 - Local change: clone only semantic HTTP/2 request parts (`as_owned_parts`).
 - Reason: HTTP/2 never needs the downstream header-case map on the upstream
   request, so hop-by-hop mutations should update one map.
-- Local change: avoid an intermediate `String` when synthesizing `Host` from
-  `:authority` on HTTP/2 → HTTP/1 translation.
-
-Remove this dependency patch after a released Pingora version adopts
-equivalent implementations.
+- Local change: skip HTTP/1 chunked `Transfer-Encoding` injection when the
+  downstream session is custom (HTTP/3).
+- Reason: QUIC responses do not use HTTP/1 framing; adding and then stripping
+  hop-by-hop headers wasted work on the bodyless and duplex proxy paths.
