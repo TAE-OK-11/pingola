@@ -9,8 +9,6 @@ services:
         LTO_MODE: fat
         TLS_PROVIDER: boringssl
         ALLOCATOR: jemalloc
-        TLS_PROVIDER: boringssl
-        ALLOCATOR: tcmalloc
     network_mode: host
     restart: unless-stopped
     stop_signal: SIGTERM

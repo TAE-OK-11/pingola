@@ -47,7 +47,7 @@ jobs:
           grep -q 'num-threads: 1' h2o/config/h2o.conf
           grep -q 'temp-buffer-path: /tmp/h2o' h2o/config/h2o.conf
           grep -q 'type: quic' h2o/config/h2o.conf
-          grep -q 'ALLOCATOR=jemalloc' h2o/docker-compose.yml
+          grep -q 'ALLOCATOR: jemalloc' h2o/docker-compose.yml
 
   image-test:
     if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.publish_images != true)
