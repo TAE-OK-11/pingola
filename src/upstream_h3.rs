@@ -1,27 +1,20 @@
 use std::collections::{HashMap, VecDeque};
 use std::error::Error as StdError;
 use std::io;
-use std::net::{
-    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener, ToSocketAddrs,
-};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Bytes, BytesMut};
-use futures::stream;
+use cloudflare_pingora::http::RequestHeader;
 use http::header::{CONNECTION, HOST, TE, TRANSFER_ENCODING, UPGRADE};
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
-use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, StreamBody};
-use hyper::body::{Body as _, Frame, Incoming};
-use hyper::server::conn::http2;
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use hyper::body::Frame;
 use log::{info, warn};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_quiche::quiche;
 use tokio_quiche::quiche::h3::{self, NameValue};
@@ -29,7 +22,8 @@ use tokio_quiche::quiche::h3::{self, NameValue};
 use crate::config::{RuntimeConfig, UpstreamConfig, UpstreamProtocol};
 use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+pub const H3_UPSTREAM_ALPN: &[u8] = b"jbs-h3-upstream";
+
 const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(100);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_UDP_PAYLOAD: usize = 1452;
@@ -44,26 +38,16 @@ const H3_CONTROL_STREAMS: u64 = 8;
 const SEND_CAPACITY_FACTOR: f64 = 3.0;
 const CC_CUBIC: &str = "cubic";
 const CC_BBR2: &str = "bbr2";
-const BRIDGE_H2_STREAM_WINDOW: u32 = 1024 * 1024;
-const BRIDGE_H2_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
-const BRIDGE_H2_MAX_FRAME: u32 = 64 * 1024;
-const BRIDGE_H2_MAX_STREAMS: u32 = MAX_PENDING_REQUESTS as u32;
-
 type BoxError = Box<dyn StdError + Send + Sync>;
-type BridgeBody = UnsyncBoxBody<Bytes, BoxError>;
 
 #[derive(Clone, Debug)]
-pub struct BridgeRoute {
-    address: SocketAddr,
+pub struct H3Route {
+    origin: SocketAddr,
     available: Arc<AtomicBool>,
     forced: bool,
 }
 
-impl BridgeRoute {
-    pub fn address(&self) -> SocketAddr {
-        self.address
-    }
-
+impl H3Route {
     pub fn should_use_h3(&self) -> bool {
         self.forced || self.available.load(Ordering::Acquire)
     }
@@ -71,12 +55,21 @@ impl BridgeRoute {
 
 #[derive(Default)]
 pub struct UpstreamH3Registry {
-    routes: HashMap<String, BridgeRoute>,
+    routes: HashMap<String, H3Route>,
+    pools: HashMap<String, Arc<H3Pool>>,
 }
 
 impl UpstreamH3Registry {
-    pub fn route(&self, name: &str) -> Option<&BridgeRoute> {
+    pub fn route(&self, name: &str) -> Option<&H3Route> {
         self.routes.get(name)
+    }
+
+    pub fn pool(&self, upstream_name: &str) -> Option<Arc<H3Pool>> {
+        self.pools.get(upstream_name).cloned()
+    }
+
+    pub fn has_routes(&self) -> bool {
+        !self.routes.is_empty()
     }
 }
 
@@ -93,18 +86,13 @@ struct BridgeSettings {
     cc_algorithm: &'static str,
 }
 
-struct BridgeSpec {
-    listener: StdTcpListener,
-    settings: BridgeSettings,
-    available: Arc<AtomicBool>,
-}
-
 pub fn start(
     runtime: Arc<RuntimeConfig>,
     h3_runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<Arc<UpstreamH3Registry>> {
     let mut routes = HashMap::new();
-    let mut specs = Vec::new();
+    let mut pools = HashMap::new();
+    let mut pool_workers = Vec::new();
 
     for (name, upstream) in &runtime.config.upstreams {
         if !upstream.protocol.uses_http3() {
@@ -116,78 +104,51 @@ pub fn start(
 
         let origin = resolve_origin(name, upstream)?;
         let server_name = upstream_server_name(name, upstream)?;
-        let listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .with_context(|| format!("failed to allocate HTTP/3 bridge listener for {name}"))?;
-        listener.set_nonblocking(true).with_context(|| {
-            format!("failed to make HTTP/3 bridge listener nonblocking for {name}")
-        })?;
-        let address = listener.local_addr()?;
         let available = Arc::new(AtomicBool::new(false));
         let forced = upstream.protocol == UpstreamProtocol::Http3;
-
+        let settings = BridgeSettings {
+            name: name.clone(),
+            origin,
+            server_name,
+            verify_peer: upstream.verify_certificate,
+            connect_timeout: Duration::from_secs(upstream.connect_timeout_seconds),
+            idle_timeout: Duration::from_secs(upstream.idle_timeout_seconds.max(1)),
+            max_streams: upstream.http3_max_concurrent_streams as u64,
+            enable_early_data: upstream.http3_early_data,
+            cc_algorithm: if upstream.http3_bbr2 {
+                CC_BBR2
+            } else {
+                CC_CUBIC
+            },
+        };
+        let (pool, receiver) = H3Pool::new(&settings);
+        pools.insert(name.clone(), pool);
+        pool_workers.push((settings, receiver, available.clone()));
         routes.insert(
             name.clone(),
-            BridgeRoute {
-                address,
-                available: available.clone(),
+            H3Route {
+                origin,
+                available,
                 forced,
             },
         );
-        specs.push(BridgeSpec {
-            listener,
-            settings: BridgeSettings {
-                name: name.clone(),
-                origin,
-                server_name,
-                verify_peer: upstream.verify_certificate,
-                connect_timeout: Duration::from_secs(upstream.connect_timeout_seconds),
-                idle_timeout: Duration::from_secs(upstream.idle_timeout_seconds.max(1)),
-                max_streams: upstream.http3_max_concurrent_streams as u64,
-                enable_early_data: upstream.http3_early_data,
-                cc_algorithm: if upstream.http3_bbr2 {
-                    CC_BBR2
-                } else {
-                    CC_CUBIC
-                },
-            },
-            available,
-        });
     }
 
-    let registry = Arc::new(UpstreamH3Registry { routes });
-    if specs.is_empty() {
+    let registry = Arc::new(UpstreamH3Registry { routes, pools });
+    if !registry.has_routes() {
         return Ok(registry);
     }
     let h3_runtime = h3_runtime
-        .ok_or_else(|| anyhow!("upstream HTTP/3 routes require the shared HTTP/3 runtime"))?;
-
-    let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<(), String>>(1);
-    h3_runtime.spawn(async move {
-        for spec in specs {
-            let listener = match TcpListener::from_std(spec.listener) {
-                Ok(listener) => listener,
-                Err(error) => {
-                    let _ = ready_tx.send(Err(format!(
-                        "upstream HTTP/3 bridge listener conversion failed: {error}"
-                    )));
-                    return;
-                }
-            };
-            let pool = H3Pool::new(spec.settings.clone(), spec.available.clone());
-            tokio::spawn(serve_bridge(listener, pool));
-        }
-        let _ = ready_tx.send(Ok(()));
-    });
-
-    ready_rx
-        .recv_timeout(STARTUP_TIMEOUT)
-        .map_err(|error| anyhow!("upstream HTTP/3 startup did not complete: {error}"))?
-        .map_err(anyhow::Error::msg)?;
+        .ok_or_else(|| anyhow!("upstream HTTP/3 routes require the shared HTTP/3 runtime"))?
+        .clone();
+    for (settings, receiver, available) in pool_workers {
+        h3_runtime.spawn(pool_manager(settings, receiver, available));
+    }
 
     for (name, route) in &registry.routes {
         info!(
-            "upstream HTTP/3 bridge started: upstream={} h2c={} forced={} hybrid_pq={} early_data=replay-safe-only",
-            name, route.address, route.forced, HYBRID_PQ_GROUPS,
+            "upstream HTTP/3 pool started: upstream={} origin={} forced={} hybrid_pq={} early_data=replay-safe-only",
+            name, route.origin, route.forced, HYBRID_PQ_GROUPS,
         );
     }
     Ok(registry)
@@ -222,14 +183,14 @@ fn upstream_server_name(name: &str, upstream: &UpstreamConfig) -> Result<String>
     Ok(authority.to_string())
 }
 
-struct H3Pool {
+pub(crate) struct H3Pool {
     commands: mpsc::Sender<Command>,
     next_id: AtomicU64,
     request_slots: Arc<Semaphore>,
 }
 
 impl H3Pool {
-    fn new(settings: BridgeSettings, available: Arc<AtomicBool>) -> Arc<Self> {
+    fn new(settings: &BridgeSettings) -> (Arc<Self>, mpsc::Receiver<Command>) {
         let request_capacity = usize::try_from(settings.max_streams)
             .unwrap_or(MAX_PENDING_REQUESTS)
             .clamp(1, MAX_PENDING_REQUESTS);
@@ -240,11 +201,10 @@ impl H3Pool {
             next_id: AtomicU64::new(1),
             request_slots: Arc::new(Semaphore::new(request_capacity)),
         });
-        tokio::spawn(pool_manager(settings, receiver, available));
-        pool
+        (pool, receiver)
     }
 
-    async fn open(
+    pub(crate) async fn open(
         &self,
         headers: Vec<h3::Header>,
         has_body: bool,
@@ -290,26 +250,16 @@ impl H3Pool {
     }
 }
 
-struct RequestHandle {
-    id: u64,
-    commands: mpsc::Sender<Command>,
-    opened: Option<oneshot::Receiver<Result<(), String>>>,
+pub(crate) struct RequestHandle {
+    pub(crate) id: u64,
+    pub(crate) commands: mpsc::Sender<Command>,
+    pub(crate) opened: Option<oneshot::Receiver<Result<(), String>>>,
     response: Option<oneshot::Receiver<Result<ResponseHead, String>>>,
     cancel_on_drop: bool,
 }
 
 impl RequestHandle {
-    async fn wait_opened(&mut self) -> Result<(), BoxError> {
-        let opened = self.opened.take().ok_or_else(|| {
-            boxed_error("upstream HTTP/3 request open channel was already consumed")
-        })?;
-        opened
-            .await
-            .map_err(|_| boxed_error("upstream HTTP/3 request open channel closed"))?
-            .map_err(boxed_error)
-    }
-
-    async fn response(mut self) -> Result<ResponseHead, BoxError> {
+    pub(crate) async fn response(mut self) -> Result<ResponseHead, BoxError> {
         let response = self
             .response
             .take()
@@ -331,15 +281,15 @@ impl Drop for RequestHandle {
     }
 }
 
-struct ResponseHead {
-    status: StatusCode,
-    headers: HeaderMap,
-    body: mpsc::Receiver<Result<Frame<Bytes>, String>>,
-    finished: Arc<AtomicBool>,
-    cancellation: ResponseCancellation,
+pub(crate) struct ResponseHead {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: mpsc::Receiver<Result<Frame<Bytes>, String>>,
+    pub(crate) finished: Arc<AtomicBool>,
+    pub(crate) cancellation: ResponseCancellation,
 }
 
-struct ResponseCancellation {
+pub(crate) struct ResponseCancellation {
     id: u64,
     commands: mpsc::Sender<Command>,
     finished: Arc<AtomicBool>,
@@ -365,7 +315,7 @@ fn enqueue_cancel(commands: &mpsc::Sender<Command>, id: u64) {
     }
 }
 
-enum Command {
+pub(crate) enum Command {
     Open {
         id: u64,
         headers: Vec<h3::Header>,
@@ -382,6 +332,7 @@ enum Command {
         fin: bool,
         completed: oneshot::Sender<Result<(), String>>,
     },
+    #[allow(dead_code)]
     Trailers {
         id: u64,
         headers: Vec<h3::Header>,
@@ -1371,115 +1322,7 @@ fn fail_all(requests: &mut AHashMap<u64, PendingRequest>, message: &str) {
     }
 }
 
-async fn serve_bridge(listener: TcpListener, pool: Arc<H3Pool>) {
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(value) => value,
-            Err(error) => {
-                warn!("upstream HTTP/3 h2c bridge accept failed: {error}");
-                continue;
-            }
-        };
-        if !peer.ip().is_loopback() {
-            warn!("upstream HTTP/3 bridge rejected non-loopback peer={peer}");
-            continue;
-        }
-        if let Err(error) = stream.set_nodelay(true) {
-            warn!("upstream HTTP/3 h2c bridge could not enable TCP_NODELAY: {error}");
-            continue;
-        }
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let service = service_fn(move |request| proxy_bridge_request(request, pool.clone()));
-            if let Err(error) = http2::Builder::new(TokioExecutor::new())
-                .adaptive_window(false)
-                .initial_stream_window_size(BRIDGE_H2_STREAM_WINDOW)
-                .initial_connection_window_size(BRIDGE_H2_CONNECTION_WINDOW)
-                .max_frame_size(BRIDGE_H2_MAX_FRAME)
-                .max_concurrent_streams(BRIDGE_H2_MAX_STREAMS)
-                .serve_connection(io, service)
-                .await
-            {
-                log::debug!("upstream HTTP/3 h2c bridge connection ended: {error}");
-            }
-        });
-    }
-}
-
-async fn proxy_bridge_request(
-    request: Request<Incoming>,
-    pool: Arc<H3Pool>,
-) -> Result<Response<BridgeBody>, BoxError> {
-    let (parts, mut body) = request.into_parts();
-    let has_body = !body.is_end_stream();
-    let allow_early_data = !has_body && matches!(parts.method, Method::GET | Method::HEAD);
-    let headers = encode_request_headers(&parts)?;
-    let mut handle = pool.open(headers, has_body, allow_early_data).await?;
-
-    if has_body {
-        handle.wait_opened().await?;
-        let id = handle.id;
-        let commands = handle.commands.clone();
-        tokio::spawn(async move {
-            let mut sent_fin = false;
-            while let Some(frame) = body.frame().await {
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        warn!("h2c bridge request body read failed id={id}: {error}");
-                        let _ = commands.send(Command::Cancel { id }).await;
-                        return;
-                    }
-                };
-                if let Some(data) = frame.data_ref()
-                    && !data.is_empty()
-                    && send_body_command(&commands, id, data.clone(), false)
-                        .await
-                        .is_err()
-                {
-                    let _ = commands.send(Command::Cancel { id }).await;
-                    return;
-                }
-                if let Some(trailers) = frame.trailers_ref() {
-                    let trailers = encode_regular_headers(trailers);
-                    if send_trailers_command(&commands, id, trailers)
-                        .await
-                        .is_err()
-                    {
-                        let _ = commands.send(Command::Cancel { id }).await;
-                        return;
-                    }
-                    sent_fin = true;
-                }
-            }
-            if !sent_fin
-                && send_body_command(&commands, id, Bytes::new(), true)
-                    .await
-                    .is_err()
-            {
-                let _ = commands.send(Command::Cancel { id }).await;
-            }
-        });
-    }
-
-    let ResponseHead {
-        status,
-        headers: response_headers,
-        body,
-        finished,
-        cancellation,
-    } = handle.response().await?;
-    let mut builder = Response::builder().status(status);
-    if let Some(headers) = builder.headers_mut() {
-        *headers = response_headers;
-    }
-    let stream = response_body_stream(body, finished, cancellation);
-    let body = StreamBody::new(stream).boxed_unsync();
-    builder.body(body).map_err(|error| error.into())
-}
-
-async fn send_body_command(
+pub(crate) async fn send_body_command(
     commands: &mpsc::Sender<Command>,
     id: u64,
     data: Bytes,
@@ -1500,6 +1343,7 @@ async fn send_body_command(
         .map_err(|_| "upstream HTTP/3 body completion channel closed".to_string())?
 }
 
+#[allow(dead_code)]
 async fn send_trailers_command(
     commands: &mpsc::Sender<Command>,
     id: u64,
@@ -1519,51 +1363,20 @@ async fn send_trailers_command(
         .map_err(|_| "upstream HTTP/3 trailer completion channel closed".to_string())?
 }
 
-fn response_body_stream(
-    body: mpsc::Receiver<Result<Frame<Bytes>, String>>,
-    finished: Arc<AtomicBool>,
-    cancellation: ResponseCancellation,
-) -> impl futures::Stream<Item = Result<Frame<Bytes>, BoxError>> {
-    stream::unfold(
-        (body, finished, cancellation, false),
-        |(mut body, finished, cancellation, reported_incomplete)| async move {
-            match body.recv().await {
-                Some(item) => Some((
-                    item.map_err(boxed_error),
-                    (body, finished, cancellation, reported_incomplete),
-                )),
-                None if finished.load(Ordering::Acquire) || reported_incomplete => None,
-                None => Some((
-                    Err(boxed_error(
-                        "upstream HTTP/3 response ended before the stream finished",
-                    )),
-                    (body, finished, cancellation, true),
-                )),
-            }
-        },
-    )
-}
-
-fn encode_request_headers(parts: &http::request::Parts) -> Result<Vec<h3::Header>, BoxError> {
-    let authority = parts
+pub(crate) fn encode_pingora_request(req: &RequestHeader) -> Result<Vec<h3::Header>, BoxError> {
+    let authority = req
         .headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())
-        .or_else(|| parts.uri.authority().map(|value| value.as_str()))
-        .ok_or_else(|| boxed_error("h2c bridge request is missing Host"))?;
-    let path = parts
-        .uri
-        .path_and_query()
-        .map_or("/", |value| value.as_str());
-    let mut output = Vec::with_capacity(parts.headers.len() + 4);
-    output.push(h3::Header::new(
-        b":method",
-        parts.method.as_str().as_bytes(),
-    ));
+        .or_else(|| req.uri.authority().map(|value| value.as_str()))
+        .ok_or_else(|| boxed_error("upstream HTTP/3 request is missing Host"))?;
+    let path = req.uri.path_and_query().map_or("/", |value| value.as_str());
+    let mut output = Vec::with_capacity(req.headers.len() + 4);
+    output.push(h3::Header::new(b":method", req.method.as_str().as_bytes()));
     output.push(h3::Header::new(b":scheme", b"https"));
     output.push(h3::Header::new(b":authority", authority.as_bytes()));
     output.push(h3::Header::new(b":path", path.as_bytes()));
-    output.extend(encode_regular_headers(&parts.headers));
+    output.extend(encode_regular_headers(&req.headers));
     Ok(output)
 }
 
@@ -1583,7 +1396,7 @@ fn encode_regular_headers(headers: &HeaderMap) -> Vec<h3::Header> {
         .collect()
 }
 
-fn decode_response_headers(list: &[h3::Header]) -> Result<(StatusCode, HeaderMap)> {
+pub(crate) fn decode_response_headers(list: &[h3::Header]) -> Result<(StatusCode, HeaderMap)> {
     let mut status = None;
     let mut regular_seen = false;
     let mut headers = HeaderMap::with_capacity(list.len());
@@ -1643,6 +1456,7 @@ mod tests {
 
     #[test]
     fn only_bodyless_get_and_head_are_early_data_safe() {
+        use http::Method;
         for method in [Method::GET, Method::HEAD] {
             assert!(matches!(method, Method::GET | Method::HEAD));
         }
@@ -1682,29 +1496,20 @@ mod tests {
     }
 
     #[test]
-    fn truncated_response_body_reports_an_error_and_cancels() {
+    fn response_cancellation_drop_enqueues_cancel() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
-            use futures::StreamExt;
-
             let (commands, mut command_rx) = mpsc::channel(1);
-            let (body_tx, body_rx) = mpsc::channel(1);
-            drop(body_tx);
-            let finished = Arc::new(AtomicBool::new(false));
-            let cancellation = ResponseCancellation {
-                id: 42,
-                commands,
-                finished: finished.clone(),
-            };
-            let body = response_body_stream(body_rx, finished, cancellation);
-            futures::pin_mut!(body);
-
-            let error = body.next().await.unwrap().unwrap_err();
-            assert!(error.to_string().contains("before the stream finished"));
-            assert!(body.next().await.is_none());
+            {
+                let _cancellation = ResponseCancellation {
+                    id: 42,
+                    commands,
+                    finished: Arc::new(AtomicBool::new(false)),
+                };
+            }
             assert!(matches!(
                 command_rx.recv().await,
                 Some(Command::Cancel { id: 42 })

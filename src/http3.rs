@@ -8,7 +8,7 @@ use bytes::Bytes;
 use cloudflare_pingora::apps::HttpServerApp;
 use cloudflare_pingora::http::RequestHeader;
 use cloudflare_pingora::protocols::http::server::Session as ServerSession;
-use cloudflare_pingora::proxy::{HttpProxy, http_proxy};
+use cloudflare_pingora::proxy::{HttpProxy, http_proxy_custom};
 use cloudflare_pingora::server::ShutdownWatch;
 use cloudflare_pingora::server::configuration::ServerConf;
 use futures::{SinkExt, StreamExt};
@@ -35,6 +35,7 @@ use crate::gateway::Gateway;
 use crate::h3_session::H3Session;
 use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, LimitZone, RateLimiter};
 use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
+use crate::upstream_h3_connector::H3UpstreamConnector;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP3_MAX_UDP_PAYLOAD_SIZE: usize = 1452;
@@ -128,6 +129,7 @@ pub fn start(
     h3_runtime: &tokio::runtime::Handle,
     gateway: Gateway,
     server_conf: Arc<ServerConf>,
+    h3_connector: H3UpstreamConnector,
 ) -> Result<()> {
     let server = &runtime.config.server;
     if server.http3_listen.is_empty() {
@@ -137,7 +139,7 @@ pub fn start(
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     h3_runtime.spawn(async move {
         let failure_tx = ready_tx.clone();
-        if let Err(error) = run(runtime, gateway, server_conf, ready_tx).await {
+        if let Err(error) = run(runtime, gateway, server_conf, h3_connector, ready_tx).await {
             let _ = failure_tx.send(Err(format!("HTTP/3 frontend startup failed: {error:#}")));
             error!("HTTP/3 frontend stopped: {error:#}");
         }
@@ -153,6 +155,7 @@ async fn run(
     runtime: Arc<RuntimeConfig>,
     gateway: Gateway,
     server_conf: Arc<ServerConf>,
+    h3_connector: H3UpstreamConnector,
     ready: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<()> {
     let server = &runtime.config.server;
@@ -265,7 +268,8 @@ async fn run(
         .http3_alt_svc_header()
         .map(|value| Arc::new(value.clone()));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let proxy = Arc::new(http_proxy(&server_conf, gateway));
+    let proxy = http_proxy_custom(server_conf.clone(), gateway, h3_connector);
+    let proxy = Arc::new(proxy);
     let shared = Arc::new(Http3Shared {
         proxy,
         shutdown: shutdown_rx,
@@ -362,7 +366,7 @@ async fn run(
 }
 
 struct Http3Shared {
-    proxy: Arc<HttpProxy<Gateway>>,
+    proxy: Arc<HttpProxy<Gateway, H3UpstreamConnector>>,
     shutdown: ShutdownWatch,
     public_listen: std::net::SocketAddr,
     alt_svc: Option<Arc<HeaderValue>>,

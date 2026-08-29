@@ -10,6 +10,7 @@ mod preflight;
 mod static_files;
 mod tls_policy;
 mod upstream_h3;
+mod upstream_h3_connector;
 
 use std::fs::{self, Permissions};
 use std::io::{Read, Write};
@@ -28,7 +29,7 @@ use cloudflare_pingora::listeners::TcpSocketOptions;
 use cloudflare_pingora::listeners::tls::TlsSettings;
 use cloudflare_pingora::protocols::TcpKeepalive;
 use cloudflare_pingora::protocols::http::v2::server::{H2Options, default_h2_options};
-use cloudflare_pingora::proxy::ProxyServiceBuilder;
+use cloudflare_pingora::proxy::{ProcessCustomSession, ProxyServiceBuilder};
 use cloudflare_pingora::server::Server;
 use cloudflare_pingora::server::configuration::ServerConf;
 use log::info;
@@ -37,6 +38,7 @@ use crate::config::RuntimeConfig;
 use crate::gateway::{Gateway, GatewayShared};
 use crate::preflight::check_runtime;
 use crate::tls_policy::HYBRID_PQ_GROUPS;
+use crate::upstream_h3_connector::H3UpstreamConnector;
 
 #[cfg(not(feature = "tls-boringssl"))]
 compile_error!("the Cloudflare BoringSSL provider is required: enable tls-boringssl");
@@ -289,7 +291,8 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         .transpose()
         .context("shared HTTP/3 runtime startup failed")?;
     let upstream_h3 = upstream_h3::start(runtime.clone(), h3_runtime.as_ref())
-        .context("upstream HTTP/3 bridge startup failed")?;
+        .context("upstream HTTP/3 pool startup failed")?;
+    let h3_connector = H3UpstreamConnector::new(upstream_h3.clone());
     let shared = Arc::new(
         GatewayShared::from_runtime(&runtime).context("shared gateway state bootstrap failed")?,
     );
@@ -311,6 +314,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     let mut service = ProxyServiceBuilder::new(&server.configuration, gateway)
         .name("pingora-gateway")
         .server_options(http_options)
+        .custom(h3_connector.clone(), noop_custom_downstream())
         .build();
     service.set_connection_limit(server_config.downstream_max_connections);
 
@@ -365,6 +369,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         let mut h2c_service = ProxyServiceBuilder::new(&server.configuration, h2c_gateway)
             .name("pingora-http3-h2c-handoff")
             .server_options(h2c_options)
+            .custom(h3_connector.clone(), noop_custom_downstream())
             .build();
         h2c_service.set_connection_limit(server_config.downstream_max_connections);
         if let Some(proxy) = h2c_service.app_logic_mut() {
@@ -388,6 +393,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
             h3_runtime,
             h3_gateway,
             server.configuration.clone(),
+            h3_connector,
         )
         .context("HTTP/3 frontend startup failed")?;
     }
@@ -405,6 +411,14 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     );
     server.add_service(service);
     server.run_forever();
+}
+
+fn noop_custom_downstream<SV>() -> ProcessCustomSession<SV, H3UpstreamConnector>
+where
+    SV: cloudflare_pingora::proxy::ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync,
+{
+    Arc::new(|_proxy, _stream, _shutdown| Box::pin(async { None }))
 }
 
 fn public_h2_options(max_concurrent_streams: u32) -> H2Options {

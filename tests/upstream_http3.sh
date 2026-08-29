@@ -31,11 +31,14 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 chmod 0600 "${RUNTIME}/key.pem"
 chmod 0644 "${RUNTIME}/cert.pem"
 
-cargo build --manifest-path "${ROOT}/Cargo.toml" --locked --bin pingora
+BUILD_DIR="${CARGO_TARGET_DIR:-${ROOT}/target}"
+PINGORA="${BUILD_DIR}/debug/pingora"
+
+cargo build --manifest-path "${ROOT}/Cargo.toml" --locked --bin pingora --target-dir "${BUILD_DIR}"
 python3 "${ROOT}/tests/backend.py" >"${BACKEND_LOG}" 2>&1 &
 BACKEND_PID=$!
 
-RUST_LOG=info "${ROOT}/target/debug/pingora" \
+RUST_LOG=info "${PINGORA}" \
   --config "${ROOT}/tests/fixtures/upstream_http3_origin.yaml" >"${ORIGIN_LOG}" 2>&1 &
 ORIGIN_PID=$!
 
@@ -51,10 +54,10 @@ for _ in {1..100}; do
 done
 kill -0 "${ORIGIN_PID}"
 
-RUST_LOG=info "${ROOT}/target/debug/pingora" \
+RUST_LOG=info "${PINGORA}" \
   --config "${ROOT}/tests/fixtures/upstream_http3_front.yaml" >"${FRONT_LOG}" 2>&1 &
 FRONT_PID=$!
-RUST_LOG=info "${ROOT}/target/debug/pingora" \
+RUST_LOG=info "${PINGORA}" \
   --config "${ROOT}/tests/fixtures/upstream_http3_fallback.yaml" >"${FALLBACK_LOG}" 2>&1 &
 FALLBACK_PID=$!
 
@@ -79,7 +82,8 @@ for port in 38081 38082; do
 done
 
 # Strict upstream HTTP/3: a normal Pingora downstream request must traverse the
-# loopback h2c bridge and then the persistent QUIC/H3 connection to the origin.
+# direct upstream HTTP/3 connector and then the persistent QUIC/H3 connection
+# to the origin.
 strict_get=$(curl --noproxy '*' -fsS -H 'host: front.test' \
   http://127.0.0.1:38081/headers)
 jq -e '.method == "GET" and .path == "/headers"' <<<"${strict_get}" >/dev/null
@@ -107,7 +111,7 @@ grep -q 'upstream HTTP/3 session ticket cached upstream=origin' "${FRONT_LOG}"
 [[ $(grep -c 'upstream HTTP/3 established upstream=origin peer=127.0.0.1:28443' "${FRONT_LOG}") -eq 1 ]]
 
 # The origin and front use a 1-second QUIC idle timeout. After the warm
-# connection expires, the bridge deliberately waits for the next replay-safe
+# connection expires, the pool deliberately waits for the next replay-safe
 # request before reconnecting so that the cached ticket and GET can be emitted
 # together as true TLS 0-RTT.
 sleep 2
@@ -146,7 +150,7 @@ if grep -q 'upstream HTTP/3 established upstream=origin peer=127.0.0.1:28453' "$
   exit 1
 fi
 
-grep -q 'upstream HTTP/3 bridge started: upstream=origin' "${FRONT_LOG}"
-grep -q 'upstream HTTP/3 bridge started: upstream=origin' "${FALLBACK_LOG}"
+grep -q 'upstream HTTP/3 pool started: upstream=origin' "${FRONT_LOG}"
+grep -q 'upstream HTTP/3 pool started: upstream=origin' "${FALLBACK_LOG}"
 
 echo 'Upstream HTTP/3 strict mode, connection reuse, request-body streaming, replay-safe 0-RTT, and H3-preferred TCP fallback tests passed'
