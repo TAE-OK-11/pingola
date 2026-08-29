@@ -23,6 +23,7 @@ write_config() {
   local file=$1
   cat >"${file}" <<'EOF'
 num-threads: 1
+temp-buffer-path: /tmp/h2o
 listen:
   - host: 127.0.0.1
     port: 80

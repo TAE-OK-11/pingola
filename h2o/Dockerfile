@@ -110,6 +110,8 @@ RUN --mount=from=builder,source=/out,target=/out,ro \
     && install -d -o 10001 -g 10001 /etc/h2o /tmp/h2o /usr/share/h2o/health \
     && install -Dm755 /out/h2o /usr/local/bin/h2o \
     && install -Dm644 /out/h2o-version.txt /usr/share/doc/h2o/version.txt \
+    && install -d -o 10001 -g 10001 /usr/local/share/h2o \
+    && ln -sf /etc/ssl/certs/ca-certificates.crt /usr/local/share/h2o/ca-bundle.crt \
     && setcap cap_net_bind_service=+ep /usr/local/bin/h2o \
     && apt-get purge --yes --auto-remove libcap2-bin
 
