@@ -135,6 +135,7 @@ RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
     COMMON_FLAGS="-O3 ${ARCH_FLAGS} ${LTO_FLAGS} -fno-strict-aliasing"; \
     cmake -G Ninja -S h2o -B h2o/build \
       -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
       -DCMAKE_C_COMPILER=clang \
       -DCMAKE_CXX_COMPILER=clang++ \
       -DCMAKE_C_FLAGS="${COMMON_FLAGS}" \

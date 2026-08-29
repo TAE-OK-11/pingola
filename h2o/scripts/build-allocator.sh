@@ -39,7 +39,7 @@ case "${ALLOCATOR}" in
           --prefix="${OUTPUT_DIR}"
       make -j "$(nproc)" install
     )
-    printf -- '-L%s/lib -Wl,-Bstatic -ljemalloc -Wl,-Bdynamic\n' "${OUTPUT_DIR}" \
+    printf -- '-Wl,-Bstatic %s/lib/libjemalloc.a -Wl,-Bdynamic\n' "${OUTPUT_DIR}" \
       >"${OUTPUT_DIR}/linker.flags"
     ;;
   tcmalloc)
@@ -56,7 +56,7 @@ case "${ALLOCATOR}" in
           --prefix="${OUTPUT_DIR}"
       make -j "$(nproc)" install
     )
-    printf -- '-L%s/lib -Wl,-Bstatic -ltcmalloc_minimal -Wl,-Bdynamic\n' "${OUTPUT_DIR}" \
+    printf -- '-Wl,-Bstatic %s/lib/libtcmalloc_minimal.a -Wl,-Bdynamic\n' "${OUTPUT_DIR}" \
       >"${OUTPUT_DIR}/linker.flags"
     ;;
   mimalloc)
@@ -76,8 +76,17 @@ case "${ALLOCATOR}" in
       -DMI_BUILD_TESTS=OFF \
       -DMI_OVERRIDE=ON
     cmake --build "${SRC_DIR}/build" --target install -j "$(nproc)"
-    printf -- '-L%s/lib -Wl,-Bstatic -lmimalloc -Wl,-Bdynamic\n' "${OUTPUT_DIR}" \
-      >"${OUTPUT_DIR}/linker.flags"
+  if [[ -f "${OUTPUT_DIR}/lib/libmimalloc.a" ]]; then
+    MIMALLOC_ARCHIVE="${OUTPUT_DIR}/lib/libmimalloc.a"
+  elif [[ -f "${OUTPUT_DIR}/lib/libmimalloc-static.a" ]]; then
+    MIMALLOC_ARCHIVE="${OUTPUT_DIR}/lib/libmimalloc-static.a"
+  else
+    echo "mimalloc static archive not found under ${OUTPUT_DIR}/lib" >&2
+    ls -la "${OUTPUT_DIR}/lib" >&2 || true
+    exit 2
+  fi
+  printf -- '-Wl,-Bstatic %s -Wl,-Bdynamic\n' "${MIMALLOC_ARCHIVE}" \
+    >"${OUTPUT_DIR}/linker.flags"
     ;;
   *)
     echo "unsupported allocator: ${ALLOCATOR}" >&2
