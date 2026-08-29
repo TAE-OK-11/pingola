@@ -186,14 +186,14 @@ impl BodyWrite for H3RequestBodyWriter {
         if let Some(open) = self.open.take() {
             open.await
                 .map_err(|_| Self::write_err("upstream HTTP/3 request open channel closed"))?
-                .map_err(|error| Self::write_err(error))?;
+                .map_err(Self::write_err)?;
         }
         if data.is_empty() {
             return Ok(());
         }
         send_body_command(&self.commands, self.id, data.clone(), false)
             .await
-            .map_err(|error| Self::write_err(&error))?;
+            .map_err(Self::write_err)?;
         data.clear();
         Ok(())
     }
@@ -205,11 +205,11 @@ impl BodyWrite for H3RequestBodyWriter {
         if let Some(open) = self.open.take() {
             open.await
                 .map_err(|_| Self::write_err("upstream HTTP/3 request open channel closed"))?
-                .map_err(|error| Self::write_err(error))?;
+                .map_err(Self::write_err)?;
         }
         send_body_command(&self.commands, self.id, Bytes::new(), true)
             .await
-            .map_err(|error| Self::write_err(&error))
+            .map_err(Self::write_err)
     }
 
     async fn cleanup(&mut self) -> Result<()> {

@@ -268,7 +268,7 @@ async fn run(
         .http3_alt_svc_header()
         .map(|value| Arc::new(value.clone()));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut proxy = http_proxy_custom(server_conf.clone(), gateway, h3_connector);
+    let proxy = http_proxy_custom(server_conf.clone(), gateway, h3_connector);
     let proxy = Arc::new(proxy);
     let shared = Arc::new(Http3Shared {
         proxy,

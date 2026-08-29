@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use cloudflare_pingora::http::RequestHeader;
 use http::header::{CONNECTION, HOST, TE, TRANSFER_ENCODING, UPGRADE};
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use hyper::body::Frame;
 use log::{info, warn};
 use tokio::net::UdpSocket;
@@ -24,7 +24,6 @@ use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
 
 pub const H3_UPSTREAM_ALPN: &[u8] = b"jbs-h3-upstream";
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(100);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_UDP_PAYLOAD: usize = 1452;
@@ -49,10 +48,6 @@ pub struct H3Route {
 }
 
 impl H3Route {
-    pub fn origin(&self) -> SocketAddr {
-        self.origin
-    }
-
     pub fn should_use_h3(&self) -> bool {
         self.forced || self.available.load(Ordering::Acquire)
     }
@@ -264,16 +259,6 @@ pub(crate) struct RequestHandle {
 }
 
 impl RequestHandle {
-    async fn wait_opened(&mut self) -> Result<(), BoxError> {
-        let opened = self.opened.take().ok_or_else(|| {
-            boxed_error("upstream HTTP/3 request open channel was already consumed")
-        })?;
-        opened
-            .await
-            .map_err(|_| boxed_error("upstream HTTP/3 request open channel closed"))?
-            .map_err(boxed_error)
-    }
-
     pub(crate) async fn response(mut self) -> Result<ResponseHead, BoxError> {
         let response = self
             .response
@@ -347,6 +332,7 @@ pub(crate) enum Command {
         fin: bool,
         completed: oneshot::Sender<Result<(), String>>,
     },
+    #[allow(dead_code)]
     Trailers {
         id: u64,
         headers: Vec<h3::Header>,
@@ -1357,7 +1343,8 @@ pub(crate) async fn send_body_command(
         .map_err(|_| "upstream HTTP/3 body completion channel closed".to_string())?
 }
 
-pub(crate) async fn send_trailers_command(
+#[allow(dead_code)]
+async fn send_trailers_command(
     commands: &mpsc::Sender<Command>,
     id: u64,
     headers: Vec<h3::Header>,
@@ -1469,6 +1456,7 @@ mod tests {
 
     #[test]
     fn only_bodyless_get_and_head_are_early_data_safe() {
+        use http::Method;
         for method in [Method::GET, Method::HEAD] {
             assert!(matches!(method, Method::GET | Method::HEAD));
         }

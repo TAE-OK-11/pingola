@@ -29,7 +29,7 @@ use cloudflare_pingora::listeners::TcpSocketOptions;
 use cloudflare_pingora::listeners::tls::TlsSettings;
 use cloudflare_pingora::protocols::TcpKeepalive;
 use cloudflare_pingora::protocols::http::v2::server::{H2Options, default_h2_options};
-use cloudflare_pingora::proxy::{HttpProxy, ProcessCustomSession, ProxyServiceBuilder};
+use cloudflare_pingora::proxy::{ProcessCustomSession, ProxyServiceBuilder};
 use cloudflare_pingora::server::Server;
 use cloudflare_pingora::server::configuration::ServerConf;
 use log::info;
@@ -38,7 +38,6 @@ use crate::config::RuntimeConfig;
 use crate::gateway::{Gateway, GatewayShared};
 use crate::preflight::check_runtime;
 use crate::tls_policy::HYBRID_PQ_GROUPS;
-use crate::upstream_h3::UpstreamH3Registry;
 use crate::upstream_h3_connector::H3UpstreamConnector;
 
 #[cfg(not(feature = "tls-boringssl"))]
