@@ -112,6 +112,8 @@ server:
   upstream_keepalive_pool_size: 128
   # Persistent profile probes deliberately exceed the production value (500).
   downstream_keepalive_requests: 1000000
+  # Concurrent probes send 512 requests per QUIC connection; keep above that cap.
+  http3_max_requests_per_connection: 1000000
   downstream_max_connections: 4096
   max_retries: 2
   access_log: false
