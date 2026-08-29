@@ -19,8 +19,8 @@ use cloudflare_pingora::modules::http::compression::{
     ResponseCompression, ResponseCompressionBuilder,
 };
 use cloudflare_pingora::prelude::HttpPeer;
-use cloudflare_pingora::protocols::{ALPN, Digest, TcpKeepalive};
 use cloudflare_pingora::protocols::tls::CustomALPN;
+use cloudflare_pingora::protocols::{ALPN, Digest, TcpKeepalive};
 use cloudflare_pingora::proxy::{
     CacheMeta, FailToProxy, ForcedFreshness, HitHandler, ProxyHttp, RawSocketHandle, Session,
     default_fail_to_proxy,
@@ -39,7 +39,7 @@ use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_hos
 use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
 use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, LimitZone, RateLimiter};
 use crate::static_files::StaticFiles;
-use crate::upstream_h3::{H3Route, H3_UPSTREAM_ALPN, UpstreamH3Registry};
+use crate::upstream_h3::{H3_UPSTREAM_ALPN, H3Route, UpstreamH3Registry};
 
 const STREAM_PREFIXES: &[&str] = &[
     "/rest/stream",

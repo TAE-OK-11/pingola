@@ -2,8 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error as StdError;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
@@ -1383,15 +1383,9 @@ pub(crate) fn encode_pingora_request(req: &RequestHeader) -> Result<Vec<h3::Head
         .and_then(|value| value.to_str().ok())
         .or_else(|| req.uri.authority().map(|value| value.as_str()))
         .ok_or_else(|| boxed_error("upstream HTTP/3 request is missing Host"))?;
-    let path = req
-        .uri
-        .path_and_query()
-        .map_or("/", |value| value.as_str());
+    let path = req.uri.path_and_query().map_or("/", |value| value.as_str());
     let mut output = Vec::with_capacity(req.headers.len() + 4);
-    output.push(h3::Header::new(
-        b":method",
-        req.method.as_str().as_bytes(),
-    ));
+    output.push(h3::Header::new(b":method", req.method.as_str().as_bytes()));
     output.push(h3::Header::new(b":scheme", b"https"));
     output.push(h3::Header::new(b":authority", authority.as_bytes()));
     output.push(h3::Header::new(b":path", path.as_bytes()));

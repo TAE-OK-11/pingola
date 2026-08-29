@@ -18,8 +18,8 @@ use hyper::body::Frame;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::upstream_h3::{
-    Command, H3Pool, ResponseCancellation, UpstreamH3Registry, encode_pingora_request,
-    send_body_command, RequestHandle, ResponseHead,
+    Command, H3Pool, RequestHandle, ResponseCancellation, ResponseHead, UpstreamH3Registry,
+    encode_pingora_request, send_body_command,
 };
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -60,11 +60,11 @@ impl custom::Connector for H3UpstreamConnector {
         peer: &P,
     ) -> Result<(Connection<Self::Session>, bool)> {
         let pool = self.pool_for_peer(peer)?;
-        let server_addr = peer
-            .address()
-            .as_inet()
-            .copied()
-            .unwrap_or_else(|| "0.0.0.0:0".parse().expect("placeholder socket address is valid"));
+        let server_addr = peer.address().as_inet().copied().unwrap_or_else(|| {
+            "0.0.0.0:0"
+                .parse()
+                .expect("placeholder socket address is valid")
+        });
         let session = H3UpstreamSession::new(pool, server_addr);
         Ok((Connection::Session(session), false))
     }
@@ -230,7 +230,8 @@ impl cloudflare_pingora::protocols::http::custom::client::Session for H3Upstream
     async fn write_request_header(&mut self, req: Box<RequestHeader>, end: bool) -> Result<()> {
         let has_body = !end;
         let allow_early_data = end && matches!(req.method, Method::GET | Method::HEAD);
-        let headers = encode_pingora_request(&req).map_err(|error| Self::write_err(error.to_string()))?;
+        let headers =
+            encode_pingora_request(&req).map_err(|error| Self::write_err(error.to_string()))?;
         let handle = self
             .pool
             .open(headers, has_body, allow_early_data)
