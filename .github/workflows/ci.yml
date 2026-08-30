@@ -14,8 +14,14 @@ on:
         type: boolean
   push:
     branches: [main]
+    paths-ignore:
+      - h2o/**
+      - .github/workflows/h2o.yml
     tags: ["v*"]
   pull_request:
+    paths-ignore:
+      - h2o/**
+      - .github/workflows/h2o.yml
 
 permissions:
   contents: read

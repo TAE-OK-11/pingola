@@ -1,7 +1,7 @@
 services:
   h2o:
     container_name: h2o
-    image: ${H2O_IMAGE:-h2o:local}
+    image: ${H2O_IMAGE:-ghcr.io/tae-ok-11/h2o:local}
     build:
       context: .
       args:
