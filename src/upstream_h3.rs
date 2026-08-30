@@ -570,7 +570,12 @@ async fn run_connection(
         .connect(settings.origin)
         .await
         .with_context(|| format!("failed to connect UDP socket for {}", settings.name))?;
+    let udp_offload = crate::kernel_socket::apply_upstream_udp_offload(&socket);
     let local = socket.local_addr()?;
+    log::debug!(
+        "upstream HTTP/3 UDP offload upstream={} local={local} capabilities={udp_offload}",
+        settings.name,
+    );
 
     let mut tls = new_hybrid_pq_context()
         .context("failed to create upstream HTTP/3 Cloudflare BoringSSL context")?;

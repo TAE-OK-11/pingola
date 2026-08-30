@@ -68,6 +68,10 @@ small set of documented local changes.
   streams.
 - Reason: short proxy responses (health checks, API JSON) avoid delayed-ACK
   stalls on the return path without extra userspace work per connection.
+- Local change: tune accepted and upstream TCP sockets with 256-KiB SO_RCVBUF /
+  SO_SNDBUF and TCP_NOTSENT_LOWAT for streaming.
+- Reason: keep kernel send/receive pipelines fed without extra userspace
+  buffering on Navidrome-sized transfers.
 
 Remove dependency patches after a released Pingora version adopts equivalent
 versions. Re-evaluate the reuse-hash cache whenever `HttpPeer` changes.

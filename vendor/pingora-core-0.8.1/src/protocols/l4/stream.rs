@@ -36,7 +36,7 @@ use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
-use crate::protocols::l4::ext::{set_tcp_keepalive, set_tcp_quickack, TcpKeepalive};
+use crate::protocols::l4::ext::{set_tcp_keepalive, set_tcp_quickack, tune_proxy_tcp_fd, TcpKeepalive};
 use crate::protocols::l4::virt;
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{
@@ -402,6 +402,10 @@ impl Stream {
                 s.set_nodelay(true)
                     .or_err(ConnectError, "failed to set_nodelay")?;
                 let _ = set_tcp_quickack(s);
+                #[cfg(unix)]
+                {
+                    let _ = tune_proxy_tcp_fd(s.as_raw_fd());
+                }
             }
             RawStream::Virtual(s) => {
                 s.set_socket_option(virt::VirtualSockOpt::NoDelay)

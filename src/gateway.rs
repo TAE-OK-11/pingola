@@ -38,6 +38,7 @@ use tokio::sync::mpsc;
 use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_host};
 use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
 use crate::h3_wire;
+use crate::kernel_socket::{self, PROXY_TCP_RCVBUF};
 use crate::limits::{
     ActiveRequestLimiter, ActiveRequestPermit, GlobalConcurrentLimiter, GlobalConcurrentPermit,
     LimitZone, RateLimiter,
@@ -2056,6 +2057,10 @@ fn prepare_upstream(
         #[cfg(target_os = "linux")]
         user_timeout: Duration::from_secs(90),
     });
+    let offload = kernel_socket::offload_report();
+    peer.options.tcp_fast_open = offload.tcp_fastopen_client;
+    peer.options.tcp_recv_buf = Some(PROXY_TCP_RCVBUF);
+    peer.options.upstream_tcp_sock_tweak_hook = Some(kernel_socket::upstream_tcp_hook());
     let h3 = upstream_h3.route(name).map(|route| {
         let mut peer = HttpPeer::new(address, false, name.to_string());
         peer.options.connection_timeout =

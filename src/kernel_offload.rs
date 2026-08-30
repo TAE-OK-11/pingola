@@ -49,10 +49,20 @@ impl KernelOffloadReport {
             return;
         }
         log::info!("kernel offload: {}", self.summary());
-        if !self.ktls_ulp {
-            log::info!(
-                "kernel offload: kTLS ULP unavailable; TCP TLS stays in userspace BoringSSL (H3/QUIC unaffected)"
-            );
+        if self.linux {
+            let mut active = Vec::new();
+            if self.udp_gso {
+                active.push("udp_gso");
+            }
+            if self.udp_gro {
+                active.push("udp_gro");
+            }
+            if self.tcp_fastopen_client {
+                active.push("tcp_fastopen_connect");
+            }
+            if !active.is_empty() {
+                log::info!("kernel offload active: {}", active.join(","));
+            }
         }
         if !self.udp_gso || !self.udp_gro {
             log::info!(

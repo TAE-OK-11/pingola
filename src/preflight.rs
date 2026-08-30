@@ -93,6 +93,14 @@ pub fn check_runtime(runtime: &RuntimeConfig, check_bind: bool) -> CheckReport {
             "TCP_ULP tls probe succeeded; host kernel can offload symmetric TLS record crypto when enabled",
         );
     }
+    report.ok(
+        "kernel TCP tuning",
+        format!(
+            "rcvbuf={} sndbuf={} quickack+notsent_lowat on accepted streams; upstream hook enabled",
+            crate::kernel_socket::PROXY_TCP_RCVBUF,
+            crate::kernel_socket::PROXY_TCP_SNDBUF,
+        ),
+    );
 
     for (name, host) in &runtime.config.hosts {
         let Some(root) = host.static_root.as_ref() else {

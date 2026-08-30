@@ -122,6 +122,7 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.rust.pgo="off" \
       org.opencontainers.image.kernel.ktls="host-dependent" \
       org.opencontainers.image.kernel.udp-offload="gso-gro-txtime" \
+      org.opencontainers.image.kernel.tcp-tuning="256k-buf,quickack,notsent-lowat,tfo" \
       org.opencontainers.image.kernel.tcp-fastopen="listener-backlog-64" \
       org.opencontainers.image.rust.codegen-units="${RUST_CODEGEN_UNITS}" \
       org.opencontainers.image.rust.linker="lld" \

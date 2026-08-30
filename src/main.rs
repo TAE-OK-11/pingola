@@ -7,6 +7,7 @@ mod h3_wire;
 mod h3_session;
 mod http3;
 mod kernel_offload;
+mod kernel_socket;
 mod limits;
 mod preflight;
 mod static_files;
@@ -282,7 +283,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
 
     let mut server = Server::new_with_opt_and_conf(None, pingora_config);
     server.bootstrap();
-    kernel_offload::KernelOffloadReport::probe().log_startup();
+    kernel_socket::log_active_offloads();
 
     let needs_h3_runtime = !server_config.http3_listen.is_empty()
         || runtime
