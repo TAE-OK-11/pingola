@@ -55,7 +55,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-verify-${{ runner.os }}-rust-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'vendor/**/Cargo.toml') }}
+          key: cargo-verify-${{ runner.os }}-rust-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'vendor/**/Cargo.toml', 'vendor/**/*.rs') }}
           restore-keys: |
             cargo-verify-${{ runner.os }}-rust-${{ env.RUST_VERSION }}-
 
