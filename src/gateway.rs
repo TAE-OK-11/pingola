@@ -1329,7 +1329,10 @@ fn forwards_accept_encoding(route: RouteClass) -> bool {
 }
 
 fn uses_downstream_compression(route: RouteClass) -> bool {
-    matches!(route, RouteClass::Vaultwarden | RouteClass::AdguardUi)
+    matches!(
+        route,
+        RouteClass::Vaultwarden | RouteClass::Couchdb | RouteClass::AdguardUi
+    )
 }
 
 fn configure_downstream_compression(
@@ -2458,7 +2461,11 @@ hosts:
             assert!(!forwards_accept_encoding(route), "route={route:?}");
         }
 
-        for route in [RouteClass::Vaultwarden, RouteClass::AdguardUi] {
+        for route in [
+            RouteClass::Vaultwarden,
+            RouteClass::Couchdb,
+            RouteClass::AdguardUi,
+        ] {
             assert!(uses_downstream_compression(route), "route={route:?}");
         }
         for route in [
@@ -2467,7 +2474,6 @@ hosts:
             RouteClass::NavidromeApi,
             RouteClass::VaultwardenAuth,
             RouteClass::VaultwardenHub,
-            RouteClass::Couchdb,
             RouteClass::Doh,
         ] {
             assert!(!uses_downstream_compression(route), "route={route:?}");
