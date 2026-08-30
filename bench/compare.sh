@@ -4,7 +4,9 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PROFILE=${BENCH_PROFILE:-smoke}
 PINGORA_IMAGE=${PINGORA_IMAGE:-ghcr.io/tae-ok-11/pingora:local}
+H2O_IMAGE=${H2O_IMAGE:-ghcr.io/tae-ok-11/pingora/h2o:latest}
 NGINX_IMAGE=${NGINX_IMAGE:-tae00217/jbs-nginx:ultra-4.0}
+BENCH_TARGETS=${BENCH_TARGETS:-pingora,h2o}
 CPU_LIMIT=${BENCH_CPUS:-0.5}
 WORKERS=${BENCH_WORKERS:-1}
 MEMORY_LIMIT=${BENCH_MEMORY:-1g}
@@ -113,7 +115,9 @@ timestamp=$(date -u +%FT%TZ)
 profile=${PROFILE}
 host=$(uname -a)
 pingora_image=${PINGORA_IMAGE}
+h2o_image=${H2O_IMAGE}
 nginx_image=${NGINX_IMAGE}
+bench_targets=${BENCH_TARGETS}
 cpu_limit=${CPU_LIMIT}
 cpu_nano=${CPU_NANO}
 workers=${WORKERS}
@@ -134,12 +138,17 @@ EOF
 rustc -vV | sed 's/^/backend_rustc_/' >>"${OUTPUT}/environment.txt"
 lscpu >>"${OUTPUT}/environment.txt" 2>&1
 docker image inspect "${PINGORA_IMAGE}" >"${OUTPUT}/pingora-inspect.json"
-docker image inspect "${NGINX_IMAGE}" >"${OUTPUT}/nginx-inspect.json"
-docker history --no-trunc "${NGINX_IMAGE}" >"${OUTPUT}/nginx-history.txt"
-docker run --rm "${NGINX_IMAGE}" nginx -V >"${OUTPUT}/nginx-V.txt" 2>&1
-docker run --rm --entrypoint sh "${NGINX_IMAGE}" -c \
-  'ldd /usr/sbin/nginx 2>/dev/null || ldd /usr/local/nginx/sbin/nginx; nginx -T' \
-  >"${OUTPUT}/nginx-runtime.txt" 2>&1 || true
+if [[ ",${BENCH_TARGETS}," == *",h2o,"* ]]; then
+  docker image inspect "${H2O_IMAGE}" >"${OUTPUT}/h2o-inspect.json"
+fi
+if [[ ",${BENCH_TARGETS}," == *",nginx,"* ]]; then
+  docker image inspect "${NGINX_IMAGE}" >"${OUTPUT}/nginx-inspect.json"
+  docker history --no-trunc "${NGINX_IMAGE}" >"${OUTPUT}/nginx-history.txt"
+  docker run --rm "${NGINX_IMAGE}" nginx -V >"${OUTPUT}/nginx-V.txt" 2>&1
+  docker run --rm --entrypoint sh "${NGINX_IMAGE}" -c \
+    'ldd /usr/sbin/nginx 2>/dev/null || ldd /usr/local/nginx/sbin/nginx; nginx -T' \
+    >"${OUTPUT}/nginx-runtime.txt" 2>&1 || true
+fi
 docker run --rm --entrypoint /usr/local/bin/pingora "${PINGORA_IMAGE}" --allocator-info \
   >"${OUTPUT}/pingora-allocator.txt"
 
@@ -185,6 +194,35 @@ route_limits:
     active_requests: 0
 EOF
 
+if [[ ",${BENCH_TARGETS}," == *",h2o,"* ]]; then
+cat >"${OUTPUT}/h2o.conf" <<EOF
+num-threads: ${WORKERS}
+temp-buffer-path: /tmp/h2o
+proxy.emit-x-forwarded-headers: ON
+proxy.timeout.connect: 2000
+proxy.timeout.io: 3600000
+proxy.timeout.keepalive: 30000
+
+listen:
+  - host: 127.0.0.1
+    port: ${HTTP_PORT}
+  - host: 127.0.0.1
+    port: ${HTTPS_PORT}
+    ssl:
+      certificate-file: /work/cert.pem
+      key-file: /work/key.pem
+      minimum-version: TLSv1.3
+
+hosts:
+  "bench.test":
+    paths:
+      /:
+        proxy.reverse.url: http://127.0.0.1:${BACKEND_PORT}
+        limit-request-body: 536870912
+EOF
+fi
+
+if [[ ",${BENCH_TARGETS}," == *",nginx,"* ]]; then
 cat >"${OUTPUT}/nginx.conf" <<EOF
 user nginx;
 worker_processes ${WORKERS};
@@ -247,15 +285,18 @@ http {
     ssl_certificate /work/cert.pem;
     ssl_certificate_key /work/key.pem;
     ssl_protocols TLSv1.3;
-    add_header X-Content-Type-Options nosniff always;
-    add_header X-Frame-Options SAMEORIGIN always;
-    add_header Referrer-Policy strict-origin-when-cross-origin always;
-    add_header Strict-Transport-Security \$hsts always;
     location / { proxy_pass http://benchmark_backend; }
   }
 }
 EOF
-chmod 0644 "${OUTPUT}/pingora.yaml" "${OUTPUT}/nginx.conf"
+fi
+chmod 0644 "${OUTPUT}/pingora.yaml"
+if [[ -f "${OUTPUT}/nginx.conf" ]]; then
+  chmod 0644 "${OUTPUT}/nginx.conf"
+fi
+if [[ -f "${OUTPUT}/h2o.conf" ]]; then
+  chmod 0644 "${OUTPUT}/h2o.conf"
+fi
 
 "${BACKEND_BIN}" --port "${BACKEND_PORT}" \
   >"${OUTPUT}/backend.stdout" 2>"${OUTPUT}/backend.stderr" &
@@ -295,22 +336,37 @@ start_proxy() {
   local proxy=$1 round=$2
   stop_proxy
   PROXY_NAME=${NAME}-${proxy}-r${round}
-  if [[ "${proxy}" == pingora ]]; then
-    docker run --detach --name "${PROXY_NAME}" --network host --read-only \
-      --cpus "${CPU_LIMIT}" --memory "${MEMORY_LIMIT}" --memory-swap "${MEMORY_LIMIT}" \
-      --ulimit nofile=32768:32768 \
-      --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
-      --group-add "${CERT_GID}" \
-      --tmpfs /tmp/pingora:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700 \
-      --volume "${OUTPUT}:/work:ro" --entrypoint /usr/local/bin/pingora \
-      "${PINGORA_IMAGE}" --config /work/pingora.yaml >/dev/null
-  else
-    docker run --detach --name "${PROXY_NAME}" --network host \
-      --cpus "${CPU_LIMIT}" --memory "${MEMORY_LIMIT}" --memory-swap "${MEMORY_LIMIT}" \
-      --ulimit nofile=32768:32768 \
-      --volume "${OUTPUT}:/work:ro" --volume "${OUTPUT}/nginx.conf:/etc/nginx/nginx.conf:ro" \
-      "${NGINX_IMAGE}" >/dev/null
-  fi
+  case "${proxy}" in
+    pingora)
+      docker run --detach --name "${PROXY_NAME}" --network host --read-only \
+        --cpus "${CPU_LIMIT}" --memory "${MEMORY_LIMIT}" --memory-swap "${MEMORY_LIMIT}" \
+        --ulimit nofile=32768:32768 \
+        --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
+        --group-add "${CERT_GID}" \
+        --tmpfs /tmp/pingora:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700 \
+        --volume "${OUTPUT}:/work:ro" --entrypoint /usr/local/bin/pingora \
+        "${PINGORA_IMAGE}" --config /work/pingora.yaml >/dev/null
+      ;;
+    h2o)
+      docker run --detach --name "${PROXY_NAME}" --network host \
+        --cpus "${CPU_LIMIT}" --memory "${MEMORY_LIMIT}" --memory-swap "${MEMORY_LIMIT}" \
+        --ulimit nofile=32768:32768 \
+        --tmpfs /tmp/h2o:rw,noexec,nosuid,nodev,mode=1777 \
+        --volume "${OUTPUT}:/work:ro" --entrypoint /usr/local/bin/h2o \
+        "${H2O_IMAGE}" -c /work/h2o.conf >/dev/null
+      ;;
+    nginx)
+      docker run --detach --name "${PROXY_NAME}" --network host \
+        --cpus "${CPU_LIMIT}" --memory "${MEMORY_LIMIT}" --memory-swap "${MEMORY_LIMIT}" \
+        --ulimit nofile=32768:32768 \
+        --volume "${OUTPUT}:/work:ro" --volume "${OUTPUT}/nginx.conf:/etc/nginx/nginx.conf:ro" \
+        "${NGINX_IMAGE}" >/dev/null
+      ;;
+    *)
+      echo "unsupported benchmark proxy: ${proxy}" >&2
+      return 1
+      ;;
+  esac
 
   local limits
   limits=$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}' "${PROXY_NAME}")
@@ -576,11 +632,15 @@ run_case() {
     "${errors}" "${distribution:-NA}" "${raw}" >>"${OUTPUT}/results.tsv"
 }
 
+IFS=',' read -r -a TARGETS <<<"${BENCH_TARGETS}"
 for ((round = 1; round <= ROUNDS; round++)); do
   if ((round % 2 == 1)); then
-    ORDER=(nginx pingora)
+    ORDER=("${TARGETS[@]}")
   else
-    ORDER=(pingora nginx)
+    ORDER=()
+    for ((idx = ${#TARGETS[@]} - 1; idx >= 0; idx--)); do
+      ORDER+=("${TARGETS[idx]}")
+    done
   fi
   for proxy in "${ORDER[@]}"; do
     if ! start_proxy "${proxy}" "${round}"; then

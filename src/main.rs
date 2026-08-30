@@ -425,9 +425,9 @@ where
 fn public_h2_options(max_concurrent_streams: u32) -> H2Options {
     configure_h2_options(
         max_concurrent_streams,
-        16 * 1024,
-        256 * 1024,
-        2 * 1024 * 1024,
+        64 * 1024,
+        1024 * 1024,
+        8 * 1024 * 1024,
     )
 }
 

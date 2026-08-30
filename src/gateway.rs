@@ -226,7 +226,7 @@ struct PreparedUpstream {
 
 #[derive(Clone, Debug)]
 struct PreparedPlan {
-    domain: http::HeaderValue,
+    upstream_host: HeaderValue,
     handler: HandlerKind,
     peer: HttpPeer,
     h3: Option<PreparedH3Peer>,
@@ -410,7 +410,11 @@ impl Gateway {
                     let upstream = upstreams.get(upstream_name)?;
                     let plan_index = prepared_plans.len();
                     prepared_plans.push(PreparedPlan {
-                        domain: domain_header.clone(),
+                        upstream_host: if route == RouteClass::Doh {
+                            DIRECT_DOH_HOST.clone()
+                        } else {
+                            domain_header.clone()
+                        },
                         handler: host.handler,
                         peer: prepare_route_peer(upstream, route),
                         h3: prepare_route_h3(upstream, route),
@@ -799,8 +803,14 @@ impl ProxyHttp for Gateway {
             .await;
         };
         let plan = &self.plans[plan_index];
-        let encoding =
-            configure_downstream_compression(session, plan.route, &self.compression_modules)?;
+        let encoding = if uses_downstream_compression(plan.route) {
+            configure_downstream_compression(session, plan.route, &self.compression_modules)?
+        } else {
+            EncodingNegotiation {
+                preferred: ContentCoding::Identity,
+                identity_acceptable: true,
+            }
+        };
         if encoding.preferred == ContentCoding::NotAcceptable {
             return send_empty(
                 &self.runtime,
@@ -954,20 +964,15 @@ impl ProxyHttp for Gateway {
             .upstream_forwarded_port
             .as_ref()
             .ok_or_else(|| Error::explain(HTTPStatus(500), "upstream forwarded port is missing"))?;
-        let domain = if plan.route == RouteClass::Doh {
-            DIRECT_DOH_HOST.clone()
-        } else {
-            plan.domain.clone()
-        };
 
         upstream_request.remove_header(&FORWARDED);
         upstream_request.remove_header(&X_FORWARDED_FOR);
         upstream_request.remove_header(&HTTP3_INTERNAL);
         upstream_request.remove_header(&HTTP3_PORT);
-        upstream_request.insert_typed_header(HOST, domain.clone());
+        upstream_request.insert_typed_header(HOST, plan.upstream_host.clone());
         upstream_request.insert_typed_header(X_REAL_IP, client_ip.clone());
         upstream_request.insert_typed_header(X_FORWARDED_FOR, client_ip.clone());
-        upstream_request.insert_typed_header(X_FORWARDED_HOST, domain);
+        upstream_request.insert_typed_header(X_FORWARDED_HOST, plan.upstream_host.clone());
         upstream_request.insert_typed_header(X_FORWARDED_PORT, forwarded_port.clone());
         upstream_request.insert_typed_header(X_FORWARDED_PROTO, if ctx.tls { HTTPS } else { HTTP });
         upstream_request.insert_typed_header(X_FORWARDED_SSL, if ctx.tls { ON } else { OFF });

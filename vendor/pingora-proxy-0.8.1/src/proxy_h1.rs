@@ -54,8 +54,8 @@ where
             }
         }
 
-        // Convert HTTP2 headers to H1
-        if req.version == Version::HTTP_2 {
+        // Convert HTTP2 headers to H1 only when the downstream session is HTTP/2.
+        if req.version == Version::HTTP_2 && session.downstream_session.as_http2().is_some() {
             req.set_version(Version::HTTP_11);
             // if client has body but has no content length, add chunked encoding
             // https://datatracker.ietf.org/doc/html/rfc9112#name-message-body
