@@ -27,6 +27,8 @@ RUN --mount=type=cache,id=h2o-apt-toolchain-${DEBIAN_SUITE},target=/var/cache/ap
         git \
         golang-go \
         g++ \
+        libc++-dev \
+        libc++abi-dev \
         libtool \
         lld \
         llvm \
