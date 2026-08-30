@@ -26,6 +26,7 @@ RUN --mount=type=cache,id=pingora-apt-builder-${DEBIAN_SUITE},target=/var/cache/
         curl \
         git \
         lld \
+        llvm \
         ninja-build \
         openssl \
         perl \
