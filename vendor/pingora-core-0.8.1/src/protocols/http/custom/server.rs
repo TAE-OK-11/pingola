@@ -112,6 +112,11 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn restore_custom_message_writer(&mut self, writer: Box<dyn CustomMessageWrite>) -> Result<()>;
 
+    /// Captured HTTP/3 wire headers for upstream passthrough without re-encoding.
+    fn take_upstream_request_wire(&mut self) -> Option<Vec<(Bytes, Bytes)>> {
+        None
+    }
+
     /// Whether this request is for upgrade (e.g., websocket).
     ///
     /// Returns `true` if the request has HTTP/1.1 version and contains an Upgrade header.
@@ -292,6 +297,10 @@ impl Session for () {
         _writer: Box<dyn CustomMessageWrite>,
     ) -> Result<()> {
         unreachable!("server session: restore_custom_message_writer")
+    }
+
+    fn take_upstream_request_wire(&mut self) -> Option<Vec<(Bytes, Bytes)>> {
+        None
     }
 
     fn is_upgrade_req(&self) -> bool {

@@ -119,6 +119,7 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.rust.target-cpu="${RUST_TARGET_CPU}" \
       org.opencontainers.image.rust.lto="${RUST_LTO}" \
       org.opencontainers.image.rust.lto-scope="full-stack" \
+      org.opencontainers.image.rust.pgo="off" \
       org.opencontainers.image.rust.codegen-units="${RUST_CODEGEN_UNITS}" \
       org.opencontainers.image.rust.linker="lld" \
       org.opencontainers.image.licenses="Apache-2.0"

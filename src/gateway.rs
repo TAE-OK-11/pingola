@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 
 use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_host};
 use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
+use crate::h3_wire;
 use crate::limits::{
     ActiveRequestLimiter, ActiveRequestPermit, GlobalConcurrentLimiter, GlobalConcurrentPermit,
     LimitZone, RateLimiter,
@@ -950,6 +951,16 @@ impl ProxyHttp for Gateway {
             return false;
         };
         plan.route.supports_h1_bodyless_fast_path() && !session.is_upgrade_req()
+    }
+
+    fn sync_upstream_request_wire(
+        &self,
+        wire: &mut Vec<(Bytes, Bytes)>,
+        upstream_request: &RequestHeader,
+    ) {
+        let mut headers = h3_wire::bytes_pairs_to_headers(std::mem::take(wire));
+        h3_wire::finalize_upstream_wire(&mut headers, upstream_request);
+        *wire = h3_wire::headers_to_bytes_pairs(headers);
     }
 
     fn h1_bodyless_poll_downstream(&self, _session: &Session, ctx: &Self::CTX) -> bool {

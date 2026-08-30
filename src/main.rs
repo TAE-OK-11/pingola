@@ -3,6 +3,7 @@ mod config;
 mod content_encoding;
 mod gateway;
 mod h3_runtime;
+mod h3_wire;
 mod h3_session;
 mod http3;
 mod limits;

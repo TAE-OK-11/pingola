@@ -34,6 +34,7 @@ use tokio_quiche::{ConnectionParams, ServerH3Driver, listen_with_capabilities};
 use crate::config::RuntimeConfig;
 use crate::gateway::{Gateway, GatewayShared, Http3AdmissionRejection};
 use crate::h3_session::H3Session;
+use crate::h3_wire;
 use crate::limits::ActiveRequestPermit;
 use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
 use crate::upstream_h3_connector::H3UpstreamConnector;
@@ -483,8 +484,10 @@ async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionCont
         return;
     }
 
+    let request_wire = h3_wire::capture_request_wire(&headers);
     let session = ServerSession::new_custom(Box::new(H3Session::new(
         request,
+        request_wire,
         send,
         recv,
         read_fin,

@@ -81,6 +81,10 @@ where
         SV::CTX: Send + Sync,
     {
         let mut req = session.req_header().clone();
+        let mut upstream_wire = session
+            .downstream_session
+            .as_custom_mut()
+            .and_then(|custom| custom.take_upstream_request_wire());
 
         if session.cache.enabled() {
             pingora_cache::filters::upstream::request_filter(
@@ -104,11 +108,17 @@ where
         if session.upstream_compression.is_enabled() {
             session.upstream_compression.request_filter(&req);
         }
+        if let Some(wire) = upstream_wire.as_mut() {
+            self.inner.sync_upstream_request_wire(wire, &req);
+        }
         let body_empty = session.as_mut().is_body_empty();
 
         debug!("Request to custom: {req:?}");
 
         let req = Box::new(req);
+        if let Some(wire) = upstream_wire {
+            client_session.set_upstream_request_wire(wire);
+        }
         if let Err(e) = client_session.write_request_header(req, body_empty).await {
             return (false, Some(e.into_up()));
         }

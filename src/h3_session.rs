@@ -7,6 +7,7 @@ use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
 use cloudflare_pingora::protocols::Digest;
 use cloudflare_pingora::protocols::http::HttpTask;
 use cloudflare_pingora::protocols::http::custom::CustomMessageWrite;
+use crate::h3_wire;
 use cloudflare_pingora::protocols::http::custom::server::Session as CustomSession;
 use cloudflare_pingora::protocols::http::date::get_cached_date;
 use cloudflare_pingora::protocols::l4::socket::SocketAddr as PingoraAddr;
@@ -43,11 +44,14 @@ pub struct H3Session {
     digest: Digest,
     alt_svc: Option<Arc<HeaderValue>>,
     wire_headers: Vec<h3::Header>,
+    request_wire: Option<Vec<h3::Header>>,
 }
 
 impl H3Session {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         request_header: RequestHeader,
+        request_wire: Vec<h3::Header>,
         send: OutboundFrameSender,
         recv: InboundFrameStream,
         request_fin: bool,
@@ -74,6 +78,7 @@ impl H3Session {
             digest: Digest::default(),
             alt_svc,
             wire_headers: Vec::with_capacity(16),
+            request_wire: Some(request_wire),
         }
     }
 
@@ -566,5 +571,11 @@ impl CustomSession for H3Session {
         _writer: Box<dyn CustomMessageWrite>,
     ) -> Result<()> {
         Ok(())
+    }
+
+    fn take_upstream_request_wire(&mut self) -> Option<Vec<(Bytes, Bytes)>> {
+        self.request_wire
+            .take()
+            .map(h3_wire::headers_to_bytes_pairs)
     }
 }

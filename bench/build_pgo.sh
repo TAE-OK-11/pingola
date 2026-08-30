@@ -26,6 +26,13 @@ set -Eeuo pipefail
 : "${BORING_PGO_WEIGHT_TLS:?}"
 : "${RUSTFLAGS_COMMON:?}"
 
+# RUSTFLAGS_COMMON must include -Clinker-plugin-lto (not -Clto=fat) so Cargo's
+# release lto=fat profile and embed-bitcode settings stay consistent.
+case "${RUSTFLAGS_COMMON}" in
+  *linker-plugin-lto*) ;;
+  *) echo "RUSTFLAGS_COMMON must include -Clinker-plugin-lto for PGO+LTO builds" >&2; exit 2 ;;
+esac
+
 case "${RUST_TARGET_CPU}" in
   x86-64-v2) ;;
   *) echo "unsupported Rust target CPU: ${RUST_TARGET_CPU}" >&2; exit 2 ;;
@@ -93,7 +100,7 @@ CARGO_TARGET_DIR=/src/target/pgo-generate \
 CFLAGS="${TRAIN_NATIVE_FLAGS}" \
 CXXFLAGS="${TRAIN_NATIVE_FLAGS}" \
 RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${PGO_TRAIN_TARGET_CPU} -C profile-generate=/src/pgo-data/raw" \
-  cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
+  cargo build --locked --profile pgo-generate --target "${RUST_TARGET_TRIPLE}" \
     --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"
 PGO_BIN="/src/target/pgo-generate/${RUST_TARGET_TRIPLE}/release/pingora"
 test -x "${PGO_BIN}"
@@ -169,7 +176,7 @@ if [[ "${PGO_NATIVE_BORING}" == on ]]; then
   CFLAGS="${TRAIN_NATIVE_FLAGS} -fprofile-instr-generate" \
   CXXFLAGS="${TRAIN_NATIVE_FLAGS} -fprofile-instr-generate" \
   RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${PGO_TRAIN_TARGET_CPU} -C link-arg=-fprofile-instr-generate" \
-    cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
+    cargo build --locked --profile pgo-generate --target "${RUST_TARGET_TRIPLE}" \
       --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"
   NATIVE_PGO_BIN="/src/target/pgo-native-generate/${RUST_TARGET_TRIPLE}/release/pingora"
   test -x "${NATIVE_PGO_BIN}"
@@ -222,7 +229,7 @@ CARGO_TARGET_DIR=/src/target/pgo-use \
 CFLAGS="${NATIVE_USE_FLAGS}" \
 CXXFLAGS="${NATIVE_USE_FLAGS}" \
 RUSTFLAGS="${FINAL_RUSTFLAGS}" \
-  cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
+  cargo build --locked --profile pgo --target "${RUST_TARGET_TRIPLE}" \
     --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"
 FINAL_BIN="/src/target/pgo-use/${RUST_TARGET_TRIPLE}/release/pingora"
 test -x "${FINAL_BIN}"

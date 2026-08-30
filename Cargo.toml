@@ -82,3 +82,12 @@ lto = "fat"
 opt-level = 3
 panic = "abort"
 strip = "symbols"
+
+# PGO instrumented builds inherit the release profile. Use:
+#   cargo build --profile pgo-generate -C profile-generate=...
+#   cargo build --profile pgo -C profile-use=...
+[profile.pgo-generate]
+inherits = "release"
+
+[profile.pgo]
+inherits = "release"
