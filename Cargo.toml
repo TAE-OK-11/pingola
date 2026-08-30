@@ -59,7 +59,7 @@ serde-saphyr = "1.1.0"
 socket2 = "0.6.5"
 tcmalloc-better = { version = "=0.1.19", optional = true, features = ["extension", "std"] }
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats", "use_std"], optional = true }
-tikv-jemallocator = { version = "0.7.0", features = ["stats"], optional = true }
+tikv-jemallocator = { version = "0.7.0", features = ["stats", "background_threads"], optional = true }
 tokio = { version = "1.53.1", features = ["fs", "net", "rt-multi-thread", "sync", "time"] }
 tokio-quiche = { version = "=0.19.1", default-features = false, features = ["gcongestion"] }
 zstd = { version = "0.13.3", default-features = false }

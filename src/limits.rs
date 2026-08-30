@@ -9,10 +9,10 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use parking_lot::Mutex;
 
-const MAX_RATE_BUCKETS: usize = 65_536;
+const MAX_RATE_BUCKETS: usize = 32_768;
 const RATE_BUCKET_IDLE: Duration = Duration::from_secs(120);
 const RATE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_ACTIVE_COUNTERS: usize = 8_192;
+const MAX_ACTIVE_COUNTERS: usize = 4_096;
 
 thread_local! {
     // Worker-local sampling avoids a shared atomic increment on every

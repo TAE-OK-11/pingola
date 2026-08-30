@@ -20,7 +20,7 @@ server:
   downstream_keepalive_requests: 500
   max_retries: 2
   graceful_shutdown_timeout_seconds: 5
-  static_cache_bytes: 16777216
+  static_cache_bytes: 8388608
   access_log: false
   health_socket: /tmp/pingora/health.sock
   legacy_pingola_health: true

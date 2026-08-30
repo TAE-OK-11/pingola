@@ -33,10 +33,14 @@ const MAX_REQUEST_COMMANDS: usize = 128;
 const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_BODY_FRAMES: usize = 8;
 const H3_BODY_RECV_BUFFER: usize = 16 * 1024;
-const INITIAL_MAX_DATA: u64 = 16 * 1024 * 1024;
+// Match downstream HTTP/3 windows so upstream QUIC buffers cannot spike RSS on
+// small hosts while still covering Navidrome streaming bandwidth-delay product.
+const INITIAL_MAX_DATA: u64 = 4 * 1024 * 1024;
 const INITIAL_STREAM_WINDOW: u64 = 1024 * 1024;
+const MAX_CONNECTION_WINDOW: u64 = 8 * 1024 * 1024;
+const MAX_STREAM_WINDOW: u64 = 2 * 1024 * 1024;
 const H3_CONTROL_STREAMS: u64 = 8;
-const SEND_CAPACITY_FACTOR: f64 = 3.0;
+const SEND_CAPACITY_FACTOR: f64 = 2.0;
 const CC_CUBIC: &str = "cubic";
 const CC_BBR2: &str = "bbr2";
 type BoxError = Box<dyn StdError + Send + Sync>;
@@ -550,6 +554,8 @@ async fn run_connection(
     quic_config.set_initial_max_stream_data_bidi_local(INITIAL_STREAM_WINDOW);
     quic_config.set_initial_max_stream_data_bidi_remote(INITIAL_STREAM_WINDOW);
     quic_config.set_initial_max_stream_data_uni(INITIAL_STREAM_WINDOW);
+    quic_config.set_max_connection_window(MAX_CONNECTION_WINDOW);
+    quic_config.set_max_stream_window(MAX_STREAM_WINDOW);
     quic_config.set_initial_max_streams_bidi(settings.max_streams);
     quic_config.set_initial_max_streams_uni(H3_CONTROL_STREAMS);
     quic_config.set_disable_active_migration(true);
