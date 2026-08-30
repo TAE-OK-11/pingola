@@ -26,11 +26,15 @@ set -Eeuo pipefail
 : "${BORING_PGO_WEIGHT_TLS:?}"
 : "${RUSTFLAGS_COMMON:?}"
 
-# RUSTFLAGS_COMMON must include -Clinker-plugin-lto (not -Clto=fat) so Cargo's
-# release lto=fat profile and embed-bitcode settings stay consistent.
+# Cargo release/pgo profiles use fat LTO. Avoid -Clinker-plugin-lto here: Debian
+# builder images ship LLVM 19 while rustc 1.98 bundles LLVM 22, and mixed LTO
+# bitcode breaks quiche/BoringSSL links. Rust PGO still optimizes the full Rust
+# dependency graph under the same fat-LTO profile.
 case "${RUSTFLAGS_COMMON}" in
-  *linker-plugin-lto*) ;;
-  *) echo "RUSTFLAGS_COMMON must include -Clinker-plugin-lto for PGO+LTO builds" >&2; exit 2 ;;
+  *linker-plugin-lto*)
+    echo "RUSTFLAGS_COMMON must not set -Clinker-plugin-lto; use cargo fat LTO profiles instead" >&2
+    exit 2
+    ;;
 esac
 
 case "${RUST_TARGET_CPU}" in
