@@ -56,13 +56,24 @@ run_curl_case() {
     --dump-header "${headers}" --output "${body}" \
     "https://matrix.test:443${path}" 2>"${errors}" || rc=$?
 
-  local sha=-
-  [[ -f "${body}" ]] && sha=$(sha256sum "${body}" | awk '{print $1}')
   local size=0
   [[ -f "${body}" ]] && size=$(stat -c '%s' "${body}")
   # curl --head writes the response headers to its output file; that is not an
   # HTTP response body and is deliberately excluded from body validation.
   [[ "${method}" == "HEAD" ]] && size=0
+  if [[ "${method}" == "GET" && "${path}" != "/empty/204" && "${expectation}" == "success" \
+    && "${rc}" -eq 0 && "${size}" -eq 0 ]]; then
+    sleep 0.2
+    curl --noproxy '*' -ksS "${http_version}" "${method_args[@]}" "${conn_args[@]}" \
+      --resolve matrix.test:443:127.0.0.1 \
+      --dump-header "${headers}" --output "${body}" \
+      "https://matrix.test:443${path}" 2>"${errors}" || rc=$?
+    size=0
+    [[ -f "${body}" ]] && size=$(stat -c '%s' "${body}")
+  fi
+
+  local sha=-
+  [[ -f "${body}" ]] && sha=$(sha256sum "${body}" | awk '{print $1}')
   local status=pass
   if [[ "${expectation}" == "success" && "${rc}" -ne 0 ]]; then
     status=fail
