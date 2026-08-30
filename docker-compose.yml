@@ -6,6 +6,9 @@ services:
       context: .
       args:
         RUST_TARGET_CPU: x86-64-v2
+    # Host networking is required for production UDP GSO/GRO and kTLS: the
+    # container inherits the host kernel module set (CONFIG_TLS, UDP_SEGMENT).
+    # On bridge networks, ensure the host kernel is >= 5.19 for TLS 1.3 kTLS RX.
     network_mode: host
     restart: unless-stopped
     stop_signal: SIGTERM

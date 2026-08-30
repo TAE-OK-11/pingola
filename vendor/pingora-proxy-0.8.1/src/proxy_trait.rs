@@ -77,6 +77,14 @@ pub trait LocalProxyHttp {
         true
     }
 
+    /// Patch captured HTTP/3 wire headers after [Self::upstream_request_filter()].
+    fn sync_upstream_request_wire(
+        &self,
+        _wire: &mut Vec<(Bytes, Bytes)>,
+        _upstream_request: &RequestHeader,
+    ) {
+    }
+
     /// Set up downstream modules.
     ///
     /// In this phase, users can add or configure [HttpModules] before the server starts up.

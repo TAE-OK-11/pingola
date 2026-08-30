@@ -318,6 +318,59 @@ pub fn get_recv_buf(_sock: RawSocket) -> io::Result<usize> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn set_snd_buf(fd: RawFd, val: usize) -> Result<()> {
+    set_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, val as c_int)
+        .or_err(ConnectError, "failed to set SO_SNDBUF")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn set_snd_buf(_fd: RawFd, _: usize) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn set_snd_buf(_sock: RawSocket, _: usize) -> Result<()> {
+    Ok(())
+}
+
+/// Lower the unsent-byte threshold so streaming responses leave the host sooner.
+#[cfg(target_os = "linux")]
+pub fn set_tcp_notsent_lowat(fd: RawFd, val: u32) -> Result<()> {
+    const TCP_NOTSENT_LOWAT: c_int = 25;
+    set_opt(fd, libc::IPPROTO_TCP, TCP_NOTSENT_LOWAT, val as c_int)
+        .or_err(ConnectError, "failed to set TCP_NOTSENT_LOWAT")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn set_tcp_notsent_lowat(_fd: RawFd, _val: u32) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn set_tcp_notsent_lowat(_sock: RawSocket, _val: u32) -> Result<()> {
+    Ok(())
+}
+
+const PROXY_TCP_SOCK_BUF: usize = 256 * 1024;
+const PROXY_TCP_NOTSENT_LOWAT: u32 = 16 * 1024;
+
+/// Best-effort Linux proxy socket tuning for accepted and connected TCP streams.
+#[cfg(target_os = "linux")]
+pub fn tune_proxy_tcp_fd(fd: RawFd) -> Result<()> {
+    const TCP_QUICKACK: c_int = 12;
+    set_opt(fd, libc::IPPROTO_TCP, TCP_QUICKACK, 1_i32)
+        .or_err(ConnectError, "failed to set TCP_QUICKACK")?;
+    set_recv_buf(fd, PROXY_TCP_SOCK_BUF)?;
+    set_snd_buf(fd, PROXY_TCP_SOCK_BUF)?;
+    set_tcp_notsent_lowat(fd, PROXY_TCP_NOTSENT_LOWAT)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn tune_proxy_tcp_fd(_fd: RawFd) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 pub fn get_snd_buf(fd: RawFd) -> io::Result<usize> {
     get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_SNDBUF).map(|v| v as usize)
 }
@@ -604,6 +657,26 @@ impl std::fmt::Display for TcpKeepalive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}/{:?}/{}", self.idle, self.interval, self.count)
     }
+}
+
+/// Enable TCP quick ACKs on Linux to reduce delayed-ack latency on short proxy
+/// responses. Unsupported platforms ignore this call.
+#[cfg(target_os = "linux")]
+pub fn set_tcp_quickack(stream: &TcpStream) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    const TCP_QUICKACK: c_int = 12;
+    set_opt(
+        stream.as_raw_fd(),
+        libc::IPPROTO_TCP,
+        TCP_QUICKACK,
+        1_i32,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_tcp_quickack(_stream: &TcpStream) -> io::Result<()> {
+    Ok(())
 }
 
 /// Apply the given TCP keepalive settings to the given connection

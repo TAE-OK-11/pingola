@@ -81,6 +81,10 @@ where
         SV::CTX: Send + Sync,
     {
         let mut req = session.req_header().clone();
+        let mut upstream_wire = session
+            .downstream_session
+            .as_custom_mut()
+            .and_then(|custom| custom.take_upstream_request_wire());
 
         if session.cache.enabled() {
             pingora_cache::filters::upstream::request_filter(
@@ -104,17 +108,37 @@ where
         if session.upstream_compression.is_enabled() {
             session.upstream_compression.request_filter(&req);
         }
+        if let Some(wire) = upstream_wire.as_mut() {
+            self.inner.sync_upstream_request_wire(wire, &req);
+        }
         let body_empty = session.as_mut().is_body_empty();
 
         debug!("Request to custom: {req:?}");
 
         let req = Box::new(req);
+        if let Some(wire) = upstream_wire {
+            client_session.set_upstream_request_wire(wire);
+        }
         if let Err(e) = client_session.write_request_header(req, body_empty).await {
             return (false, Some(e.into_up()));
         }
 
         client_session.set_read_timeout(peer.options.read_timeout);
         client_session.set_write_timeout(peer.options.write_timeout);
+
+        let use_bodyless_fast_path = matches!(session.req_header().method, Method::GET | Method::HEAD)
+            && body_empty
+            && !session.cache.enabled()
+            && !session.cache.bypassing()
+            && !session.is_upgrade_req()
+            && self.inner.h1_bodyless_fast_path(session, ctx);
+
+        if use_bodyless_fast_path {
+            return match self.proxy_bodyless_custom(session, client_session, ctx).await {
+                Ok(reuse_downstream) => (reuse_downstream, None),
+                Err(e) => (false, Some(e)),
+            };
+        }
 
         // take the body writer out of the client for easy duplex
         let mut client_body = client_session
@@ -663,6 +687,224 @@ where
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
         }
+    }
+
+    /// Proxy a non-upgraded, cache-disabled GET/HEAD without per-request mpsc pipes.
+    async fn proxy_bodyless_custom(
+        &self,
+        session: &mut Session,
+        client_session: &mut C::Session,
+        ctx: &mut SV::CTX,
+    ) -> Result<bool>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        let mut serve_from_cache = ServeFromCache::new();
+        let mut range_body_filter = RangeBodyFilter::new();
+
+        client_session
+            .read_response_header()
+            .await
+            .map_err(|e| e.into_up())?;
+
+        let resp_header = Box::new(client_session.response_header().expect("just read").clone());
+        let header_eos = match client_session.check_response_end_or_error(true).await {
+            Ok(eos) => eos,
+            Err(e) => {
+                let _ = self
+                    .write_filtered_custom_task(
+                        session,
+                        HttpTask::Header(resp_header, false),
+                        ctx,
+                        &mut serve_from_cache,
+                        &mut range_body_filter,
+                    )
+                    .await;
+                return Err(e.into_up());
+            }
+        };
+
+        if self
+            .write_filtered_custom_task(
+                session,
+                HttpTask::Header(resp_header, header_eos),
+                ctx,
+                &mut serve_from_cache,
+                &mut range_body_filter,
+            )
+            .await?
+        {
+            session
+                .as_mut()
+                .finish_body()
+                .await
+                .map_err(|e| e.into_down())?;
+            return Ok(true);
+        }
+
+        if !header_eos {
+            if self.inner.h1_bodyless_poll_downstream(session, ctx) {
+                loop {
+                    tokio::select! {
+                        biased;
+                        chunk = client_session.read_response_body() => {
+                            match chunk.map_err(|e| e.into_up())? {
+                                Some(data) => {
+                                    let eos = client_session
+                                        .check_response_end_or_error(false)
+                                        .await
+                                        .map_err(|e| e.into_up())?;
+                                    if data.is_empty() && !eos {
+                                        continue;
+                                    }
+                                    let done = self
+                                        .write_filtered_custom_task(
+                                            session,
+                                            HttpTask::Body(Some(data), eos),
+                                            ctx,
+                                            &mut serve_from_cache,
+                                            &mut range_body_filter,
+                                        )
+                                        .await?;
+                                    if done || eos {
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    let trailers = client_session
+                                        .read_trailers()
+                                        .await
+                                        .map_err(|e| e.into_up())?;
+                                    if let Some(trailers) = trailers {
+                                        let done = self
+                                            .write_filtered_custom_task(
+                                                session,
+                                                HttpTask::Trailer(Some(Box::new(trailers))),
+                                                ctx,
+                                                &mut serve_from_cache,
+                                                &mut range_body_filter,
+                                            )
+                                            .await?;
+                                        if done {
+                                            break;
+                                        }
+                                    }
+                                    let _ = self
+                                        .write_filtered_custom_task(
+                                            session,
+                                            HttpTask::Done,
+                                            ctx,
+                                            &mut serve_from_cache,
+                                            &mut range_body_filter,
+                                        )
+                                        .await?;
+                                    break;
+                                }
+                            }
+                        }
+                        downstream = session.downstream_session.read_body_or_idle(true) => {
+                            match downstream {
+                                Err(e) => return Err(e.into_down()),
+                                Ok(_) => {
+                                    return Error::explain(
+                                        ReadError,
+                                        "unexpected downstream body on an empty custom request",
+                                    )
+                                    .into_err();
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                loop {
+                    match client_session.read_response_body().await.map_err(|e| e.into_up())? {
+                        Some(data) => {
+                            let eos = client_session
+                                .check_response_end_or_error(false)
+                                .await
+                                .map_err(|e| e.into_up())?;
+                            if data.is_empty() && !eos {
+                                continue;
+                            }
+                            let done = self
+                                .write_filtered_custom_task(
+                                    session,
+                                    HttpTask::Body(Some(data), eos),
+                                    ctx,
+                                    &mut serve_from_cache,
+                                    &mut range_body_filter,
+                                )
+                                .await?;
+                            if done || eos {
+                                break;
+                            }
+                        }
+                        None => {
+                            let trailers = client_session
+                                .read_trailers()
+                                .await
+                                .map_err(|e| e.into_up())?;
+                            if let Some(trailers) = trailers {
+                                let _ = self
+                                    .write_filtered_custom_task(
+                                        session,
+                                        HttpTask::Trailer(Some(Box::new(trailers))),
+                                        ctx,
+                                        &mut serve_from_cache,
+                                        &mut range_body_filter,
+                                    )
+                                    .await?;
+                            }
+                            let _ = self
+                                .write_filtered_custom_task(
+                                    session,
+                                    HttpTask::Done,
+                                    ctx,
+                                    &mut serve_from_cache,
+                                    &mut range_body_filter,
+                                )
+                                .await?;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        session
+            .as_mut()
+            .finish_body()
+            .await
+            .map_err(|e| e.into_down())?;
+        Ok(true)
+    }
+
+    async fn write_filtered_custom_task(
+        &self,
+        session: &mut Session,
+        mut task: HttpTask,
+        ctx: &mut SV::CTX,
+        serve_from_cache: &mut ServeFromCache,
+        range_body_filter: &mut RangeBodyFilter,
+    ) -> Result<bool>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        session.upstream_compression.response_filter(&mut task);
+        let task = self
+            .custom_response_filter(
+                session,
+                task,
+                ctx,
+                serve_from_cache,
+                range_body_filter,
+                false,
+            )
+            .await?;
+        session.write_response_tasks(vec![task]).await
     }
 
     async fn send_body_to_custom(

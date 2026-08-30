@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::h3_wire;
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
@@ -43,11 +44,14 @@ pub struct H3Session {
     digest: Digest,
     alt_svc: Option<Arc<HeaderValue>>,
     wire_headers: Vec<h3::Header>,
+    request_wire: Option<Vec<h3::Header>>,
 }
 
 impl H3Session {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         request_header: RequestHeader,
+        request_wire: Vec<h3::Header>,
         send: OutboundFrameSender,
         recv: InboundFrameStream,
         request_fin: bool,
@@ -74,6 +78,7 @@ impl H3Session {
             digest: Digest::default(),
             alt_svc,
             wire_headers: Vec::with_capacity(16),
+            request_wire: Some(request_wire),
         }
     }
 
@@ -446,7 +451,31 @@ impl CustomSession for H3Session {
     }
 
     async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
-        if no_body_expected || self.is_body_done() {
+        if no_body_expected {
+            if self.is_body_done() {
+                std::future::pending::<()>().await;
+                return Ok(None);
+            }
+            loop {
+                match self.recv.recv().await {
+                    Some(InboundFrame::Body(data, fin)) => {
+                        if data.is_empty() && !fin {
+                            continue;
+                        }
+                        return Err(Self::read_err(
+                            "unexpected downstream body on an empty HTTP/3 request",
+                        ));
+                    }
+                    Some(InboundFrame::Datagram(_)) => continue,
+                    None => {
+                        return Err(Self::read_err(
+                            "HTTP/3 downstream closed while streaming response",
+                        ));
+                    }
+                }
+            }
+        }
+        if self.is_body_done() {
             std::future::pending::<()>().await;
             Ok(None)
         } else {
@@ -542,5 +571,11 @@ impl CustomSession for H3Session {
         _writer: Box<dyn CustomMessageWrite>,
     ) -> Result<()> {
         Ok(())
+    }
+
+    fn take_upstream_request_wire(&mut self) -> Option<Vec<(Bytes, Bytes)>> {
+        self.request_wire
+            .take()
+            .map(h3_wire::headers_to_bytes_pairs)
     }
 }

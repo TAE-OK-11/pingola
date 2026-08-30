@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use cloudflare_pingora::connectors::http::custom::{self, Connection};
 use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
 use cloudflare_pingora::protocols::Digest;
@@ -16,7 +16,9 @@ use http::header::CONTENT_LENGTH;
 use http::{HeaderMap, Method};
 use hyper::body::Frame;
 use tokio::sync::{mpsc, oneshot};
+use tokio_quiche::quiche::h3;
 
+use crate::h3_wire;
 use crate::upstream_h3::{
     Command, H3Pool, RequestHandle, ResponseCancellation, ResponseHead, UpstreamH3Registry,
     encode_pingora_request, send_body_command,
@@ -101,6 +103,7 @@ pub struct H3UpstreamSession {
     digest: Digest,
     body_done: bool,
     expects_request_body: bool,
+    pending_request_wire: Option<Vec<h3::Header>>,
 }
 
 impl H3UpstreamSession {
@@ -121,6 +124,7 @@ impl H3UpstreamSession {
             digest: Digest::default(),
             body_done: false,
             expects_request_body: false,
+            pending_request_wire: None,
         }
     }
 
@@ -178,7 +182,10 @@ struct H3RequestBodyWriter {
     commands: mpsc::Sender<Command>,
     open: Option<oneshot::Receiver<Result<(), String>>>,
     expects_body: bool,
+    pending: BytesMut,
 }
+
+const UPSTREAM_BODY_BATCH_THRESHOLD: usize = 24 * 1024;
 
 #[async_trait]
 impl BodyWrite for H3RequestBodyWriter {
@@ -191,10 +198,11 @@ impl BodyWrite for H3RequestBodyWriter {
         if data.is_empty() {
             return Ok(());
         }
-        let chunk = std::mem::take(data);
-        send_body_command(&self.commands, self.id, chunk, false)
-            .await
-            .map_err(Self::write_err)?;
+        self.pending.extend_from_slice(data);
+        data.clear();
+        if self.pending.len() >= UPSTREAM_BODY_BATCH_THRESHOLD {
+            self.flush_pending(false).await?;
+        }
         Ok(())
     }
 
@@ -207,9 +215,13 @@ impl BodyWrite for H3RequestBodyWriter {
                 .map_err(|_| Self::write_err("upstream HTTP/3 request open channel closed"))?
                 .map_err(Self::write_err)?;
         }
-        send_body_command(&self.commands, self.id, Bytes::new(), true)
-            .await
-            .map_err(Self::write_err)
+        if self.pending.is_empty() {
+            send_body_command(&self.commands, self.id, Bytes::new(), true)
+                .await
+                .map_err(Self::write_err)
+        } else {
+            self.flush_pending(true).await
+        }
     }
 
     async fn cleanup(&mut self) -> Result<()> {
@@ -223,6 +235,16 @@ impl H3RequestBodyWriter {
     fn write_err(message: impl Into<String>) -> Box<Error> {
         Error::explain(ErrorType::WriteError, message.into())
     }
+
+    async fn flush_pending(&mut self, fin: bool) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::replace(&mut self.pending, BytesMut::new()).freeze();
+        send_body_command(&self.commands, self.id, chunk, fin)
+            .await
+            .map_err(Self::write_err)
+    }
 }
 
 #[async_trait]
@@ -230,8 +252,11 @@ impl cloudflare_pingora::protocols::http::custom::client::Session for H3Upstream
     async fn write_request_header(&mut self, req: Box<RequestHeader>, end: bool) -> Result<()> {
         let has_body = !end;
         let allow_early_data = end && matches!(req.method, Method::GET | Method::HEAD);
-        let headers =
-            encode_pingora_request(&req).map_err(|error| Self::write_err(error.to_string()))?;
+        let headers = if let Some(wire) = self.pending_request_wire.take() {
+            wire
+        } else {
+            encode_pingora_request(&req).map_err(|error| Self::write_err(error.to_string()))?
+        };
         let handle = self
             .pool
             .open(headers, has_body, allow_early_data)
@@ -383,7 +408,12 @@ impl cloudflare_pingora::protocols::http::custom::client::Session for H3Upstream
             commands: handle.commands.clone(),
             open: handle.opened.take(),
             expects_body: self.expects_request_body,
+            pending: BytesMut::with_capacity(UPSTREAM_BODY_BATCH_THRESHOLD),
         }))
+    }
+
+    fn set_upstream_request_wire(&mut self, wire: Vec<(Bytes, Bytes)>) {
+        self.pending_request_wire = Some(h3_wire::bytes_pairs_to_headers(wire));
     }
 
     async fn finish_custom(&mut self) -> Result<()> {

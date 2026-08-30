@@ -15,8 +15,8 @@ server:
   http3_stateless_retry: true
   certificate: /etc/pingora/cert/live/tae00217.cloud/fullchain.pem
   private_key: /etc/pingora/cert/live/tae00217.cloud/privkey.pem
-  threads: 1
-  upstream_keepalive_pool_size: 256
+  threads: 2
+  upstream_keepalive_pool_size: 64
   downstream_keepalive_requests: 500
   max_retries: 2
   graceful_shutdown_timeout_seconds: 5
@@ -25,10 +25,17 @@ server:
   health_socket: /tmp/pingora/health.sock
   legacy_pingola_health: true
   health_details: false
-  global_active_requests: 0
+  global_active_requests: 192
   static_active_requests_per_client: 16
   http2_max_concurrent_streams: 32
-  downstream_max_connections: 2048
+  http2_stream_window_bytes: 1048576
+  http2_connection_window_bytes: 8388608
+  quic_initial_max_data: 4194304
+  quic_stream_window: 1048576
+  quic_max_connection_window: 8388608
+  quic_max_stream_window: 2097152
+  quic_send_capacity_factor: 2.0
+  downstream_max_connections: 384
   downstream_request_header_timeout_seconds: 15
 
 trusted_proxies:
@@ -64,6 +71,11 @@ upstreams:
     verify_certificate: true
     http3_bbr2: true
     http3_max_concurrent_streams: 64
+    http2_max_concurrent_streams: 64
+    http2_stream_window_bytes: 1048576
+    http2_connection_window_bytes: 8388608
+    http3_warmup: true
+    http3_warmup_path: /rest/ping
     connect_timeout_seconds: 5
     idle_timeout_seconds: 300
     read_timeout_seconds: 3600
@@ -112,6 +124,20 @@ upstreams:
     read_timeout_seconds: 30
     write_timeout_seconds: 30
     idle_timeout_seconds: 300
+
+route_limits:
+  navidrome_stream:
+    rate_per_second: 40
+    burst: 15
+    active_requests: 10
+  navidrome_cover:
+    rate_per_second: 20
+    burst: 20
+    active_requests: 24
+  navidrome_api:
+    rate_per_second: 20
+    burst: 30
+    active_requests: 24
 
 hosts:
   navidrome_cdn:

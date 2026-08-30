@@ -37,6 +37,8 @@ use tokio::sync::mpsc;
 
 use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_host};
 use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
+use crate::h3_wire;
+use crate::kernel_socket::{self, PROXY_TCP_RCVBUF};
 use crate::limits::{
     ActiveRequestLimiter, ActiveRequestPermit, GlobalConcurrentLimiter, GlobalConcurrentPermit,
     LimitZone, RateLimiter,
@@ -327,10 +329,16 @@ impl Default for RequestContext {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Http3AdmissionRejection {
+    RateLimited,
+    TooManyConnections,
+}
+
 /// Process-wide admission and static cache shared by the public listener
-/// and the loopback HTTP/3 → H2c handoff. Separate Gateway instances must
-/// not own their own limiters or LRU, or H2+H3 clients would get 2× quota
-/// and the 1 GiB host would hold two 16 MiB asset caches.
+/// and the HTTP/3 frontend. Separate Gateway instances must not own their
+/// own limiters or LRU, or H2+H3 clients would get 2× quota and the host
+/// would hold duplicate static asset caches.
 pub struct GatewayShared {
     static_files: StaticFiles,
     rates: RateLimiter,
@@ -339,6 +347,26 @@ pub struct GatewayShared {
 }
 
 impl GatewayShared {
+    pub fn admit_http3_connection(
+        &self,
+        peer: std::net::SocketAddr,
+        rate_per_second: f64,
+        burst: u32,
+        max_active: usize,
+    ) -> Result<ActiveRequestPermit, Http3AdmissionRejection> {
+        if !self.rates.allow(
+            LimitZone::Http3Connection,
+            peer.ip(),
+            rate_per_second,
+            burst,
+        ) {
+            return Err(Http3AdmissionRejection::RateLimited);
+        }
+        self.active_requests
+            .acquire(LimitZone::Http3Connection, peer.ip(), max_active)
+            .ok_or(Http3AdmissionRejection::TooManyConnections)
+    }
+
     pub fn from_runtime(runtime: &RuntimeConfig) -> anyhow::Result<Self> {
         let roots = runtime
             .config
@@ -926,11 +954,15 @@ impl ProxyHttp for Gateway {
         plan.route.supports_h1_bodyless_fast_path() && !session.is_upgrade_req()
     }
 
-    fn h1_bodyless_poll_downstream(&self, session: &Session, ctx: &Self::CTX) -> bool {
-        if is_direct_http3(session) {
-            // QUIC custom sessions never detect disconnect via read_body_or_idle().
-            return false;
-        }
+    fn sync_upstream_request_wire(
+        &self,
+        wire: &mut Vec<(Bytes, Bytes)>,
+        upstream_request: &RequestHeader,
+    ) {
+        h3_wire::finalize_upstream_wire_pairs(wire, upstream_request);
+    }
+
+    fn h1_bodyless_poll_downstream(&self, _session: &Session, ctx: &Self::CTX) -> bool {
         self.plans.get(ctx.plan_index).is_some_and(|plan| {
             matches!(
                 plan.route,
@@ -1290,7 +1322,7 @@ impl ProxyHttp for Gateway {
 /// Let selected application origins negotiate their own response encoding.
 ///
 /// Audio, binary DoH, authentication responses and upgraded/long-lived
-/// connections deliberately stay uncompressed. Vaultwarden and CouchDB use a
+/// connections deliberately stay uncompressed. Vaultwarden UI responses use a
 /// separate bounded streaming compressor in the downstream response path.
 fn forwards_accept_encoding(route: RouteClass) -> bool {
     matches!(route, RouteClass::NavidromeApi | RouteClass::NavidromeCover)
@@ -2028,6 +2060,10 @@ fn prepare_upstream(
         #[cfg(target_os = "linux")]
         user_timeout: Duration::from_secs(90),
     });
+    let offload = kernel_socket::offload_report();
+    peer.options.tcp_fast_open = offload.tcp_fastopen_client;
+    peer.options.tcp_recv_buf = Some(PROXY_TCP_RCVBUF);
+    peer.options.upstream_tcp_sock_tweak_hook = Some(kernel_socket::upstream_tcp_hook());
     let h3 = upstream_h3.route(name).map(|route| {
         let mut peer = HttpPeer::new(address, false, name.to_string());
         peer.options.connection_timeout =

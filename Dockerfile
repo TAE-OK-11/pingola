@@ -75,11 +75,12 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
     case "${RUST_LTO}" in thin|fat) ;; *) echo "unsupported Rust LTO mode: ${RUST_LTO}" >&2; exit 2 ;; esac; \
     case "${RUST_CODEGEN_UNITS}" in 1|2|4|8|16) ;; *) echo "unsupported codegen units: ${RUST_CODEGEN_UNITS}" >&2; exit 2 ;; esac; \
     case "${RUST_TARGET_CPU}" in \
-      x86-64-v2) NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic' ;; \
+      x86-64-v2) NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic -ffunction-sections -fdata-sections' ;; \
       *) echo "unsupported Rust target CPU: ${RUST_TARGET_CPU}" >&2; exit 2 ;; \
     esac; \
     CARGO_TARGET_DIR=/src/target/release \
-    CFLAGS="${NATIVE_FLAGS}" CXXFLAGS="${NATIVE_FLAGS}" \
+    CFLAGS="${NATIVE_FLAGS}" \
+    CXXFLAGS="${NATIVE_FLAGS}" \
     RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU}" \
       cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
         --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
@@ -113,6 +114,12 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.rust.target="${RUST_TARGET_TRIPLE}" \
       org.opencontainers.image.rust.target-cpu="${RUST_TARGET_CPU}" \
       org.opencontainers.image.rust.lto="${RUST_LTO}" \
+      org.opencontainers.image.rust.lto-scope="cargo-fat" \
+      org.opencontainers.image.rust.pgo="off" \
+      org.opencontainers.image.kernel.ktls="host-dependent" \
+      org.opencontainers.image.kernel.udp-offload="gso-gro-txtime" \
+      org.opencontainers.image.kernel.tcp-tuning="256k-buf,quickack,notsent-lowat,tfo" \
+      org.opencontainers.image.kernel.tcp-fastopen="listener-backlog-64" \
       org.opencontainers.image.rust.codegen-units="${RUST_CODEGEN_UNITS}" \
       org.opencontainers.image.rust.linker="lld" \
       org.opencontainers.image.licenses="Apache-2.0"
@@ -135,7 +142,7 @@ COPY --link --chown=10001:10001 config/pingora.yaml /etc/pingora/pingora.yaml
 USER 10001:10001
 WORKDIR /tmp/pingora
 
-ENV MALLOC_CONF="narenas:1,retain:false,dirty_decay_ms:500,muzzy_decay_ms:500,background_thread:true,tcache_max:4096"
+ENV MALLOC_CONF="narenas:1,percpu_arena:percpu,retain:false,dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:true,tcache_max:8192"
 
 EXPOSE 80/tcp 443/tcp 443/udp
 

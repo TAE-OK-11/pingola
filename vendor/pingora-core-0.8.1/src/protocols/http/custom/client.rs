@@ -66,6 +66,9 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn take_request_body_writer(&mut self) -> Option<Box<dyn BodyWrite>>;
 
+    /// Install captured HTTP/3 wire headers for the next upstream request.
+    fn set_upstream_request_wire(&mut self, _wire: Vec<(Bytes, Bytes)>) {}
+
     async fn finish_custom(&mut self) -> Result<()>;
 
     fn take_custom_message_reader(
@@ -172,5 +175,9 @@ impl Session for () {
 
     fn take_request_body_writer(&mut self) -> Option<Box<dyn BodyWrite>> {
         unreachable!("client session: take_request_body_writer")
+    }
+
+    fn set_upstream_request_wire(&mut self, _wire: Vec<(Bytes, Bytes)>) {
+        unreachable!("client session: set_upstream_request_wire")
     }
 }

@@ -12,6 +12,7 @@ ECDSA_CURVE=${PGO_ECDSA_CURVE:-prime256v1}
 REQUIRE_PROFILE=${PGO_REQUIRE_PROFILE:-true}
 ROUND=${PGO_TRAIN_ROUND:-1}
 TARGET_HTTPS_PORT=${PGO_UPSTREAM_TARGET_HTTPS_PORT:-19445}
+TARGET_H3_PORT=${PGO_UPSTREAM_TARGET_H3_PORT:-19446}
 ORIGIN_H3_PORT=${PGO_UPSTREAM_ORIGIN_H3_PORT:-19444}
 ORIGIN_INTERNAL_PORT=${PGO_UPSTREAM_ORIGIN_INTERNAL_PORT:-18081}
 BACKEND_PORT=${PGO_UPSTREAM_BACKEND_PORT:-19001}
@@ -72,13 +73,28 @@ run_h2load() {
   }
 }
 
+run_h3_probe() {
+  local name=$1
+  local authority=$2
+  local path=$3
+  local requests=$4
+
+  if ! "${HTTP3_PROBE_BIN}" "127.0.0.1:${TARGET_H3_PORT}" "${authority}" "${path}" "${requests}" \
+    >"${OUTPUT_DIR}/${name}.out" 2>"${OUTPUT_DIR}/${name}.log"; then
+    echo "upstream H3 direct-gateway workload failed: ${name}" >&2
+    sed -n '1,160p' "${OUTPUT_DIR}/${name}.log" >&2
+    show_failure_logs
+    exit 1
+  fi
+}
+
 rm -rf "${RUNTIME_DIR}"
 install -d -m 0700 "${OUTPUT_DIR}" "${RUNTIME_DIR}"
 openssl genpkey -algorithm EC -pkeyopt "ec_paramgen_curve:${ECDSA_CURVE}" \
   -out "${RUNTIME_DIR}/key.pem" >"${OUTPUT_DIR}/openssl-key.log" 2>&1
 openssl req -new -x509 -sha256 -days 1 -key "${RUNTIME_DIR}/key.pem" \
   -subj '/CN=pgo.test' \
-  -addext 'subjectAltName=DNS:pgo.test,DNS:origin.test' \
+  -addext 'subjectAltName=DNS:pgo.test,DNS:origin.test,DNS:music.test' \
   -out "${RUNTIME_DIR}/cert.pem" >"${OUTPUT_DIR}/openssl-cert.log" 2>&1
 chmod 0600 "${RUNTIME_DIR}/key.pem" "${RUNTIME_DIR}/cert.pem"
 
@@ -109,15 +125,19 @@ upstreams:
     idle_timeout_seconds: 30
 hosts:
   profile: { domains: ["origin.test", "pgo.test"], handler: vaultwarden, upstream: backend }
+  stream: { domains: ["music.test"], handler: navidrome-main, upstream: backend }
 route_limits:
   vaultwarden: { rate_per_second: 0, active_requests: 0 }
+  navidrome_stream: { rate_per_second: 0, active_requests: 0 }
 EOF_ORIGIN
 
 cat >"${OUTPUT_DIR}/target.yaml" <<EOF_TARGET
 server:
   http_listen: []
   https_listen: ["127.0.0.1:${TARGET_HTTPS_PORT}"]
-  http3_listen: []
+  http3_listen: ["127.0.0.1:${TARGET_H3_PORT}"]
+  http3_max_idle_timeout_seconds: 60
+  http3_max_concurrent_streams: 128
   certificate: ${RUNTIME_DIR}/cert.pem
   private_key: ${RUNTIME_DIR}/key.pem
   health_socket: ${RUNTIME_DIR}/target-health.sock
@@ -126,6 +146,7 @@ server:
   upstream_keepalive_pool_size: 128
   downstream_keepalive_requests: 1000000
   http2_max_concurrent_streams: 128
+  http3_max_requests_per_connection: 1000000
   graceful_shutdown_timeout_seconds: 2
 trusted_proxies: ["127.0.0.0/8"]
 upstreams:
@@ -144,8 +165,10 @@ upstreams:
     idle_timeout_seconds: 3
 hosts:
   profile: { domains: ["pgo.test"], handler: vaultwarden, upstream: origin_h3 }
+  stream: { domains: ["music.test"], handler: navidrome-main, upstream: origin_h3 }
 route_limits:
   vaultwarden: { rate_per_second: 0, active_requests: 0 }
+  navidrome_stream: { rate_per_second: 0, active_requests: 0 }
 EOF_TARGET
 
 "${BACKEND_BIN}" --port "${BACKEND_PORT}" >"${OUTPUT_DIR}/backend.log" 2>&1 &
@@ -175,6 +198,21 @@ LLVM_PROFILE_FILE="${OUTPUT_DIR}/pingora-upstream-${CC}-r${ROUND}-%p-%m.profraw"
 PINGORA_PID=$!
 wait_tcp "${TARGET_HTTPS_PORT}" "${PINGORA_PID}" target
 
+h3_ready=false
+for _ in {1..200}; do
+  if "${HTTP3_PROBE_BIN}" "127.0.0.1:${TARGET_H3_PORT}" pgo.test /json/512 \
+    >"${OUTPUT_DIR}/target-h3-readiness.out" 2>"${OUTPUT_DIR}/target-h3-readiness.log"; then
+    h3_ready=true
+    break
+  fi
+  kill -0 "${PINGORA_PID}" 2>/dev/null || { show_failure_logs; exit 1; }
+  sleep 0.05
+done
+[[ "${h3_ready}" == true ]] || {
+  echo "target HTTP/3 listener did not become ready on 127.0.0.1:${TARGET_H3_PORT}" >&2
+  exit 1
+}
+
 run_h2load small -n 6000 -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/json/512"
@@ -188,7 +226,7 @@ run_h2load large-json -n 1000 -c 4 -m 8 -w 16 -W 20 --sni pgo.test \
 # Prefer a Content-Length bulk path for the majority of transfer training: it
 # matches large object/audio/range-style responses more closely than the
 # synthetic chunked fixture. Keep a separate chunked workload so incremental
-# response forwarding and H3/H2C handoff paths remain represented in PGO.
+# response forwarding and bodyless fast paths remain represented in PGO.
 # Both workloads are serialized to avoid teaching the profile a single-thread
 # synthetic queue-overflow artifact rather than steady production forwarding.
 run_h2load bulk-512k -n 160 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
@@ -197,6 +235,14 @@ run_h2load bulk-512k -n 160 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
 run_h2load chunked-128k -n 256 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/131072"
+
+# Direct-gateway H3 downstream -> upstream H3 exercises wire passthrough,
+# bodyless fast path, and header sync without TLS/H2 framing overhead.
+for index in $(seq 1 4); do
+  run_h3_probe "h3-downstream-json-${index}" pgo.test /json/512 256
+done
+run_h3_probe h3-downstream-stream music.test /stream/524288 8
+run_h3_probe h3-downstream-bulk pgo.test /bytes/262144 32
 
 # The target uses a deliberately short three-second upstream QUIC idle timeout
 # only for this training fixture. Waiting past it repeatedly exercises reconnect,
@@ -224,6 +270,9 @@ medium_requests=3000
 large_json_requests=1000
 bulk_512k_requests=160
 chunked_128k_requests=256
+h3_downstream_json_requests=1024
+h3_downstream_stream_requests=8
+h3_downstream_bulk_requests=32
 resumption_cycles=8
 resumption_requests=256
 early_data_client=true

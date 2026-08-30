@@ -227,7 +227,7 @@ impl StaticFiles {
             cache: AssetCache::new(cache_bytes),
             paths,
             // Bound whole-file allocations as well as CPU-heavy compression.
-            cold_read_slot: Semaphore::new(1),
+            cold_read_slot: Semaphore::new(2),
             // HTTP/2 and HTTP/3 multiplexing means a socket limit alone does
             // not bound metadata work or open file descriptors.
             request_slots: Semaphore::new(MAX_ACTIVE_STATIC_REQUESTS),
@@ -562,6 +562,21 @@ async fn serve_streaming_file(
             )
         })?)
     };
+    #[cfg(target_os = "linux")]
+    if let Some(file) = file.as_ref()
+        && length > FILE_CHUNK_BYTES as u64
+    {
+        use std::os::unix::io::AsRawFd;
+        const POSIX_FADV_SEQUENTIAL: libc::c_int = 2;
+        let _ = unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                0,
+                length as libc::off_t,
+                POSIX_FADV_SEQUENTIAL,
+            )
+        };
+    }
     let mut response = ResponseHeader::build(200, Some(10)).unwrap();
     response.insert_header(CONTENT_TYPE, content_type)?;
     response.insert_header(CONTENT_LENGTH, length.to_string())?;

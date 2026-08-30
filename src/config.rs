@@ -32,7 +32,7 @@ fn default_threads() -> usize {
 }
 
 fn default_keepalive_pool() -> usize {
-    256
+    64
 }
 
 fn default_downstream_keepalive_requests() -> u32 {
@@ -76,7 +76,39 @@ fn default_http3_max_connections_per_ip() -> usize {
 }
 
 fn default_downstream_max_connections() -> usize {
-    2048
+    512
+}
+
+fn default_http2_stream_window_bytes() -> u32 {
+    1024 * 1024
+}
+
+fn default_http2_connection_window_bytes() -> u32 {
+    8 * 1024 * 1024
+}
+
+fn default_quic_initial_max_data() -> u64 {
+    4 * 1024 * 1024
+}
+
+fn default_quic_stream_window() -> u64 {
+    1024 * 1024
+}
+
+fn default_quic_max_connection_window() -> u64 {
+    8 * 1024 * 1024
+}
+
+fn default_quic_max_stream_window() -> u64 {
+    2 * 1024 * 1024
+}
+
+fn default_quic_send_capacity_factor() -> f64 {
+    2.0
+}
+
+fn default_http3_warmup_path() -> String {
+    "/rest/ping".to_string()
 }
 
 fn default_downstream_request_header_timeout() -> u64 {
@@ -211,6 +243,20 @@ pub struct ServerConfig {
     pub downstream_max_connections: usize,
     #[serde(default = "default_downstream_request_header_timeout")]
     pub downstream_request_header_timeout_seconds: u64,
+    #[serde(default = "default_http2_stream_window_bytes")]
+    pub http2_stream_window_bytes: u32,
+    #[serde(default = "default_http2_connection_window_bytes")]
+    pub http2_connection_window_bytes: u32,
+    #[serde(default = "default_quic_initial_max_data")]
+    pub quic_initial_max_data: u64,
+    #[serde(default = "default_quic_stream_window")]
+    pub quic_stream_window: u64,
+    #[serde(default = "default_quic_max_connection_window")]
+    pub quic_max_connection_window: u64,
+    #[serde(default = "default_quic_max_stream_window")]
+    pub quic_max_stream_window: u64,
+    #[serde(default = "default_quic_send_capacity_factor")]
+    pub quic_send_capacity_factor: f64,
     /// Insert standard security headers on proxied responses. Disable only in
     /// controlled benchmark fixtures where the comparison proxy omits them.
     #[serde(default = "default_true")]
@@ -253,6 +299,12 @@ pub struct UpstreamConfig {
     pub write_timeout_seconds: Option<u64>,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_seconds: u64,
+    /// Issue a replay-safe GET after pool start so the first client stream
+    /// reuses a warmed QUIC session ticket instead of paying handshake cost.
+    #[serde(default)]
+    pub http3_warmup: bool,
+    #[serde(default = "default_http3_warmup_path")]
+    pub http3_warmup_path: String,
 }
 
 /// HTTP version policy for a single upstream.
@@ -452,6 +504,29 @@ fn validate(config: &Config) -> Result<()> {
     if !(1..=1024).contains(&config.server.http2_max_concurrent_streams) {
         bail!("server.http2_max_concurrent_streams must be between 1 and 1024");
     }
+    if !(64 * 1024..=16 * 1024 * 1024).contains(&config.server.http2_stream_window_bytes) {
+        bail!("server.http2_stream_window_bytes must be between 65536 and 16777216");
+    }
+    if !(256 * 1024..=64 * 1024 * 1024).contains(&config.server.http2_connection_window_bytes) {
+        bail!("server.http2_connection_window_bytes must be between 262144 and 67108864");
+    }
+    if !(256 * 1024..=64 * 1024 * 1024).contains(&config.server.quic_initial_max_data) {
+        bail!("server.quic_initial_max_data must be between 262144 and 67108864");
+    }
+    if !(64 * 1024..=16 * 1024 * 1024).contains(&config.server.quic_stream_window) {
+        bail!("server.quic_stream_window must be between 65536 and 16777216");
+    }
+    if !(1024 * 1024..=64 * 1024 * 1024).contains(&config.server.quic_max_connection_window) {
+        bail!("server.quic_max_connection_window must be between 1048576 and 67108864");
+    }
+    if !(256 * 1024..=16 * 1024 * 1024).contains(&config.server.quic_max_stream_window) {
+        bail!("server.quic_max_stream_window must be between 262144 and 16777216");
+    }
+    if !config.server.quic_send_capacity_factor.is_finite()
+        || !(1.0..=8.0).contains(&config.server.quic_send_capacity_factor)
+    {
+        bail!("server.quic_send_capacity_factor must be finite and between 1 and 8");
+    }
     if !(1..=1024).contains(&config.server.http3_max_concurrent_streams) {
         bail!("server.http3_max_concurrent_streams must be between 1 and 1024");
     }
@@ -639,6 +714,11 @@ fn validate(config: &Config) -> Result<()> {
         }
         if upstream.protocol.uses_http3() && !upstream.tls {
             bail!("HTTP/3 upstream {name} requires tls: true");
+        }
+        if upstream.http3_warmup && upstream.http3_warmup_path.is_empty() {
+            bail!(
+                "upstream {name} http3_warmup_path must not be empty when http3_warmup is enabled"
+            );
         }
     }
 

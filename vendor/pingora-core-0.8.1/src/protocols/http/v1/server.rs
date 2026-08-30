@@ -439,15 +439,22 @@ impl HttpSession {
 
     /// Read the request body. `Ok(None)` when there is no (more) body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        let read = self.read_body().await?;
-        Ok(read.map(|b| {
-            let bytes = Bytes::copy_from_slice(self.get_body(&b));
-            self.body_bytes_read += bytes.len();
+        let Some(body_ref) = self.read_body().await? else {
+            return Ok(None);
+        };
+        let length = self.get_body(&body_ref).len();
+        self.body_bytes_read += length;
+        if let Some(bytes) = self.body_reader.take_filled_body(&body_ref) {
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.write_to_buffer(&bytes);
             }
-            bytes
-        }))
+            return Ok(Some(bytes));
+        }
+        let bytes = Bytes::copy_from_slice(self.get_body(&body_ref));
+        if let Some(buffer) = self.retry_buffer.as_mut() {
+            buffer.write_to_buffer(&bytes);
+        }
+        Ok(Some(bytes))
     }
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
