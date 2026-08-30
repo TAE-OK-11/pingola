@@ -106,7 +106,7 @@ CXXFLAGS="${TRAIN_NATIVE_FLAGS}" \
 RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${PGO_TRAIN_TARGET_CPU} -C profile-generate=/src/pgo-data/raw" \
   cargo build --locked --profile pgo-generate --target "${RUST_TARGET_TRIPLE}" \
     --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"
-PGO_BIN="/src/target/pgo-generate/${RUST_TARGET_TRIPLE}/release/pingora"
+PGO_BIN="/src/target/pgo-generate/${RUST_TARGET_TRIPLE}/pgo-generate/pingora"
 test -x "${PGO_BIN}"
 
 for round in $(seq 1 "${PGO_TRAIN_ROUNDS}"); do
@@ -182,7 +182,7 @@ if [[ "${PGO_NATIVE_BORING}" == on ]]; then
   RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${PGO_TRAIN_TARGET_CPU} -C link-arg=-fprofile-instr-generate" \
     cargo build --locked --profile pgo-generate --target "${RUST_TARGET_TRIPLE}" \
       --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"
-  NATIVE_PGO_BIN="/src/target/pgo-native-generate/${RUST_TARGET_TRIPLE}/release/pingora"
+  NATIVE_PGO_BIN="/src/target/pgo-native-generate/${RUST_TARGET_TRIPLE}/pgo-generate/pingora"
   test -x "${NATIVE_PGO_BIN}"
 
   for round in $(seq 1 "${PGO_NATIVE_TRAIN_ROUNDS}"); do
@@ -235,7 +235,7 @@ CXXFLAGS="${NATIVE_USE_FLAGS}" \
 RUSTFLAGS="${FINAL_RUSTFLAGS}" \
   cargo build --locked --profile pgo --target "${RUST_TARGET_TRIPLE}" \
     --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"
-FINAL_BIN="/src/target/pgo-use/${RUST_TARGET_TRIPLE}/release/pingora"
+FINAL_BIN="/src/target/pgo-use/${RUST_TARGET_TRIPLE}/pgo/pingora"
 test -x "${FINAL_BIN}"
 install -Dm755 "${FINAL_BIN}" /out/pingora
 install -Dm644 /src/pgo-data/profile-summary.txt /out/pgo-profile-summary.txt
