@@ -182,6 +182,7 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.allocator="${ALLOCATOR}" \
       org.opencontainers.image.tls.provider="${TLS_PROVIDER}" \
       org.opencontainers.image.http3.provider="quiche" \
+      org.opencontainers.image.http3.internal-protocol="direct-gateway" \
       org.opencontainers.image.quic.tls.provider="boringssl" \
       org.opencontainers.image.rust.pgo="${PGO_MODE}" \
       org.opencontainers.image.native.pgo="${PGO_NATIVE_BORING}" \
@@ -228,6 +229,8 @@ COPY --link --chown=10001:10001 config/pingora.yaml /etc/pingora/pingora.yaml
 
 USER 10001:10001
 WORKDIR /tmp/pingora
+
+ENV MALLOC_CONF="narenas:1,retain:false,dirty_decay_ms:1000,tcache_max:8192"
 
 EXPOSE 80/tcp 443/tcp 443/udp
 

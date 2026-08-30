@@ -26,7 +26,6 @@ thread_local! {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum LimitZone {
-    Global = 0,
     Static = 1,
     Http3Connection = 2,
     NavidromeStream = 3,
@@ -271,6 +270,42 @@ impl Drop for ActiveRequestPermit {
     }
 }
 
+/// Process-wide concurrent request cap. Unlike [`ActiveRequestLimiter`], this is
+/// not keyed by client IP so HTTP/2 multiplexing on one connection does not
+/// consume one slot per stream from the same address.
+pub struct GlobalConcurrentLimiter {
+    active: Arc<AtomicUsize>,
+}
+
+impl GlobalConcurrentLimiter {
+    pub fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn acquire(&self, limit: usize) -> Option<GlobalConcurrentPermit> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < limit).then_some(current + 1)
+            })
+            .ok()
+            .map(|_| GlobalConcurrentPermit {
+                counter: self.active.clone(),
+            })
+    }
+}
+
+pub struct GlobalConcurrentPermit {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for GlobalConcurrentPermit {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +409,17 @@ mod tests {
         assert!(limiter.acquire(LimitZone::NavidromeStream, ip, 1).is_none());
         assert!(limiter.acquire(LimitZone::Vaultwarden, ip, 1).is_some());
         assert!(limiter.acquire(LimitZone::Doh, ip, 1).is_some());
+    }
+
+    #[test]
+    fn global_concurrent_limiter_is_not_per_client() {
+        let limiter = GlobalConcurrentLimiter::new();
+        let first = limiter.acquire(2).unwrap();
+        let second = limiter.acquire(2).unwrap();
+        assert!(limiter.acquire(2).is_none());
+        drop(first);
+        assert!(limiter.acquire(2).is_some());
+        drop(second);
     }
 
     #[test]

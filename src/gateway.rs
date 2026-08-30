@@ -37,7 +37,10 @@ use tokio::sync::mpsc;
 
 use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_host};
 use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
-use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, LimitZone, RateLimiter};
+use crate::limits::{
+    ActiveRequestLimiter, ActiveRequestPermit, GlobalConcurrentLimiter, GlobalConcurrentPermit,
+    LimitZone, RateLimiter,
+};
 use crate::static_files::StaticFiles;
 use crate::upstream_h3::{H3_UPSTREAM_ALPN, H3Route, UpstreamH3Registry};
 
@@ -298,8 +301,9 @@ pub struct RequestContext {
     identity_acceptable: bool,
     compression_selected: bool,
     started_at: Option<Instant>,
+    limits_exempt: bool,
     _active_request_permit: Option<ActiveRequestPermit>,
-    _global_request_permit: Option<ActiveRequestPermit>,
+    _global_request_permit: Option<GlobalConcurrentPermit>,
 }
 
 impl Default for RequestContext {
@@ -318,6 +322,7 @@ impl Default for RequestContext {
             identity_acceptable: true,
             compression_selected: false,
             started_at: None,
+            limits_exempt: false,
             _active_request_permit: None,
             _global_request_permit: None,
         }
@@ -332,6 +337,7 @@ pub struct GatewayShared {
     static_files: StaticFiles,
     rates: RateLimiter,
     active_requests: ActiveRequestLimiter,
+    global_concurrent: GlobalConcurrentLimiter,
 }
 
 impl GatewayShared {
@@ -350,6 +356,7 @@ impl GatewayShared {
             static_files: StaticFiles::new(roots, runtime.config.server.static_cache_bytes)?,
             rates: RateLimiter::new(),
             active_requests: ActiveRequestLimiter::new(),
+            global_concurrent: GlobalConcurrentLimiter::new(),
         })
     }
 }
@@ -470,14 +477,10 @@ impl Gateway {
 
     fn acquire_global_request(&self, ctx: &mut RequestContext) -> bool {
         let limit = self.runtime.config.server.global_active_requests;
-        if limit == 0 {
+        if limit == 0 || ctx.limits_exempt {
             return true;
         }
-        let Some(permit) =
-            self.shared
-                .active_requests
-                .acquire(LimitZone::Global, ctx.client_ip, limit)
-        else {
+        let Some(permit) = self.shared.global_concurrent.acquire(limit) else {
             return false;
         };
         ctx._global_request_permit = Some(permit);
@@ -597,6 +600,7 @@ impl ProxyHttp for Gateway {
         };
         ctx.http3 = http3;
         ctx.tls = tls;
+        ctx.limits_exempt = peer_limits_exempt(&self.runtime, session);
         ctx.forwarded_port = if internal_http3 {
             session
                 .req_header()
@@ -733,6 +737,7 @@ impl ProxyHttp for Gateway {
                 return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
             };
             ctx.client_ip = client_ip;
+            ctx.limits_exempt = client_limits_exempt(ctx.limits_exempt, client_ip);
             if !self.acquire_global_request(ctx) {
                 return send_empty(
                     &self.runtime,
@@ -745,23 +750,25 @@ impl ProxyHttp for Gateway {
                 )
                 .await;
             }
-            let Some(permit) = self.shared.active_requests.acquire(
-                LimitZone::Static,
-                client_ip,
-                self.runtime.config.server.static_active_requests_per_client,
-            ) else {
-                return send_empty(
-                    &self.runtime,
-                    session,
-                    429,
-                    Some(host.handler),
-                    tls,
-                    http3,
-                    &[("retry-after", "1")],
-                )
-                .await;
-            };
-            ctx._active_request_permit = Some(permit);
+            if !ctx.limits_exempt {
+                let Some(permit) = self.shared.active_requests.acquire(
+                    LimitZone::Static,
+                    client_ip,
+                    self.runtime.config.server.static_active_requests_per_client,
+                ) else {
+                    return send_empty(
+                        &self.runtime,
+                        session,
+                        429,
+                        Some(host.handler),
+                        tls,
+                        http3,
+                        &[("retry-after", "1")],
+                    )
+                    .await;
+                };
+                ctx._active_request_permit = Some(permit);
+            }
             return self
                 .shared
                 .static_files
@@ -774,6 +781,7 @@ impl ProxyHttp for Gateway {
             return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
         };
         ctx.client_ip = client_ip;
+        ctx.limits_exempt = client_limits_exempt(ctx.limits_exempt, client_ip);
         self.prepare_upstream_forwarded_headers(session, ctx)?;
 
         if host.handler == HandlerKind::NavidromeMain && path == "/" {
@@ -840,6 +848,7 @@ impl ProxyHttp for Gateway {
         }
 
         if let Some((rate, burst)) = plan.rate_limit
+            && !ctx.limits_exempt
             && !self
                 .shared
                 .rates
@@ -870,7 +879,7 @@ impl ProxyHttp for Gateway {
             .await;
         }
 
-        if plan.active_request_limit > 0 {
+        if plan.active_request_limit > 0 && !ctx.limits_exempt {
             let Some(permit) = self.shared.active_requests.acquire(
                 plan.route.limit_zone(),
                 client_ip,
@@ -1742,6 +1751,18 @@ fn request_has_internal_http3_marker(runtime: &RuntimeConfig, request: &RequestH
     })
 }
 
+fn peer_limits_exempt(runtime: &RuntimeConfig, session: &Session) -> bool {
+    let _ = runtime;
+    session
+        .client_addr()
+        .and_then(|address| address.as_inet())
+        .is_some_and(|address| address.ip().is_loopback())
+}
+
+fn client_limits_exempt(peer_exempt: bool, client_ip: IpAddr) -> bool {
+    peer_exempt || client_ip.is_loopback()
+}
+
 fn is_internal_http3(runtime: &RuntimeConfig, session: &Session) -> bool {
     let Some(expected) = runtime.http3_internal_addr() else {
         return false;
@@ -2269,6 +2290,17 @@ hosts:
         );
         let plan = &gateway.plans[host.plan("/rest/stream").unwrap()];
         assert!(plan.peer.cached_reuse_hash.is_some());
+    }
+
+    #[test]
+    fn global_concurrent_limit_is_shared_across_client_ips() {
+        let shared = GatewayShared::from_runtime(&runtime()).unwrap();
+        let first = shared.global_concurrent.acquire(2).unwrap();
+        let second = shared.global_concurrent.acquire(2).unwrap();
+        assert!(shared.global_concurrent.acquire(2).is_none());
+        drop(first);
+        assert!(shared.global_concurrent.acquire(2).is_some());
+        drop(second);
     }
 
     #[test]

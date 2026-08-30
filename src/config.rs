@@ -597,6 +597,21 @@ fn validate(config: &Config) -> Result<()> {
         {
             bail!("server.http3_internal_listen conflicts with a public TCP listener");
         }
+        let mut has_ipv4_wildcard = false;
+        let mut has_ipv6_wildcard = false;
+        for address in &config.server.http3_listen {
+            let address = address.parse::<SocketAddr>()?;
+            match address.ip() {
+                IpAddr::V4(ipv4) if ipv4.is_unspecified() => has_ipv4_wildcard = true,
+                IpAddr::V6(ipv6) if ipv6.is_unspecified() => has_ipv6_wildcard = true,
+                _ => {}
+            }
+        }
+        if has_ipv6_wildcard && !has_ipv4_wildcard {
+            bail!(
+                "server.http3_listen uses [::] without 0.0.0.0; with net.ipv6.bindv6only=1 IPv4 QUIC will not bind"
+            );
+        }
     }
     if config.hosts.is_empty() {
         bail!("at least one host is required");
@@ -893,6 +908,26 @@ hosts:
         .unwrap();
         assert_eq!(h2c.protocol, UpstreamProtocol::Http2);
         assert_eq!(h2c.http2_max_concurrent_streams, 64);
+    }
+
+    #[test]
+    fn rejects_http3_ipv6_only_without_ipv4_wildcard() {
+        let mut config = sample_config();
+        config.server.https_listen = vec!["0.0.0.0:443".into(), "[::]:443".into()];
+        config.server.certificate = Some("cert.pem".into());
+        config.server.private_key = Some("key.pem".into());
+        config.server.http3_listen = vec!["[::]:443".into()];
+        assert!(RuntimeConfig::new(config).is_err());
+    }
+
+    #[test]
+    fn accepts_http3_dual_stack_wildcards() {
+        let mut config = sample_config();
+        config.server.https_listen = vec!["0.0.0.0:443".into(), "[::]:443".into()];
+        config.server.certificate = Some("cert.pem".into());
+        config.server.private_key = Some("key.pem".into());
+        config.server.http3_listen = vec!["0.0.0.0:443".into(), "[::]:443".into()];
+        assert!(RuntimeConfig::new(config).is_ok());
     }
 
     #[test]

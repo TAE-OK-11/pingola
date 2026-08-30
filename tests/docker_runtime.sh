@@ -34,7 +34,7 @@ write_config() {
     printf '  https_listen: %s\n' "${https}"
     printf '  http3_listen: %s\n' "${http3}"
     if [[ "${http3}" != '[]' ]]; then
-      printf '  http3_internal_listen: "127.0.0.1:18080"\n'
+      printf '  http3_internal_handoff_enabled: false\n'
       printf '  http3_max_idle_timeout_seconds: 15\n'
       printf '  http3_max_concurrent_streams: 16\n'
     fi
@@ -100,7 +100,10 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.lto"}}' "${name}") == "${EXPECTED_LTO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.tls.provider"}}' "${name}") == "${EXPECTED_TLS_PROVIDER}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.http3.provider"}}' "${name}") == quiche ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.http3.internal-protocol"}}' "${name}") == direct-gateway ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.quic.tls.provider"}}' "${name}") == boringssl ]]
+  test "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${name}" | sed -n 's/^MALLOC_CONF=//p')" \
+    = 'narenas:1,retain:false,dirty_decay_ms:1000,tcache_max:8192'
   docker image inspect "${IMAGE}" | jq -e '.[0].Config.ExposedPorts["443/udp"] != null' >/dev/null
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.pgo"}}' "${name}") == "${EXPECTED_PGO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.linker"}}' "${name}") == lld ]]

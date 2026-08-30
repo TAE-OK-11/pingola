@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error as StdError;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -83,6 +84,7 @@ struct BridgeSettings {
     origin: SocketAddr,
     server_name: String,
     verify_peer: bool,
+    trust_anchor: Option<PathBuf>,
     connect_timeout: Duration,
     idle_timeout: Duration,
     max_streams: u64,
@@ -115,6 +117,7 @@ pub fn start(
             origin,
             server_name,
             verify_peer: upstream.verify_certificate,
+            trust_anchor: runtime.config.server.certificate.clone(),
             connect_timeout: Duration::from_secs(upstream.connect_timeout_seconds),
             idle_timeout: Duration::from_secs(upstream.idle_timeout_seconds.max(1)),
             max_streams: upstream.http3_max_concurrent_streams as u64,
@@ -421,6 +424,13 @@ async fn pool_manager(
                 Some(command) => Some(command),
                 None => return,
             }
+        } else if !connected_once {
+            // Avoid a startup handshake race against a still-booting origin and
+            // defer TLS work until the first proxied request actually needs H3.
+            match commands.recv().await {
+                Some(command) => Some(command),
+                None => return,
+            }
         } else {
             None
         };
@@ -499,6 +509,14 @@ async fn run_connection(
     if settings.verify_peer {
         tls.set_default_verify_paths()
             .context("failed to load default trust roots for HTTP/3 upstream")?;
+        if let Some(anchor) = settings.trust_anchor.as_deref() {
+            tls.set_ca_file(anchor).with_context(|| {
+                format!(
+                    "failed to load HTTP/3 upstream trust anchor {}",
+                    anchor.display()
+                )
+            })?;
+        }
     }
     let mut quic_config =
         quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls)

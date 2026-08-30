@@ -214,7 +214,7 @@ jobs:
             org.opencontainers.image.allocator=jemalloc
             org.opencontainers.image.tls.provider=boringssl
             org.opencontainers.image.http3.provider=quiche
-            org.opencontainers.image.http3.internal-protocol=h2c
+            org.opencontainers.image.http3.internal-protocol=direct-gateway
 
       - name: Build and publish x86-64-v2 full-stack PGO
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
