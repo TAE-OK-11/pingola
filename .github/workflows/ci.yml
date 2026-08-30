@@ -16,6 +16,9 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+    paths-ignore:
+      - h2o/**
+      - .github/workflows/h2o.yml
 
 permissions:
   contents: read

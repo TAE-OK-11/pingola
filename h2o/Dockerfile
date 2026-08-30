@@ -101,7 +101,7 @@ RUN git init h2o \
 
 RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
     --mount=from=jemalloc-builder,source=/opt/jemalloc,target=/opt/jemalloc,ro \
-    --mount=type=cache,id=h2o-cmake-build-${H2O_VERSION}-${TARGET_CPU}-${LTO_MODE}-${TLS_PROVIDER}-jemalloc,target=/src/h2o/build,sharing=locked \
+    --mount=type=cache,id=h2o-cmake-build-${H2O_VERSION}-${TARGET_CPU}-${LTO_MODE}-${TLS_PROVIDER}-jemalloc-clang-noring,target=/src/h2o/build,sharing=locked \
     set -eux; \
     case "${TARGET_CPU}" in \
       x86-64-v2) ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' ;; \
@@ -119,8 +119,8 @@ RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
     cmake -G Ninja -S h2o -B h2o/build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
-      -DCMAKE_C_COMPILER=gcc \
-      -DCMAKE_CXX_COMPILER=g++ \
+      -DCMAKE_C_COMPILER=clang \
+      -DCMAKE_CXX_COMPILER=clang++ \
       -DCMAKE_C_FLAGS="${COMMON_FLAGS}" \
       -DCMAKE_CXX_FLAGS="${COMMON_FLAGS}" \
       -DCMAKE_EXE_LINKER_FLAGS="${LINK_FLAGS}" \
@@ -172,7 +172,7 @@ RUN --mount=from=builder,source=/out,target=/out,ro \
     --mount=type=cache,id=h2o-apt-lists-runtime-${DEBIAN_SUITE},target=/var/lib/apt/lists,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean \
     && apt-get update -o Acquire::Retries=3 \
-    && apt-get install --yes --no-install-recommends bash ca-certificates curl libcap2-bin libstdc++6 \
+    && apt-get install --yes --no-install-recommends bash ca-certificates curl libcap2-bin libc++1 libc++abi1 libstdc++6 \
     && groupadd --gid 10001 h2o \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin h2o \
     && install -d -o 10001 -g 10001 /etc/h2o /tmp/h2o /usr/share/h2o/health \
