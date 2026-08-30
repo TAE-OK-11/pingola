@@ -6,7 +6,7 @@ IMAGE=${H2O_TEST_IMAGE:-ghcr.io/tae-ok-11/pingora/h2o:local}
 EXPECTED_TARGET_CPU=${H2O_EXPECTED_TARGET_CPU:-x86-64-v2}
 EXPECTED_LTO=${H2O_EXPECTED_LTO:-fat}
 EXPECTED_TLS_PROVIDER=${H2O_EXPECTED_TLS_PROVIDER:-boringssl}
-EXPECTED_ALLOCATOR=${H2O_EXPECTED_ALLOCATOR:-jemalloc}
+EXPECTED_ALLOCATOR=jemalloc
 RUNTIME=${H2O_DOCKER_TEST_RUNTIME:-/tmp/h2o-docker-runtime}
 CONTAINERS=()
 
@@ -107,4 +107,4 @@ curl --noproxy '*' -fsS -H 'host: health.invalid' \
   http://127.0.0.1:80/pingora-health -o /dev/null
 docker exec h2o-test-http /usr/local/bin/h2o -c /etc/h2o/h2o.conf -m test >/dev/null
 
-echo "Docker UID 10001, read-only filesystem, ${EXPECTED_TLS_PROVIDER}, ${EXPECTED_ALLOCATOR}, fusion, healthcheck, and config validation tests passed"
+echo "Docker UID 10001, read-only filesystem, ${EXPECTED_TLS_PROVIDER}, jemalloc, healthcheck, and config validation tests passed"

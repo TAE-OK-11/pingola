@@ -6,7 +6,6 @@ ARG H2O_REPOSITORY=https://github.com/h2o/h2o.git
 ARG TARGET_CPU=x86-64-v2
 ARG LTO_MODE=fat
 ARG TLS_PROVIDER=boringssl
-ARG ALLOCATOR=jemalloc
 ARG DEBIAN_SUITE=13
 
 FROM debian:${DEBIAN_SUITE}-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS toolchain
@@ -35,7 +34,6 @@ RUN --mount=type=cache,id=h2o-apt-toolchain-${DEBIAN_SUITE},target=/var/cache/ap
         ninja-build \
         perl \
         pkg-config \
-        liburing-dev \
         zlib1g-dev
 
 FROM toolchain AS tls-builder
@@ -65,25 +63,21 @@ RUN --mount=type=cache,id=h2o-tls-${TLS_PROVIDER},target=/tmp/h2o-tls-cache,shar
     esac; \
     WORK_ROOT=/tmp/h2o-tls-cache /usr/local/bin/build-tls.sh /opt/tls "${TLS_PROVIDER}" "${ARCH_FLAGS}"
 
-FROM toolchain AS allocator-builder
+FROM toolchain AS jemalloc-builder
 
 ARG TARGET_CPU
-ARG ALLOCATOR
 
 WORKDIR /build
-COPY --link scripts/build-allocator.sh /usr/local/bin/build-allocator.sh
+COPY --link scripts/build-jemalloc.sh /usr/local/bin/build-jemalloc.sh
 
-RUN --mount=type=cache,id=h2o-allocator-${ALLOCATOR},target=/tmp/h2o-allocator-cache,sharing=locked \
-    chmod 755 /usr/local/bin/build-allocator.sh \
+RUN --mount=type=cache,id=h2o-jemalloc,target=/tmp/h2o-jemalloc-cache,sharing=locked \
+    chmod 755 /usr/local/bin/build-jemalloc.sh \
     && set -eux; \
     case "${TARGET_CPU}" in \
       x86-64-v2) ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' ;; \
       *) echo "unsupported target CPU: ${TARGET_CPU}" >&2; exit 2 ;; \
     esac; \
-    case "${ALLOCATOR}" in system|jemalloc|tcmalloc|mimalloc) ;; \
-      *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; \
-    esac; \
-    WORK_ROOT=/tmp/h2o-allocator-cache /usr/local/bin/build-allocator.sh /opt/allocator "${ALLOCATOR}" "${ARCH_FLAGS}"
+    WORK_ROOT=/tmp/h2o-jemalloc-cache /usr/local/bin/build-jemalloc.sh /opt/jemalloc "${ARCH_FLAGS}"
 
 FROM toolchain AS builder
 
@@ -93,11 +87,10 @@ ARG H2O_REPOSITORY
 ARG TARGET_CPU
 ARG LTO_MODE
 ARG TLS_PROVIDER
-ARG ALLOCATOR
 
 WORKDIR /src
 
-COPY --link scripts/build-tls.sh scripts/build-allocator.sh /usr/local/bin/
+COPY --link scripts/build-tls.sh scripts/build-jemalloc.sh /usr/local/bin/
 
 RUN git init h2o \
     && git -C h2o remote add origin "${H2O_REPOSITORY}" \
@@ -107,8 +100,8 @@ RUN git init h2o \
     && git -C h2o submodule update --init --recursive --depth=1
 
 RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
-    --mount=from=allocator-builder,source=/opt/allocator,target=/opt/allocator,ro \
-    --mount=type=cache,id=h2o-cmake-build-${H2O_VERSION}-${TARGET_CPU}-${LTO_MODE}-${TLS_PROVIDER}-${ALLOCATOR},target=/src/h2o/build,sharing=locked \
+    --mount=from=jemalloc-builder,source=/opt/jemalloc,target=/opt/jemalloc,ro \
+    --mount=type=cache,id=h2o-cmake-build-${H2O_VERSION}-${TARGET_CPU}-${LTO_MODE}-${TLS_PROVIDER}-jemalloc,target=/src/h2o/build,sharing=locked \
     set -eux; \
     case "${TARGET_CPU}" in \
       x86-64-v2) ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' ;; \
@@ -120,14 +113,14 @@ RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
       off) LTO_FLAGS='' ;; \
       *) echo "unsupported LTO mode: ${LTO_MODE}" >&2; exit 2 ;; \
     esac; \
-    ALLOCATOR_LINK="$(tr -d '\n' </opt/allocator/linker.flags)"; \
-    LINK_FLAGS="-fuse-ld=lld -Wl,--gc-sections ${LTO_FLAGS} ${ALLOCATOR_LINK} -lstdc++ -lpthread -ldl -lm"; \
+    JEMALLOC_LINK="$(tr -d '\n' </opt/jemalloc/linker.flags)"; \
+    LINK_FLAGS="-fuse-ld=lld -Wl,--gc-sections ${LTO_FLAGS} ${JEMALLOC_LINK} -lstdc++ -lpthread -ldl -lm"; \
     COMMON_FLAGS="-O3 ${ARCH_FLAGS} ${LTO_FLAGS} -fno-strict-aliasing"; \
     cmake -G Ninja -S h2o -B h2o/build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
-      -DCMAKE_C_COMPILER=clang \
-      -DCMAKE_CXX_COMPILER=clang++ \
+      -DCMAKE_C_COMPILER=gcc \
+      -DCMAKE_CXX_COMPILER=g++ \
       -DCMAKE_C_FLAGS="${COMMON_FLAGS}" \
       -DCMAKE_CXX_FLAGS="${COMMON_FLAGS}" \
       -DCMAKE_EXE_LINKER_FLAGS="${LINK_FLAGS}" \
@@ -142,13 +135,13 @@ RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
       -DWITH_CCACHE=OFF \
       -DWITH_FUSION=OFF \
       -DWITH_KTLS=ON \
-      -DWITH_IO_URING=ON; \
+      -DWITH_IO_URING=OFF; \
     cmake --build h2o/build --target h2o -j "$(nproc)"; \
     install -d /out; \
     install -Dm755 h2o/build/h2o /out/h2o; \
     h2o/build/h2o --version | tee /out/h2o-version.txt; \
     cp /opt/tls/tls-provider.txt /out/tls-provider.txt; \
-    cp /opt/allocator/allocator.txt /out/allocator.txt
+    cp /opt/jemalloc/allocator.txt /out/allocator.txt
 
 FROM debian:${DEBIAN_SUITE}-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS runtime
 
@@ -158,7 +151,6 @@ ARG H2O_VERSION
 ARG TARGET_CPU
 ARG LTO_MODE
 ARG TLS_PROVIDER
-ARG ALLOCATOR
 ARG DEBIAN_SUITE
 
 LABEL org.opencontainers.image.title="H2O" \
@@ -172,7 +164,7 @@ LABEL org.opencontainers.image.title="H2O" \
       org.opencontainers.image.h2o.lto="${LTO_MODE}" \
       org.opencontainers.image.h2o.linker="lld" \
       org.opencontainers.image.tls.provider="${TLS_PROVIDER}" \
-      org.opencontainers.image.allocator="${ALLOCATOR}" \
+      org.opencontainers.image.allocator="jemalloc" \
       org.opencontainers.image.licenses="MIT"
 
 RUN --mount=from=builder,source=/out,target=/out,ro \
@@ -180,7 +172,7 @@ RUN --mount=from=builder,source=/out,target=/out,ro \
     --mount=type=cache,id=h2o-apt-lists-runtime-${DEBIAN_SUITE},target=/var/lib/apt/lists,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean \
     && apt-get update -o Acquire::Retries=3 \
-    && apt-get install --yes --no-install-recommends bash ca-certificates curl libcap2-bin libc++1 libc++abi1 libstdc++6 liburing2 \
+    && apt-get install --yes --no-install-recommends bash ca-certificates curl libcap2-bin libstdc++6 \
     && groupadd --gid 10001 h2o \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin h2o \
     && install -d -o 10001 -g 10001 /etc/h2o /tmp/h2o /usr/share/h2o/health \

@@ -40,13 +40,13 @@ jobs:
         run: |
           bash -n h2o/scripts/healthcheck.sh
           bash -n h2o/scripts/build-tls.sh
-          bash -n h2o/scripts/build-allocator.sh
+          bash -n h2o/scripts/build-jemalloc.sh
           bash -n h2o/scripts/allocator-info.sh
           bash -n h2o/tests/docker_runtime.sh
           grep -q 'num-threads: 1' h2o/config/h2o.conf
           grep -q 'temp-buffer-path: /tmp/h2o' h2o/config/h2o.conf
           grep -q 'type: quic' h2o/config/h2o.conf
-          grep -q 'ALLOCATOR: jemalloc' h2o/docker-compose.yml
+          grep -q 'TLS_PROVIDER: boringssl' h2o/docker-compose.yml
 
   image-test:
     if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.publish_images != true)
@@ -60,7 +60,6 @@ jobs:
           - target_cpu: x86-64-v2
             lto_mode: fat
             tls_provider: boringssl
-            allocator: jemalloc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -70,32 +69,30 @@ jobs:
         with:
           context: h2o
           load: true
-          tags: h2o:ci-${{ matrix.allocator }}
+          tags: h2o:ci
           pull: true
           build-args: |
             H2O_VERSION=${{ env.H2O_VERSION }}
             TARGET_CPU=${{ matrix.target_cpu }}
             LTO_MODE=${{ matrix.lto_mode }}
             TLS_PROVIDER=${{ matrix.tls_provider }}
-            ALLOCATOR=${{ matrix.allocator }}
             BUILD_VERSION=ci
             BUILD_REVISION=${{ github.sha }}
-          cache-from: type=gha,scope=h2o-${{ matrix.tls_provider }}-${{ matrix.allocator }}-${{ matrix.lto_mode }}
-          cache-to: type=gha,mode=max,scope=h2o-${{ matrix.tls_provider }}-${{ matrix.allocator }}-${{ matrix.lto_mode }}
+          cache-from: type=gha,scope=h2o-${{ matrix.tls_provider }}-jemalloc-${{ matrix.lto_mode }}
+          cache-to: type=gha,mode=max,scope=h2o-${{ matrix.tls_provider }}-jemalloc-${{ matrix.lto_mode }}
 
       - name: Verify image
         env:
-          IMAGE: h2o:ci-${{ matrix.allocator }}
-          H2O_TEST_IMAGE: h2o:ci-${{ matrix.allocator }}
+          IMAGE: h2o:ci
+          H2O_TEST_IMAGE: h2o:ci
           H2O_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
           H2O_EXPECTED_LTO: ${{ matrix.lto_mode }}
           H2O_EXPECTED_TLS_PROVIDER: ${{ matrix.tls_provider }}
-          H2O_EXPECTED_ALLOCATOR: ${{ matrix.allocator }}
         run: |
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.h2o.target-cpu"]')" = "${{ matrix.target_cpu }}"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.h2o.lto"]')" = "${{ matrix.lto_mode }}"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.tls.provider"]')" = "${{ matrix.tls_provider }}"
-          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator"]')" = "${{ matrix.allocator }}"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator"]')" = "jemalloc"
           bash h2o/tests/docker_runtime.sh
 
   publish:
@@ -133,7 +130,7 @@ jobs:
             type=match,pattern=h2o-v(.*),group=1
           labels: |
             org.opencontainers.image.title=JBS H2O
-            org.opencontainers.image.description=Debian 13 H2O with BoringSSL, jemalloc, kTLS, and io_uring
+            org.opencontainers.image.description=Debian 13 H2O with BoringSSL, jemalloc, and kTLS
             org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
             org.opencontainers.image.h2o.version=${{ env.H2O_VERSION }}
             org.opencontainers.image.tls.provider=boringssl
@@ -153,12 +150,9 @@ jobs:
             TARGET_CPU=x86-64-v2
             LTO_MODE=fat
             TLS_PROVIDER=boringssl
-            ALLOCATOR=jemalloc
             BUILD_VERSION=${{ steps.meta.outputs.version }}
             BUILD_REVISION=${{ github.sha }}
-          cache-from: |
-            type=gha,scope=h2o-boringssl-jemalloc-fat
-            type=gha,scope=h2o-boringssl-mimalloc-fat
+          cache-from: type=gha,scope=h2o-boringssl-jemalloc-fat
           cache-to: type=gha,mode=max,scope=h2o-boringssl-jemalloc-fat
           provenance: mode=max
           sbom: true
