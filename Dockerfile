@@ -34,7 +34,8 @@ RUN --mount=type=cache,id=pingora-apt-builder-${DEBIAN_SUITE},target=/var/cache/
     && git --version \
     && rustc --version \
     && cargo --version \
-    && clang --version | head -n1
+    && clang --version | head -n1 \
+    && rustup component add llvm-tools-preview
 
 WORKDIR /src
 
@@ -48,17 +49,19 @@ ARG RUST_CODEGEN_UNITS
 ARG ALLOCATOR=jemalloc
 ARG TLS_PROVIDER
 
-ENV CARGO_HTTP_MULTIPLEXING=true \
+ENV RUST_LLVM_BIN="/usr/local/rustup/toolchains/${RUST_VERSION}-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin" \
+    CARGO_HTTP_MULTIPLEXING=true \
     CARGO_HTTP_TIMEOUT=120 \
     CARGO_INCREMENTAL=0 \
     CARGO_NET_RETRY=10 \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${RUST_CODEGEN_UNITS} \
     CARGO_PROFILE_RELEASE_LTO=${RUST_LTO} \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang \
+    PATH="/usr/local/rustup/toolchains/${RUST_VERSION}-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin:${PATH}" \
     AR=llvm-ar \
     RANLIB=llvm-ranlib \
     CMAKE_GENERATOR=Ninja \
-    RUSTFLAGS_COMMON="-C linker-plugin-lto -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections"
+    RUSTFLAGS_COMMON="-C linker-plugin-lto -C link-arg=-fuse-ld=/usr/local/rustup/toolchains/${RUST_VERSION}-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld -C link-arg=-Wl,--gc-sections"
 
 # Keep dependency downloads in a source-independent layer. BuildKit exports
 # these caches to GitHub Actions, so source-only changes avoid registry churn.
@@ -81,11 +84,9 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       x86-64-v2) NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic -ffunction-sections -fdata-sections' ;; \
       *) echo "unsupported Rust target CPU: ${RUST_TARGET_CPU}" >&2; exit 2 ;; \
     esac; \
-    NATIVE_LTO_FLAGS='-flto=thin'; \
     CARGO_TARGET_DIR=/src/target/release \
-    CFLAGS="${NATIVE_FLAGS} ${NATIVE_LTO_FLAGS}" \
-    CXXFLAGS="${NATIVE_FLAGS} ${NATIVE_LTO_FLAGS}" \
-    LDFLAGS="${NATIVE_LTO_FLAGS}" \
+    CFLAGS="${NATIVE_FLAGS}" \
+    CXXFLAGS="${NATIVE_FLAGS}" \
     RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU}" \
       cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
         --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
