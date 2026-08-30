@@ -578,17 +578,14 @@ impl ProxyHttp for Gateway {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        let direct_h3 = is_direct_http3(session);
         let plain_h1 = session.downstream_session.as_http1().is_some() && !is_tls(session);
-        let internal_http3 = if plain_h1 {
+        let internal_http3 = if direct_h3 || plain_h1 {
             false
         } else {
             is_internal_http3(&self.runtime, session)
         };
-        let http3 = if plain_h1 {
-            false
-        } else {
-            internal_http3 || is_direct_http3(session)
-        };
+        let http3 = direct_h3 || internal_http3;
         let tls = if plain_h1 {
             false
         } else {
@@ -604,7 +601,7 @@ impl ProxyHttp for Gateway {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u16>().ok())
                 .or_else(|| self.runtime.http3_public_port())
-        } else if is_direct_http3(session) {
+        } else if direct_h3 {
             self.runtime.http3_public_port()
         } else {
             None
@@ -1089,7 +1086,9 @@ impl ProxyHttp for Gateway {
             && session.req_header().version == Version::HTTP_11
             && session.is_upgrade_req();
         strip_response_hop_headers(response, forwards_upgrade)?;
-        insert_security_headers(response, plan.handler, ctx.tls)?;
+        if self.runtime.config.server.security_headers {
+            insert_security_headers(response, plan.handler, ctx.tls)?;
+        }
         if ctx.tls
             && !ctx.http3
             && let Some(alt_svc) = self.runtime.http3_alt_svc_header()
@@ -2115,7 +2114,9 @@ async fn send_empty(
     for (name, value) in headers {
         response.insert_header(*name, *value)?;
     }
-    if let Some(handler) = handler {
+    if let Some(handler) = handler
+        && runtime.config.server.security_headers
+    {
         insert_security_headers(&mut response, handler, tls)?;
     }
     if tls

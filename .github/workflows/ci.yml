@@ -133,7 +133,7 @@ jobs:
           tags: pingora:ci-${{ matrix.target_cpu }}
           pull: true
           build-args: |
-            ALLOCATOR=tcmalloc
+            ALLOCATOR=jemalloc
             TLS_PROVIDER=boringssl
             PGO_MODE=${{ matrix.pgo_mode }}
             PGO_NATIVE_BORING=${{ matrix.native_pgo }}
@@ -203,9 +203,9 @@ jobs:
             type=semver,pattern={{version}}
           labels: |
             org.opencontainers.image.title=JBS Pingora
-            org.opencontainers.image.description=Cloudflare BoringSSL TLS, Quiche HTTP/3, and h2c internal bridge
+            org.opencontainers.image.description=Cloudflare BoringSSL TLS, Quiche HTTP/3 direct Gateway, jemalloc
             org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
-            org.opencontainers.image.allocator=tcmalloc
+            org.opencontainers.image.allocator=jemalloc
             org.opencontainers.image.tls.provider=boringssl
             org.opencontainers.image.http3.provider=quiche
             org.opencontainers.image.http3.internal-protocol=h2c
@@ -220,7 +220,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            ALLOCATOR=tcmalloc
+            ALLOCATOR=jemalloc
             TLS_PROVIDER=boringssl
             PGO_MODE=train
             PGO_NATIVE_BORING=on

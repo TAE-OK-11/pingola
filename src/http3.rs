@@ -521,7 +521,6 @@ async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionCont
         .proxy
         .process_new_http(session, &context.shared.shutdown)
         .await;
-    crate::allocator::hint_release_idle_pages();
 }
 
 fn decode_request_headers(headers: &[h3::Header]) -> Result<RequestHeader> {

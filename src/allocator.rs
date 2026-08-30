@@ -4,7 +4,7 @@ use anyhow::Result;
 #[cfg(feature = "tcmalloc")]
 use anyhow::bail;
 #[cfg(feature = "jemalloc")]
-use tikv_jemalloc_ctl::{epoch, stats, version as jemalloc_version};
+use tikv_jemalloc_ctl::{background_thread, epoch, stats, version as jemalloc_version};
 
 #[cfg(any(
     all(feature = "jemalloc", feature = "tcmalloc"),
@@ -45,6 +45,10 @@ pub fn configure_for_proxy() {
         tcmalloc_set_max_per_cpu_cache_size(TCMALLOC_MAX_PER_CPU_CACHE_BYTES);
         tcmalloc_set_background_release_rate(TCMALLOC_BACKGROUND_RELEASE_BYTES_PER_SECOND);
     }
+    #[cfg(feature = "jemalloc")]
+    {
+        let _ = background_thread::write(true);
+    }
 }
 
 /// Start a lightweight background thread that returns idle TCMalloc pages to the
@@ -62,6 +66,18 @@ pub fn start_background_reclaimer() {
             })
             .ok();
     }
+    #[cfg(feature = "jemalloc")]
+    {
+        std::thread::Builder::new()
+            .name("jemalloc-reclaim".into())
+            .spawn(|| {
+                loop {
+                    let _ = epoch::advance();
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            })
+            .ok();
+    }
 }
 
 /// Nudge the allocator to release free pages after a QUIC connection closes.
@@ -69,6 +85,10 @@ pub fn hint_release_idle_pages() {
     #[cfg(feature = "tcmalloc")]
     if tcmalloc_better::TCMalloc::needs_process_background_actions() {
         tcmalloc_better::TCMalloc::process_background_actions();
+    }
+    #[cfg(feature = "jemalloc")]
+    {
+        let _ = epoch::advance();
     }
 }
 

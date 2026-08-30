@@ -161,6 +161,7 @@ server:
   downstream_keepalive_requests: 1000000
   max_retries: 0
   access_log: false
+  security_headers: false
   health_details: false
   http2_max_concurrent_streams: 128
   graceful_shutdown_timeout_seconds: 2

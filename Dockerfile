@@ -10,12 +10,10 @@ ARG TLS_PROVIDER=boringssl
 ARG PGO_MODE=off
 ARG PGO_TRAIN_TARGET_CPU=x86-64-v2
 ARG PGO_NATIVE_BORING=off
-# Rust PGO: H2 stays deliberately strong because the downstream H3 frontend
-# reaches the main proxy through an internal H2C bridge. H3 client/server and
-# congestion-control paths receive dedicated profiles instead of being folded
-# into one generic QUIC workload.
+# Rust PGO: downstream H3 uses direct Gateway integration (no loopback h2c).
+# Weight H3 and upstream H3 heavily; keep H2 for public TLS but below H3.
 ARG PGO_WEIGHT_H1=60
-ARG PGO_WEIGHT_H2=180
+ARG PGO_WEIGHT_H2=120
 ARG PGO_WEIGHT_H3=900
 ARG PGO_WEIGHT_UPSTREAM_H3_BBR2=700
 ARG PGO_WEIGHT_UPSTREAM_H3_CUBIC=250
@@ -73,7 +71,7 @@ ARG RUST_TARGET_TRIPLE
 ARG RUST_TARGET_CPU
 ARG RUST_LTO
 ARG RUST_CODEGEN_UNITS
-ARG ALLOCATOR=tcmalloc
+ARG ALLOCATOR=jemalloc
 ARG TLS_PROVIDER
 ARG PGO_MODE
 ARG PGO_TRAIN_TARGET_CPU
@@ -154,7 +152,7 @@ FROM debian:${DEBIAN_SUITE}-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcb
 
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=unknown
-ARG ALLOCATOR=tcmalloc
+ARG ALLOCATOR=jemalloc
 ARG TLS_PROVIDER
 ARG PGO_MODE
 ARG PGO_TRAIN_TARGET_CPU

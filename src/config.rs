@@ -120,6 +120,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_false() -> bool {
+    false
+}
+
 fn default_connect_timeout() -> u64 {
     5
 }
@@ -189,7 +193,7 @@ pub struct ServerConfig {
     /// Legacy loopback h2c handoff listener. The HTTP/3 frontend uses direct
     /// Gateway integration; keep this disabled in production to avoid retaining
     /// an extra TCP/H2 service and connection pool.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub http3_internal_handoff_enabled: bool,
     #[serde(default)]
     pub certificate: Option<PathBuf>,
@@ -225,6 +229,10 @@ pub struct ServerConfig {
     pub downstream_max_connections: usize,
     #[serde(default = "default_downstream_request_header_timeout")]
     pub downstream_request_header_timeout_seconds: u64,
+    /// Insert standard security headers on proxied responses. Disable only in
+    /// controlled benchmark fixtures where the comparison proxy omits them.
+    #[serde(default = "default_true")]
+    pub security_headers: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -377,7 +385,9 @@ impl RuntimeConfig {
             .map(|port| HeaderValue::from_str(&format!("h3=\":{port}\"; ma=86400")))
             .transpose()
             .context("HTTP/3 Alt-Svc value is not a valid header")?;
-        let http3_internal_token = if config.server.http3_listen.is_empty() {
+        let http3_internal_token = if config.server.http3_listen.is_empty()
+            || !config.server.http3_internal_handoff_enabled
+        {
             None
         } else {
             let mut token = [0_u8; 32];
@@ -402,7 +412,8 @@ impl RuntimeConfig {
     }
 
     pub fn http3_internal_addr(&self) -> Option<SocketAddr> {
-        (!self.config.server.http3_listen.is_empty())
+        (!self.config.server.http3_listen.is_empty()
+            && self.config.server.http3_internal_handoff_enabled)
             .then_some(self.config.server.http3_internal_listen)
     }
 
