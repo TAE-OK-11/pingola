@@ -82,10 +82,7 @@ pub fn finalize_upstream_wire(wire: &mut Vec<h3::Header>, req: &RequestHeader) {
 
     wire.clear();
     wire.reserve(req.headers.len().saturating_add(4));
-    wire.push(h3::Header::new(
-        b":method",
-        req.method.as_str().as_bytes(),
-    ));
+    wire.push(h3::Header::new(b":method", req.method.as_str().as_bytes()));
     wire.push(h3::Header::new(b":scheme", b"https"));
     wire.push(h3::Header::new(b":authority", authority.as_bytes()));
     wire.push(h3::Header::new(b":path", path.as_bytes()));
@@ -100,10 +97,7 @@ pub fn finalize_upstream_wire(wire: &mut Vec<h3::Header>, req: &RequestHeader) {
         {
             wire.push(existing);
         } else {
-            wire.push(h3::Header::new(
-                name.as_str().as_bytes(),
-                value.as_bytes(),
-            ));
+            wire.push(h3::Header::new(name.as_str().as_bytes(), value.as_bytes()));
         }
     }
 }
@@ -134,10 +128,7 @@ pub fn finalize_upstream_wire_pairs(wire: &mut Vec<(Bytes, Bytes)>, req: &Reques
         Bytes::from_static(b":method"),
         Bytes::copy_from_slice(req.method.as_str().as_bytes()),
     ));
-    wire.push((
-        Bytes::from_static(b":scheme"),
-        Bytes::from_static(b"https"),
-    ));
+    wire.push((Bytes::from_static(b":scheme"), Bytes::from_static(b"https")));
     wire.push((
         Bytes::from_static(b":authority"),
         Bytes::copy_from_slice(authority.as_bytes()),
@@ -191,7 +182,8 @@ mod tests {
         let mut req = RequestHeader::build(Method::GET, b"/rest/stream?id=1", None).unwrap();
         req.set_version(Version::HTTP_3);
         req.insert_header(HOST, "origin.internal").unwrap();
-        req.insert_header(USER_AGENT, "navidrome-client/1.0").unwrap();
+        req.insert_header(USER_AGENT, "navidrome-client/1.0")
+            .unwrap();
         req.insert_header(ACCEPT_ENCODING, "gzip").unwrap();
         req.insert_header("x-forwarded-for", "203.0.113.1").unwrap();
         req.insert_header("x-real-ip", "203.0.113.1").unwrap();
@@ -216,7 +208,8 @@ mod tests {
         let mut req = RequestHeader::build(Method::GET, b"/rest/stream?id=1", None).unwrap();
         req.set_version(Version::HTTP_3);
         req.insert_header(HOST, "origin.internal").unwrap();
-        req.insert_header(USER_AGENT, "navidrome-client/1.0").unwrap();
+        req.insert_header(USER_AGENT, "navidrome-client/1.0")
+            .unwrap();
 
         finalize_upstream_wire(&mut wire, &req);
 
@@ -234,7 +227,8 @@ mod tests {
         let mut req = RequestHeader::build(Method::GET, b"/rest/stream?id=1", None).unwrap();
         req.set_version(Version::HTTP_3);
         req.insert_header(HOST, "origin.internal").unwrap();
-        req.insert_header(USER_AGENT, "navidrome-client/1.0").unwrap();
+        req.insert_header(USER_AGENT, "navidrome-client/1.0")
+            .unwrap();
         req.insert_header("x-forwarded-for", "203.0.113.1").unwrap();
 
         finalize_upstream_wire(&mut wire_headers, &req);

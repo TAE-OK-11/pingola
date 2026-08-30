@@ -15,8 +15,8 @@ use futures::Stream;
 use http::header::CONTENT_LENGTH;
 use http::{HeaderMap, Method};
 use hyper::body::Frame;
-use tokio_quiche::quiche::h3;
 use tokio::sync::{mpsc, oneshot};
+use tokio_quiche::quiche::h3;
 
 use crate::h3_wire;
 use crate::upstream_h3::{

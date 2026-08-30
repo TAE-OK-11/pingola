@@ -569,7 +569,12 @@ async fn serve_streaming_file(
         use std::os::unix::io::AsRawFd;
         const POSIX_FADV_SEQUENTIAL: libc::c_int = 2;
         let _ = unsafe {
-            libc::posix_fadvise(file.as_raw_fd(), 0, length as libc::off_t, POSIX_FADV_SEQUENTIAL)
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                0,
+                length as libc::off_t,
+                POSIX_FADV_SEQUENTIAL,
+            )
         };
     }
     let mut response = ResponseHeader::build(200, Some(10)).unwrap();
