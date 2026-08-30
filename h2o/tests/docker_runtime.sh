@@ -82,6 +82,7 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{json .HostConfig.CapAdd}}' "${name}") == '["CAP_NET_BIND_SERVICE"]' ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.h2o.target-cpu"}}' "${name}") == "${EXPECTED_TARGET_CPU}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.h2o.lto"}}' "${name}") == "${EXPECTED_LTO}" ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.h2o.lto-scope"}}' "${name}") == full-stack ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.h2o.linker"}}' "${name}") == lld ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.tls.provider"}}' "${name}") == "${EXPECTED_TLS_PROVIDER}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.allocator"}}' "${name}") == "${EXPECTED_ALLOCATOR}" ]]
@@ -90,6 +91,9 @@ assert_container_hardening() {
   docker exec "${name}" grep -q "tls_provider=${EXPECTED_TLS_PROVIDER}" /usr/share/doc/h2o/tls-provider.txt
   docker exec "${name}" grep -q "allocator=${EXPECTED_ALLOCATOR}" /usr/share/doc/h2o/allocator.txt
   docker exec "${name}" grep -q "jemalloc=" /usr/share/doc/h2o/allocator.txt
+  docker exec "${name}" grep -q "lto=${EXPECTED_LTO}" /usr/share/doc/h2o/allocator.txt
+  docker exec "${name}" grep -q "lto=${EXPECTED_LTO}" /usr/share/doc/h2o/tls-provider.txt
+  docker exec "${name}" grep -q "lto_scope=full-stack" /usr/share/doc/h2o/build-info.txt
   docker exec "${name}" /usr/local/bin/h2o-allocator-info | grep -q "allocator=${EXPECTED_ALLOCATOR}"
   test "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${name}" | sed -n 's/^MALLOC_CONF=//p')" \
     = "narenas:1,retain:false,dirty_decay_ms:1000,tcache_max:8192"

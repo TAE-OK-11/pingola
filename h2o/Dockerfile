@@ -41,13 +41,14 @@ RUN --mount=type=cache,id=h2o-apt-toolchain-${DEBIAN_SUITE},target=/var/cache/ap
 FROM toolchain AS tls-builder
 
 ARG TARGET_CPU
+ARG LTO_MODE
 ARG BORINGSSL_VERSION
 
 WORKDIR /build
-COPY --link scripts/build-tls.sh /usr/local/bin/build-tls.sh
+COPY --link scripts/resolve-lto-flags.sh scripts/build-tls.sh /usr/local/bin/
 
-RUN --mount=type=cache,id=h2o-tls-boringssl-${BORINGSSL_VERSION},target=/tmp/h2o-tls-cache,sharing=locked \
-    chmod 755 /usr/local/bin/build-tls.sh \
+RUN --mount=type=cache,id=h2o-tls-boringssl-${BORINGSSL_VERSION}-${LTO_MODE},target=/tmp/h2o-tls-cache,sharing=locked \
+    chmod 755 /usr/local/bin/resolve-lto-flags.sh /usr/local/bin/build-tls.sh \
     && set -eux; \
     case "${TARGET_CPU}" in \
       x86-64-v2) ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' ;; \
@@ -55,18 +56,20 @@ RUN --mount=type=cache,id=h2o-tls-boringssl-${BORINGSSL_VERSION},target=/tmp/h2o
     esac; \
     WORK_ROOT=/tmp/h2o-tls-cache \
       BORINGSSL_VERSION="${BORINGSSL_VERSION}" \
+      LTO_MODE="${LTO_MODE}" \
       /usr/local/bin/build-tls.sh /opt/tls "${ARCH_FLAGS}"
 
 FROM toolchain AS jemalloc-builder
 
 ARG TARGET_CPU
+ARG LTO_MODE
 ARG JEMALLOC_VERSION
 
 WORKDIR /build
-COPY --link scripts/build-jemalloc.sh /usr/local/bin/build-jemalloc.sh
+COPY --link scripts/resolve-lto-flags.sh scripts/build-jemalloc.sh /usr/local/bin/
 
-RUN --mount=type=cache,id=h2o-jemalloc-${JEMALLOC_VERSION},target=/tmp/h2o-jemalloc-cache,sharing=locked \
-    chmod 755 /usr/local/bin/build-jemalloc.sh \
+RUN --mount=type=cache,id=h2o-jemalloc-${JEMALLOC_VERSION}-${LTO_MODE},target=/tmp/h2o-jemalloc-cache,sharing=locked \
+    chmod 755 /usr/local/bin/resolve-lto-flags.sh /usr/local/bin/build-jemalloc.sh \
     && set -eux; \
     case "${TARGET_CPU}" in \
       x86-64-v2) ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' ;; \
@@ -74,6 +77,7 @@ RUN --mount=type=cache,id=h2o-jemalloc-${JEMALLOC_VERSION},target=/tmp/h2o-jemal
     esac; \
     WORK_ROOT=/tmp/h2o-jemalloc-cache \
       JEMALLOC_VERSION="${JEMALLOC_VERSION}" \
+      LTO_MODE="${LTO_MODE}" \
       /usr/local/bin/build-jemalloc.sh /opt/jemalloc "${ARCH_FLAGS}"
 
 FROM toolchain AS builder
@@ -110,12 +114,14 @@ RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
     esac; \
     JEMALLOC_LINK="$(tr -d '\n' </opt/jemalloc/linker.flags)"; \
     LINK_FLAGS="-fuse-ld=lld -Wl,--gc-sections ${LTO_FLAGS} ${JEMALLOC_LINK} -lstdc++ -lpthread -ldl -lm"; \
-    COMMON_FLAGS="-O3 ${ARCH_FLAGS} ${LTO_FLAGS} -fno-strict-aliasing"; \
+    COMMON_FLAGS="-O3 ${ARCH_FLAGS} ${LTO_FLAGS} -fno-strict-aliasing -ffunction-sections -fdata-sections"; \
     cmake -G Ninja -S h2o -B h2o/build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
       -DCMAKE_C_COMPILER=clang \
       -DCMAKE_CXX_COMPILER=clang++ \
+      -DCMAKE_AR=llvm-ar \
+      -DCMAKE_RANLIB=llvm-ranlib \
       -DCMAKE_C_FLAGS="${COMMON_FLAGS}" \
       -DCMAKE_CXX_FLAGS="${COMMON_FLAGS}" \
       -DCMAKE_EXE_LINKER_FLAGS="${LINK_FLAGS}" \
@@ -136,7 +142,15 @@ RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
     install -Dm755 h2o/build/h2o /out/h2o; \
     h2o/build/h2o --version | tee /out/h2o-version.txt; \
     cp /opt/tls/tls-provider.txt /out/tls-provider.txt; \
-    cp /opt/jemalloc/allocator.txt /out/allocator.txt
+    cp /opt/jemalloc/allocator.txt /out/allocator.txt; \
+    { \
+      printf 'h2o=%s\n' "${H2O_VERSION}"; \
+      printf 'target_cpu=%s\n' "${TARGET_CPU}"; \
+      printf 'lto=%s\n' "${LTO_MODE}"; \
+      printf 'lto_scope=full-stack\n'; \
+      printf 'linker=lld\n'; \
+      printf 'ktls=on\n'; \
+    } > /out/build-info.txt
 
 FROM debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132 AS runtime
 
@@ -159,6 +173,7 @@ LABEL org.opencontainers.image.title="H2O" \
       org.opencontainers.image.h2o.version="${H2O_VERSION}" \
       org.opencontainers.image.h2o.target-cpu="${TARGET_CPU}" \
       org.opencontainers.image.h2o.lto="${LTO_MODE}" \
+      org.opencontainers.image.h2o.lto-scope="full-stack" \
       org.opencontainers.image.h2o.linker="lld" \
       org.opencontainers.image.tls.provider="boringssl" \
       org.opencontainers.image.tls.boringssl="${BORINGSSL_VERSION}" \
@@ -179,6 +194,7 @@ RUN --mount=from=builder,source=/out,target=/out,ro \
     && install -Dm644 /out/h2o-version.txt /usr/share/doc/h2o/version.txt \
     && install -Dm644 /out/tls-provider.txt /usr/share/doc/h2o/tls-provider.txt \
     && install -Dm644 /out/allocator.txt /usr/share/doc/h2o/allocator.txt \
+    && install -Dm644 /out/build-info.txt /usr/share/doc/h2o/build-info.txt \
     && install -d -o 10001 -g 10001 /usr/local/share/h2o \
     && ln -sf /etc/ssl/certs/ca-certificates.crt /usr/local/share/h2o/ca-bundle.crt \
     && setcap cap_net_bind_service=+ep /usr/local/bin/h2o \
