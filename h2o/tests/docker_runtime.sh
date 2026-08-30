@@ -91,6 +91,8 @@ assert_container_hardening() {
   docker exec "${name}" grep -q "allocator=${EXPECTED_ALLOCATOR}" /usr/share/doc/h2o/allocator.txt
   docker exec "${name}" grep -q "jemalloc=" /usr/share/doc/h2o/allocator.txt
   docker exec "${name}" /usr/local/bin/h2o-allocator-info | grep -q "allocator=${EXPECTED_ALLOCATOR}"
+  test "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${name}" | sed -n 's/^MALLOC_CONF=//p')" \
+    = "narenas:1,retain:false,dirty_decay_ms:1000,tcache_max:8192"
   docker exec "${name}" /usr/local/bin/h2o --version | grep -qi 'OpenSSL'
 
   if docker exec "${name}" sh -c 'command -v setcap >/dev/null || dpkg-query -W libcap2-bin >/dev/null 2>&1'; then

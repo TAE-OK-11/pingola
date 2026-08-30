@@ -189,6 +189,8 @@ COPY --link --chown=10001:10001 health/index.txt /usr/share/h2o/health/index.txt
 COPY --link --chmod=755 scripts/healthcheck.sh /usr/local/bin/h2o-healthcheck
 COPY --link --chmod=755 scripts/allocator-info.sh /usr/local/bin/h2o-allocator-info
 
+ENV MALLOC_CONF="narenas:1,retain:false,dirty_decay_ms:1000,tcache_max:8192"
+
 USER 10001:10001
 WORKDIR /tmp/h2o
 

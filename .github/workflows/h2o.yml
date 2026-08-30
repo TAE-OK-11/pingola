@@ -58,7 +58,13 @@ jobs:
           bash -n h2o/tests/docker_runtime.sh
           grep -q 'num-threads: 1' h2o/config/h2o.conf
           grep -q 'temp-buffer-path: /tmp/h2o' h2o/config/h2o.conf
+          grep -q 'max-connections: 2048' h2o/config/h2o.conf
+          grep -q 'http2-idle-timeout: 300' h2o/config/h2o.conf
+          grep -q 'http3-idle-timeout: 300' h2o/config/h2o.conf
+          grep -q 'proxy.preserve-host: ON' h2o/config/h2o.conf
+          grep -q 'proxy.tunnel: ON' h2o/config/h2o.conf
           grep -q 'type: quic' h2o/config/h2o.conf
+          grep -F 'MALLOC_CONF="narenas:1,retain:false,dirty_decay_ms:1000,tcache_max:8192"' h2o/Dockerfile
           grep -q 'ghcr.io/tae-ok-11/h2o' h2o/docker-compose.yml
           {
             echo "H2O_VERSION=${H2O_VERSION}"
@@ -112,6 +118,8 @@ jobs:
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator"]')" = "jemalloc"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator.jemalloc"]')" = "${{ needs.verify-config.outputs.jemalloc_version }}"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.tls.boringssl"]')" = "${{ needs.verify-config.outputs.boringssl_version }}"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Env[]' | sed -n 's/^MALLOC_CONF=//p')" \
+            = "narenas:1,retain:false,dirty_decay_ms:1000,tcache_max:8192"
           bash h2o/tests/docker_runtime.sh
 
   publish:
