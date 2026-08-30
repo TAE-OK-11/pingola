@@ -327,10 +327,16 @@ impl Default for RequestContext {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Http3AdmissionRejection {
+    RateLimited,
+    TooManyConnections,
+}
+
 /// Process-wide admission and static cache shared by the public listener
-/// and the loopback HTTP/3 → H2c handoff. Separate Gateway instances must
-/// not own their own limiters or LRU, or H2+H3 clients would get 2× quota
-/// and the 1 GiB host would hold two 16 MiB asset caches.
+/// and the HTTP/3 frontend. Separate Gateway instances must not own their
+/// own limiters or LRU, or H2+H3 clients would get 2× quota and the host
+/// would hold duplicate static asset caches.
 pub struct GatewayShared {
     static_files: StaticFiles,
     rates: RateLimiter,
@@ -339,6 +345,26 @@ pub struct GatewayShared {
 }
 
 impl GatewayShared {
+    pub fn admit_http3_connection(
+        &self,
+        peer: std::net::SocketAddr,
+        rate_per_second: f64,
+        burst: u32,
+        max_active: usize,
+    ) -> Result<ActiveRequestPermit, Http3AdmissionRejection> {
+        if !self.rates.allow(
+            LimitZone::Http3Connection,
+            peer.ip(),
+            rate_per_second,
+            burst,
+        ) {
+            return Err(Http3AdmissionRejection::RateLimited);
+        }
+        self.active_requests
+            .acquire(LimitZone::Http3Connection, peer.ip(), max_active)
+            .ok_or(Http3AdmissionRejection::TooManyConnections)
+    }
+
     pub fn from_runtime(runtime: &RuntimeConfig) -> anyhow::Result<Self> {
         let roots = runtime
             .config
@@ -926,11 +952,7 @@ impl ProxyHttp for Gateway {
         plan.route.supports_h1_bodyless_fast_path() && !session.is_upgrade_req()
     }
 
-    fn h1_bodyless_poll_downstream(&self, session: &Session, ctx: &Self::CTX) -> bool {
-        if is_direct_http3(session) {
-            // QUIC custom sessions never detect disconnect via read_body_or_idle().
-            return false;
-        }
+    fn h1_bodyless_poll_downstream(&self, _session: &Session, ctx: &Self::CTX) -> bool {
         self.plans.get(ctx.plan_index).is_some_and(|plan| {
             matches!(
                 plan.route,

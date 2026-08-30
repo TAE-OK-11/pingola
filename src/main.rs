@@ -320,8 +320,11 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     service.set_connection_limit(server_config.downstream_max_connections);
 
     if let Some(proxy) = service.app_logic_mut() {
-        proxy.h2_options = Some(public_h2_options(
+        proxy.h2_options = Some(configure_h2_options(
             server_config.http2_max_concurrent_streams,
+            64 * 1024,
+            server_config.http2_stream_window_bytes,
+            server_config.http2_connection_window_bytes,
         ));
     }
 
@@ -368,6 +371,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
             runtime.clone(),
             h3_runtime,
             h3_gateway,
+            shared.clone(),
             server.configuration.clone(),
             h3_connector,
         )
@@ -394,15 +398,6 @@ where
     SV::CTX: Send + Sync,
 {
     Arc::new(|_proxy, _stream, _shutdown| Box::pin(async { None }))
-}
-
-fn public_h2_options(max_concurrent_streams: u32) -> H2Options {
-    configure_h2_options(
-        max_concurrent_streams,
-        64 * 1024,
-        1024 * 1024,
-        8 * 1024 * 1024,
-    )
 }
 
 fn configure_h2_options(
@@ -449,6 +444,6 @@ mod tests {
 
     #[test]
     fn downstream_h2_options_accept_the_fixed_windows() {
-        let _public = public_h2_options(32);
+        let _public = configure_h2_options(32, 64 * 1024, 1024 * 1024, 8 * 1024 * 1024);
     }
 }

@@ -227,7 +227,7 @@ impl StaticFiles {
             cache: AssetCache::new(cache_bytes),
             paths,
             // Bound whole-file allocations as well as CPU-heavy compression.
-            cold_read_slot: Semaphore::new(1),
+            cold_read_slot: Semaphore::new(2),
             // HTTP/2 and HTTP/3 multiplexing means a socket limit alone does
             // not bound metadata work or open file descriptors.
             request_slots: Semaphore::new(MAX_ACTIVE_STATIC_REQUESTS),

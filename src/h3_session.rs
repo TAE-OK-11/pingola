@@ -446,7 +446,31 @@ impl CustomSession for H3Session {
     }
 
     async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
-        if no_body_expected || self.is_body_done() {
+        if no_body_expected {
+            if self.is_body_done() {
+                std::future::pending::<()>().await;
+                return Ok(None);
+            }
+            loop {
+                match self.recv.recv().await {
+                    Some(InboundFrame::Body(data, fin)) => {
+                        if data.is_empty() && !fin {
+                            continue;
+                        }
+                        return Err(Self::read_err(
+                            "unexpected downstream body on an empty HTTP/3 request",
+                        ));
+                    }
+                    Some(InboundFrame::Datagram(_)) => continue,
+                    None => {
+                        return Err(Self::read_err(
+                            "HTTP/3 downstream closed while streaming response",
+                        ));
+                    }
+                }
+            }
+        }
+        if self.is_body_done() {
             std::future::pending::<()>().await;
             Ok(None)
         } else {

@@ -32,24 +32,16 @@ use tokio_quiche::socket::QuicListener;
 use tokio_quiche::{ConnectionParams, ServerH3Driver, listen_with_capabilities};
 
 use crate::config::RuntimeConfig;
-use crate::gateway::Gateway;
+use crate::gateway::{Gateway, GatewayShared, Http3AdmissionRejection};
 use crate::h3_session::H3Session;
-use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, LimitZone, RateLimiter};
+use crate::limits::ActiveRequestPermit;
 use crate::tls_policy::{HYBRID_PQ_GROUPS, new_hybrid_pq_context};
 use crate::upstream_h3_connector::H3UpstreamConnector;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP3_MAX_UDP_PAYLOAD_SIZE: usize = 1452;
 const HTTP3_CONTROL_STREAM_LIMIT: u64 = 8;
-const HTTP3_SEND_CAPACITY_FACTOR: f64 = 2.0;
 const HTTP3_MAX_AMPLIFICATION_FACTOR: usize = 3;
-// 1 vCPU / 1 GiB host: enough bandwidth-delay product for Navidrome streams
-// without allowing slow consumers to retain multi-megabyte buffers per stream.
-// Idle RSS is reclaimed via jemalloc background thread and connection-close hints.
-const HTTP3_INITIAL_MAX_DATA: u64 = 4 * 1024 * 1024;
-const HTTP3_STREAM_WINDOW: u64 = 1024 * 1024;
-const HTTP3_MAX_CONNECTION_WINDOW: u64 = 8 * 1024 * 1024;
-const HTTP3_MAX_STREAM_WINDOW: u64 = 2 * 1024 * 1024;
 const HTTP3_CC_BBR2: &str = "bbr2";
 
 #[derive(Debug)]
@@ -85,53 +77,11 @@ fn build_hybrid_pq_quic_context(certificate: &str, private_key: &str) -> Result<
     Ok(builder)
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum Http3AdmissionRejection {
-    RateLimited,
-    TooManyConnections,
-}
-
-struct Http3Admission {
-    rate: RateLimiter,
-    active: ActiveRequestLimiter,
-    rate_per_second: f64,
-    burst: u32,
-    max_active: usize,
-}
-
-impl Http3Admission {
-    fn new(rate_per_second: f64, burst: u32, max_active: usize) -> Self {
-        Self {
-            rate: RateLimiter::new(),
-            active: ActiveRequestLimiter::new(),
-            rate_per_second,
-            burst,
-            max_active,
-        }
-    }
-
-    fn admit(
-        &self,
-        peer: std::net::SocketAddr,
-    ) -> Result<ActiveRequestPermit, Http3AdmissionRejection> {
-        if !self.rate.allow(
-            LimitZone::Http3Connection,
-            peer.ip(),
-            self.rate_per_second,
-            self.burst,
-        ) {
-            return Err(Http3AdmissionRejection::RateLimited);
-        }
-        self.active
-            .acquire(LimitZone::Http3Connection, peer.ip(), self.max_active)
-            .ok_or(Http3AdmissionRejection::TooManyConnections)
-    }
-}
-
 pub fn start(
     runtime: Arc<RuntimeConfig>,
     h3_runtime: &tokio::runtime::Handle,
     gateway: Gateway,
+    shared: Arc<GatewayShared>,
     server_conf: Arc<ServerConf>,
     h3_connector: H3UpstreamConnector,
 ) -> Result<()> {
@@ -143,7 +93,16 @@ pub fn start(
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     h3_runtime.spawn(async move {
         let failure_tx = ready_tx.clone();
-        if let Err(error) = run(runtime, gateway, server_conf, h3_connector, ready_tx).await {
+        if let Err(error) = run(
+            runtime,
+            gateway,
+            shared,
+            server_conf,
+            h3_connector,
+            ready_tx,
+        )
+        .await
+        {
             let _ = failure_tx.send(Err(format!("HTTP/3 frontend startup failed: {error:#}")));
             error!("HTTP/3 frontend stopped: {error:#}");
         }
@@ -158,6 +117,7 @@ pub fn start(
 async fn run(
     runtime: Arc<RuntimeConfig>,
     gateway: Gateway,
+    shared: Arc<GatewayShared>,
     server_conf: Arc<ServerConf>,
     h3_connector: H3UpstreamConnector,
     ready: mpsc::SyncSender<Result<(), String>>,
@@ -217,12 +177,12 @@ async fn run(
     quic.listen_backlog = server.downstream_max_connections.min(16_384);
     quic.initial_max_streams_bidi = u64::from(server.http3_max_concurrent_streams);
     quic.initial_max_streams_uni = HTTP3_CONTROL_STREAM_LIMIT;
-    quic.initial_max_data = HTTP3_INITIAL_MAX_DATA;
-    quic.initial_max_stream_data_bidi_local = HTTP3_STREAM_WINDOW;
-    quic.initial_max_stream_data_bidi_remote = HTTP3_STREAM_WINDOW;
-    quic.initial_max_stream_data_uni = HTTP3_STREAM_WINDOW;
-    quic.max_connection_window = HTTP3_MAX_CONNECTION_WINDOW;
-    quic.max_stream_window = HTTP3_MAX_STREAM_WINDOW;
+    quic.initial_max_data = server.quic_initial_max_data;
+    quic.initial_max_stream_data_bidi_local = server.quic_stream_window;
+    quic.initial_max_stream_data_bidi_remote = server.quic_stream_window;
+    quic.initial_max_stream_data_uni = server.quic_stream_window;
+    quic.max_connection_window = server.quic_max_connection_window;
+    quic.max_stream_window = server.quic_max_stream_window;
     quic.max_recv_udp_payload_size = HTTP3_MAX_UDP_PAYLOAD_SIZE;
     quic.max_send_udp_payload_size = HTTP3_MAX_UDP_PAYLOAD_SIZE;
     quic.discover_path_mtu = true;
@@ -236,7 +196,7 @@ async fn run(
     // supports it and falls back to userspace pacing otherwise.
     quic.enable_pacing = true;
     quic.enable_hystart = false;
-    quic.send_capacity_factor = HTTP3_SEND_CAPACITY_FACTOR;
+    quic.send_capacity_factor = server.quic_send_capacity_factor;
     quic.enable_early_data = allow_early_data;
     quic.disable_active_migration = true;
     // Keep connection-ID/path state minimal. NAT rebinding can still be handled
@@ -274,7 +234,7 @@ async fn run(
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let proxy = http_proxy_custom(server_conf.clone(), gateway, h3_connector);
     let proxy = Arc::new(proxy);
-    let shared = Arc::new(Http3Shared {
+    let h3_shared = Arc::new(Http3Shared {
         proxy,
         shutdown: shutdown_rx,
         public_listen,
@@ -285,14 +245,13 @@ async fn run(
     let max_streams_per_connection = server.http3_max_concurrent_streams as usize;
     let post_accept_timeout = Duration::from_secs(server.downstream_request_header_timeout_seconds);
     let connection_limit = Arc::new(Semaphore::new(server.downstream_max_connections));
-    let admission = Arc::new(Http3Admission::new(
-        server.http3_connection_rate_per_second,
-        server.http3_connection_burst,
-        server.http3_max_connections_per_ip,
-    ));
+    let admission = shared.clone();
+    let admission_rate = server.http3_connection_rate_per_second;
+    let admission_burst = server.http3_connection_burst;
+    let admission_max_per_ip = server.http3_max_connections_per_ip;
 
     for mut listener in listeners {
-        let shared = shared.clone();
+        let connection_h3_shared = h3_shared.clone();
         let connection_limit = connection_limit.clone();
         let admission = admission.clone();
         tokio::spawn(async move {
@@ -309,7 +268,12 @@ async fn run(
                             }
                         };
                         let peer = connection.peer_addr();
-                        let client_permit = match admission.admit(peer) {
+                        let client_permit = match admission.admit_http3_connection(
+                            peer,
+                            admission_rate,
+                            admission_burst,
+                            admission_max_per_ip,
+                        ) {
                             Ok(permit) => permit,
                             Err(Http3AdmissionRejection::RateLimited) => {
                                 warn!(
@@ -338,7 +302,7 @@ async fn run(
                             controller,
                             Http3ConnectionContext {
                                 peer,
-                                shared: shared.clone(),
+                                shared: connection_h3_shared.clone(),
                                 stream_slots: Arc::new(Semaphore::new(max_streams_per_connection)),
                             },
                             permit,
@@ -361,8 +325,8 @@ async fn run(
         HTTP3_MAX_AMPLIFICATION_FACTOR,
         allow_early_data,
         HTTP3_MAX_UDP_PAYLOAD_SIZE,
-        HTTP3_SEND_CAPACITY_FACTOR,
-        HTTP3_STREAM_WINDOW,
+        server.quic_send_capacity_factor,
+        server.quic_stream_window,
         server.http3_connection_rate_per_second,
         server.http3_connection_burst,
         server.http3_max_connections_per_ip,
@@ -746,20 +710,40 @@ mod tests {
 
     #[test]
     fn http3_admission_limits_rate_and_active_connections() {
+        use crate::config::Config;
+        use crate::gateway::{GatewayShared, Http3AdmissionRejection};
+
+        let config: Config = serde_saphyr::from_str(
+            r#"
+server:
+  http_listen: ["127.0.0.1:8080"]
+  https_listen: []
+trusted_proxies: ["127.0.0.0/8"]
+upstreams:
+  app:
+    address: "127.0.0.1:9000"
+hosts:
+  app:
+    domains: ["app.example.com"]
+    handler: navidrome-main
+    upstream: app
+"#,
+        )
+        .unwrap();
+        let runtime = RuntimeConfig::new(config).unwrap();
+        let shared = GatewayShared::from_runtime(&runtime).unwrap();
         let peer: std::net::SocketAddr = "192.0.2.44:443".parse().unwrap();
 
-        let active = Http3Admission::new(10_000.0, 8, 1);
-        let permit = active.admit(peer).unwrap();
+        let permit = shared.admit_http3_connection(peer, 10_000.0, 8, 1).unwrap();
         assert!(matches!(
-            active.admit(peer),
+            shared.admit_http3_connection(peer, 10_000.0, 8, 1),
             Err(Http3AdmissionRejection::TooManyConnections)
         ));
         drop(permit);
 
-        let rate = Http3Admission::new(0.1, 0, 8);
-        let _permit = rate.admit(peer).unwrap();
+        let _permit = shared.admit_http3_connection(peer, 0.1, 0, 8).unwrap();
         assert!(matches!(
-            rate.admit(peer),
+            shared.admit_http3_connection(peer, 0.1, 0, 8),
             Err(Http3AdmissionRejection::RateLimited)
         ));
     }

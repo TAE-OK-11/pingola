@@ -31,18 +31,12 @@ const MAX_UDP_PAYLOAD: usize = 1452;
 const MAX_H3_HEADER_BYTES: u64 = 64 * 1024;
 const MAX_REQUEST_COMMANDS: usize = 128;
 const MAX_PENDING_REQUESTS: usize = 128;
-const MAX_BODY_FRAMES: usize = 8;
-const H3_BODY_RECV_BUFFER: usize = 16 * 1024;
-// Match downstream HTTP/3 windows so upstream QUIC buffers cannot spike RSS on
-// small hosts while still covering Navidrome streaming bandwidth-delay product.
-const INITIAL_MAX_DATA: u64 = 4 * 1024 * 1024;
-const INITIAL_STREAM_WINDOW: u64 = 1024 * 1024;
-const MAX_CONNECTION_WINDOW: u64 = 8 * 1024 * 1024;
-const MAX_STREAM_WINDOW: u64 = 2 * 1024 * 1024;
+const MAX_BODY_FRAMES: usize = 12;
+const H3_BODY_RECV_BUFFER: usize = 24 * 1024;
 const H3_CONTROL_STREAMS: u64 = 8;
-const SEND_CAPACITY_FACTOR: f64 = 2.0;
 const CC_CUBIC: &str = "cubic";
 const CC_BBR2: &str = "bbr2";
+const WARMUP_REQUEST_ID: u64 = 0;
 type BoxError = Box<dyn StdError + Send + Sync>;
 
 #[derive(Clone, Debug)]
@@ -102,6 +96,12 @@ struct BridgeSettings {
     max_streams: u64,
     enable_early_data: bool,
     cc_algorithm: &'static str,
+    quic_initial_max_data: u64,
+    quic_stream_window: u64,
+    quic_max_connection_window: u64,
+    quic_max_stream_window: u64,
+    quic_send_capacity_factor: f64,
+    warmup_path: Option<String>,
 }
 
 pub fn start(
@@ -125,6 +125,7 @@ pub fn start(
         let available = Arc::new(AtomicBool::new(false));
         let forced = upstream.protocol == UpstreamProtocol::Http3;
         let preferred = upstream.protocol == UpstreamProtocol::Http3Preferred;
+        let server = &runtime.config.server;
         let settings = BridgeSettings {
             name: name.clone(),
             origin,
@@ -140,6 +141,14 @@ pub fn start(
             } else {
                 CC_CUBIC
             },
+            quic_initial_max_data: server.quic_initial_max_data,
+            quic_stream_window: server.quic_stream_window,
+            quic_max_connection_window: server.quic_max_connection_window,
+            quic_max_stream_window: server.quic_max_stream_window,
+            quic_send_capacity_factor: server.quic_send_capacity_factor,
+            warmup_path: upstream
+                .http3_warmup
+                .then(|| upstream.http3_warmup_path.clone()),
         };
         let (pool, receiver) = H3Pool::new(&settings);
         pools.insert(name.clone(), pool);
@@ -400,6 +409,7 @@ struct PendingRequest {
     response_started: bool,
     pending_write: Option<PendingWrite>,
     pending_response: Option<Frame<Bytes>>,
+    discard_body: bool,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -417,6 +427,50 @@ impl PendingRequest {
             write.fail(message);
         }
     }
+}
+
+fn enqueue_warmup_request(
+    path: &str,
+    authority: &str,
+    requests: &mut AHashMap<u64, PendingRequest>,
+    waiting: &mut VecDeque<u64>,
+) {
+    if requests.contains_key(&WARMUP_REQUEST_ID) {
+        return;
+    }
+    let headers = vec![
+        h3::Header::new(b":method", b"GET"),
+        h3::Header::new(b":scheme", b"https"),
+        h3::Header::new(b":authority", authority.as_bytes()),
+        h3::Header::new(b":path", path.as_bytes()),
+        h3::Header::new(b"host", authority.as_bytes()),
+    ];
+    let (cancel, _cancel_rx) = mpsc::channel(1);
+    let (body_tx, _body_rx) = mpsc::channel(MAX_BODY_FRAMES);
+    let response_finished = Arc::new(AtomicBool::new(false));
+    requests.insert(
+        WARMUP_REQUEST_ID,
+        PendingRequest {
+            headers,
+            has_body: false,
+            allow_early_data: false,
+            cancel,
+            opened: None,
+            response: None,
+            body_tx,
+            body_rx: None,
+            response_finished,
+            stream_id: None,
+            response_started: false,
+            pending_write: None,
+            pending_response: None,
+            discard_body: true,
+            _permit: Arc::new(Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("warmup permit"),
+        },
+    );
+    waiting.push_back(WARMUP_REQUEST_ID);
 }
 
 async fn pool_manager(
@@ -550,12 +604,12 @@ async fn run_connection(
     quic_config.set_max_idle_timeout(settings.idle_timeout.as_millis() as u64);
     quic_config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD);
     quic_config.set_max_send_udp_payload_size(MAX_UDP_PAYLOAD);
-    quic_config.set_initial_max_data(INITIAL_MAX_DATA);
-    quic_config.set_initial_max_stream_data_bidi_local(INITIAL_STREAM_WINDOW);
-    quic_config.set_initial_max_stream_data_bidi_remote(INITIAL_STREAM_WINDOW);
-    quic_config.set_initial_max_stream_data_uni(INITIAL_STREAM_WINDOW);
-    quic_config.set_max_connection_window(MAX_CONNECTION_WINDOW);
-    quic_config.set_max_stream_window(MAX_STREAM_WINDOW);
+    quic_config.set_initial_max_data(settings.quic_initial_max_data);
+    quic_config.set_initial_max_stream_data_bidi_local(settings.quic_stream_window);
+    quic_config.set_initial_max_stream_data_bidi_remote(settings.quic_stream_window);
+    quic_config.set_initial_max_stream_data_uni(settings.quic_stream_window);
+    quic_config.set_max_connection_window(settings.quic_max_connection_window);
+    quic_config.set_max_stream_window(settings.quic_max_stream_window);
     quic_config.set_initial_max_streams_bidi(settings.max_streams);
     quic_config.set_initial_max_streams_uni(H3_CONTROL_STREAMS);
     quic_config.set_disable_active_migration(true);
@@ -565,7 +619,7 @@ async fn run_connection(
     quic_config.enable_hystart(true);
     quic_config.enable_pacing(true);
     quic_config.grease(true);
-    quic_config.set_send_capacity_factor(SEND_CAPACITY_FACTOR);
+    quic_config.set_send_capacity_factor(settings.quic_send_capacity_factor);
     if settings.enable_early_data {
         quic_config.enable_early_data();
     }
@@ -604,6 +658,8 @@ async fn run_connection(
     let mut response_blocked = None;
     let mut draining = false;
     let handshake_deadline = Instant::now() + settings.connect_timeout;
+    let mut warmup_pending = settings.warmup_path.is_some();
+    let mut warmup_done = false;
     let mut established_logged = false;
     let mut session_logged = false;
 
@@ -642,6 +698,22 @@ async fn run_connection(
                     h3::Connection::with_transport(&mut conn, &h3_config)
                         .context("failed to create upstream HTTP/3 connection")?,
                 );
+            }
+            if app_ready && warmup_pending && !warmup_done {
+                if let Some(path) = settings.warmup_path.as_deref() {
+                    enqueue_warmup_request(
+                        path,
+                        &settings.server_name,
+                        &mut requests,
+                        &mut waiting,
+                    );
+                    warmup_done = true;
+                    info!(
+                        "upstream HTTP/3 warmup queued upstream={} path={path}",
+                        settings.name
+                    );
+                }
+                warmup_pending = false;
             }
             if conn.is_established() {
                 if !draining {
@@ -832,6 +904,7 @@ fn handle_command(
                     response_started: false,
                     pending_write: None,
                     pending_response: None,
+                    discard_body: false,
                     _permit: permit,
                 },
             );
@@ -1114,9 +1187,21 @@ fn process_h3_events(
                     if status.is_informational() {
                         continue;
                     }
+                    let discard_body = requests
+                        .get(&request_id)
+                        .is_some_and(|request| request.discard_body);
                     let request = requests
                         .get_mut(&request_id)
                         .ok_or_else(|| anyhow!("HTTP/3 response has no request state"))?;
+                    if discard_body {
+                        request.response_started = true;
+                        if !status.is_success() {
+                            warn!(
+                                "upstream HTTP/3 warmup returned {status} request_id={request_id}"
+                            );
+                        }
+                        continue;
+                    }
                     let body = request
                         .body_rx
                         .take()
@@ -1192,7 +1277,15 @@ fn process_h3_events(
                 }
             }
             h3::Event::Data => {
-                match drain_response_body(h3_conn, conn, request_id, requests, body_buf)? {
+                let discard_body = requests
+                    .get(&request_id)
+                    .is_some_and(|request| request.discard_body);
+                let retry = if discard_body {
+                    discard_response_body(h3_conn, conn, request_id, requests, body_buf)?
+                } else {
+                    drain_response_body(h3_conn, conn, request_id, requests, body_buf)?
+                };
+                match retry {
                     DeliveryRetry::Ready => {}
                     DeliveryRetry::Blocked => {
                         *response_blocked = Some(request_id);
@@ -1206,6 +1299,10 @@ fn process_h3_events(
             h3::Event::Finished => {
                 stream_to_request.remove(&stream_id);
                 if let Some(mut request) = requests.remove(&request_id) {
+                    if request.discard_body {
+                        request.response_finished.store(true, Ordering::Release);
+                        continue;
+                    }
                     if request.response_started {
                         request.response_finished.store(true, Ordering::Release);
                     } else if let Some(response) = request.response.take() {
@@ -1232,6 +1329,28 @@ enum DeliveryRetry {
     Ready,
     Blocked,
     Closed(&'static str),
+}
+
+fn discard_response_body(
+    h3_conn: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    request_id: u64,
+    requests: &AHashMap<u64, PendingRequest>,
+    body_buf: &mut BytesMut,
+) -> Result<DeliveryRetry> {
+    let stream_id = requests
+        .get(&request_id)
+        .and_then(|request| request.stream_id)
+        .ok_or_else(|| anyhow!("HTTP/3 discard body has no request stream"))?;
+    if body_buf.len() < H3_BODY_RECV_BUFFER {
+        body_buf.resize(H3_BODY_RECV_BUFFER, 0);
+    }
+    let dest = &mut body_buf[..H3_BODY_RECV_BUFFER];
+    match h3_conn.recv_body(conn, stream_id, dest) {
+        Ok(read) if read > 0 => Ok(DeliveryRetry::Ready),
+        Ok(_) | Err(h3::Error::Done) => Ok(DeliveryRetry::Ready),
+        Err(error) => Err(anyhow!("HTTP/3 warmup body discard failed: {error:?}")),
+    }
 }
 
 fn drain_response_body(
