@@ -76,7 +76,7 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
-const TASK_BUFFER_SIZE: usize = 4;
+const TASK_BUFFER_SIZE: usize = 16;
 
 mod proxy_cache;
 mod proxy_common;

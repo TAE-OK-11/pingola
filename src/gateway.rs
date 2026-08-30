@@ -1312,17 +1312,14 @@ impl ProxyHttp for Gateway {
 /// Let selected application origins negotiate their own response encoding.
 ///
 /// Audio, binary DoH, authentication responses and upgraded/long-lived
-/// connections deliberately stay uncompressed. Vaultwarden and CouchDB use a
+/// connections deliberately stay uncompressed. Vaultwarden UI responses use a
 /// separate bounded streaming compressor in the downstream response path.
 fn forwards_accept_encoding(route: RouteClass) -> bool {
     matches!(route, RouteClass::NavidromeApi | RouteClass::NavidromeCover)
 }
 
 fn uses_downstream_compression(route: RouteClass) -> bool {
-    matches!(
-        route,
-        RouteClass::Vaultwarden | RouteClass::Couchdb | RouteClass::AdguardUi
-    )
+    matches!(route, RouteClass::Vaultwarden | RouteClass::AdguardUi)
 }
 
 fn configure_downstream_compression(
@@ -2447,11 +2444,7 @@ hosts:
             assert!(!forwards_accept_encoding(route), "route={route:?}");
         }
 
-        for route in [
-            RouteClass::Vaultwarden,
-            RouteClass::Couchdb,
-            RouteClass::AdguardUi,
-        ] {
+        for route in [RouteClass::Vaultwarden, RouteClass::AdguardUi] {
             assert!(uses_downstream_compression(route), "route={route:?}");
         }
         for route in [
@@ -2460,6 +2453,7 @@ hosts:
             RouteClass::NavidromeApi,
             RouteClass::VaultwardenAuth,
             RouteClass::VaultwardenHub,
+            RouteClass::Couchdb,
             RouteClass::Doh,
         ] {
             assert!(!uses_downstream_compression(route), "route={route:?}");

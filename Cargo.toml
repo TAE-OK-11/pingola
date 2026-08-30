@@ -55,7 +55,7 @@ cloudflare-pingora = { package = "pingora", version = "=0.8.1", default-features
 rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-serde-saphyr = "1.1.0"
+serde-saphyr = "1.2.0"
 socket2 = "0.6.5"
 tcmalloc-better = { version = "=0.1.19", optional = true, features = ["extension", "std"] }
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats", "use_std"], optional = true }
@@ -77,6 +77,7 @@ pingora-proxy = { path = "vendor/pingora-proxy-0.8.1" }
 
 [profile.release]
 codegen-units = 1
+incremental = false
 lto = "fat"
 opt-level = 3
 panic = "abort"
