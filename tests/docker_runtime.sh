@@ -102,7 +102,7 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.quic.tls.provider"}}' "${name}") == boringssl ]]
   test "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${name}" | sed -n 's/^MALLOC_CONF=//p')" \
     = 'narenas:1,percpu_arena:percpu,retain:false,dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:true,tcache_max:8192'
-  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.lto-scope"}}' "${name}") == full-stack ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.lto-scope"}}' "${name}") == cargo-fat ]]
   docker image inspect "${IMAGE}" | jq -e '.[0].Config.ExposedPorts["443/udp"] != null' >/dev/null
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.linker"}}' "${name}") == lld ]]
 
