@@ -299,7 +299,6 @@ pub struct RequestContext {
     identity_acceptable: bool,
     compression_selected: bool,
     started_at: Option<Instant>,
-    global_limits_exempt: bool,
     upstream_h3_tcp_fallback: bool,
     _active_request_permit: Option<ActiveRequestPermit>,
     _global_request_permit: Option<GlobalConcurrentPermit>,
@@ -321,7 +320,6 @@ impl Default for RequestContext {
             identity_acceptable: true,
             compression_selected: false,
             started_at: None,
-            global_limits_exempt: false,
             upstream_h3_tcp_fallback: false,
             _active_request_permit: None,
             _global_request_permit: None,
@@ -477,7 +475,7 @@ impl Gateway {
 
     fn acquire_global_request(&self, ctx: &mut RequestContext) -> bool {
         let limit = self.runtime.config.server.global_active_requests;
-        if limit == 0 || ctx.global_limits_exempt {
+        if limit == 0 {
             return true;
         }
         let Some(permit) = self.shared.global_concurrent.acquire(limit) else {
@@ -595,7 +593,6 @@ impl ProxyHttp for Gateway {
         };
         ctx.http3 = http3;
         ctx.tls = tls;
-        ctx.global_limits_exempt = peer_global_limits_exempt(&self.runtime, session);
         ctx.forwarded_port = if direct_h3 {
             self.runtime.http3_public_port()
         } else {
@@ -1742,14 +1739,6 @@ fn is_tls(session: &Session) -> bool {
         .digest()
         .and_then(|digest| digest.ssl_digest.as_ref())
         .is_some()
-}
-
-fn peer_global_limits_exempt(runtime: &RuntimeConfig, session: &Session) -> bool {
-    let _ = runtime;
-    session
-        .client_addr()
-        .and_then(|address| address.as_inet())
-        .is_some_and(|address| address.ip().is_loopback())
 }
 
 fn session_client_ip(runtime: &RuntimeConfig, session: &Session) -> Option<IpAddr> {
