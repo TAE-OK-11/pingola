@@ -2273,7 +2273,10 @@ hosts:
             ..RequestContext::default()
         };
         let plan = &gateway.plans[ctx.plan_index];
-        let h3 = plan.h3.as_ref().expect("http3 upstream must expose an H3 plan");
+        let h3 = plan
+            .h3
+            .as_ref()
+            .expect("http3 upstream must expose an H3 plan");
         assert!(h3.route.should_use_direct_h3(false));
         let peer = gateway
             .precomputed_upstream_peer(&ctx)
