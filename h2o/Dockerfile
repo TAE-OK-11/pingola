@@ -1,14 +1,16 @@
-# syntax=docker/dockerfile:1.25@sha256:0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12
+# syntax=docker/dockerfile:1.26@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 # check=error=true
 
 ARG H2O_VERSION=706842c0f8c0d9422efb97a4d8ef7d6ec9df87b7
 ARG H2O_REPOSITORY=https://github.com/h2o/h2o.git
+ARG BORINGSSL_VERSION=da02aac3ebb96152074ea180a5a74559b82343b1
+ARG JEMALLOC_VERSION=5.3.1
 ARG TARGET_CPU=x86-64-v2
 ARG LTO_MODE=fat
-ARG TLS_PROVIDER=boringssl
 ARG DEBIAN_SUITE=13
+ARG DEBIAN_DIGEST=sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 
-FROM debian:${DEBIAN_SUITE}-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS toolchain
+FROM debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132 AS toolchain
 
 ARG DEBIAN_SUITE
 
@@ -39,58 +41,51 @@ RUN --mount=type=cache,id=h2o-apt-toolchain-${DEBIAN_SUITE},target=/var/cache/ap
 FROM toolchain AS tls-builder
 
 ARG TARGET_CPU
-ARG LTO_MODE
-ARG TLS_PROVIDER
+ARG BORINGSSL_VERSION
 
 WORKDIR /build
 COPY --link scripts/build-tls.sh /usr/local/bin/build-tls.sh
 
-RUN --mount=type=cache,id=h2o-tls-${TLS_PROVIDER},target=/tmp/h2o-tls-cache,sharing=locked \
+RUN --mount=type=cache,id=h2o-tls-boringssl-${BORINGSSL_VERSION},target=/tmp/h2o-tls-cache,sharing=locked \
     chmod 755 /usr/local/bin/build-tls.sh \
     && set -eux; \
     case "${TARGET_CPU}" in \
       x86-64-v2) ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' ;; \
       *) echo "unsupported target CPU: ${TARGET_CPU}" >&2; exit 2 ;; \
     esac; \
-    case "${LTO_MODE}" in \
-      fat) LTO_FLAGS='-flto' ;; \
-      thin) LTO_FLAGS='-flto=thin' ;; \
-      off) LTO_FLAGS='' ;; \
-      *) echo "unsupported LTO mode: ${LTO_MODE}" >&2; exit 2 ;; \
-    esac; \
-    case "${TLS_PROVIDER}" in boringssl|aws-lc) ;; \
-      *) echo "unsupported TLS provider: ${TLS_PROVIDER}" >&2; exit 2 ;; \
-    esac; \
-    WORK_ROOT=/tmp/h2o-tls-cache /usr/local/bin/build-tls.sh /opt/tls "${TLS_PROVIDER}" "${ARCH_FLAGS}"
+    WORK_ROOT=/tmp/h2o-tls-cache \
+      BORINGSSL_VERSION="${BORINGSSL_VERSION}" \
+      /usr/local/bin/build-tls.sh /opt/tls "${ARCH_FLAGS}"
 
 FROM toolchain AS jemalloc-builder
 
 ARG TARGET_CPU
+ARG JEMALLOC_VERSION
 
 WORKDIR /build
 COPY --link scripts/build-jemalloc.sh /usr/local/bin/build-jemalloc.sh
 
-RUN --mount=type=cache,id=h2o-jemalloc,target=/tmp/h2o-jemalloc-cache,sharing=locked \
+RUN --mount=type=cache,id=h2o-jemalloc-${JEMALLOC_VERSION},target=/tmp/h2o-jemalloc-cache,sharing=locked \
     chmod 755 /usr/local/bin/build-jemalloc.sh \
     && set -eux; \
     case "${TARGET_CPU}" in \
       x86-64-v2) ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' ;; \
       *) echo "unsupported target CPU: ${TARGET_CPU}" >&2; exit 2 ;; \
     esac; \
-    WORK_ROOT=/tmp/h2o-jemalloc-cache /usr/local/bin/build-jemalloc.sh /opt/jemalloc "${ARCH_FLAGS}"
+    WORK_ROOT=/tmp/h2o-jemalloc-cache \
+      JEMALLOC_VERSION="${JEMALLOC_VERSION}" \
+      /usr/local/bin/build-jemalloc.sh /opt/jemalloc "${ARCH_FLAGS}"
 
 FROM toolchain AS builder
 
-ARG DEBIAN_SUITE
 ARG H2O_VERSION
 ARG H2O_REPOSITORY
 ARG TARGET_CPU
 ARG LTO_MODE
-ARG TLS_PROVIDER
+ARG BORINGSSL_VERSION
+ARG JEMALLOC_VERSION
 
 WORKDIR /src
-
-COPY --link scripts/build-tls.sh scripts/build-jemalloc.sh /usr/local/bin/
 
 RUN git init h2o \
     && git -C h2o remote add origin "${H2O_REPOSITORY}" \
@@ -101,7 +96,7 @@ RUN git init h2o \
 
 RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
     --mount=from=jemalloc-builder,source=/opt/jemalloc,target=/opt/jemalloc,ro \
-    --mount=type=cache,id=h2o-cmake-build-${H2O_VERSION}-${TARGET_CPU}-${LTO_MODE}-${TLS_PROVIDER}-jemalloc-clang-noring,target=/src/h2o/build,sharing=locked \
+    --mount=type=cache,id=h2o-cmake-${H2O_VERSION}-${BORINGSSL_VERSION}-${JEMALLOC_VERSION}-${TARGET_CPU}-${LTO_MODE},target=/src/h2o/build,sharing=locked \
     set -eux; \
     case "${TARGET_CPU}" in \
       x86-64-v2) ARCH_FLAGS='-march=x86-64-v2 -mtune=generic' ;; \
@@ -143,28 +138,32 @@ RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
     cp /opt/tls/tls-provider.txt /out/tls-provider.txt; \
     cp /opt/jemalloc/allocator.txt /out/allocator.txt
 
-FROM debian:${DEBIAN_SUITE}-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS runtime
+FROM debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132 AS runtime
 
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=unknown
 ARG H2O_VERSION
 ARG TARGET_CPU
 ARG LTO_MODE
-ARG TLS_PROVIDER
+ARG BORINGSSL_VERSION
+ARG JEMALLOC_VERSION
 ARG DEBIAN_SUITE
+ARG DEBIAN_DIGEST
 
 LABEL org.opencontainers.image.title="H2O" \
-      org.opencontainers.image.description="High-performance JBS H2O reverse proxy" \
+      org.opencontainers.image.description="Standalone JBS H2O reverse proxy" \
       org.opencontainers.image.source="https://github.com/TAE-OK-11/pingola" \
       org.opencontainers.image.version="${BUILD_VERSION}" \
       org.opencontainers.image.revision="${BUILD_REVISION}" \
-      org.opencontainers.image.base.name="debian:${DEBIAN_SUITE}-slim" \
+      org.opencontainers.image.base.name="debian:13-slim@${DEBIAN_DIGEST}" \
       org.opencontainers.image.h2o.version="${H2O_VERSION}" \
       org.opencontainers.image.h2o.target-cpu="${TARGET_CPU}" \
       org.opencontainers.image.h2o.lto="${LTO_MODE}" \
       org.opencontainers.image.h2o.linker="lld" \
-      org.opencontainers.image.tls.provider="${TLS_PROVIDER}" \
+      org.opencontainers.image.tls.provider="boringssl" \
+      org.opencontainers.image.tls.boringssl="${BORINGSSL_VERSION}" \
       org.opencontainers.image.allocator="jemalloc" \
+      org.opencontainers.image.allocator.jemalloc="${JEMALLOC_VERSION}" \
       org.opencontainers.image.licenses="MIT"
 
 RUN --mount=from=builder,source=/out,target=/out,ro \

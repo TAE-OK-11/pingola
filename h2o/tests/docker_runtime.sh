@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-IMAGE=${H2O_TEST_IMAGE:-ghcr.io/tae-ok-11/pingora/h2o:local}
+IMAGE=${H2O_TEST_IMAGE:-ghcr.io/tae-ok-11/h2o:local}
 EXPECTED_TARGET_CPU=${H2O_EXPECTED_TARGET_CPU:-x86-64-v2}
 EXPECTED_LTO=${H2O_EXPECTED_LTO:-fat}
 EXPECTED_TLS_PROVIDER=${H2O_EXPECTED_TLS_PROVIDER:-boringssl}
@@ -89,6 +89,7 @@ assert_container_hardening() {
   docker exec "${name}" test -s /usr/share/doc/h2o/version.txt
   docker exec "${name}" grep -q "tls_provider=${EXPECTED_TLS_PROVIDER}" /usr/share/doc/h2o/tls-provider.txt
   docker exec "${name}" grep -q "allocator=${EXPECTED_ALLOCATOR}" /usr/share/doc/h2o/allocator.txt
+  docker exec "${name}" grep -q "jemalloc=" /usr/share/doc/h2o/allocator.txt
   docker exec "${name}" /usr/local/bin/h2o-allocator-info | grep -q "allocator=${EXPECTED_ALLOCATOR}"
   docker exec "${name}" /usr/local/bin/h2o --version | grep -qi 'OpenSSL'
 
