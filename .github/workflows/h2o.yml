@@ -52,13 +52,23 @@ jobs:
           test "$(grep -c "${DEBIAN_DIGEST#sha256:}" h2o/Dockerfile)" -ge 3
           grep -F "# syntax=${DOCKERFILE_SYNTAX}" h2o/Dockerfile
           bash -n h2o/scripts/healthcheck.sh
+          bash -n h2o/scripts/resolve-lto-flags.sh
           bash -n h2o/scripts/build-tls.sh
           bash -n h2o/scripts/build-jemalloc.sh
           bash -n h2o/scripts/allocator-info.sh
           bash -n h2o/tests/docker_runtime.sh
           grep -q 'num-threads: 1' h2o/config/h2o.conf
           grep -q 'temp-buffer-path: /tmp/h2o' h2o/config/h2o.conf
+          grep -q 'max-connections: 2048' h2o/config/h2o.conf
+          grep -q 'http2-idle-timeout: 300' h2o/config/h2o.conf
+          grep -q 'http3-idle-timeout: 300' h2o/config/h2o.conf
+          grep -q 'proxy.preserve-host: ON' h2o/config/h2o.conf
+          grep -q 'proxy.tunnel: ON' h2o/config/h2o.conf
+          grep -q 'proxy.zerocopy: always' h2o/config/h2o.conf
+          grep -q 'soft-connection-limit:' h2o/config/h2o.conf
+          grep -q 'lto-scope="full-stack"' h2o/Dockerfile
           grep -q 'type: quic' h2o/config/h2o.conf
+          grep -F 'MALLOC_CONF="narenas:1,retain:false,dirty_decay_ms:1000,tcache_max:8192"' h2o/Dockerfile
           grep -q 'ghcr.io/tae-ok-11/h2o' h2o/docker-compose.yml
           {
             echo "H2O_VERSION=${H2O_VERSION}"
@@ -108,10 +118,17 @@ jobs:
         run: |
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.h2o.target-cpu"]')" = "x86-64-v2"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.h2o.lto"]')" = "fat"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.h2o.lto-scope"]')" = "full-stack"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.tls.provider"]')" = "boringssl"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator"]')" = "jemalloc"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.allocator.jemalloc"]')" = "${{ needs.verify-config.outputs.jemalloc_version }}"
           test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.tls.boringssl"]')" = "${{ needs.verify-config.outputs.boringssl_version }}"
+          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Env[]' | sed -n 's/^MALLOC_CONF=//p')" \
+            = "narenas:1,retain:false,dirty_decay_ms:1000,tcache_max:8192"
+          docker run --rm --entrypoint grep "${IMAGE}" -q 'lto=fat' /usr/share/doc/h2o/build-info.txt
+          docker run --rm --entrypoint grep "${IMAGE}" -q 'lto_scope=full-stack' /usr/share/doc/h2o/build-info.txt
+          docker run --rm --entrypoint grep "${IMAGE}" -q 'lto=fat' /usr/share/doc/h2o/tls-provider.txt
+          docker run --rm --entrypoint grep "${IMAGE}" -q 'lto=fat' /usr/share/doc/h2o/allocator.txt
           bash h2o/tests/docker_runtime.sh
 
   publish:
@@ -157,9 +174,10 @@ jobs:
             type=match,pattern=h2o-v(.*),group=1
           labels: |
             org.opencontainers.image.title=JBS H2O
-            org.opencontainers.image.description=Debian 13 H2O with BoringSSL, jemalloc, and kTLS
+            org.opencontainers.image.description=Debian 13 H2O with full-stack fat-LTO, BoringSSL, jemalloc, and kTLS
             org.opencontainers.image.source=https://github.com/TAE-OK-11/pingola
             org.opencontainers.image.h2o.version=${{ needs.verify-config.outputs.h2o_version }}
+            org.opencontainers.image.h2o.lto-scope=full-stack
             org.opencontainers.image.tls.provider=boringssl
             org.opencontainers.image.tls.boringssl=${{ needs.verify-config.outputs.boringssl_version }}
             org.opencontainers.image.allocator=jemalloc
