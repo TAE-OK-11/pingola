@@ -252,17 +252,10 @@ impl BodyReader {
         buf_ref.get(self.body_buf.as_ref().unwrap())
     }
 
-    /// Move a complete upstream body chunk out without copying it.
-    ///
-    /// This is intentionally limited to an exact, final chunk. Partial,
-    /// chunk-framed, downstream and overread ranges keep the established copy
-    /// path so their parsing and connection-reuse semantics do not change.
-    pub fn take_completed_body(&mut self, buf_ref: &BufRef) -> Option<Bytes> {
-        if !self.upstream
-            || !self.body_done()
-            || self.has_bytes_overread()
-            || buf_ref.0 != 0
-        {
+    /// Move a filled body buffer out without copying when the entire chunk is
+    /// contained in the body reader's internal buffer and parsing is complete.
+    pub fn take_filled_body(&mut self, buf_ref: &BufRef) -> Option<Bytes> {
+        if !self.body_done() || self.has_bytes_overread() || buf_ref.0 != 0 {
             return None;
         }
         let body_buf = self.body_buf.take()?;
@@ -271,6 +264,18 @@ impl BodyReader {
             return None;
         }
         Some(body_buf.freeze())
+    }
+
+    /// Move a complete upstream body chunk out without copying it.
+    ///
+    /// This is intentionally limited to an exact, final chunk. Partial,
+    /// chunk-framed, downstream and overread ranges keep the established copy
+    /// path so their parsing and connection-reuse semantics do not change.
+    pub fn take_completed_body(&mut self, buf_ref: &BufRef) -> Option<Bytes> {
+        if !self.upstream {
+            return None;
+        }
+        self.take_filled_body(buf_ref)
     }
 
     #[allow(dead_code)]

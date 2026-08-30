@@ -59,6 +59,15 @@ small set of documented local changes.
 - Reason: a truncated request cannot be replayed, so retaining its contents
   only pins memory until the downstream connection closes. This follows the
   post-0.8.1 Cloudflare Pingora optimization.
+- Local change: move filled downstream H1 request body buffers into `Bytes`
+  without copying when the chunk is complete.
+- Reason: upstream H1 already used `take_completed_body()`; the downstream
+  server path still copied every body chunk even when the internal buffer was
+  complete. `take_filled_body()` shares the same safety guards.
+- Local change: enable `TCP_QUICKACK` alongside `TCP_NODELAY` on Linux TCP
+  streams.
+- Reason: short proxy responses (health checks, API JSON) avoid delayed-ACK
+  stalls on the return path without extra userspace work per connection.
 
 Remove dependency patches after a released Pingora version adopts equivalent
 versions. Re-evaluate the reuse-hash cache whenever `HttpPeer` changes.

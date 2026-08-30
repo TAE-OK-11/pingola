@@ -958,9 +958,7 @@ impl ProxyHttp for Gateway {
         wire: &mut Vec<(Bytes, Bytes)>,
         upstream_request: &RequestHeader,
     ) {
-        let mut headers = h3_wire::bytes_pairs_to_headers(std::mem::take(wire));
-        h3_wire::finalize_upstream_wire(&mut headers, upstream_request);
-        *wire = h3_wire::headers_to_bytes_pairs(headers);
+        h3_wire::finalize_upstream_wire_pairs(wire, upstream_request);
     }
 
     fn h1_bodyless_poll_downstream(&self, _session: &Session, ctx: &Self::CTX) -> bool {

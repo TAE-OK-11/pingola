@@ -606,6 +606,26 @@ impl std::fmt::Display for TcpKeepalive {
     }
 }
 
+/// Enable TCP quick ACKs on Linux to reduce delayed-ack latency on short proxy
+/// responses. Unsupported platforms ignore this call.
+#[cfg(target_os = "linux")]
+pub fn set_tcp_quickack(stream: &TcpStream) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    const TCP_QUICKACK: c_int = 12;
+    set_opt(
+        stream.as_raw_fd(),
+        libc::IPPROTO_TCP,
+        TCP_QUICKACK,
+        1_i32,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_tcp_quickack(_stream: &TcpStream) -> io::Result<()> {
+    Ok(())
+}
+
 /// Apply the given TCP keepalive settings to the given connection
 pub fn set_tcp_keepalive(stream: &TcpStream, ka: &TcpKeepalive) -> Result<()> {
     #[cfg(unix)]

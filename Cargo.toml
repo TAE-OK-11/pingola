@@ -41,6 +41,7 @@ futures = { version = "0.3.34", default-features = false, features = ["std", "as
 getrandom = "0.4.3"
 hex = "0.4.3"
 http = "1.5.0"
+libc = "0.2.180"
 http-body-util = "0.1.5"
 httpdate = "1.0.3"
 hyper = { version = "1.11.1", features = ["client", "server", "http2"] }

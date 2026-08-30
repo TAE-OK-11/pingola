@@ -60,6 +60,7 @@ pub fn bytes_pairs_to_headers(pairs: Vec<(Bytes, Bytes)>) -> Vec<h3::Header> {
 ///
 /// Pseudo-headers are rebuilt from `req`. Regular headers are taken from `req`
 /// while reusing unchanged downstream allocations when possible.
+#[cfg(test)]
 pub fn finalize_upstream_wire(wire: &mut Vec<h3::Header>, req: &RequestHeader) {
     let authority = req
         .headers
@@ -102,6 +103,63 @@ pub fn finalize_upstream_wire(wire: &mut Vec<h3::Header>, req: &RequestHeader) {
             wire.push(h3::Header::new(
                 name.as_str().as_bytes(),
                 value.as_bytes(),
+            ));
+        }
+    }
+}
+
+/// Same as [`finalize_upstream_wire`] but operates on trait-bound byte pairs
+/// without converting through `h3::Header`.
+pub fn finalize_upstream_wire_pairs(wire: &mut Vec<(Bytes, Bytes)>, req: &RequestHeader) {
+    let authority = req
+        .headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| req.uri.authority().map(|value| value.as_str()))
+        .unwrap_or("");
+    let path = req.uri.path_and_query().map_or("/", |value| value.as_str());
+
+    let mut reusable = HashMap::with_capacity(wire.len());
+    let mut scratch = Vec::with_capacity(32);
+    for (name, value) in wire.drain(..) {
+        if is_pseudo(&name) || skip_regular_header(&name, &value) {
+            continue;
+        }
+        reusable.insert(lowercase_key(&name, &mut scratch).to_vec(), (name, value));
+    }
+
+    wire.clear();
+    wire.reserve(req.headers.len().saturating_add(4));
+    wire.push((
+        Bytes::from_static(b":method"),
+        Bytes::copy_from_slice(req.method.as_str().as_bytes()),
+    ));
+    wire.push((
+        Bytes::from_static(b":scheme"),
+        Bytes::from_static(b"https"),
+    ));
+    wire.push((
+        Bytes::from_static(b":authority"),
+        Bytes::copy_from_slice(authority.as_bytes()),
+    ));
+    wire.push((
+        Bytes::from_static(b":path"),
+        Bytes::copy_from_slice(path.as_bytes()),
+    ));
+
+    for (name, value) in &req.headers {
+        if skip_regular_header(name.as_str().as_bytes(), value.as_bytes()) {
+            continue;
+        }
+        let key = lowercase_key(name.as_str().as_bytes(), &mut scratch).to_vec();
+        if let Some((existing_name, existing_value)) = reusable.remove(&key)
+            && existing_value.as_ref() == value.as_bytes()
+        {
+            wire.push((existing_name, existing_value));
+        } else {
+            wire.push((
+                Bytes::copy_from_slice(name.as_str().as_bytes()),
+                Bytes::copy_from_slice(value.as_bytes()),
             ));
         }
     }
@@ -167,6 +225,26 @@ mod tests {
             .find(|header| header.name() == b"user-agent")
             .expect("user-agent");
         assert_eq!(reused.value(), user_agent.as_slice());
+    }
+
+    #[test]
+    fn finalize_pairs_matches_header_finalize() {
+        let mut wire_headers = sample_wire();
+        let mut wire_pairs = headers_to_bytes_pairs(sample_wire());
+        let mut req = RequestHeader::build(Method::GET, b"/rest/stream?id=1", None).unwrap();
+        req.set_version(Version::HTTP_3);
+        req.insert_header(HOST, "origin.internal").unwrap();
+        req.insert_header(USER_AGENT, "navidrome-client/1.0").unwrap();
+        req.insert_header("x-forwarded-for", "203.0.113.1").unwrap();
+
+        finalize_upstream_wire(&mut wire_headers, &req);
+        finalize_upstream_wire_pairs(&mut wire_pairs, &req);
+
+        assert_eq!(wire_pairs.len(), wire_headers.len());
+        for ((pair_name, pair_value), header) in wire_pairs.iter().zip(wire_headers.iter()) {
+            assert_eq!(pair_name.as_ref(), header.name());
+            assert_eq!(pair_value.as_ref(), header.value());
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ use rustix::process::{getegid, geteuid};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::config::RuntimeConfig;
+use crate::kernel_offload::KernelOffloadReport;
 
 const MAX_PEM_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -77,6 +78,20 @@ pub fn check_runtime(runtime: &RuntimeConfig, check_bind: bool) -> CheckReport {
         report.ok("TLS files", "not required (no HTTPS listeners)");
     } else {
         check_tls(runtime, &mut report);
+    }
+
+    let offload = KernelOffloadReport::probe();
+    report.ok("kernel offload", offload.summary());
+    if offload.linux && !offload.ktls_ulp {
+        report.ok(
+            "kernel kTLS",
+            "ULP unavailable on host; TCP TLS remains userspace (expected with BoringSSL until kTLS hook lands)",
+        );
+    } else if offload.ktls_ulp {
+        report.ok(
+            "kernel kTLS",
+            "TCP_ULP tls probe succeeded; host kernel can offload symmetric TLS record crypto when enabled",
+        );
     }
 
     for (name, host) in &runtime.config.hosts {
