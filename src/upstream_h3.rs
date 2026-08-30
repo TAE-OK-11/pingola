@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error as StdError;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -32,10 +33,14 @@ const MAX_REQUEST_COMMANDS: usize = 128;
 const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_BODY_FRAMES: usize = 8;
 const H3_BODY_RECV_BUFFER: usize = 16 * 1024;
-const INITIAL_MAX_DATA: u64 = 16 * 1024 * 1024;
+// Match downstream HTTP/3 windows so upstream QUIC buffers cannot spike RSS on
+// small hosts while still covering Navidrome streaming bandwidth-delay product.
+const INITIAL_MAX_DATA: u64 = 4 * 1024 * 1024;
 const INITIAL_STREAM_WINDOW: u64 = 1024 * 1024;
+const MAX_CONNECTION_WINDOW: u64 = 8 * 1024 * 1024;
+const MAX_STREAM_WINDOW: u64 = 2 * 1024 * 1024;
 const H3_CONTROL_STREAMS: u64 = 8;
-const SEND_CAPACITY_FACTOR: f64 = 3.0;
+const SEND_CAPACITY_FACTOR: f64 = 2.0;
 const CC_CUBIC: &str = "cubic";
 const CC_BBR2: &str = "bbr2";
 type BoxError = Box<dyn StdError + Send + Sync>;
@@ -45,15 +50,23 @@ pub struct H3Route {
     origin: SocketAddr,
     available: Arc<AtomicBool>,
     forced: bool,
+    preferred: bool,
 }
 
 impl H3Route {
-    pub fn should_use_h3(&self) -> bool {
-        self.forced || self.available.load(Ordering::Acquire)
+    pub fn should_use_direct_h3(&self, tcp_fallback: bool) -> bool {
+        if tcp_fallback {
+            return false;
+        }
+        self.forced || self.preferred
     }
 
     pub fn is_available(&self) -> bool {
         self.available.load(Ordering::Acquire)
+    }
+
+    pub fn allows_tcp_fallback(&self) -> bool {
+        self.preferred && !self.forced
     }
 }
 
@@ -83,6 +96,7 @@ struct BridgeSettings {
     origin: SocketAddr,
     server_name: String,
     verify_peer: bool,
+    trust_anchor: Option<PathBuf>,
     connect_timeout: Duration,
     idle_timeout: Duration,
     max_streams: u64,
@@ -110,11 +124,13 @@ pub fn start(
         let server_name = upstream_server_name(name, upstream)?;
         let available = Arc::new(AtomicBool::new(false));
         let forced = upstream.protocol == UpstreamProtocol::Http3;
+        let preferred = upstream.protocol == UpstreamProtocol::Http3Preferred;
         let settings = BridgeSettings {
             name: name.clone(),
             origin,
             server_name,
             verify_peer: upstream.verify_certificate,
+            trust_anchor: runtime.config.server.certificate.clone(),
             connect_timeout: Duration::from_secs(upstream.connect_timeout_seconds),
             idle_timeout: Duration::from_secs(upstream.idle_timeout_seconds.max(1)),
             max_streams: upstream.http3_max_concurrent_streams as u64,
@@ -134,6 +150,7 @@ pub fn start(
                 origin,
                 available,
                 forced,
+                preferred,
             },
         );
     }
@@ -151,8 +168,8 @@ pub fn start(
 
     for (name, route) in &registry.routes {
         info!(
-            "upstream HTTP/3 pool started: upstream={} origin={} forced={} hybrid_pq={} early_data=replay-safe-only",
-            name, route.origin, route.forced, HYBRID_PQ_GROUPS,
+            "upstream HTTP/3 pool started: upstream={} origin={} connector=direct forced={} preferred={} hybrid_pq={} early_data=replay-safe-only",
+            name, route.origin, route.forced, route.preferred, HYBRID_PQ_GROUPS,
         );
     }
     Ok(registry)
@@ -421,6 +438,13 @@ async fn pool_manager(
                 Some(command) => Some(command),
                 None => return,
             }
+        } else if !connected_once {
+            // Avoid a startup handshake race against a still-booting origin and
+            // defer TLS work until the first proxied request actually needs H3.
+            match commands.recv().await {
+                Some(command) => Some(command),
+                None => return,
+            }
         } else {
             None
         };
@@ -499,6 +523,14 @@ async fn run_connection(
     if settings.verify_peer {
         tls.set_default_verify_paths()
             .context("failed to load default trust roots for HTTP/3 upstream")?;
+        if let Some(anchor) = settings.trust_anchor.as_deref() {
+            tls.set_ca_file(anchor).with_context(|| {
+                format!(
+                    "failed to load HTTP/3 upstream trust anchor {}",
+                    anchor.display()
+                )
+            })?;
+        }
     }
     let mut quic_config =
         quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls)
@@ -522,6 +554,8 @@ async fn run_connection(
     quic_config.set_initial_max_stream_data_bidi_local(INITIAL_STREAM_WINDOW);
     quic_config.set_initial_max_stream_data_bidi_remote(INITIAL_STREAM_WINDOW);
     quic_config.set_initial_max_stream_data_uni(INITIAL_STREAM_WINDOW);
+    quic_config.set_max_connection_window(MAX_CONNECTION_WINDOW);
+    quic_config.set_max_stream_window(MAX_STREAM_WINDOW);
     quic_config.set_initial_max_streams_bidi(settings.max_streams);
     quic_config.set_initial_max_streams_uni(H3_CONTROL_STREAMS);
     quic_config.set_disable_active_migration(true);

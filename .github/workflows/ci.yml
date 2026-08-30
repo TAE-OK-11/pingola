@@ -119,14 +119,12 @@ jobs:
     if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.publish_images != true)
     needs: verify
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - target_cpu: x86-64-v2
-            pgo_mode: train
-            native_pgo: on
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -141,24 +139,14 @@ jobs:
           build-args: |
             ALLOCATOR=jemalloc
             TLS_PROVIDER=boringssl
-            PGO_MODE=${{ matrix.pgo_mode }}
-            PGO_NATIVE_BORING=${{ matrix.native_pgo }}
-            PGO_TRAIN_TARGET_CPU=${{ matrix.target_cpu }}
-            PGO_WEIGHT_H1=60
-            PGO_WEIGHT_H2=180
-            PGO_WEIGHT_H3=900
-            PGO_WEIGHT_UPSTREAM_H3_BBR2=700
-            PGO_WEIGHT_UPSTREAM_H3_CUBIC=250
-            PGO_WEIGHT_TLS=300
-            PGO_WEIGHT_TAIL=80
             RUST_TARGET_CPU=${{ matrix.target_cpu }}
             RUST_LTO=fat
             BUILD_VERSION=ci
             BUILD_REVISION=${{ github.sha }}
           cache-from: |
-            type=gha,scope=image-test-${{ matrix.target_cpu }}-${{ matrix.pgo_mode }}
-            type=gha,scope=image-${{ matrix.target_cpu }}-full-pgo
-          cache-to: type=gha,mode=max,scope=image-test-${{ matrix.target_cpu }}-${{ matrix.pgo_mode }}
+            type=gha,scope=image-test-${{ matrix.target_cpu }}
+            type=gha,scope=image-${{ matrix.target_cpu }}-release
+          cache-to: type=gha,mode=max,scope=image-test-${{ matrix.target_cpu }}
 
       - name: Verify image
         env:
@@ -167,13 +155,7 @@ jobs:
           PINGORA_EXPECTED_TARGET_CPU: ${{ matrix.target_cpu }}
           PINGORA_EXPECTED_LTO: fat
           PINGORA_EXPECTED_TLS_PROVIDER: boringssl
-          PINGORA_EXPECTED_PGO: ${{ matrix.pgo_mode }}
-        run: |
-          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.rust.pgo-train-target-cpu"]')" = "${{ matrix.target_cpu }}"
-          test "$(docker image inspect "${IMAGE}" | jq -r '.[0].Config.Labels["org.opencontainers.image.native.pgo"]')" = "${{ matrix.native_pgo }}"
-          tests/docker_runtime.sh
-          docker run --rm --entrypoint test "${IMAGE}" -s /usr/share/doc/pingora/pgo-profile-summary.txt
-          docker run --rm --entrypoint test "${IMAGE}" -s /usr/share/doc/pingora/pgo-native-profile-summary.txt
+        run: tests/docker_runtime.sh
 
   publish:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_images)
@@ -214,9 +196,9 @@ jobs:
             org.opencontainers.image.allocator=jemalloc
             org.opencontainers.image.tls.provider=boringssl
             org.opencontainers.image.http3.provider=quiche
-            org.opencontainers.image.http3.internal-protocol=h2c
+            org.opencontainers.image.http3.internal-protocol=direct-gateway
 
-      - name: Build and publish x86-64-v2 full-stack PGO
+      - name: Build and publish x86-64-v2 release image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -228,23 +210,13 @@ jobs:
           build-args: |
             ALLOCATOR=jemalloc
             TLS_PROVIDER=boringssl
-            PGO_MODE=train
-            PGO_NATIVE_BORING=on
-            PGO_TRAIN_TARGET_CPU=x86-64-v2
-            PGO_WEIGHT_H1=60
-            PGO_WEIGHT_H2=180
-            PGO_WEIGHT_H3=900
-            PGO_WEIGHT_UPSTREAM_H3_BBR2=700
-            PGO_WEIGHT_UPSTREAM_H3_CUBIC=250
-            PGO_WEIGHT_TLS=300
-            PGO_WEIGHT_TAIL=80
             RUST_TARGET_CPU=x86-64-v2
             RUST_LTO=fat
             BUILD_VERSION=${{ steps.meta.outputs.version }}
             BUILD_REVISION=${{ github.sha }}
           cache-from: |
-            type=gha,scope=image-x86-64-v2-full-pgo
-            type=gha,scope=image-test-x86-64-v2-train
-          cache-to: type=gha,mode=max,scope=image-x86-64-v2-full-pgo
+            type=gha,scope=image-x86-64-v2-release
+            type=gha,scope=image-test-x86-64-v2
+          cache-to: type=gha,mode=max,scope=image-x86-64-v2-release
           provenance: mode=max
           sbom: true

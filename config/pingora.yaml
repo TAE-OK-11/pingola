@@ -8,8 +8,6 @@ server:
   http3_listen:
     - "0.0.0.0:443"
     - "[::]:443"
-  http3_internal_listen: "127.0.0.1:18080"
-  http3_internal_handoff_enabled: false
   http3_max_idle_timeout_seconds: 300
   http3_max_requests_per_connection: 128
   http3_max_concurrent_streams: 64
@@ -22,7 +20,7 @@ server:
   downstream_keepalive_requests: 500
   max_retries: 2
   graceful_shutdown_timeout_seconds: 5
-  static_cache_bytes: 16777216
+  static_cache_bytes: 8388608
   access_log: false
   health_socket: /tmp/pingora/health.sock
   legacy_pingola_health: true
@@ -60,7 +58,13 @@ trusted_proxies:
 upstreams:
   navidrome:
     address: "10.77.0.1:4533"
-    protocol: http1
+    tls: true
+    sni: music.tae00217.cloud
+    protocol: http3-preferred
+    verify_certificate: true
+    http3_bbr2: true
+    http3_max_concurrent_streams: 64
+    connect_timeout_seconds: 5
     idle_timeout_seconds: 300
     read_timeout_seconds: 3600
     write_timeout_seconds: 3600

@@ -9,7 +9,6 @@ OUTPUT_DIR=${4:?usage: pgo_train_h3.sh PINGORA_BIN BACKEND_BIN HTTP3_PROBE_BIN O
 ECDSA_CURVE=${PGO_ECDSA_CURVE:-prime256v1}
 REQUIRE_PROFILE=${PGO_REQUIRE_PROFILE:-true}
 HTTP3_PORT=${PGO_HTTP3_PORT:-19443}
-HTTP3_INTERNAL_PORT=${PGO_HTTP3_INTERNAL_PORT:-18080}
 BACKEND_PORT=${PGO_BACKEND_PORT:-19000}
 ROUND=${PGO_TRAIN_ROUND:-1}
 RUNTIME_DIR=${OUTPUT_DIR}/runtime
@@ -99,7 +98,6 @@ server:
   http_listen: []
   https_listen: []
   http3_listen: ["127.0.0.1:${HTTP3_PORT}"]
-  http3_internal_listen: "127.0.0.1:${HTTP3_INTERNAL_PORT}"
   http3_max_idle_timeout_seconds: 60
   http3_max_concurrent_streams: 64
   # Fresh-handshake probes remain active until the QUIC idle timeout expires.
@@ -218,7 +216,6 @@ scenario=h3
 round=${ROUND}
 ecdsa_curve=${ECDSA_CURVE}
 http3_port=${HTTP3_PORT}
-http3_internal_port=${HTTP3_INTERNAL_PORT}
 backend_port=${BACKEND_PORT}
 backend_connections=${upstream_connections}
 fresh_handshakes=64

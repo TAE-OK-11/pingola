@@ -37,7 +37,10 @@ use tokio::sync::mpsc;
 
 use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_host};
 use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
-use crate::limits::{ActiveRequestLimiter, ActiveRequestPermit, LimitZone, RateLimiter};
+use crate::limits::{
+    ActiveRequestLimiter, ActiveRequestPermit, GlobalConcurrentLimiter, GlobalConcurrentPermit,
+    LimitZone, RateLimiter,
+};
 use crate::static_files::StaticFiles;
 use crate::upstream_h3::{H3_UPSTREAM_ALPN, H3Route, UpstreamH3Registry};
 
@@ -80,8 +83,6 @@ const ALT_SVC: HeaderName = HeaderName::from_static("alt-svc");
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 const X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
 const REFERRER_POLICY: HeaderName = HeaderName::from_static("referrer-policy");
-const HTTP3_INTERNAL: HeaderName = HeaderName::from_static("x-jbs-http3-internal");
-const HTTP3_PORT: HeaderName = HeaderName::from_static("x-jbs-http3-port");
 #[cfg(test)]
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
@@ -298,8 +299,9 @@ pub struct RequestContext {
     identity_acceptable: bool,
     compression_selected: bool,
     started_at: Option<Instant>,
+    upstream_h3_tcp_fallback: bool,
     _active_request_permit: Option<ActiveRequestPermit>,
-    _global_request_permit: Option<ActiveRequestPermit>,
+    _global_request_permit: Option<GlobalConcurrentPermit>,
 }
 
 impl Default for RequestContext {
@@ -318,6 +320,7 @@ impl Default for RequestContext {
             identity_acceptable: true,
             compression_selected: false,
             started_at: None,
+            upstream_h3_tcp_fallback: false,
             _active_request_permit: None,
             _global_request_permit: None,
         }
@@ -332,6 +335,7 @@ pub struct GatewayShared {
     static_files: StaticFiles,
     rates: RateLimiter,
     active_requests: ActiveRequestLimiter,
+    global_concurrent: GlobalConcurrentLimiter,
 }
 
 impl GatewayShared {
@@ -350,6 +354,7 @@ impl GatewayShared {
             static_files: StaticFiles::new(roots, runtime.config.server.static_cache_bytes)?,
             rates: RateLimiter::new(),
             active_requests: ActiveRequestLimiter::new(),
+            global_concurrent: GlobalConcurrentLimiter::new(),
         })
     }
 }
@@ -473,11 +478,7 @@ impl Gateway {
         if limit == 0 {
             return true;
         }
-        let Some(permit) =
-            self.shared
-                .active_requests
-                .acquire(LimitZone::Global, ctx.client_ip, limit)
-        else {
+        let Some(permit) = self.shared.global_concurrent.acquire(limit) else {
             return false;
         };
         ctx._global_request_permit = Some(permit);
@@ -584,12 +585,7 @@ impl ProxyHttp for Gateway {
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let direct_h3 = is_direct_http3(session);
         let plain_h1 = session.downstream_session.as_http1().is_some() && !is_tls(session);
-        let internal_http3 = if direct_h3 || plain_h1 {
-            false
-        } else {
-            is_internal_http3(&self.runtime, session)
-        };
-        let http3 = direct_h3 || internal_http3;
+        let http3 = direct_h3;
         let tls = if plain_h1 {
             false
         } else {
@@ -597,15 +593,7 @@ impl ProxyHttp for Gateway {
         };
         ctx.http3 = http3;
         ctx.tls = tls;
-        ctx.forwarded_port = if internal_http3 {
-            session
-                .req_header()
-                .headers
-                .get(&HTTP3_PORT)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u16>().ok())
-                .or_else(|| self.runtime.http3_public_port())
-        } else if direct_h3 {
+        ctx.forwarded_port = if direct_h3 {
             self.runtime.http3_public_port()
         } else {
             None
@@ -728,7 +716,7 @@ impl ProxyHttp for Gateway {
             session.set_read_timeout(Some(Duration::from_secs(30)));
             session.set_write_timeout(Some(Duration::from_secs(30)));
             session.set_keepalive(Some(30));
-            let Some(client_ip) = session_client_ip(&self.runtime, session, internal_http3) else {
+            let Some(client_ip) = session_client_ip(&self.runtime, session) else {
                 session.set_keepalive(None);
                 return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
             };
@@ -745,11 +733,13 @@ impl ProxyHttp for Gateway {
                 )
                 .await;
             }
-            let Some(permit) = self.shared.active_requests.acquire(
+            if let Some(permit) = self.shared.active_requests.acquire(
                 LimitZone::Static,
                 client_ip,
                 self.runtime.config.server.static_active_requests_per_client,
-            ) else {
+            ) {
+                ctx._active_request_permit = Some(permit);
+            } else {
                 return send_empty(
                     &self.runtime,
                     session,
@@ -760,8 +750,7 @@ impl ProxyHttp for Gateway {
                     &[("retry-after", "1")],
                 )
                 .await;
-            };
-            ctx._active_request_permit = Some(permit);
+            }
             return self
                 .shared
                 .static_files
@@ -769,7 +758,7 @@ impl ProxyHttp for Gateway {
                 .await;
         }
 
-        let Some(client_ip) = session_client_ip(&self.runtime, session, internal_http3) else {
+        let Some(client_ip) = session_client_ip(&self.runtime, session) else {
             session.set_keepalive(None);
             return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
         };
@@ -913,7 +902,7 @@ impl ProxyHttp for Gateway {
     ) -> Result<Box<HttpPeer>> {
         let plan = self.request_plan(ctx)?;
         if let Some(h3) = &plan.h3
-            && h3.route.should_use_h3()
+            && h3.route.should_use_direct_h3(ctx.upstream_h3_tcp_fallback)
         {
             return Ok(Box::new(h3.peer.clone()));
         }
@@ -923,7 +912,9 @@ impl ProxyHttp for Gateway {
     fn precomputed_upstream_peer<'a>(&'a self, ctx: &Self::CTX) -> Option<&'a HttpPeer> {
         let plan = self.plans.get(ctx.plan_index)?;
         match plan.h3.as_ref() {
-            Some(h3) if h3.route.should_use_h3() => Some(&h3.peer),
+            Some(h3) if h3.route.should_use_direct_h3(ctx.upstream_h3_tcp_fallback) => {
+                Some(&h3.peer)
+            }
             _ => Some(&plan.peer),
         }
     }
@@ -967,8 +958,6 @@ impl ProxyHttp for Gateway {
 
         upstream_request.remove_header(&FORWARDED);
         upstream_request.remove_header(&X_FORWARDED_FOR);
-        upstream_request.remove_header(&HTTP3_INTERNAL);
-        upstream_request.remove_header(&HTTP3_PORT);
         upstream_request.insert_typed_header(HOST, plan.upstream_host.clone());
         upstream_request.insert_typed_header(X_REAL_IP, client_ip.clone());
         upstream_request.insert_typed_header(X_FORWARDED_FOR, client_ip.clone());
@@ -1177,10 +1166,14 @@ impl ProxyHttp for Gateway {
     fn fail_to_connect(
         &self,
         session: &mut Session,
-        _peer: &HttpPeer,
+        peer: &HttpPeer,
         ctx: &mut Self::CTX,
         mut error: Box<Error>,
     ) -> Box<Error> {
+        if try_upstream_h3_tcp_fallback(self, session, peer, ctx, &mut error) {
+            return error;
+        }
+
         let retryable_error = matches!(
             error.etype(),
             ErrorType::ConnectTimedout
@@ -1223,6 +1216,9 @@ impl ProxyHttp for Gateway {
         }
         if session.response_written().is_some() {
             error.set_retry(false);
+            return error;
+        }
+        if try_upstream_h3_tcp_fallback(self, session, peer, ctx, &mut error) {
             return error;
         }
         let can_retry = client_reused
@@ -1733,45 +1729,47 @@ fn is_tls(session: &Session) -> bool {
         .is_some()
 }
 
-fn request_has_internal_http3_marker(runtime: &RuntimeConfig, request: &RequestHeader) -> bool {
-    runtime.http3_internal_token().is_some_and(|expected| {
-        request
-            .headers
-            .get(&HTTP3_INTERNAL)
-            .is_some_and(|value| value == expected)
-    })
-}
-
-fn is_internal_http3(runtime: &RuntimeConfig, session: &Session) -> bool {
-    let Some(expected) = runtime.http3_internal_addr() else {
-        return false;
-    };
-    // Public H1/H2 never carries the private marker. Exit before socket
-    // address lookups on the overwhelmingly common path.
-    if !request_has_internal_http3_marker(runtime, session.req_header()) {
+fn try_upstream_h3_tcp_fallback(
+    gateway: &Gateway,
+    session: &mut Session,
+    peer: &HttpPeer,
+    ctx: &mut RequestContext,
+    error: &mut Error,
+) -> bool {
+    if !matches!(peer.options.alpn, ALPN::Custom(_)) {
         return false;
     }
-    let server_matches = session
-        .server_addr()
-        .and_then(|address| address.as_inet())
-        .is_some_and(|address| *address == expected);
-    let peer_is_loopback = session
-        .client_addr()
-        .and_then(|address| address.as_inet())
-        .is_some_and(|address| address.ip().is_loopback());
-    server_matches && peer_is_loopback
+    let Ok(plan) = gateway.request_plan(ctx) else {
+        return false;
+    };
+    let Some(h3) = &plan.h3 else {
+        return false;
+    };
+    if !h3.route.allows_tcp_fallback()
+        || ctx.upstream_h3_tcp_fallback
+        || !request_is_replay_safe(session)
+        || ctx.retries >= gateway.runtime.config.server.max_retries
+    {
+        return false;
+    }
+    ctx.upstream_h3_tcp_fallback = true;
+    ctx.retries += 1;
+    warn!(
+        "upstream HTTP/3 direct path failed; falling back to TCP/TLS attempt={} method={} category={}",
+        ctx.retries,
+        session.req_header().method,
+        error.etype().as_str(),
+    );
+    error.set_retry(true);
+    true
 }
 
-fn session_client_ip(
-    runtime: &RuntimeConfig,
-    session: &Session,
-    internal_http3: bool,
-) -> Option<IpAddr> {
+fn session_client_ip(runtime: &RuntimeConfig, session: &Session) -> Option<IpAddr> {
     let peer_ip = session
         .client_addr()
         .and_then(|address| address.as_inet())
         .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |address| address.ip());
-    if !internal_http3 && !runtime.is_trusted_proxy(peer_ip) {
+    if !runtime.is_trusted_proxy(peer_ip) {
         return Some(peer_ip);
     }
     let forwarded_for = match canonical_forwarded_for(&session.req_header().headers) {
@@ -1779,11 +1777,6 @@ fn session_client_ip(
         Ok(None) => return Some(peer_ip),
         Err(()) => return None,
     };
-    if internal_http3 {
-        return (!forwarded_for.contains(','))
-            .then(|| forwarded_for.trim().parse::<IpAddr>().ok())
-            .flatten();
-    }
     Some(resolve_client_ip(runtime, peer_ip, Some(forwarded_for)))
 }
 
@@ -2247,6 +2240,52 @@ hosts:
     }
 
     #[test]
+    fn http3_upstream_plan_exposes_direct_custom_peer() {
+        use cloudflare_pingora::upstreams::peer::{ALPN, Peer};
+
+        let config: Config = serde_saphyr::from_str(
+            r#"
+server:
+  http_listen: ["127.0.0.1:38081"]
+  https_listen: []
+trusted_proxies: ["127.0.0.0/8"]
+upstreams:
+  origin:
+    address: "127.0.0.1:28443"
+    tls: true
+    sni: origin.test
+    protocol: http3
+hosts:
+  front:
+    domains: ["front.test"]
+    handler: navidrome-main
+    upstream: origin
+"#,
+        )
+        .unwrap();
+        let runtime = Arc::new(RuntimeConfig::new(config).unwrap());
+        let h3_runtime = crate::h3_runtime::start(1).unwrap();
+        let upstream_h3 = crate::upstream_h3::start(runtime.clone(), Some(&h3_runtime)).unwrap();
+        let gateway = Gateway::new(runtime, upstream_h3).unwrap();
+        let host = gateway.host("front.test").unwrap();
+        let ctx = RequestContext {
+            plan_index: host.plan("/headers").unwrap(),
+            ..RequestContext::default()
+        };
+        let plan = &gateway.plans[ctx.plan_index];
+        let h3 = plan
+            .h3
+            .as_ref()
+            .expect("http3 upstream must expose an H3 plan");
+        assert!(h3.route.should_use_direct_h3(false));
+        let peer = gateway
+            .precomputed_upstream_peer(&ctx)
+            .expect("route must expose a prepared upstream peer");
+        assert!(matches!(peer.get_alpn(), Some(ALPN::Custom(_))));
+        assert!(std::ptr::eq(peer, &h3.peer));
+    }
+
+    #[test]
     fn ignores_spoofed_forwarded_for_from_untrusted_peer() {
         let runtime = runtime();
         let peer = "198.51.100.20".parse().unwrap();
@@ -2269,6 +2308,17 @@ hosts:
         );
         let plan = &gateway.plans[host.plan("/rest/stream").unwrap()];
         assert!(plan.peer.cached_reuse_hash.is_some());
+    }
+
+    #[test]
+    fn global_concurrent_limit_is_shared_across_client_ips() {
+        let shared = GatewayShared::from_runtime(&runtime()).unwrap();
+        let first = shared.global_concurrent.acquire(2).unwrap();
+        let second = shared.global_concurrent.acquire(2).unwrap();
+        assert!(shared.global_concurrent.acquire(2).is_none());
+        drop(first);
+        assert!(shared.global_concurrent.acquire(2).is_some());
+        drop(second);
     }
 
     #[test]
@@ -2321,14 +2371,6 @@ hosts:
             .precomputed_upstream_peer(&ctx)
             .expect("H1 route must expose a prepared peer");
         assert!(std::ptr::eq(peer, &gateway.plans[ctx.plan_index].peer));
-    }
-
-    #[test]
-    fn public_requests_without_h3_marker_are_not_internal() {
-        let runtime = runtime();
-        let mut request = RequestHeader::build(Method::GET, b"/", None).unwrap();
-        request.insert_header(HOST, "app.example.com").unwrap();
-        assert!(!request_has_internal_http3_marker(&runtime, &request));
     }
 
     #[test]

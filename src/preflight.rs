@@ -334,22 +334,6 @@ fn check_listener_binds(runtime: &RuntimeConfig, report: &mut CheckReport) {
             ),
         }
     }
-    if !runtime.config.server.http3_listen.is_empty() {
-        let address = runtime.config.server.http3_internal_listen;
-        match bind_listener(&address.to_string()) {
-            Ok(socket) => {
-                report.ok(
-                    format!("listener bind HTTP/3 internal {address}"),
-                    "bound loopback TCP",
-                );
-                sockets.push(socket);
-            }
-            Err(error) => report.error(
-                format!("listener bind HTTP/3 internal {address}"),
-                format!("failed to bind internal TCP address {address}: {error:#}"),
-            ),
-        }
-    }
     let mut udp_sockets = Vec::new();
     for address in &runtime.config.server.http3_listen {
         match bind_udp_listener(address) {

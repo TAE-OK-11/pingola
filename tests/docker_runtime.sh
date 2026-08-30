@@ -7,7 +7,6 @@ EXPECTED_ALLOCATOR=${PINGORA_EXPECTED_ALLOCATOR:-jemalloc}
 EXPECTED_TARGET_CPU=${PINGORA_EXPECTED_TARGET_CPU:-x86-64-v2}
 EXPECTED_LTO=${PINGORA_EXPECTED_LTO:-fat}
 EXPECTED_TLS_PROVIDER=${PINGORA_EXPECTED_TLS_PROVIDER:-boringssl}
-EXPECTED_PGO=${PINGORA_EXPECTED_PGO:-off}
 RUNTIME=${PINGORA_DOCKER_TEST_RUNTIME:-/tmp/pingora-docker-runtime}
 CONTAINERS=()
 
@@ -34,7 +33,6 @@ write_config() {
     printf '  https_listen: %s\n' "${https}"
     printf '  http3_listen: %s\n' "${http3}"
     if [[ "${http3}" != '[]' ]]; then
-      printf '  http3_internal_listen: "127.0.0.1:18080"\n'
       printf '  http3_max_idle_timeout_seconds: 15\n'
       printf '  http3_max_concurrent_streams: 16\n'
     fi
@@ -88,7 +86,7 @@ start_container() {
 }
 
 assert_container_hardening() {
-  local name=$1 native_pgo
+  local name=$1
   [[ $(docker inspect --format '{{.Config.User}}' "${name}") == 10001:10001 ]]
   [[ $(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "${name}") == true ]]
   [[ $(docker inspect --format '{{json .HostConfig.CapDrop}}' "${name}") == '["ALL"]' ]]
@@ -100,19 +98,12 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.lto"}}' "${name}") == "${EXPECTED_LTO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.tls.provider"}}' "${name}") == "${EXPECTED_TLS_PROVIDER}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.http3.provider"}}' "${name}") == quiche ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.http3.internal-protocol"}}' "${name}") == direct-gateway ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.quic.tls.provider"}}' "${name}") == boringssl ]]
+  test "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${name}" | sed -n 's/^MALLOC_CONF=//p')" \
+    = 'narenas:1,retain:false,dirty_decay_ms:500,muzzy_decay_ms:500,background_thread:true,tcache_max:4096'
   docker image inspect "${IMAGE}" | jq -e '.[0].Config.ExposedPorts["443/udp"] != null' >/dev/null
-  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.pgo"}}' "${name}") == "${EXPECTED_PGO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.linker"}}' "${name}") == lld ]]
-
-  native_pgo=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.native.pgo"}}' "${name}")
-  case "${native_pgo}" in on|off) ;; *) echo "invalid native PGO label: ${native_pgo}" >&2; return 1 ;; esac
-  if [[ "${EXPECTED_PGO}" == train ]]; then
-    docker exec "${name}" sh -c 'test -s /usr/share/doc/pingora/pgo-profile-summary.txt'
-    if [[ "${native_pgo}" == on ]]; then
-      docker exec "${name}" sh -c 'test -s /usr/share/doc/pingora/pgo-native-profile-summary.txt'
-    fi
-  fi
 
   if docker exec "${name}" sh -c 'command -v setcap >/dev/null || dpkg-query -W libcap2-bin >/dev/null 2>&1'; then
     echo "runtime image unexpectedly contains libcap2-bin" >&2
@@ -153,4 +144,4 @@ docker logs pingora-test-https-ipv6 2>&1 \
 docker exec pingora-test-https-ipv6 /usr/local/bin/pingora \
   --config /etc/pingora/pingora.yaml --check >/dev/null
 
-echo "Docker UID 10001, read-only filesystem, HTTP-only, HTTPS/HTTP3 IPv6-only, UDP exposure, healthcheck, ${EXPECTED_ALLOCATOR}, ${EXPECTED_TLS_PROVIDER}, and pgo=${EXPECTED_PGO} tests passed"
+echo "Docker UID 10001, read-only filesystem, HTTP-only, HTTPS/HTTP3 IPv6-only, UDP exposure, healthcheck, ${EXPECTED_ALLOCATOR}, and ${EXPECTED_TLS_PROVIDER} tests passed"
