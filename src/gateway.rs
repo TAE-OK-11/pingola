@@ -902,7 +902,7 @@ impl ProxyHttp for Gateway {
     ) -> Result<Box<HttpPeer>> {
         let plan = self.request_plan(ctx)?;
         if let Some(h3) = &plan.h3
-            && h3.route.should_use_direct_h3(!ctx.upstream_h3_tcp_fallback)
+            && h3.route.should_use_direct_h3(ctx.upstream_h3_tcp_fallback)
         {
             return Ok(Box::new(h3.peer.clone()));
         }
@@ -912,7 +912,7 @@ impl ProxyHttp for Gateway {
     fn precomputed_upstream_peer<'a>(&'a self, ctx: &Self::CTX) -> Option<&'a HttpPeer> {
         let plan = self.plans.get(ctx.plan_index)?;
         match plan.h3.as_ref() {
-            Some(h3) if h3.route.should_use_direct_h3(!ctx.upstream_h3_tcp_fallback) => {
+            Some(h3) if h3.route.should_use_direct_h3(ctx.upstream_h3_tcp_fallback) => {
                 Some(&h3.peer)
             }
             _ => Some(&plan.peer),
@@ -1170,22 +1170,7 @@ impl ProxyHttp for Gateway {
         ctx: &mut Self::CTX,
         mut error: Box<Error>,
     ) -> Box<Error> {
-        if matches!(peer.options.alpn, ALPN::Custom(_))
-            && let Ok(plan) = self.request_plan(ctx)
-            && let Some(h3) = &plan.h3
-            && h3.route.allows_tcp_fallback()
-            && !ctx.upstream_h3_tcp_fallback
-            && request_is_replay_safe(session)
-            && ctx.retries < self.runtime.config.server.max_retries
-        {
-            ctx.upstream_h3_tcp_fallback = true;
-            ctx.retries += 1;
-            warn!(
-                "upstream HTTP/3 direct connect failed; falling back to TCP/TLS attempt={} method={}",
-                ctx.retries,
-                session.req_header().method
-            );
-            error.set_retry(true);
+        if try_upstream_h3_tcp_fallback(self, session, peer, ctx, &mut error) {
             return error;
         }
 
@@ -1231,6 +1216,9 @@ impl ProxyHttp for Gateway {
         }
         if session.response_written().is_some() {
             error.set_retry(false);
+            return error;
+        }
+        if try_upstream_h3_tcp_fallback(self, session, peer, ctx, &mut error) {
             return error;
         }
         let can_retry = client_reused
@@ -1741,6 +1729,41 @@ fn is_tls(session: &Session) -> bool {
         .is_some()
 }
 
+fn try_upstream_h3_tcp_fallback(
+    gateway: &Gateway,
+    session: &mut Session,
+    peer: &HttpPeer,
+    ctx: &mut RequestContext,
+    error: &mut Error,
+) -> bool {
+    if !matches!(peer.options.alpn, ALPN::Custom(_)) {
+        return false;
+    }
+    let Ok(plan) = gateway.request_plan(ctx) else {
+        return false;
+    };
+    let Some(h3) = &plan.h3 else {
+        return false;
+    };
+    if !h3.route.allows_tcp_fallback()
+        || ctx.upstream_h3_tcp_fallback
+        || !request_is_replay_safe(session)
+        || ctx.retries >= gateway.runtime.config.server.max_retries
+    {
+        return false;
+    }
+    ctx.upstream_h3_tcp_fallback = true;
+    ctx.retries += 1;
+    warn!(
+        "upstream HTTP/3 direct path failed; falling back to TCP/TLS attempt={} method={} category={}",
+        ctx.retries,
+        session.req_header().method,
+        error.etype().as_str(),
+    );
+    error.set_retry(true);
+    true
+}
+
 fn session_client_ip(runtime: &RuntimeConfig, session: &Session) -> Option<IpAddr> {
     let peer_ip = session
         .client_addr()
@@ -2214,6 +2237,49 @@ hosts:
         )
         .unwrap();
         RuntimeConfig::new(config).unwrap()
+    }
+
+    #[test]
+    fn http3_upstream_plan_exposes_direct_custom_peer() {
+        use cloudflare_pingora::upstreams::peer::{ALPN, Peer};
+
+        let config: Config = serde_saphyr::from_str(
+            r#"
+server:
+  http_listen: ["127.0.0.1:38081"]
+  https_listen: []
+trusted_proxies: ["127.0.0.0/8"]
+upstreams:
+  origin:
+    address: "127.0.0.1:28443"
+    tls: true
+    sni: origin.test
+    protocol: http3
+hosts:
+  front:
+    domains: ["front.test"]
+    handler: navidrome-main
+    upstream: origin
+"#,
+        )
+        .unwrap();
+        let runtime = Arc::new(RuntimeConfig::new(config).unwrap());
+        let h3_runtime = crate::h3_runtime::start(1).unwrap();
+        let upstream_h3 = crate::upstream_h3::start(runtime.clone(), Some(&h3_runtime)).unwrap();
+        let gateway = Gateway::new(runtime, upstream_h3).unwrap();
+        let host = gateway.host("front.test").unwrap();
+        let ctx = RequestContext {
+            plan_index: host.plan("/headers").unwrap(),
+            ..RequestContext::default()
+        };
+        let plan = &gateway.plans[ctx.plan_index];
+        let h3 = plan.h3.as_ref().expect("http3 upstream must expose an H3 plan");
+        assert!(h3.route.should_use_direct_h3(false));
+        let peer = gateway
+            .precomputed_upstream_peer(&ctx)
+            .expect("route must expose a prepared upstream peer");
+        assert!(matches!(peer.get_alpn(), Some(ALPN::Custom(_))));
+        assert!(std::ptr::eq(peer, &h3.peer));
     }
 
     #[test]
