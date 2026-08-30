@@ -299,7 +299,7 @@ pub struct RequestContext {
     identity_acceptable: bool,
     compression_selected: bool,
     started_at: Option<Instant>,
-    limits_exempt: bool,
+    global_limits_exempt: bool,
     upstream_h3_tcp_fallback: bool,
     _active_request_permit: Option<ActiveRequestPermit>,
     _global_request_permit: Option<GlobalConcurrentPermit>,
@@ -321,7 +321,7 @@ impl Default for RequestContext {
             identity_acceptable: true,
             compression_selected: false,
             started_at: None,
-            limits_exempt: false,
+            global_limits_exempt: false,
             upstream_h3_tcp_fallback: false,
             _active_request_permit: None,
             _global_request_permit: None,
@@ -477,7 +477,7 @@ impl Gateway {
 
     fn acquire_global_request(&self, ctx: &mut RequestContext) -> bool {
         let limit = self.runtime.config.server.global_active_requests;
-        if limit == 0 || ctx.limits_exempt {
+        if limit == 0 || ctx.global_limits_exempt {
             return true;
         }
         let Some(permit) = self.shared.global_concurrent.acquire(limit) else {
@@ -595,7 +595,7 @@ impl ProxyHttp for Gateway {
         };
         ctx.http3 = http3;
         ctx.tls = tls;
-        ctx.limits_exempt = peer_limits_exempt(&self.runtime, session);
+        ctx.global_limits_exempt = peer_global_limits_exempt(&self.runtime, session);
         ctx.forwarded_port = if direct_h3 {
             self.runtime.http3_public_port()
         } else {
@@ -724,7 +724,6 @@ impl ProxyHttp for Gateway {
                 return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
             };
             ctx.client_ip = client_ip;
-            ctx.limits_exempt = client_limits_exempt(ctx.limits_exempt, client_ip);
             if !self.acquire_global_request(ctx) {
                 return send_empty(
                     &self.runtime,
@@ -737,24 +736,23 @@ impl ProxyHttp for Gateway {
                 )
                 .await;
             }
-            if !ctx.limits_exempt {
-                let Some(permit) = self.shared.active_requests.acquire(
-                    LimitZone::Static,
-                    client_ip,
-                    self.runtime.config.server.static_active_requests_per_client,
-                ) else {
-                    return send_empty(
-                        &self.runtime,
-                        session,
-                        429,
-                        Some(host.handler),
-                        tls,
-                        http3,
-                        &[("retry-after", "1")],
-                    )
-                    .await;
-                };
+            if let Some(permit) = self.shared.active_requests.acquire(
+                LimitZone::Static,
+                client_ip,
+                self.runtime.config.server.static_active_requests_per_client,
+            ) {
                 ctx._active_request_permit = Some(permit);
+            } else {
+                return send_empty(
+                    &self.runtime,
+                    session,
+                    429,
+                    Some(host.handler),
+                    tls,
+                    http3,
+                    &[("retry-after", "1")],
+                )
+                .await;
             }
             return self
                 .shared
@@ -768,7 +766,6 @@ impl ProxyHttp for Gateway {
             return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
         };
         ctx.client_ip = client_ip;
-        ctx.limits_exempt = client_limits_exempt(ctx.limits_exempt, client_ip);
         self.prepare_upstream_forwarded_headers(session, ctx)?;
 
         if host.handler == HandlerKind::NavidromeMain && path == "/" {
@@ -835,7 +832,6 @@ impl ProxyHttp for Gateway {
         }
 
         if let Some((rate, burst)) = plan.rate_limit
-            && !ctx.limits_exempt
             && !self
                 .shared
                 .rates
@@ -866,7 +862,7 @@ impl ProxyHttp for Gateway {
             .await;
         }
 
-        if plan.active_request_limit > 0 && !ctx.limits_exempt {
+        if plan.active_request_limit > 0 {
             let Some(permit) = self.shared.active_requests.acquire(
                 plan.route.limit_zone(),
                 client_ip,
@@ -1748,16 +1744,12 @@ fn is_tls(session: &Session) -> bool {
         .is_some()
 }
 
-fn peer_limits_exempt(runtime: &RuntimeConfig, session: &Session) -> bool {
+fn peer_global_limits_exempt(runtime: &RuntimeConfig, session: &Session) -> bool {
     let _ = runtime;
     session
         .client_addr()
         .and_then(|address| address.as_inet())
         .is_some_and(|address| address.ip().is_loopback())
-}
-
-fn client_limits_exempt(peer_exempt: bool, client_ip: IpAddr) -> bool {
-    peer_exempt || client_ip.is_loopback()
 }
 
 fn session_client_ip(runtime: &RuntimeConfig, session: &Session) -> Option<IpAddr> {
