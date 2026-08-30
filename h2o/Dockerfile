@@ -180,7 +180,7 @@ RUN --mount=from=builder,source=/out,target=/out,ro \
     --mount=type=cache,id=h2o-apt-lists-runtime-${DEBIAN_SUITE},target=/var/lib/apt/lists,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean \
     && apt-get update -o Acquire::Retries=3 \
-    && apt-get install --yes --no-install-recommends bash ca-certificates curl libcap2-bin libc++1 libc++abi1 libstdc++6 \
+    && apt-get install --yes --no-install-recommends bash ca-certificates curl libcap2-bin libc++1 libc++abi1 libstdc++6 liburing2 \
     && groupadd --gid 10001 h2o \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin h2o \
     && install -d -o 10001 -g 10001 /etc/h2o /tmp/h2o /usr/share/h2o/health \
