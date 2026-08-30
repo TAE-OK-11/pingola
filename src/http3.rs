@@ -11,6 +11,7 @@ use cloudflare_pingora::protocols::http::server::Session as ServerSession;
 use cloudflare_pingora::proxy::{HttpProxy, http_proxy_custom};
 use cloudflare_pingora::server::ShutdownWatch;
 use cloudflare_pingora::server::configuration::ServerConf;
+use futures::stream::FuturesUnordered;
 use futures::{SinkExt, StreamExt};
 use http::header::{CONNECTION, HOST, HeaderName, TE, TRANSFER_ENCODING, UPGRADE};
 use http::uri::{PathAndQuery, Scheme};
@@ -44,7 +45,7 @@ const HTTP3_SEND_CAPACITY_FACTOR: f64 = 2.0;
 const HTTP3_MAX_AMPLIFICATION_FACTOR: usize = 3;
 // 1 vCPU / 1 GiB host: enough bandwidth-delay product for Navidrome streams
 // without allowing slow consumers to retain multi-megabyte buffers per stream.
-// Idle RSS is reclaimed via TCMalloc background release and per-stream hints.
+// Idle RSS is reclaimed via jemalloc background thread and connection-close hints.
 const HTTP3_INITIAL_MAX_DATA: u64 = 4 * 1024 * 1024;
 const HTTP3_STREAM_WINDOW: u64 = 1024 * 1024;
 const HTTP3_MAX_CONNECTION_WINDOW: u64 = 8 * 1024 * 1024;
@@ -394,62 +395,73 @@ async fn handle_connection(
     _client_connection_permit: ActiveRequestPermit,
 ) {
     let peer = context.peer;
-    while let Some(event) = controller.event_receiver_mut().recv().await {
-        match event {
-            ServerH3Event::Headers {
-                incoming_headers,
-                is_in_early_data,
-                ..
-            } => {
-                if *is_in_early_data
-                    && (!context.shared.allow_early_data
-                        || !early_data_request_is_replay_safe(&incoming_headers))
-                {
-                    warn!("HTTP/3 unsafe early-data request rejected peer={peer}");
-                    let IncomingH3Headers { mut send, .. } = incoming_headers;
-                    if let Err(error) = send_error(
-                        &mut send,
-                        StatusCode::TOO_EARLY,
-                        "HTTP/3 early data is limited to bodyless GET/HEAD",
-                    )
-                    .await
-                    {
-                        warn!("failed to reject HTTP/3 early-data request peer={peer}: {error:#}");
-                    }
-                    continue;
-                }
-                if *is_in_early_data {
-                    info!("HTTP/3 early-data request accepted peer={peer}");
-                }
-                let stream_slots = context.stream_slots.clone();
-                let Ok(stream_permit) = stream_slots.try_acquire_owned() else {
-                    warn!("HTTP/3 stream rejected: concurrent stream limit reached peer={peer}");
-                    let IncomingH3Headers { mut send, .. } = incoming_headers;
-                    if let Err(error) = send_error(
-                        &mut send,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "HTTP/3 concurrent stream limit reached",
-                    )
-                    .await
-                    {
-                        warn!(
-                            "failed to reject HTTP/3 stream-limit request peer={peer}: {error:#}"
-                        );
-                    }
-                    continue;
+    let mut inflight = FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            biased;
+            Some(_) = inflight.next(), if !inflight.is_empty() => {}
+            event = controller.event_receiver_mut().recv() => {
+                let Some(event) = event else {
+                    break;
                 };
-                let task_context = context.clone();
-                tokio::spawn(async move {
-                    let _stream_permit = stream_permit;
-                    proxy_request(incoming_headers, task_context).await;
-                });
-            }
-            ServerH3Event::Core(H3Event::BodyBytesReceived { .. }) => {}
-            ServerH3Event::Core(event) => {
-                log::debug!("HTTP/3 connection event peer={peer}: {event:?}");
+                match event {
+                    ServerH3Event::Headers {
+                        incoming_headers,
+                        is_in_early_data,
+                        ..
+                    } => {
+                        if *is_in_early_data
+                            && (!context.shared.allow_early_data
+                                || !early_data_request_is_replay_safe(&incoming_headers))
+                        {
+                            warn!("HTTP/3 unsafe early-data request rejected peer={peer}");
+                            let IncomingH3Headers { mut send, .. } = incoming_headers;
+                            if let Err(error) = send_error(
+                                &mut send,
+                                StatusCode::TOO_EARLY,
+                                "HTTP/3 early data is limited to bodyless GET/HEAD",
+                            )
+                            .await
+                            {
+                                warn!("failed to reject HTTP/3 early-data request peer={peer}: {error:#}");
+                            }
+                            continue;
+                        }
+                        if *is_in_early_data {
+                            info!("HTTP/3 early-data request accepted peer={peer}");
+                        }
+                        let stream_slots = context.stream_slots.clone();
+                        let Ok(stream_permit) = stream_slots.try_acquire_owned() else {
+                            warn!("HTTP/3 stream rejected: concurrent stream limit reached peer={peer}");
+                            let IncomingH3Headers { mut send, .. } = incoming_headers;
+                            if let Err(error) = send_error(
+                                &mut send,
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "HTTP/3 concurrent stream limit reached",
+                            )
+                            .await
+                            {
+                                warn!(
+                                    "failed to reject HTTP/3 stream-limit request peer={peer}: {error:#}"
+                                );
+                            }
+                            continue;
+                        };
+                        let task_context = context.clone();
+                        inflight.push(async move {
+                            let _stream_permit = stream_permit;
+                            proxy_request(incoming_headers, task_context).await
+                        });
+                    }
+                    ServerH3Event::Core(H3Event::BodyBytesReceived { .. }) => {}
+                    ServerH3Event::Core(event) => {
+                        log::debug!("HTTP/3 connection event peer={peer}: {event:?}");
+                    }
+                }
             }
         }
     }
+    while inflight.next().await.is_some() {}
     drop(context);
     crate::allocator::hint_release_idle_pages();
 }
@@ -521,7 +533,6 @@ async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionCont
         .proxy
         .process_new_http(session, &context.shared.shutdown)
         .await;
-    crate::allocator::hint_release_idle_pages();
 }
 
 fn decode_request_headers(headers: &[h3::Header]) -> Result<RequestHeader> {
@@ -532,7 +543,7 @@ fn decode_request_headers(headers: &[h3::Header]) -> Result<RequestHeader> {
 }
 
 fn decode_request_headers_fast(headers: &[h3::Header]) -> Option<Result<RequestHeader>> {
-    if headers.is_empty() || headers.len() > 16 {
+    if headers.is_empty() || headers.len() > 32 {
         return None;
     }
     let mut method = None;

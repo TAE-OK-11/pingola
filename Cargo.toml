@@ -12,7 +12,7 @@ name = "pingora"
 path = "src/main.rs"
 
 [features]
-default = ["tcmalloc", "tls-boringssl"]
+default = ["jemalloc", "tls-boringssl"]
 jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemallocator"]
 tcmalloc = ["dep:tcmalloc-better"]
 system-allocator = []

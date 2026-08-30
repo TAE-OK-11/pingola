@@ -46,7 +46,12 @@ run_curl_case() {
   if [[ "${method}" == "HEAD" ]]; then
     method_args=(--head)
   fi
-  curl --noproxy '*' -ksS "${http_version}" "${method_args[@]}" \
+  local conn_args=()
+  # Each matrix case validates an isolated response body. Disable downstream
+  # HTTP/1 keep-alive reuse so one bodyless fast-path bug cannot poison later
+  # cases on the same TLS connection (seen on CI with stale vendor artifacts).
+  [[ "${protocol}" == "h1" ]] && conn_args=(--no-keepalive)
+  curl --noproxy '*' -ksS "${http_version}" "${method_args[@]}" "${conn_args[@]}" \
     --resolve matrix.test:443:127.0.0.1 \
     --dump-header "${headers}" --output "${body}" \
     "https://matrix.test:443${path}" 2>"${errors}" || rc=$?
@@ -121,7 +126,10 @@ GATEWAY_PID=$!
 ready=0
 for _ in {1..100}; do
   if curl --noproxy '*' -fsS -H 'host: matrix.test' \
-    http://127.0.0.1:80/pingora-health -o /dev/null 2>/dev/null; then
+    http://127.0.0.1:80/pingora-health -o /dev/null 2>/dev/null \
+    && curl --noproxy '*' -ksS --http1.1 --no-keepalive \
+      --resolve matrix.test:443:127.0.0.1 \
+      "https://matrix.test:443/empty/204" -o /dev/null 2>/dev/null; then
     ready=1
     break
   fi

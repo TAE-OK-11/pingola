@@ -226,7 +226,7 @@ struct PreparedUpstream {
 
 #[derive(Clone, Debug)]
 struct PreparedPlan {
-    domain: http::HeaderValue,
+    upstream_host: HeaderValue,
     handler: HandlerKind,
     peer: HttpPeer,
     h3: Option<PreparedH3Peer>,
@@ -410,7 +410,11 @@ impl Gateway {
                     let upstream = upstreams.get(upstream_name)?;
                     let plan_index = prepared_plans.len();
                     prepared_plans.push(PreparedPlan {
-                        domain: domain_header.clone(),
+                        upstream_host: if route == RouteClass::Doh {
+                            DIRECT_DOH_HOST.clone()
+                        } else {
+                            domain_header.clone()
+                        },
                         handler: host.handler,
                         peer: prepare_route_peer(upstream, route),
                         h3: prepare_route_h3(upstream, route),
@@ -578,17 +582,14 @@ impl ProxyHttp for Gateway {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        let direct_h3 = is_direct_http3(session);
         let plain_h1 = session.downstream_session.as_http1().is_some() && !is_tls(session);
-        let internal_http3 = if plain_h1 {
+        let internal_http3 = if direct_h3 || plain_h1 {
             false
         } else {
             is_internal_http3(&self.runtime, session)
         };
-        let http3 = if plain_h1 {
-            false
-        } else {
-            internal_http3 || is_direct_http3(session)
-        };
+        let http3 = direct_h3 || internal_http3;
         let tls = if plain_h1 {
             false
         } else {
@@ -604,7 +605,7 @@ impl ProxyHttp for Gateway {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u16>().ok())
                 .or_else(|| self.runtime.http3_public_port())
-        } else if is_direct_http3(session) {
+        } else if direct_h3 {
             self.runtime.http3_public_port()
         } else {
             None
@@ -802,8 +803,14 @@ impl ProxyHttp for Gateway {
             .await;
         };
         let plan = &self.plans[plan_index];
-        let encoding =
-            configure_downstream_compression(session, plan.route, &self.compression_modules)?;
+        let encoding = if uses_downstream_compression(plan.route) {
+            configure_downstream_compression(session, plan.route, &self.compression_modules)?
+        } else {
+            EncodingNegotiation {
+                preferred: ContentCoding::Identity,
+                identity_acceptable: true,
+            }
+        };
         if encoding.preferred == ContentCoding::NotAcceptable {
             return send_empty(
                 &self.runtime,
@@ -957,20 +964,15 @@ impl ProxyHttp for Gateway {
             .upstream_forwarded_port
             .as_ref()
             .ok_or_else(|| Error::explain(HTTPStatus(500), "upstream forwarded port is missing"))?;
-        let domain = if plan.route == RouteClass::Doh {
-            DIRECT_DOH_HOST.clone()
-        } else {
-            plan.domain.clone()
-        };
 
         upstream_request.remove_header(&FORWARDED);
         upstream_request.remove_header(&X_FORWARDED_FOR);
         upstream_request.remove_header(&HTTP3_INTERNAL);
         upstream_request.remove_header(&HTTP3_PORT);
-        upstream_request.insert_typed_header(HOST, domain.clone());
+        upstream_request.insert_typed_header(HOST, plan.upstream_host.clone());
         upstream_request.insert_typed_header(X_REAL_IP, client_ip.clone());
         upstream_request.insert_typed_header(X_FORWARDED_FOR, client_ip.clone());
-        upstream_request.insert_typed_header(X_FORWARDED_HOST, domain);
+        upstream_request.insert_typed_header(X_FORWARDED_HOST, plan.upstream_host.clone());
         upstream_request.insert_typed_header(X_FORWARDED_PORT, forwarded_port.clone());
         upstream_request.insert_typed_header(X_FORWARDED_PROTO, if ctx.tls { HTTPS } else { HTTP });
         upstream_request.insert_typed_header(X_FORWARDED_SSL, if ctx.tls { ON } else { OFF });
@@ -1089,7 +1091,9 @@ impl ProxyHttp for Gateway {
             && session.req_header().version == Version::HTTP_11
             && session.is_upgrade_req();
         strip_response_hop_headers(response, forwards_upgrade)?;
-        insert_security_headers(response, plan.handler, ctx.tls)?;
+        if self.runtime.config.server.security_headers {
+            insert_security_headers(response, plan.handler, ctx.tls)?;
+        }
         if ctx.tls
             && !ctx.http3
             && let Some(alt_svc) = self.runtime.http3_alt_svc_header()
@@ -2115,7 +2119,9 @@ async fn send_empty(
     for (name, value) in headers {
         response.insert_header(*name, *value)?;
     }
-    if let Some(handler) = handler {
+    if let Some(handler) = handler
+        && runtime.config.server.security_headers
+    {
         insert_security_headers(&mut response, handler, tls)?;
     }
     if tls

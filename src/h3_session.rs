@@ -124,7 +124,7 @@ impl H3Session {
                 .push(h3::Header::new(b"alt-svc", value.as_bytes()));
         }
         for (name, value) in &header.headers {
-            if Self::hop_by_hop(name) || name == DATE {
+            if Self::hop_by_hop(name) || name == DATE || name == ALT_SVC {
                 continue;
             }
             self.wire_headers
@@ -150,11 +150,6 @@ impl H3Session {
         if !header.headers.contains_key(&DATE) {
             header.insert_typed_header(DATE, get_cached_date());
         }
-        if !header.headers.contains_key(&ALT_SVC)
-            && let Some(value) = self.alt_svc.as_deref()
-        {
-            header.insert_typed_header(ALT_SVC, value.clone());
-        }
         self.response_written = Some(header);
         self.ended = end;
         if end {
@@ -179,7 +174,9 @@ impl H3Session {
         let wire_headers = std::mem::take(&mut self.wire_headers);
         self.send_frame(OutboundFrame::Headers(wire_headers, None))
             .await?;
-        self.response_written = Some(Box::new(header.clone()));
+        self.response_written = Some(Box::new(
+            ResponseHeader::build(header.status, None).unwrap(),
+        ));
         self.ended = end;
         if end {
             self.send_frame(OutboundFrame::Body(Bytes::new(), true))
@@ -240,7 +237,6 @@ impl Drop for H3Session {
         self.retry_buffer = None;
         self.wire_headers.clear();
         self.response_written = None;
-        crate::allocator::hint_release_idle_pages();
     }
 }
 
