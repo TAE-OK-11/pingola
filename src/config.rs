@@ -1,14 +1,13 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use http::HeaderValue;
 use ipnet::IpNet;
 use serde::Deserialize;
@@ -46,12 +45,6 @@ fn default_max_retries() -> usize {
 
 fn default_http2_max_concurrent_streams() -> u32 {
     32
-}
-
-fn default_http3_internal_listen() -> SocketAddr {
-    "127.0.0.1:18080"
-        .parse()
-        .expect("the default HTTP/3 internal listener is valid")
 }
 
 fn default_http3_max_idle_timeout() -> u64 {
@@ -120,10 +113,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_false() -> bool {
-    false
-}
-
 fn default_connect_timeout() -> u64 {
     5
 }
@@ -170,8 +159,6 @@ pub struct ServerConfig {
     pub https_listen: Vec<String>,
     #[serde(default)]
     pub http3_listen: Vec<String>,
-    #[serde(default = "default_http3_internal_listen")]
-    pub http3_internal_listen: SocketAddr,
     #[serde(default = "default_http3_max_idle_timeout")]
     pub http3_max_idle_timeout_seconds: u64,
     #[serde(default = "default_http3_max_requests_per_connection")]
@@ -190,11 +177,6 @@ pub struct ServerConfig {
     pub http3_connection_burst: u32,
     #[serde(default = "default_http3_max_connections_per_ip")]
     pub http3_max_connections_per_ip: usize,
-    /// Legacy loopback h2c handoff listener. The HTTP/3 frontend uses direct
-    /// Gateway integration; keep this disabled in production to avoid retaining
-    /// an extra TCP/H2 service and connection pool.
-    #[serde(default = "default_false")]
-    pub http3_internal_handoff_enabled: bool,
     #[serde(default)]
     pub certificate: Option<PathBuf>,
     #[serde(default)]
@@ -342,20 +324,10 @@ pub struct RouteLimitConfig {
     pub active_requests: Option<usize>,
 }
 
-#[derive(Clone)]
-struct Http3InternalToken(HeaderValue);
-
-impl fmt::Debug for Http3InternalToken {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Http3InternalToken([redacted])")
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub config: Arc<Config>,
     trusted_proxy_cache_id: u64,
-    http3_internal_token: Option<Http3InternalToken>,
     http3_public_port: Option<u16>,
     http3_alt_svc_header: Option<HeaderValue>,
 }
@@ -385,36 +357,13 @@ impl RuntimeConfig {
             .map(|port| HeaderValue::from_str(&format!("h3=\":{port}\"; ma=86400")))
             .transpose()
             .context("HTTP/3 Alt-Svc value is not a valid header")?;
-        let http3_internal_token = if config.server.http3_listen.is_empty()
-            || !config.server.http3_internal_handoff_enabled
-        {
-            None
-        } else {
-            let mut token = [0_u8; 32];
-            getrandom::fill(&mut token)
-                .map_err(|error| anyhow!("failed to generate HTTP/3 internal token: {error}"))?;
-            let token = HeaderValue::from_str(&hex::encode(token))
-                .context("generated HTTP/3 internal token is not a valid header value")?;
-            Some(Http3InternalToken(token))
-        };
 
         Ok(Self {
             config: Arc::new(config),
             trusted_proxy_cache_id: NEXT_RUNTIME_CONFIG_ID.fetch_add(1, Ordering::Relaxed),
-            http3_internal_token,
             http3_public_port,
             http3_alt_svc_header,
         })
-    }
-
-    pub fn http3_internal_token(&self) -> Option<&HeaderValue> {
-        self.http3_internal_token.as_ref().map(|token| &token.0)
-    }
-
-    pub fn http3_internal_addr(&self) -> Option<SocketAddr> {
-        (!self.config.server.http3_listen.is_empty()
-            && self.config.server.http3_internal_handoff_enabled)
-            .then_some(self.config.server.http3_internal_listen)
     }
 
     pub fn http3_public_port(&self) -> Option<u16> {
@@ -569,10 +518,6 @@ fn validate(config: &Config) -> Result<()> {
         bail!("certificate and private_key are required for HTTPS or HTTP/3 listeners");
     }
     if !config.server.http3_listen.is_empty() {
-        let internal = config.server.http3_internal_listen;
-        if !internal.ip().is_loopback() {
-            bail!("server.http3_internal_listen must use a loopback address");
-        }
         let mut public_port = None;
         for address in &config.server.http3_listen {
             let address = address.parse::<SocketAddr>()?;
@@ -586,16 +531,6 @@ fn validate(config: &Config) -> Result<()> {
                 None => public_port = Some(address.port()),
                 _ => {}
             }
-        }
-        if config
-            .server
-            .http_listen
-            .iter()
-            .chain(&config.server.https_listen)
-            .filter_map(|address| address.parse::<SocketAddr>().ok())
-            .any(|address| address == internal)
-        {
-            bail!("server.http3_internal_listen conflicts with a public TCP listener");
         }
         let mut has_ipv4_wildcard = false;
         let mut has_ipv6_wildcard = false;

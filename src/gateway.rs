@@ -83,8 +83,6 @@ const ALT_SVC: HeaderName = HeaderName::from_static("alt-svc");
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 const X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
 const REFERRER_POLICY: HeaderName = HeaderName::from_static("referrer-policy");
-const HTTP3_INTERNAL: HeaderName = HeaderName::from_static("x-jbs-http3-internal");
-const HTTP3_PORT: HeaderName = HeaderName::from_static("x-jbs-http3-port");
 #[cfg(test)]
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
@@ -302,6 +300,7 @@ pub struct RequestContext {
     compression_selected: bool,
     started_at: Option<Instant>,
     limits_exempt: bool,
+    upstream_h3_tcp_fallback: bool,
     _active_request_permit: Option<ActiveRequestPermit>,
     _global_request_permit: Option<GlobalConcurrentPermit>,
 }
@@ -323,6 +322,7 @@ impl Default for RequestContext {
             compression_selected: false,
             started_at: None,
             limits_exempt: false,
+            upstream_h3_tcp_fallback: false,
             _active_request_permit: None,
             _global_request_permit: None,
         }
@@ -587,12 +587,7 @@ impl ProxyHttp for Gateway {
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let direct_h3 = is_direct_http3(session);
         let plain_h1 = session.downstream_session.as_http1().is_some() && !is_tls(session);
-        let internal_http3 = if direct_h3 || plain_h1 {
-            false
-        } else {
-            is_internal_http3(&self.runtime, session)
-        };
-        let http3 = direct_h3 || internal_http3;
+        let http3 = direct_h3;
         let tls = if plain_h1 {
             false
         } else {
@@ -601,15 +596,7 @@ impl ProxyHttp for Gateway {
         ctx.http3 = http3;
         ctx.tls = tls;
         ctx.limits_exempt = peer_limits_exempt(&self.runtime, session);
-        ctx.forwarded_port = if internal_http3 {
-            session
-                .req_header()
-                .headers
-                .get(&HTTP3_PORT)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u16>().ok())
-                .or_else(|| self.runtime.http3_public_port())
-        } else if direct_h3 {
+        ctx.forwarded_port = if direct_h3 {
             self.runtime.http3_public_port()
         } else {
             None
@@ -732,7 +719,7 @@ impl ProxyHttp for Gateway {
             session.set_read_timeout(Some(Duration::from_secs(30)));
             session.set_write_timeout(Some(Duration::from_secs(30)));
             session.set_keepalive(Some(30));
-            let Some(client_ip) = session_client_ip(&self.runtime, session, internal_http3) else {
+            let Some(client_ip) = session_client_ip(&self.runtime, session) else {
                 session.set_keepalive(None);
                 return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
             };
@@ -776,7 +763,7 @@ impl ProxyHttp for Gateway {
                 .await;
         }
 
-        let Some(client_ip) = session_client_ip(&self.runtime, session, internal_http3) else {
+        let Some(client_ip) = session_client_ip(&self.runtime, session) else {
             session.set_keepalive(None);
             return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
         };
@@ -922,7 +909,7 @@ impl ProxyHttp for Gateway {
     ) -> Result<Box<HttpPeer>> {
         let plan = self.request_plan(ctx)?;
         if let Some(h3) = &plan.h3
-            && h3.route.should_use_h3()
+            && h3.route.should_use_direct_h3(!ctx.upstream_h3_tcp_fallback)
         {
             return Ok(Box::new(h3.peer.clone()));
         }
@@ -932,7 +919,9 @@ impl ProxyHttp for Gateway {
     fn precomputed_upstream_peer<'a>(&'a self, ctx: &Self::CTX) -> Option<&'a HttpPeer> {
         let plan = self.plans.get(ctx.plan_index)?;
         match plan.h3.as_ref() {
-            Some(h3) if h3.route.should_use_h3() => Some(&h3.peer),
+            Some(h3) if h3.route.should_use_direct_h3(!ctx.upstream_h3_tcp_fallback) => {
+                Some(&h3.peer)
+            }
             _ => Some(&plan.peer),
         }
     }
@@ -976,8 +965,6 @@ impl ProxyHttp for Gateway {
 
         upstream_request.remove_header(&FORWARDED);
         upstream_request.remove_header(&X_FORWARDED_FOR);
-        upstream_request.remove_header(&HTTP3_INTERNAL);
-        upstream_request.remove_header(&HTTP3_PORT);
         upstream_request.insert_typed_header(HOST, plan.upstream_host.clone());
         upstream_request.insert_typed_header(X_REAL_IP, client_ip.clone());
         upstream_request.insert_typed_header(X_FORWARDED_FOR, client_ip.clone());
@@ -1186,10 +1173,29 @@ impl ProxyHttp for Gateway {
     fn fail_to_connect(
         &self,
         session: &mut Session,
-        _peer: &HttpPeer,
+        peer: &HttpPeer,
         ctx: &mut Self::CTX,
         mut error: Box<Error>,
     ) -> Box<Error> {
+        if matches!(peer.options.alpn, ALPN::Custom(_))
+            && let Ok(plan) = self.request_plan(ctx)
+            && let Some(h3) = &plan.h3
+            && h3.route.allows_tcp_fallback()
+            && !ctx.upstream_h3_tcp_fallback
+            && request_is_replay_safe(session)
+            && ctx.retries < self.runtime.config.server.max_retries
+        {
+            ctx.upstream_h3_tcp_fallback = true;
+            ctx.retries += 1;
+            warn!(
+                "upstream HTTP/3 direct connect failed; falling back to TCP/TLS attempt={} method={}",
+                ctx.retries,
+                session.req_header().method
+            );
+            error.set_retry(true);
+            return error;
+        }
+
         let retryable_error = matches!(
             error.etype(),
             ErrorType::ConnectTimedout
@@ -1742,15 +1748,6 @@ fn is_tls(session: &Session) -> bool {
         .is_some()
 }
 
-fn request_has_internal_http3_marker(runtime: &RuntimeConfig, request: &RequestHeader) -> bool {
-    runtime.http3_internal_token().is_some_and(|expected| {
-        request
-            .headers
-            .get(&HTTP3_INTERNAL)
-            .is_some_and(|value| value == expected)
-    })
-}
-
 fn peer_limits_exempt(runtime: &RuntimeConfig, session: &Session) -> bool {
     let _ = runtime;
     session
@@ -1763,36 +1760,12 @@ fn client_limits_exempt(peer_exempt: bool, client_ip: IpAddr) -> bool {
     peer_exempt || client_ip.is_loopback()
 }
 
-fn is_internal_http3(runtime: &RuntimeConfig, session: &Session) -> bool {
-    let Some(expected) = runtime.http3_internal_addr() else {
-        return false;
-    };
-    // Public H1/H2 never carries the private marker. Exit before socket
-    // address lookups on the overwhelmingly common path.
-    if !request_has_internal_http3_marker(runtime, session.req_header()) {
-        return false;
-    }
-    let server_matches = session
-        .server_addr()
-        .and_then(|address| address.as_inet())
-        .is_some_and(|address| *address == expected);
-    let peer_is_loopback = session
-        .client_addr()
-        .and_then(|address| address.as_inet())
-        .is_some_and(|address| address.ip().is_loopback());
-    server_matches && peer_is_loopback
-}
-
-fn session_client_ip(
-    runtime: &RuntimeConfig,
-    session: &Session,
-    internal_http3: bool,
-) -> Option<IpAddr> {
+fn session_client_ip(runtime: &RuntimeConfig, session: &Session) -> Option<IpAddr> {
     let peer_ip = session
         .client_addr()
         .and_then(|address| address.as_inet())
         .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |address| address.ip());
-    if !internal_http3 && !runtime.is_trusted_proxy(peer_ip) {
+    if !runtime.is_trusted_proxy(peer_ip) {
         return Some(peer_ip);
     }
     let forwarded_for = match canonical_forwarded_for(&session.req_header().headers) {
@@ -1800,11 +1773,6 @@ fn session_client_ip(
         Ok(None) => return Some(peer_ip),
         Err(()) => return None,
     };
-    if internal_http3 {
-        return (!forwarded_for.contains(','))
-            .then(|| forwarded_for.trim().parse::<IpAddr>().ok())
-            .flatten();
-    }
     Some(resolve_client_ip(runtime, peer_ip, Some(forwarded_for)))
 }
 
@@ -2353,14 +2321,6 @@ hosts:
             .precomputed_upstream_peer(&ctx)
             .expect("H1 route must expose a prepared peer");
         assert!(std::ptr::eq(peer, &gateway.plans[ctx.plan_index].peer));
-    }
-
-    #[test]
-    fn public_requests_without_h3_marker_are_not_internal() {
-        let runtime = runtime();
-        let mut request = RequestHeader::build(Method::GET, b"/", None).unwrap();
-        request.insert_header(HOST, "app.example.com").unwrap();
-        assert!(!request_has_internal_http3_marker(&runtime, &request));
     }
 
     #[test]

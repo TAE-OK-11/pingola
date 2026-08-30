@@ -34,7 +34,6 @@ write_config() {
     printf '  https_listen: %s\n' "${https}"
     printf '  http3_listen: %s\n' "${http3}"
     if [[ "${http3}" != '[]' ]]; then
-      printf '  http3_internal_handoff_enabled: false\n'
       printf '  http3_max_idle_timeout_seconds: 15\n'
       printf '  http3_max_concurrent_streams: 16\n'
     fi

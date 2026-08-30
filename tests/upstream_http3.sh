@@ -150,7 +150,7 @@ if grep -q 'upstream HTTP/3 established upstream=origin peer=127.0.0.1:28453' "$
   exit 1
 fi
 
-grep -q 'upstream HTTP/3 pool started: upstream=origin' "${FRONT_LOG}"
-grep -q 'upstream HTTP/3 pool started: upstream=origin' "${FALLBACK_LOG}"
+grep -q 'upstream HTTP/3 pool started: upstream=origin.*connector=direct' "${FRONT_LOG}"
+grep -q 'upstream HTTP/3 pool started: upstream=origin.*connector=direct' "${FALLBACK_LOG}"
 
 echo 'Upstream HTTP/3 strict mode, connection reuse, request-body streaming, replay-safe 0-RTT, and H3-preferred TCP fallback tests passed'

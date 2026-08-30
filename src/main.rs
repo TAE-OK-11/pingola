@@ -358,31 +358,6 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         Some(Permissions::from_mode(0o600)),
     );
 
-    if !server_config.http3_listen.is_empty() && server_config.http3_internal_handoff_enabled {
-        let h2c_gateway =
-            Gateway::with_shared(runtime.clone(), upstream_h3.clone(), shared.clone())
-                .context("HTTP/3 h2c service bootstrap failed")?;
-        let mut h2c_options = HttpServerOptions::default();
-        h2c_options.h2c = true;
-        h2c_options.request_header_timeout = Some(Duration::from_secs(
-            server_config.downstream_request_header_timeout_seconds,
-        ));
-        let mut h2c_service = ProxyServiceBuilder::new(&server.configuration, h2c_gateway)
-            .name("pingora-http3-h2c-handoff")
-            .server_options(h2c_options)
-            .custom(h3_connector.clone(), noop_custom_downstream())
-            .build();
-        h2c_service.set_connection_limit(server_config.downstream_max_connections);
-        if let Some(proxy) = h2c_service.app_logic_mut() {
-            proxy.h2_options = Some(handoff_h2_options(
-                server_config.http3_max_concurrent_streams,
-            ));
-        }
-        let internal = server_config.http3_internal_listen.to_string();
-        h2c_service.add_tcp_with_settings(&internal, listener_options(&internal)?);
-        server.add_service(h2c_service);
-    }
-
     if !server_config.http3_listen.is_empty() {
         let h3_runtime = h3_runtime
             .as_ref()
@@ -400,13 +375,12 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     }
 
     info!(
-        "starting Pingora with {} TLS 1.3 hybrid_pq={}: http={:?} https={:?} http3_udp={:?} http3_internal={} health_socket={} threads={}",
+        "starting Pingora with {} TLS 1.3 hybrid_pq={}: http={:?} https={:?} http3_udp={:?} downstream_h3=direct upstream_h3=direct health_socket={} threads={}",
         tls_provider_name(),
         HYBRID_PQ_GROUPS,
         server_config.http_listen,
         server_config.https_listen,
         server_config.http3_listen,
-        server_config.http3_internal_listen,
         server_config.health_socket.display(),
         server_config.threads
     );
@@ -428,15 +402,6 @@ fn public_h2_options(max_concurrent_streams: u32) -> H2Options {
         64 * 1024,
         1024 * 1024,
         8 * 1024 * 1024,
-    )
-}
-
-fn handoff_h2_options(max_concurrent_streams: u32) -> H2Options {
-    configure_h2_options(
-        max_concurrent_streams,
-        64 * 1024,
-        1024 * 1024,
-        16 * 1024 * 1024,
     )
 }
 
@@ -485,6 +450,5 @@ mod tests {
     #[test]
     fn downstream_h2_options_accept_the_fixed_windows() {
         let _public = public_h2_options(32);
-        let _handoff = handoff_h2_options(64);
     }
 }

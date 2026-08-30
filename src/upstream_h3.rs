@@ -46,15 +46,23 @@ pub struct H3Route {
     origin: SocketAddr,
     available: Arc<AtomicBool>,
     forced: bool,
+    preferred: bool,
 }
 
 impl H3Route {
-    pub fn should_use_h3(&self) -> bool {
-        self.forced || self.available.load(Ordering::Acquire)
+    pub fn should_use_direct_h3(&self, tcp_fallback: bool) -> bool {
+        if tcp_fallback {
+            return false;
+        }
+        self.forced || self.preferred
     }
 
     pub fn is_available(&self) -> bool {
         self.available.load(Ordering::Acquire)
+    }
+
+    pub fn allows_tcp_fallback(&self) -> bool {
+        self.preferred && !self.forced
     }
 }
 
@@ -112,6 +120,7 @@ pub fn start(
         let server_name = upstream_server_name(name, upstream)?;
         let available = Arc::new(AtomicBool::new(false));
         let forced = upstream.protocol == UpstreamProtocol::Http3;
+        let preferred = upstream.protocol == UpstreamProtocol::Http3Preferred;
         let settings = BridgeSettings {
             name: name.clone(),
             origin,
@@ -137,6 +146,7 @@ pub fn start(
                 origin,
                 available,
                 forced,
+                preferred,
             },
         );
     }
@@ -154,8 +164,8 @@ pub fn start(
 
     for (name, route) in &registry.routes {
         info!(
-            "upstream HTTP/3 pool started: upstream={} origin={} forced={} hybrid_pq={} early_data=replay-safe-only",
-            name, route.origin, route.forced, HYBRID_PQ_GROUPS,
+            "upstream HTTP/3 pool started: upstream={} origin={} connector=direct forced={} preferred={} hybrid_pq={} early_data=replay-safe-only",
+            name, route.origin, route.forced, route.preferred, HYBRID_PQ_GROUPS,
         );
     }
     Ok(registry)

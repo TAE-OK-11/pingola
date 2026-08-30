@@ -87,7 +87,6 @@ server:
   http_listen: []
   https_listen: []
   http3_listen: ["127.0.0.1:${ORIGIN_H3_PORT}"]
-  http3_internal_listen: "127.0.0.1:${ORIGIN_INTERNAL_PORT}"
   http3_max_idle_timeout_seconds: 30
   http3_max_concurrent_streams: 128
   http3_enable_early_data: true

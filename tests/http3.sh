@@ -65,13 +65,6 @@ for protocol in --http1.1 --http2; do
   grep -qi '^location: https://app.test/app/' <<<"${headers}"
 done
 
-# The private handoff listener must accept HTTP/2 prior knowledge. This request
-# intentionally lacks the random internal token, so a successful h2c exchange
-# returns the normal HTTPS redirect rather than entering the trusted H3 path.
-h2c_probe=$(nghttp --no-dep -nv -H ':authority: app.test' \
-  http://127.0.0.1:18080/headers 2>&1)
-grep -q ':status: 308' <<<"${h2c_probe}"
-
 app_response=$("${ROOT}/target/debug/examples/http3_probe" \
   127.0.0.1:18443 app.test /headers)
 jq -e '.method == "GET"' <<<"${app_response}" >/dev/null
@@ -82,33 +75,20 @@ jq -e '.headers["x-forwarded-proto"] == "https"' \
   <<<"${app_response}" >/dev/null
 jq -e '.headers["x-forwarded-port"] == "18443"' \
   <<<"${app_response}" >/dev/null
-jq -e '.headers["x-jbs-http3-internal"] == null' \
-  <<<"${app_response}" >/dev/null
-jq -e '.headers["x-jbs-http3-port"] == null' \
-  <<<"${app_response}" >/dev/null
 jq -e '.headers.connection == null' <<<"${app_response}" >/dev/null
 
 static_response=$("${ROOT}/target/debug/examples/http3_probe" \
   127.0.0.1:18443 static.test /)
 grep -q 'pingora-static-response' <<<"${static_response}"
 
-# The same authority over plaintext TCP remains redirected while the trusted
-# HTTP/3 loopback handoff is treated as an authenticated HTTPS transport.
 location=$(curl --noproxy '*' -sSI -H 'host: app.test' \
   http://127.0.0.1:18081/headers | awk -F': ' \
   'tolower($1) == "location" {gsub("\r", "", $2); print $2}')
 [[ "${location}" == "https://app.test/headers" ]]
 
-# A loopback caller cannot forge the private H3 handoff with the old static
-# marker. The request must still be treated as plaintext and redirected.
-spoof_location=$(curl --noproxy '*' -sSI -H 'host: app.test' \
-  -H 'x-jbs-http3-internal: 1' -H 'x-jbs-http3-port: 18443' \
-  http://127.0.0.1:18080/headers | awk -F': ' \
-  'tolower($1) == "location" {gsub("\r", "", $2); print $2}')
-[[ "${spoof_location}" == "https://app.test/headers" ]]
-
 grep -q 'HTTP/3 frontend started:.*internal=direct-gateway' "${GATEWAY_LOG}"
 grep -q 'HTTP/3 frontend started:.*hybrid_pq=X25519MLKEM768:X25519:P-256.*stateless_retry=true.*max_amplification=3' "${GATEWAY_LOG}"
 grep -q 'http3_udp=\["127.0.0.1:18443"\]' "${GATEWAY_LOG}"
+grep -q 'downstream_h3=direct upstream_h3=direct' "${GATEWAY_LOG}"
 
-echo "HTTP/3 hybrid PQ TLS, stateless Retry, anti-DDoS admission, QUIC proxy, h2c multiplexing, Alt-Svc, forwarding, and isolation tests passed"
+echo "HTTP/3 hybrid PQ TLS, stateless Retry, anti-DDoS admission, direct QUIC proxy, Alt-Svc, forwarding, and isolation tests passed"

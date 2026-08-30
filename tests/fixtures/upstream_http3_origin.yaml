@@ -6,7 +6,6 @@ server:
     - "127.0.0.1:28453"
   http3_listen:
     - "127.0.0.1:28443"
-  http3_internal_listen: "127.0.0.1:28080"
   http3_max_idle_timeout_seconds: 1
   http3_max_concurrent_streams: 32
   http3_enable_early_data: true
