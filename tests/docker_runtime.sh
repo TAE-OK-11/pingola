@@ -7,6 +7,7 @@ EXPECTED_ALLOCATOR=${PINGORA_EXPECTED_ALLOCATOR:-jemalloc}
 EXPECTED_TARGET_CPU=${PINGORA_EXPECTED_TARGET_CPU:-x86-64-v2}
 EXPECTED_LTO=${PINGORA_EXPECTED_LTO:-fat}
 EXPECTED_TLS_PROVIDER=${PINGORA_EXPECTED_TLS_PROVIDER:-boringssl}
+EXPECTED_PGO=${PINGORA_EXPECTED_PGO:-off}
 RUNTIME=${PINGORA_DOCKER_TEST_RUNTIME:-/tmp/pingora-docker-runtime}
 CONTAINERS=()
 
@@ -103,6 +104,10 @@ assert_container_hardening() {
   test "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${name}" | sed -n 's/^MALLOC_CONF=//p')" \
     = 'narenas:1,percpu_arena:percpu,retain:false,dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:true,tcache_max:8192'
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.lto-scope"}}' "${name}") == cargo-fat ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.pgo"}}' "${name}") == "${EXPECTED_PGO}" ]]
+  if [[ "${EXPECTED_PGO}" == train ]]; then
+    docker exec "${name}" test -s /usr/share/doc/pingora/pgo-profile-summary.txt
+  fi
   docker image inspect "${IMAGE}" | jq -e '.[0].Config.ExposedPorts["443/udp"] != null' >/dev/null
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.linker"}}' "${name}") == lld ]]
 
