@@ -428,7 +428,7 @@ async fn handle_connection(
                             continue;
                         }
                         if *is_in_early_data {
-                            log::debug!("HTTP/3 early-data request accepted peer={peer}");
+                            info!("HTTP/3 early-data request accepted peer={peer}");
                         }
                         let stream_slots = context.stream_slots.clone();
                         let Ok(stream_permit) = stream_slots.try_acquire_owned() else {
