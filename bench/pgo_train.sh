@@ -354,15 +354,42 @@ train_light_json() {
 }
 
 train_bulk() {
-  # 5 MiB and 30 MiB object transfers for large-file forwarding paths.
-  run_h2load bulk-5m -n "$(pgo_train_scale 600)" -c 4 -m 8 -w 16 -W 20 --sni cdn.test \
+  run_h2load bulk-bytes -n "$(pgo_train_scale 600)" -c 4 -m 8 -w 16 -W 20 --sni cdn.test \
     -H 'host: cdn.test' -H 'accept-encoding: identity' \
-    "https://127.0.0.1:${HTTPS_PORT}/bytes/5242880"
+    "https://127.0.0.1:${HTTPS_PORT}/bytes/4194304"
   BULK_SERIAL_N="$(pgo_train_scale 48)"
   if [[ "${PGO_TRAIN_FAST:-off}" == on ]] && (( BULK_SERIAL_N > 12 )); then
     BULK_SERIAL_N=12
   fi
-  run_h2load bulk-30m -n "${BULK_SERIAL_N}" -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
+  run_h2load bulk-serial -n "${BULK_SERIAL_N}" -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
+    -H 'host: pgo.test' -H 'accept-encoding: identity' \
+    "https://127.0.0.1:${HTTPS_PORT}/bytes/10485760"
+  for _ in $(seq 1 "$(pgo_train_scale 400)"); do
+    curl --noproxy '*' --http2 --insecure --fail --silent --show-error --output /dev/null \
+      --resolve "cdn.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: cdn.test' -H 'Range: bytes=1048576-2097151' -H 'Accept-Encoding: identity' \
+      "https://cdn.test:${HTTPS_PORT}/bytes/10485760"
+  done
+  stream_pids=()
+  for _ in $(seq 1 "$(pgo_train_scale 4)"); do
+    curl --noproxy '*' --http2 --insecure --fail --silent --show-error --output /dev/null \
+      --resolve "music.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: music.test' -H 'Accept-Encoding: identity' \
+      "https://music.test:${HTTPS_PORT}/stream/4194304" &
+    stream_pids+=("$!")
+  done
+  for pid in "${stream_pids[@]}"; do
+    wait "${pid}"
+  done
+
+  run_h2load bulk-5m -n "$(pgo_train_scale 600)" -c 4 -m 8 -w 16 -W 20 --sni cdn.test \
+    -H 'host: cdn.test' -H 'accept-encoding: identity' \
+    "https://127.0.0.1:${HTTPS_PORT}/bytes/5242880"
+  BULK_30M_N="$(pgo_train_scale 48)"
+  if [[ "${PGO_TRAIN_FAST:-off}" == on ]] && (( BULK_30M_N > 12 )); then
+    BULK_30M_N=12
+  fi
+  run_h2load bulk-30m -n "${BULK_30M_N}" -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
     -H 'host: pgo.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/bytes/31457280"
   for _ in $(seq 1 "$(pgo_train_scale 400)"); do
