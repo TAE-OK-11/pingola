@@ -71,6 +71,7 @@ jobs:
           bash -n bench/build_pgo.sh
           bash -n bench/pgo_train.sh
           bash -n bench/pgo_train_h3.sh
+          bash -n bench/pgo_train_upstream_h2.sh
           bash -n bench/pgo_train_upstream_h3.sh
           rustc --edition=2024 -D warnings bench/backend.rs -o /tmp/pgo-backend
           rustc --edition=2024 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
@@ -224,8 +225,15 @@ jobs:
             PGO_WEIGHT_H1=60
             PGO_WEIGHT_H2=120
             PGO_WEIGHT_H3=900
+            PGO_WEIGHT_UPSTREAM_H2=350
             PGO_WEIGHT_UPSTREAM_H3_BBR2=700
             PGO_WEIGHT_UPSTREAM_H3_CUBIC=250
+            PGO_WEIGHT_ZSTD=120
+            PGO_WEIGHT_INTERNAL=100
+            PGO_WEIGHT_BULK=180
+            PGO_WEIGHT_AUDIO_ALAC=100
+            PGO_WEIGHT_AUDIO_AAC=100
+            PGO_WEIGHT_LIGHT_JSON=80
             PGO_WEIGHT_TLS=300
             PGO_WEIGHT_TAIL=80
             RUST_TARGET_CPU=x86-64-v2

@@ -22,7 +22,7 @@ BACKEND_PID=
 PINGORA_PID=
 
 case "${SCENARIO}" in
-  h1|h2|tls|tail) ;;
+  h1|h2|tls|tail|zstd|light-json|bulk|internal|audio-alac|audio-aac) ;;
   *)
     echo "unsupported PGO scenario: ${SCENARIO}" >&2
     exit 2
@@ -318,6 +318,118 @@ train_tail() {
     "https://127.0.0.1:${HTTPS_PORT}/json/512"
 }
 
+train_zstd() {
+  for host in pgo.test couch.test; do
+    for _ in $(seq 1 "$(pgo_train_scale 120)"); do
+      curl --noproxy '*' --http2 --insecure --compressed --fail --silent --show-error --output /dev/null \
+        --resolve "${host}:${HTTPS_PORT}:127.0.0.1" \
+        -H "Host: ${host}" -H 'Accept-Encoding: zstd' \
+        "https://${host}:${HTTPS_PORT}/json/65536"
+    done
+  done
+  run_h2load zstd-vaultwarden -n "$(pgo_train_scale 6000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
+    -H 'host: pgo.test' -H 'accept-encoding: zstd' \
+    "https://127.0.0.1:${HTTPS_PORT}/json/65536"
+  run_h2load zstd-couch -n "$(pgo_train_scale 3000)" -c 4 -m 8 -w 16 -W 20 --sni couch.test \
+    -H 'host: couch.test' -H 'accept-encoding: zstd' \
+    "https://127.0.0.1:${HTTPS_PORT}/json/65536"
+  for _ in $(seq 1 "$(pgo_train_scale 300)"); do
+    curl --noproxy '*' --http2 --insecure --compressed --fail --silent --show-error --output /dev/null \
+      --resolve "static.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: static.test' -H 'Accept-Encoding: zstd' \
+      "https://static.test:${HTTPS_PORT}/train.json"
+  done
+}
+
+train_light_json() {
+  run_h2load light-json-burst -n "$(pgo_train_scale 32000)" -c 16 -m 32 -w 16 -W 20 --sni pgo.test \
+    -H 'host: pgo.test' -H 'accept-encoding: identity' \
+    "https://127.0.0.1:${HTTPS_PORT}/json/512"
+  "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 16 --requests-per-thread "$(pgo_train_scale 6000)" \
+    --path /json/512 --expected-length 512 --body-validation any
+  for _ in $(seq 1 "$(pgo_train_scale 1500)"); do
+    curl --noproxy '*' --http1.1 --fail --silent --show-error --output /dev/null \
+      -H 'Host: pgo.test' "http://127.0.0.1:${HTTP_PORT}/json/512"
+  done
+}
+
+train_bulk() {
+  run_h2load bulk-bytes -n "$(pgo_train_scale 600)" -c 4 -m 8 -w 16 -W 20 --sni cdn.test \
+    -H 'host: cdn.test' -H 'accept-encoding: identity' \
+    "https://127.0.0.1:${HTTPS_PORT}/bytes/4194304"
+  BULK_SERIAL_N="$(pgo_train_scale 48)"
+  if [[ "${PGO_TRAIN_FAST:-off}" == on ]] && (( BULK_SERIAL_N > 12 )); then
+    BULK_SERIAL_N=12
+  fi
+  run_h2load bulk-serial -n "${BULK_SERIAL_N}" -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
+    -H 'host: pgo.test' -H 'accept-encoding: identity' \
+    "https://127.0.0.1:${HTTPS_PORT}/bytes/10485760"
+  for _ in $(seq 1 "$(pgo_train_scale 400)"); do
+    curl --noproxy '*' --http2 --insecure --fail --silent --show-error --output /dev/null \
+      --resolve "cdn.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: cdn.test' -H 'Range: bytes=1048576-2097151' -H 'Accept-Encoding: identity' \
+      "https://cdn.test:${HTTPS_PORT}/bytes/10485760"
+  done
+  stream_pids=()
+  for _ in $(seq 1 "$(pgo_train_scale 4)"); do
+    curl --noproxy '*' --http2 --insecure --fail --silent --show-error --output /dev/null \
+      --resolve "music.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: music.test' -H 'Accept-Encoding: identity' \
+      "https://music.test:${HTTPS_PORT}/stream/4194304" &
+    stream_pids+=("$!")
+  done
+  for pid in "${stream_pids[@]}"; do
+    wait "${pid}"
+  done
+}
+
+train_internal() {
+  run_h2load internal-static -n "$(pgo_train_scale 20000)" -c 8 -m 32 -w 16 -W 20 --sni static.test \
+    -H 'host: static.test' -H 'accept-encoding: identity' \
+    "https://127.0.0.1:${HTTPS_PORT}/hot.bin"
+  "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 32 --requests-per-thread "$(pgo_train_scale 400)" \
+    --path /json/512 --expected-length 512 --body-validation any
+  run_h2load internal-json-h2 -n "$(pgo_train_scale 12000)" -c 8 -m 16 -w 16 -W 20 --sni pgo.test \
+    -H 'host: pgo.test' -H 'accept-encoding: identity' \
+    "https://127.0.0.1:${HTTPS_PORT}/json/512"
+}
+
+train_audio_alac() {
+  local size=1048576
+  local streams
+  streams="$(pgo_train_scale 6)"
+  for _ in $(seq 1 "${streams}"); do
+    curl --noproxy '*' --http2 --insecure --fail --silent --show-error --output /dev/null \
+      --resolve "music.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: music.test' -H 'Accept-Encoding: identity' \
+      "https://music.test:${HTTPS_PORT}/rest/stream/alac/${size}"
+  done
+  for _ in $(seq 1 "$(pgo_train_scale 24)"); do
+    curl --noproxy '*' --http2 --insecure --fail --silent --show-error --output /dev/null \
+      --resolve "music.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: music.test' -H 'Range: bytes=65536-131071' -H 'Accept-Encoding: identity' \
+      "https://music.test:${HTTPS_PORT}/rest/stream/alac/${size}"
+  done
+}
+
+train_audio_aac() {
+  local size=524288
+  local streams
+  streams="$(pgo_train_scale 6)"
+  for _ in $(seq 1 "${streams}"); do
+    curl --noproxy '*' --http2 --insecure --fail --silent --show-error --output /dev/null \
+      --resolve "music.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: music.test' -H 'Accept-Encoding: identity' \
+      "https://music.test:${HTTPS_PORT}/rest/stream/aac/${size}"
+  done
+  for _ in $(seq 1 "$(pgo_train_scale 24)"); do
+    curl --noproxy '*' --http2 --insecure --fail --silent --show-error --output /dev/null \
+      --resolve "music.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: music.test' -H 'Range: bytes=32768-98303' -H 'Accept-Encoding: identity' \
+      "https://music.test:${HTTPS_PORT}/rest/stream/aac/${size}"
+  done
+}
+
 rm -rf "${RUNTIME_DIR}"
 install -d -m 0700 "${OUTPUT_DIR}" "${RUNTIME_DIR}" "${STATIC_DIR}"
 
@@ -332,6 +444,7 @@ openssl pkey -in "${RUNTIME_DIR}/key.pem" -check -noout \
   >>"${OUTPUT_DIR}/openssl-key.log" 2>&1
 
 dd if=/dev/zero of="${STATIC_DIR}/hot.bin" bs=4096 count=1 status=none
+printf '%8192s' | tr ' ' 'x' >"${STATIC_DIR}/train.json"
 for index in $(seq 1 64); do
   dd if=/dev/zero of="${STATIC_DIR}/cold-${index}.bin" bs=512 count=1 status=none
 done

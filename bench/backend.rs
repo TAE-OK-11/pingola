@@ -335,6 +335,29 @@ fn respond(stream: &mut TcpStream, request: Request) -> io::Result<()> {
             request.range.as_deref(),
             send_body,
             request.close,
+            "application/octet-stream",
+        );
+    }
+    if let Some(value) = path.strip_prefix("/rest/stream/alac/") {
+        let size = parse_payload_size(value)?;
+        return write_bytes_response(
+            stream,
+            size,
+            request.range.as_deref(),
+            send_body,
+            request.close,
+            "audio/mp4",
+        );
+    }
+    if let Some(value) = path.strip_prefix("/rest/stream/aac/") {
+        let size = parse_payload_size(value)?;
+        return write_bytes_response(
+            stream,
+            size,
+            request.range.as_deref(),
+            send_body,
+            request.close,
+            "audio/mpeg",
         );
     }
     write_text_response(stream, 404, "Not Found", b"not found\n", request.close)
@@ -423,6 +446,7 @@ fn write_bytes_response(
     requested_range: Option<&str>,
     send_body: bool,
     close: bool,
+    content_type: &str,
 ) -> io::Result<()> {
     let selected = match requested_range {
         Some(value) => match parse_byte_range(value, size) {
@@ -446,7 +470,7 @@ fn write_bytes_response(
     let mut response = Vec::with_capacity(256 + length.min(SMALL_RESPONSE_BYTES));
     write!(
         response,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/octet-stream\r\nContent-Length: {length}\r\nAccept-Ranges: bytes\r\nETag: {etag}\r\n"
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nAccept-Ranges: bytes\r\nETag: {etag}\r\n"
     )
     .expect("writing to Vec cannot fail");
     if let Some(value) = content_range {

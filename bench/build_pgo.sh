@@ -11,8 +11,15 @@ set -Eeuo pipefail
 : "${PGO_WEIGHT_H1:?}"
 : "${PGO_WEIGHT_H2:?}"
 : "${PGO_WEIGHT_H3:?}"
+: "${PGO_WEIGHT_UPSTREAM_H2:?}"
 : "${PGO_WEIGHT_UPSTREAM_H3_BBR2:?}"
 : "${PGO_WEIGHT_UPSTREAM_H3_CUBIC:?}"
+: "${PGO_WEIGHT_ZSTD:?}"
+: "${PGO_WEIGHT_INTERNAL:?}"
+: "${PGO_WEIGHT_BULK:?}"
+: "${PGO_WEIGHT_AUDIO_ALAC:?}"
+: "${PGO_WEIGHT_AUDIO_AAC:?}"
+: "${PGO_WEIGHT_LIGHT_JSON:?}"
 : "${PGO_WEIGHT_TLS:?}"
 : "${PGO_WEIGHT_TAIL:?}"
 : "${PGO_TRAIN_ROUNDS:?}"
@@ -54,7 +61,9 @@ case "${PGO_ECDSA_CURVE}" in prime256v1|secp384r1) ;; *) echo "unsupported ECDSA
 
 for value in \
   "${PGO_WEIGHT_H1}" "${PGO_WEIGHT_H2}" "${PGO_WEIGHT_H3}" \
-  "${PGO_WEIGHT_UPSTREAM_H3_BBR2}" "${PGO_WEIGHT_UPSTREAM_H3_CUBIC}" \
+  "${PGO_WEIGHT_UPSTREAM_H2}" "${PGO_WEIGHT_UPSTREAM_H3_BBR2}" "${PGO_WEIGHT_UPSTREAM_H3_CUBIC}" \
+  "${PGO_WEIGHT_ZSTD}" "${PGO_WEIGHT_INTERNAL}" "${PGO_WEIGHT_BULK}" \
+  "${PGO_WEIGHT_AUDIO_ALAC}" "${PGO_WEIGHT_AUDIO_AAC}" "${PGO_WEIGHT_LIGHT_JSON}" \
   "${PGO_WEIGHT_TLS}" "${PGO_WEIGHT_TAIL}" "${PGO_TRAIN_ROUNDS}" \
   "${PGO_NATIVE_TRAIN_ROUNDS}" "${BORING_PGO_WEIGHT_H2}" "${BORING_PGO_WEIGHT_H3}" \
   "${BORING_PGO_WEIGHT_UPSTREAM_H3_BBR2}" "${BORING_PGO_WEIGHT_UPSTREAM_H3_CUBIC}" \
@@ -94,8 +103,11 @@ test -x "${ORIGIN_BIN}"
 rm -rf /src/pgo-data
 install -d \
   /src/pgo-data/raw/h1 /src/pgo-data/raw/h2 /src/pgo-data/raw/h3 \
-  /src/pgo-data/raw/upstream-h3-bbr2 /src/pgo-data/raw/upstream-h3-cubic \
-  /src/pgo-data/raw/tls /src/pgo-data/raw/tail
+  /src/pgo-data/raw/upstream-h2 /src/pgo-data/raw/upstream-h3-bbr2 \
+  /src/pgo-data/raw/upstream-h3-cubic /src/pgo-data/raw/zstd \
+  /src/pgo-data/raw/internal /src/pgo-data/raw/bulk \
+  /src/pgo-data/raw/audio-alac /src/pgo-data/raw/audio-aac \
+  /src/pgo-data/raw/light-json /src/pgo-data/raw/tls /src/pgo-data/raw/tail
 
 # RUSTFLAGS is intentionally global: rustc applies instrumentation to JBS
 # Pingora plus Rust dependencies such as vendored Pingora, hyper/h2,
@@ -110,7 +122,7 @@ PGO_BIN="/src/target/pgo-generate/${RUST_TARGET_TRIPLE}/pgo-generate/pingora"
 test -x "${PGO_BIN}"
 
 for round in $(seq 1 "${PGO_TRAIN_ROUNDS}"); do
-  for scenario in h1 h2 tls tail; do
+  for scenario in h1 h2 tls tail zstd internal bulk audio-alac audio-aac light-json; do
     echo "Rust PGO scenario=${scenario} round=${round}/${PGO_TRAIN_ROUNDS} cpu=${PGO_TRAIN_TARGET_CPU}"
     PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" PGO_TRAIN_ROUND="${round}" \
       bench/pgo_train.sh "${PGO_BIN}" /tmp/pgo-backend /tmp/pgo-client \
@@ -122,6 +134,11 @@ for round in $(seq 1 "${PGO_TRAIN_ROUNDS}"); do
     bench/pgo_train_h3.sh "${PGO_BIN}" /tmp/pgo-backend "${H3_PROBE}" \
       /src/pgo-data/raw/h3
 
+  echo "Rust PGO scenario=upstream-h2 round=${round}/${PGO_TRAIN_ROUNDS} cpu=${PGO_TRAIN_TARGET_CPU}"
+  PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" PGO_TRAIN_ROUND="${round}" \
+    bench/pgo_train_upstream_h2.sh "${PGO_BIN}" "${ORIGIN_BIN}" /tmp/pgo-backend \
+      /src/pgo-data/raw/upstream-h2
+
   for cc in bbr2 cubic; do
     [[ "${PGO_TRAIN_FAST:-off}" == on && "${cc}" == cubic ]] && continue
     echo "Rust PGO scenario=upstream-h3-${cc} round=${round}/${PGO_TRAIN_ROUNDS} cpu=${PGO_TRAIN_TARGET_CPU}"
@@ -131,7 +148,8 @@ for round in $(seq 1 "${PGO_TRAIN_ROUNDS}"); do
   done
 done
 
-for scenario in h1 h2 h3 upstream-h3-bbr2 upstream-h3-cubic tls tail; do
+for scenario in h1 h2 h3 upstream-h2 upstream-h3-bbr2 upstream-h3-cubic \
+  zstd internal bulk audio-alac audio-aac light-json tls tail; do
   if [[ "${scenario}" == upstream-h3-cubic && "${PGO_TRAIN_FAST:-off}" == on ]] \
     && ! compgen -G "/src/pgo-data/raw/upstream-h3-cubic/*.profraw" >/dev/null; then
     cp "/src/pgo-data/upstream-h3-bbr2.profdata" "/src/pgo-data/upstream-h3-cubic.profdata"
@@ -145,8 +163,15 @@ done
   --weighted-input="${PGO_WEIGHT_H1},/src/pgo-data/h1.profdata" \
   --weighted-input="${PGO_WEIGHT_H2},/src/pgo-data/h2.profdata" \
   --weighted-input="${PGO_WEIGHT_H3},/src/pgo-data/h3.profdata" \
+  --weighted-input="${PGO_WEIGHT_UPSTREAM_H2},/src/pgo-data/upstream-h2.profdata" \
   --weighted-input="${PGO_WEIGHT_UPSTREAM_H3_BBR2},/src/pgo-data/upstream-h3-bbr2.profdata" \
   --weighted-input="${PGO_WEIGHT_UPSTREAM_H3_CUBIC},/src/pgo-data/upstream-h3-cubic.profdata" \
+  --weighted-input="${PGO_WEIGHT_ZSTD},/src/pgo-data/zstd.profdata" \
+  --weighted-input="${PGO_WEIGHT_INTERNAL},/src/pgo-data/internal.profdata" \
+  --weighted-input="${PGO_WEIGHT_BULK},/src/pgo-data/bulk.profdata" \
+  --weighted-input="${PGO_WEIGHT_AUDIO_ALAC},/src/pgo-data/audio-alac.profdata" \
+  --weighted-input="${PGO_WEIGHT_AUDIO_AAC},/src/pgo-data/audio-aac.profdata" \
+  --weighted-input="${PGO_WEIGHT_LIGHT_JSON},/src/pgo-data/light-json.profdata" \
   --weighted-input="${PGO_WEIGHT_TLS},/src/pgo-data/tls.profdata" \
   --weighted-input="${PGO_WEIGHT_TAIL},/src/pgo-data/tail.profdata" \
   -o /src/pgo-data/merged.profdata
@@ -154,7 +179,7 @@ test -s /src/pgo-data/merged.profdata
 
 {
   echo "cpu=${PGO_TRAIN_TARGET_CPU} rounds=${PGO_TRAIN_ROUNDS}"
-  echo "weights h1=${PGO_WEIGHT_H1} h2=${PGO_WEIGHT_H2} h3=${PGO_WEIGHT_H3} upstream_h3_bbr2=${PGO_WEIGHT_UPSTREAM_H3_BBR2} upstream_h3_cubic=${PGO_WEIGHT_UPSTREAM_H3_CUBIC} tls=${PGO_WEIGHT_TLS} tail=${PGO_WEIGHT_TAIL}"
+  echo "weights h1=${PGO_WEIGHT_H1} h2=${PGO_WEIGHT_H2} h3=${PGO_WEIGHT_H3} upstream_h2=${PGO_WEIGHT_UPSTREAM_H2} upstream_h3_bbr2=${PGO_WEIGHT_UPSTREAM_H3_BBR2} upstream_h3_cubic=${PGO_WEIGHT_UPSTREAM_H3_CUBIC} zstd=${PGO_WEIGHT_ZSTD} internal=${PGO_WEIGHT_INTERNAL} bulk=${PGO_WEIGHT_BULK} audio_alac=${PGO_WEIGHT_AUDIO_ALAC} audio_aac=${PGO_WEIGHT_AUDIO_AAC} light_json=${PGO_WEIGHT_LIGHT_JSON} tls=${PGO_WEIGHT_TLS} tail=${PGO_WEIGHT_TAIL}"
   "${RUST_LLVM_PROFDATA}" show --counts --covered --topn=150 /src/pgo-data/merged.profdata
   if [[ "${PGO_TRAIN_FAST:-off}" != on ]]; then
     for pair in 'h2 h3' 'h3 upstream-h3-bbr2' 'upstream-h3-bbr2 upstream-h3-cubic' 'upstream-h3-bbr2 tls' 'h3 tail'; do
