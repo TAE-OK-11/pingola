@@ -84,11 +84,18 @@ opt-level = 3
 panic = "abort"
 strip = "symbols"
 
-# PGO instrumented builds inherit the release profile (fat LTO). Training uses
-# `cargo build --profile pgo-generate -C profile-generate=...`; the final image
-# uses `cargo build --profile pgo -C profile-use=...` via bench/build_pgo.sh.
+# PGO instrumented builds inherit release opts but skip fat LTO: the generate
+# binary is throwaway and fat LTO there dominates CI publish time.
 [profile.pgo-generate]
 inherits = "release"
+lto = "thin"
+codegen-units = 4
+
+# Helper binaries for PGO training (origin + HTTP/3 probe) do not need LTO.
+[profile.pgo-tools]
+inherits = "release"
+lto = false
+codegen-units = 8
 
 [profile.pgo]
 inherits = "release"

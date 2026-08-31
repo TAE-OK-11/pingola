@@ -67,6 +67,7 @@ jobs:
 
       - name: Static and dependency checks
         run: |
+          bash -n bench/pgo_train_scale.sh
           bash -n bench/build_pgo.sh
           bash -n bench/pgo_train.sh
           bash -n bench/pgo_train_h3.sh
@@ -166,7 +167,7 @@ jobs:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_images)
     needs: verify
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 180
     permissions:
       contents: read
       packages: write
@@ -218,6 +219,8 @@ jobs:
             PGO_MODE=train
             PGO_NATIVE_BORING=off
             PGO_TRAIN_TARGET_CPU=x86-64-v2
+            PGO_TRAIN_ROUNDS=1
+            PGO_TRAIN_FAST=on
             PGO_WEIGHT_H1=60
             PGO_WEIGHT_H2=120
             PGO_WEIGHT_H3=900

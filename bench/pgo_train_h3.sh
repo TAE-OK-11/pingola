@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# shellcheck source=bench/pgo_train_scale.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pgo_train_scale.sh"
+
 PINGORA_BIN=${1:?usage: pgo_train_h3.sh PINGORA_BIN BACKEND_BIN HTTP3_PROBE_BIN OUTPUT_DIR}
 BACKEND_BIN=${2:?usage: pgo_train_h3.sh PINGORA_BIN BACKEND_BIN HTTP3_PROBE_BIN OUTPUT_DIR}
 HTTP3_PROBE_BIN=${3:?usage: pgo_train_h3.sh PINGORA_BIN BACKEND_BIN HTTP3_PROBE_BIN OUTPUT_DIR}
@@ -184,7 +187,7 @@ fi
 
 # Train fresh QUIC handshakes and stateless Retry without allowing this path to
 # dominate the profile. Persistent connections below carry the bulk workload.
-for index in $(seq 1 64); do
+for index in $(seq 1 "$(pgo_train_scale 64)"); do
   run_probe "h3-handshake-${index}" pgo.test /json/512 1
 done
 
@@ -192,17 +195,17 @@ done
 # dispatch, QPACK, task scheduling, loopback proxying, and response framing.
 probe_pids=()
 for index in $(seq 1 8); do
-  run_probe "h3-json-concurrent-${index}" pgo.test /json/512 512 &
+  run_probe "h3-json-concurrent-${index}" pgo.test /json/512 "$(pgo_train_scale 512)" &
   probe_pids+=("$!")
 done
 for pid in "${probe_pids[@]}"; do
   wait "${pid}"
 done
 
-run_probe h3-static static.test /hot.bin 2000
-run_probe h3-large-json couch.test /json/65536 256
-run_probe h3-medium-body cdn.test /bytes/4096 1000
-run_probe h3-music-stream music.test /stream/1048576 16
+run_probe h3-static static.test /hot.bin "$(pgo_train_scale 2000)"
+run_probe h3-large-json couch.test /json/65536 "$(pgo_train_scale 256)"
+run_probe h3-medium-body cdn.test /bytes/4096 "$(pgo_train_scale 1000)"
+run_probe h3-music-stream music.test /stream/1048576 "$(pgo_train_scale 16)"
 
 upstream_connections=$(curl --noproxy '*' --fail --silent --show-error \
   "http://127.0.0.1:${BACKEND_PORT}/stats/connections")
