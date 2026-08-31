@@ -242,6 +242,22 @@ run_h2load small -n "$(pgo_train_scale 6000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.t
 run_h2load medium -n "$(pgo_train_scale 3000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/bytes/4096"
+
+# Run direct-gateway H3 probes before long serial bulk transfers. After ~30+
+# minutes of HTTPS/H2 load the downstream QUIC controller can close and later
+# probes fail with "controller is closed" even though the listener is up.
+H3_JSON_PROBES=4
+H3_JSON_REQUESTS=256
+if [[ "${PGO_TRAIN_FAST:-off}" == on ]]; then
+  H3_JSON_PROBES=2
+  H3_JSON_REQUESTS=128
+fi
+for index in $(seq 1 "${H3_JSON_PROBES}"); do
+  run_h3_probe "h3-downstream-json-${index}" pgo.test /json/512 "${H3_JSON_REQUESTS}"
+done
+run_h3_probe h3-downstream-stream music.test /stream/524288 "$(pgo_train_scale 8)"
+run_h3_probe h3-downstream-bulk pgo.test /bytes/262144 "$(pgo_train_scale 32)"
+
 run_h2load large-json -n "$(pgo_train_scale 1000)" -c 4 -m 8 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/json/65536"
@@ -266,14 +282,6 @@ run_h2load bulk-512k -n "${UPSTREAM_BULK_N}" -c 1 -m 1 -w 16 -W 20 --sni pgo.tes
 run_h2load chunked-128k -n "${UPSTREAM_CHUNKED_N}" -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/131072"
-
-# Direct-gateway H3 downstream -> upstream H3 exercises wire passthrough,
-# bodyless fast path, and header sync without TLS/H2 framing overhead.
-for index in $(seq 1 4); do
-  run_h3_probe "h3-downstream-json-${index}" pgo.test /json/512 256
-done
-run_h3_probe h3-downstream-stream music.test /stream/524288 "$(pgo_train_scale 8)"
-run_h3_probe h3-downstream-bulk pgo.test /bytes/262144 32
 
 # The target uses a deliberately short three-second upstream QUIC idle timeout
 # only for this training fixture. Waiting past it repeatedly exercises reconnect,
