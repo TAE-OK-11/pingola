@@ -103,7 +103,7 @@ rm -rf /src/pgo-data
 install -d \
   /src/pgo-data/raw/h1 /src/pgo-data/raw/h2 /src/pgo-data/raw/h3 \
   /src/pgo-data/raw/upstream-h2 /src/pgo-data/raw/upstream-h3-bbr2 \
-  /src/pgo-data/raw/upstream-h3-cubic   /src/pgo-data/raw/zstd /src/pgo-data/raw/compress-br \
+  /src/pgo-data/raw/upstream-h3-cubic   /src/pgo-data/raw/zstd /src/pgo-data/raw/compress_br \
   /src/pgo-data/raw/internal /src/pgo-data/raw/bulk \
   /src/pgo-data/raw/light-json /src/pgo-data/raw/tls /src/pgo-data/raw/tail
 
@@ -120,7 +120,7 @@ PGO_BIN="/src/target/pgo-generate/${RUST_TARGET_TRIPLE}/pgo-generate/pingora"
 test -x "${PGO_BIN}"
 
 for round in $(seq 1 "${PGO_TRAIN_ROUNDS}"); do
-  for scenario in h1 h2 tls tail zstd compress-br internal bulk light-json; do
+  for scenario in h1 h2 tls tail zstd compress_br internal bulk light-json; do
     echo "Rust PGO scenario=${scenario} round=${round}/${PGO_TRAIN_ROUNDS} cpu=${PGO_TRAIN_TARGET_CPU}"
     PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" PGO_TRAIN_ROUND="${round}" \
       bench/pgo_train.sh "${PGO_BIN}" /tmp/pgo-backend /tmp/pgo-client \
@@ -147,7 +147,7 @@ for round in $(seq 1 "${PGO_TRAIN_ROUNDS}"); do
 done
 
 for scenario in h1 h2 h3 upstream-h2 upstream-h3-bbr2 upstream-h3-cubic \
-  zstd compress-br internal bulk light-json tls tail; do
+  zstd compress_br internal bulk light-json tls tail; do
   if [[ "${scenario}" == upstream-h3-cubic && "${PGO_TRAIN_FAST:-off}" == on ]] \
     && ! compgen -G "/src/pgo-data/raw/upstream-h3-cubic/*.profraw" >/dev/null; then
     cp "/src/pgo-data/upstream-h3-bbr2.profdata" "/src/pgo-data/upstream-h3-cubic.profdata"
@@ -165,7 +165,7 @@ done
   --weighted-input="${PGO_WEIGHT_UPSTREAM_H3_BBR2},/src/pgo-data/upstream-h3-bbr2.profdata" \
   --weighted-input="${PGO_WEIGHT_UPSTREAM_H3_CUBIC},/src/pgo-data/upstream-h3-cubic.profdata" \
   --weighted-input="${PGO_WEIGHT_ZSTD},/src/pgo-data/zstd.profdata" \
-  --weighted-input="${PGO_WEIGHT_COMPRESS_BR},/src/pgo-data/compress-br.profdata" \
+  --weighted-input="${PGO_WEIGHT_COMPRESS_BR},/src/pgo-data/compress_br.profdata" \
   --weighted-input="${PGO_WEIGHT_INTERNAL},/src/pgo-data/internal.profdata" \
   --weighted-input="${PGO_WEIGHT_BULK},/src/pgo-data/bulk.profdata" \
   --weighted-input="${PGO_WEIGHT_LIGHT_JSON},/src/pgo-data/light-json.profdata" \

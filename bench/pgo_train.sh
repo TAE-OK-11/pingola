@@ -22,7 +22,7 @@ BACKEND_PID=
 PINGORA_PID=
 
 case "${SCENARIO}" in
-  h1|h2|tls|tail|zstd|light-json|bulk|internal|compress-br) ;;
+  h1|h2|tls|tail|zstd|light-json|bulk|internal|compress_br) ;;
   *)
     echo "unsupported PGO scenario: ${SCENARIO}" >&2
     exit 2
