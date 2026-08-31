@@ -231,8 +231,6 @@ jobs:
             PGO_WEIGHT_ZSTD=120
             PGO_WEIGHT_INTERNAL=100
             PGO_WEIGHT_BULK=180
-            PGO_WEIGHT_AUDIO_ALAC=100
-            PGO_WEIGHT_AUDIO_AAC=100
             PGO_WEIGHT_LIGHT_JSON=80
             PGO_WEIGHT_TLS=300
             PGO_WEIGHT_TAIL=80

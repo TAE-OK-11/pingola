@@ -160,12 +160,12 @@ run_h2load small -n "$(pgo_train_scale 6000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.t
 run_h2load medium -n "$(pgo_train_scale 3000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/bytes/4096"
-run_h2load audio-aac -n "$(pgo_train_scale 64)" -c 2 -m 4 -w 16 -W 20 --sni music.test \
-  -H 'host: music.test' -H 'accept-encoding: identity' \
-  "https://127.0.0.1:${TARGET_HTTPS_PORT}/rest/stream/aac/524288"
-run_h2load audio-alac -n "$(pgo_train_scale 64)" -c 2 -m 4 -w 16 -W 20 --sni music.test \
-  -H 'host: music.test' -H 'accept-encoding: identity' \
-  "https://127.0.0.1:${TARGET_HTTPS_PORT}/rest/stream/alac/1048576"
+run_h2load bulk-5m -n "$(pgo_train_scale 64)" -c 2 -m 4 -w 16 -W 20 --sni pgo.test \
+  -H 'host: pgo.test' -H 'accept-encoding: identity' \
+  "https://127.0.0.1:${TARGET_HTTPS_PORT}/bytes/5242880"
+run_h2load bulk-30m -n "$(pgo_train_scale 24)" -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
+  -H 'host: pgo.test' -H 'accept-encoding: identity' \
+  "https://127.0.0.1:${TARGET_HTTPS_PORT}/bytes/31457280"
 
 UPSTREAM_BULK_N="$(pgo_train_scale 160)"
 UPSTREAM_CHUNKED_N="$(pgo_train_scale 256)"
@@ -199,8 +199,8 @@ medium_requests=3000
 large_json_requests=1000
 bulk_512k_requests=160
 chunked_128k_requests=256
-audio_aac_requests=64
-audio_alac_requests=64
+bulk_5m_requests=64
+bulk_30m_requests=24
 resumption_cycles=8
 resumption_requests=256
 EOF_WORKLOAD
