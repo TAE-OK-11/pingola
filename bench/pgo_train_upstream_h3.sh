@@ -76,19 +76,39 @@ run_h2load() {
   }
 }
 
+ensure_h3_ready() {
+  for _ in {1..80}; do
+    if "${HTTP3_PROBE_BIN}" "127.0.0.1:${TARGET_H3_PORT}" pgo.test /json/512 1 \
+      >"${OUTPUT_DIR}/h3-ready.out" 2>"${OUTPUT_DIR}/h3-ready.log"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "target HTTP/3 listener not ready before probe workload" >&2
+  show_failure_logs
+  return 1
+}
+
 run_h3_probe() {
   local name=$1
   local authority=$2
   local path=$3
   local requests=$4
+  local attempt
 
-  if ! "${HTTP3_PROBE_BIN}" "127.0.0.1:${TARGET_H3_PORT}" "${authority}" "${path}" "${requests}" \
-    >"${OUTPUT_DIR}/${name}.out" 2>"${OUTPUT_DIR}/${name}.log"; then
-    echo "upstream H3 direct-gateway workload failed: ${name}" >&2
-    sed -n '1,160p' "${OUTPUT_DIR}/${name}.log" >&2
-    show_failure_logs
-    exit 1
-  fi
+  for attempt in 1 2 3; do
+    ensure_h3_ready || exit 1
+    if "${HTTP3_PROBE_BIN}" "127.0.0.1:${TARGET_H3_PORT}" "${authority}" "${path}" "${requests}" \
+      >"${OUTPUT_DIR}/${name}.out" 2>"${OUTPUT_DIR}/${name}.log"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  echo "upstream H3 direct-gateway workload failed: ${name}" >&2
+  sed -n '1,160p' "${OUTPUT_DIR}/${name}.log" >&2
+  show_failure_logs
+  exit 1
 }
 
 rm -rf "${RUNTIME_DIR}"
@@ -232,10 +252,18 @@ run_h2load large-json -n "$(pgo_train_scale 1000)" -c 4 -m 8 -w 16 -W 20 --sni p
 # response forwarding and bodyless fast paths remain represented in PGO.
 # Both workloads are serialized to avoid teaching the profile a single-thread
 # synthetic queue-overflow artifact rather than steady production forwarding.
-run_h2load bulk-512k -n "$(pgo_train_scale 160)" -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
+# Serial bulk transfers dominate publish wall time; cap them harder in fast mode.
+UPSTREAM_BULK_N="$(pgo_train_scale 160)"
+UPSTREAM_CHUNKED_N="$(pgo_train_scale 256)"
+if [[ "${PGO_TRAIN_FAST:-off}" == on ]]; then
+  (( UPSTREAM_BULK_N > 24 )) && UPSTREAM_BULK_N=24
+  (( UPSTREAM_CHUNKED_N > 32 )) && UPSTREAM_CHUNKED_N=32
+fi
+
+run_h2load bulk-512k -n "${UPSTREAM_BULK_N}" -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/bytes/524288"
-run_h2load chunked-128k -n "$(pgo_train_scale 256)" -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
+run_h2load chunked-128k -n "${UPSTREAM_CHUNKED_N}" -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/131072"
 
@@ -244,7 +272,7 @@ run_h2load chunked-128k -n "$(pgo_train_scale 256)" -c 1 -m 1 -w 16 -W 20 --sni 
 for index in $(seq 1 4); do
   run_h3_probe "h3-downstream-json-${index}" pgo.test /json/512 256
 done
-run_h3_probe h3-downstream-stream music.test /stream/524288 8
+run_h3_probe h3-downstream-stream music.test /stream/524288 "$(pgo_train_scale 8)"
 run_h3_probe h3-downstream-bulk pgo.test /bytes/262144 32
 
 # The target uses a deliberately short three-second upstream QUIC idle timeout
