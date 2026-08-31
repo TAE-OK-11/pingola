@@ -72,8 +72,14 @@ run_probe() {
   local authority=$2
   local path=$3
   local requests=$4
+  local accept_encoding=${5:-}
+  local -a probe_args=("127.0.0.1:${HTTP3_PORT}" "${authority}" "${path}" "${requests}")
 
-  if ! "${HTTP3_PROBE_BIN}" "127.0.0.1:${HTTP3_PORT}" "${authority}" "${path}" "${requests}" \
+  if [[ -n "${accept_encoding}" ]]; then
+    probe_args+=("${accept_encoding}")
+  fi
+
+  if ! "${HTTP3_PROBE_BIN}" "${probe_args[@]}" \
     >"${OUTPUT_DIR}/${name}.out" 2>"${OUTPUT_DIR}/${name}.log"; then
     echo "HTTP/3 PGO workload failed: ${name}" >&2
     sed -n '1,160p' "${OUTPUT_DIR}/${name}.log" >&2
@@ -95,6 +101,7 @@ openssl pkey -in "${RUNTIME_DIR}/key.pem" -check -noout \
   >>"${OUTPUT_DIR}/openssl-key.log" 2>&1
 
 dd if=/dev/zero of="${STATIC_DIR}/hot.bin" bs=4096 count=1 status=none
+printf '%8192s' | tr ' ' 'x' >"${STATIC_DIR}/train.json"
 
 cat >"${OUTPUT_DIR}/pingora.yaml" <<EOF_YAML
 server:
@@ -204,6 +211,9 @@ done
 
 run_probe h3-static static.test /hot.bin "$(pgo_train_scale 2000)"
 run_probe h3-large-json couch.test /json/65536 "$(pgo_train_scale 256)"
+run_probe h3-compress-json pgo.test /json/65536 "$(pgo_train_scale 128)" "zstd"
+run_probe h3-compress-couch couch.test /json/65536 "$(pgo_train_scale 64)" "br, zstd, gzip"
+run_probe h3-compress-static static.test /train.json "$(pgo_train_scale 128)" "zstd"
 run_probe h3-medium-body cdn.test /bytes/4096 "$(pgo_train_scale 1000)"
 run_probe h3-music-stream music.test /stream/1048576 "$(pgo_train_scale 16)"
 

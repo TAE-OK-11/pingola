@@ -360,6 +360,28 @@ fn respond(stream: &mut TcpStream, request: Request) -> io::Result<()> {
             "audio/mpeg",
         );
     }
+    if let Some(value) = path.strip_prefix("/rest/getCoverArt/") {
+        let size = value
+            .rsplit('/')
+            .next()
+            .and_then(|segment| segment.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(65536);
+        return write_bytes_response(
+            stream,
+            size,
+            request.range.as_deref(),
+            send_body,
+            request.close,
+            "image/jpeg",
+        );
+    }
+    if path.strip_prefix("/api/accounts/").is_some() && request.method == Method::Post {
+        return write_json_response(stream, 512, send_body, request.close);
+    }
+    if path.starts_with("/identity/connect/") && request.method == Method::Post {
+        return write_json_response(stream, 512, send_body, request.close);
+    }
     write_text_response(stream, 404, "Not Found", b"not found\n", request.close)
 }
 

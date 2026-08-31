@@ -94,11 +94,17 @@ run_h3_probe() {
   local authority=$2
   local path=$3
   local requests=$4
+  local accept_encoding=${5:-}
   local attempt
+  local -a probe_args=("127.0.0.1:${TARGET_H3_PORT}" "${authority}" "${path}" "${requests}")
+
+  if [[ -n "${accept_encoding}" ]]; then
+    probe_args+=("${accept_encoding}")
+  fi
 
   for attempt in 1 2 3; do
     ensure_h3_ready || exit 1
-    if "${HTTP3_PROBE_BIN}" "127.0.0.1:${TARGET_H3_PORT}" "${authority}" "${path}" "${requests}" \
+    if "${HTTP3_PROBE_BIN}" "${probe_args[@]}" \
       >"${OUTPUT_DIR}/${name}.out" 2>"${OUTPUT_DIR}/${name}.log"; then
       return 0
     fi
@@ -255,6 +261,7 @@ fi
 for index in $(seq 1 "${H3_JSON_PROBES}"); do
   run_h3_probe "h3-downstream-json-${index}" pgo.test /json/512 "${H3_JSON_REQUESTS}"
 done
+run_h3_probe h3-downstream-compress pgo.test /json/65536 "$(pgo_train_scale 64)" "zstd"
 run_h3_probe h3-downstream-stream music.test /stream/524288 "$(pgo_train_scale 8)"
 run_h3_probe h3-downstream-bulk pgo.test /bytes/262144 "$(pgo_train_scale 32)"
 

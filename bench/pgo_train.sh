@@ -22,7 +22,7 @@ BACKEND_PID=
 PINGORA_PID=
 
 case "${SCENARIO}" in
-  h1|h2|tls|tail|zstd|light-json|bulk|internal) ;;
+  h1|h2|tls|tail|zstd|light-json|bulk|internal|compress-br) ;;
   *)
     echo "unsupported PGO scenario: ${SCENARIO}" >&2
     exit 2
@@ -160,6 +160,18 @@ train_h2() {
   run_h2load h2-doh -n "$(pgo_train_scale 16000)" -c 4 -m 32 -w 16 -W 20 --sni dns.test \
     -H 'host: dns.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/dns-query"
+
+  for _ in $(seq 1 "$(pgo_train_scale 400)"); do
+    printf '\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00' | \
+      curl --noproxy '*' --http2 --insecure --fail --silent --show-error --output /dev/null \
+        --resolve "dns.test:${HTTPS_PORT}:127.0.0.1" \
+        -H 'Host: dns.test' -H 'Content-Type: application/dns-message' \
+        --data-binary @- "https://dns.test:${HTTPS_PORT}/dns-query"
+  done
+
+  run_h2load h2-cover -n "$(pgo_train_scale 2000)" -c 4 -m 8 -w 16 -W 20 --sni music.test \
+    -H 'host: music.test' -H 'accept-encoding: identity' \
+    "https://127.0.0.1:${HTTPS_PORT}/rest/getCoverArt/test/65536"
 
   for _ in $(seq 1 512); do
     curl --noproxy '*' --http2 --insecure --fail --silent --show-error --output /dev/null \
@@ -415,11 +427,65 @@ train_internal() {
   run_h2load internal-static -n "$(pgo_train_scale 20000)" -c 8 -m 32 -w 16 -W 20 --sni static.test \
     -H 'host: static.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/hot.bin"
+  static_etag=$(curl --noproxy '*' --silent --show-error -I \
+    -H 'Host: static.test' "http://127.0.0.1:${HTTP_PORT}/hot.bin" \
+    | awk -F': ' 'tolower($1)=="etag" {gsub(/\r/,"",$2); print $2; exit}')
+  if [[ -z "${static_etag}" ]]; then
+    echo "failed to capture static hot.bin ETag for 304 training" >&2
+    exit 1
+  fi
+  for _ in $(seq 1 "$(pgo_train_scale 500)"); do
+    curl --noproxy '*' --fail --silent --show-error --output /dev/null \
+      -H 'Host: static.test' -H "If-None-Match: ${static_etag}" \
+      "http://127.0.0.1:${HTTP_PORT}/hot.bin"
+  done
+  for _ in $(seq 1 "$(pgo_train_scale 250)"); do
+    curl --noproxy '*' --http2 --insecure --fail --silent --show-error --output /dev/null \
+      --resolve "static.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: static.test' -H "If-None-Match: ${static_etag}" \
+      "https://static.test:${HTTPS_PORT}/hot.bin"
+  done
   "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 32 --requests-per-thread "$(pgo_train_scale 400)" \
     --path /json/512 --expected-length 512 --body-validation any
   run_h2load internal-json-h2 -n "$(pgo_train_scale 12000)" -c 8 -m 16 -w 16 -W 20 --sni pgo.test \
     -H 'host: pgo.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/json/512"
+  for _ in $(seq 1 "$(pgo_train_scale 64)"); do
+    curl --noproxy '*' --http2 --insecure --fail --silent --show-error --output /dev/null \
+      --resolve "pgo.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: pgo.test' -H 'Content-Type: application/json' \
+      --data '{"email":"pgo@example.test"}' \
+      "https://pgo.test:${HTTPS_PORT}/api/accounts/prelogin"
+  done
+}
+
+train_compress_br() {
+  for host in pgo.test couch.test; do
+    for _ in $(seq 1 "$(pgo_train_scale 120)"); do
+      curl --noproxy '*' --http2 --insecure --compressed --fail --silent --show-error --output /dev/null \
+        --resolve "${host}:${HTTPS_PORT}:127.0.0.1" \
+        -H "Host: ${host}" -H 'Accept-Encoding: br' \
+        "https://${host}:${HTTPS_PORT}/json/65536"
+    done
+  done
+  run_h2load br-vaultwarden -n "$(pgo_train_scale 6000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
+    -H 'host: pgo.test' -H 'accept-encoding: br' \
+    "https://127.0.0.1:${HTTPS_PORT}/json/65536"
+  run_h2load br-couch -n "$(pgo_train_scale 3000)" -c 4 -m 8 -w 16 -W 20 --sni couch.test \
+    -H 'host: couch.test' -H 'accept-encoding: br' \
+    "https://127.0.0.1:${HTTPS_PORT}/json/65536"
+  for _ in $(seq 1 "$(pgo_train_scale 300)"); do
+    curl --noproxy '*' --http2 --insecure --compressed --fail --silent --show-error --output /dev/null \
+      --resolve "static.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: static.test' -H 'Accept-Encoding: br' \
+      "https://static.test:${HTTPS_PORT}/train.json"
+  done
+  for _ in $(seq 1 "$(pgo_train_scale 48)"); do
+    curl --noproxy '*' --http2 --insecure --compressed --fail --silent --show-error --output /dev/null \
+      --resolve "pgo.test:${HTTPS_PORT}:127.0.0.1" \
+      -H 'Host: pgo.test' -H 'Accept-Encoding: br, zstd, gzip' \
+      "https://pgo.test:${HTTPS_PORT}/json/65536"
+  done
 }
 
 rm -rf "${RUNTIME_DIR}"

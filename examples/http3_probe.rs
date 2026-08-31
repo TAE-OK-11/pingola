@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     let peer: SocketAddr = arguments
         .next()
         .ok_or_else(|| {
-            anyhow!("usage: http3_probe <address> <authority> <path> [requests] [concurrency]")
+            anyhow!("usage: http3_probe <address> <authority> <path> [requests] [concurrency] [accept-encoding]")
         })?
         .parse()
         .context("invalid HTTP/3 peer address")?;
@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
         .map(|value| value.parse::<u64>().context("invalid HTTP/3 concurrency"))
         .transpose()?
         .unwrap_or(1);
+    let accept_encoding = arguments.next();
     if arguments.next().is_some() {
         bail!("too many arguments");
     }
@@ -73,7 +74,7 @@ async fn main() -> Result<()> {
         .map_err(|error| anyhow!("HTTP/3 QUIC handshake failed: {error}"))?;
 
     let expected_alt_svc = format!("h3=\":{}\"", peer.port());
-    let request_headers = vec![
+    let mut request_headers = vec![
         h3::Header::new(b":method", b"GET"),
         h3::Header::new(b":scheme", b"https"),
         h3::Header::new(b":authority", authority.as_bytes()),
@@ -81,6 +82,9 @@ async fn main() -> Result<()> {
         h3::Header::new(b"user-agent", b"jbs-http3-probe/2"),
         h3::Header::new(b"accept", b"application/json, text/html;q=0.9"),
     ];
+    if let Some(value) = accept_encoding {
+        request_headers.push(h3::Header::new(b"accept-encoding", value.as_bytes()));
+    }
 
     let mut next_request_id = 1_u64;
     let mut completed = 0_u64;
