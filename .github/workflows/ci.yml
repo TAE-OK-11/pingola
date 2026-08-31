@@ -166,7 +166,7 @@ jobs:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_images)
     needs: verify
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 240
     permissions:
       contents: read
       packages: write
