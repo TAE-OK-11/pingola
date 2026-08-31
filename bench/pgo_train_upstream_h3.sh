@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# shellcheck source=bench/pgo_train_scale.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pgo_train_scale.sh"
+
 PINGORA_BIN=${1:?usage: pgo_train_upstream_h3.sh PINGORA_BIN ORIGIN_BIN BACKEND_BIN HTTP3_PROBE_BIN OUTPUT_DIR CC}
 ORIGIN_BIN=${2:?usage: pgo_train_upstream_h3.sh PINGORA_BIN ORIGIN_BIN BACKEND_BIN HTTP3_PROBE_BIN OUTPUT_DIR CC}
 BACKEND_BIN=${3:?usage: pgo_train_upstream_h3.sh PINGORA_BIN ORIGIN_BIN BACKEND_BIN HTTP3_PROBE_BIN OUTPUT_DIR CC}
@@ -213,13 +216,13 @@ done
   exit 1
 }
 
-run_h2load small -n 6000 -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
+run_h2load small -n "$(pgo_train_scale 6000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/json/512"
-run_h2load medium -n 3000 -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
+run_h2load medium -n "$(pgo_train_scale 3000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/bytes/4096"
-run_h2load large-json -n 1000 -c 4 -m 8 -w 16 -W 20 --sni pgo.test \
+run_h2load large-json -n "$(pgo_train_scale 1000)" -c 4 -m 8 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/json/65536"
 
@@ -229,10 +232,10 @@ run_h2load large-json -n 1000 -c 4 -m 8 -w 16 -W 20 --sni pgo.test \
 # response forwarding and bodyless fast paths remain represented in PGO.
 # Both workloads are serialized to avoid teaching the profile a single-thread
 # synthetic queue-overflow artifact rather than steady production forwarding.
-run_h2load bulk-512k -n 160 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
+run_h2load bulk-512k -n "$(pgo_train_scale 160)" -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/bytes/524288"
-run_h2load chunked-128k -n 256 -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
+run_h2load chunked-128k -n "$(pgo_train_scale 256)" -c 1 -m 1 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
   "https://127.0.0.1:${TARGET_HTTPS_PORT}/stream/131072"
 
@@ -248,7 +251,7 @@ run_h3_probe h3-downstream-bulk pgo.test /bytes/262144 32
 # only for this training fixture. Waiting past it repeatedly exercises reconnect,
 # ticket caching/resumption, and replay-safe early-data paths without risking
 # spurious idle expiry during the transfer workload above.
-for index in $(seq 1 8); do
+for index in $(seq 1 "$(pgo_train_scale 8)"); do
   sleep 3.3
   run_h2load "resume-${index}" -n 32 -c 1 -m 1 --sni pgo.test \
     -H 'host: pgo.test' -H 'accept-encoding: identity' \

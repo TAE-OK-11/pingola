@@ -83,11 +83,11 @@ CARGO_TARGET_DIR=/src/target/pgo-tools \
 CFLAGS="${TRAIN_NATIVE_FLAGS}" \
 CXXFLAGS="${TRAIN_NATIVE_FLAGS}" \
 RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${PGO_TRAIN_TARGET_CPU}" \
-  cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
+  cargo build --locked --profile pgo-tools --target "${RUST_TARGET_TRIPLE}" \
     --bin pingora --example http3_probe --no-default-features \
     --features "${ALLOCATOR},tls-${TLS_PROVIDER}"
-H3_PROBE="/src/target/pgo-tools/${RUST_TARGET_TRIPLE}/release/examples/http3_probe"
-ORIGIN_BIN="/src/target/pgo-tools/${RUST_TARGET_TRIPLE}/release/pingora"
+H3_PROBE="/src/target/pgo-tools/${RUST_TARGET_TRIPLE}/pgo-tools/examples/http3_probe"
+ORIGIN_BIN="/src/target/pgo-tools/${RUST_TARGET_TRIPLE}/pgo-tools/pingora"
 test -x "${H3_PROBE}"
 test -x "${ORIGIN_BIN}"
 
@@ -123,6 +123,7 @@ for round in $(seq 1 "${PGO_TRAIN_ROUNDS}"); do
       /src/pgo-data/raw/h3
 
   for cc in bbr2 cubic; do
+    [[ "${PGO_TRAIN_FAST:-off}" == on && "${cc}" == cubic ]] && continue
     echo "Rust PGO scenario=upstream-h3-${cc} round=${round}/${PGO_TRAIN_ROUNDS} cpu=${PGO_TRAIN_TARGET_CPU}"
     PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" PGO_TRAIN_ROUND="${round}" \
       bench/pgo_train_upstream_h3.sh "${PGO_BIN}" "${ORIGIN_BIN}" /tmp/pgo-backend \
@@ -131,6 +132,11 @@ for round in $(seq 1 "${PGO_TRAIN_ROUNDS}"); do
 done
 
 for scenario in h1 h2 h3 upstream-h3-bbr2 upstream-h3-cubic tls tail; do
+  if [[ "${scenario}" == upstream-h3-cubic && "${PGO_TRAIN_FAST:-off}" == on ]] \
+    && ! compgen -G "/src/pgo-data/raw/upstream-h3-cubic/*.profraw" >/dev/null; then
+    cp "/src/pgo-data/upstream-h3-bbr2.profdata" "/src/pgo-data/upstream-h3-cubic.profdata"
+    continue
+  fi
   "${RUST_LLVM_PROFDATA}" merge --failure-mode=any \
     -o "/src/pgo-data/${scenario}.profdata" "/src/pgo-data/raw/${scenario}"/*.profraw
 done
@@ -150,11 +156,13 @@ test -s /src/pgo-data/merged.profdata
   echo "cpu=${PGO_TRAIN_TARGET_CPU} rounds=${PGO_TRAIN_ROUNDS}"
   echo "weights h1=${PGO_WEIGHT_H1} h2=${PGO_WEIGHT_H2} h3=${PGO_WEIGHT_H3} upstream_h3_bbr2=${PGO_WEIGHT_UPSTREAM_H3_BBR2} upstream_h3_cubic=${PGO_WEIGHT_UPSTREAM_H3_CUBIC} tls=${PGO_WEIGHT_TLS} tail=${PGO_WEIGHT_TAIL}"
   "${RUST_LLVM_PROFDATA}" show --counts --covered --topn=150 /src/pgo-data/merged.profdata
-  for pair in 'h2 h3' 'h3 upstream-h3-bbr2' 'upstream-h3-bbr2 upstream-h3-cubic' 'upstream-h3-bbr2 tls' 'h3 tail'; do
-    set -- ${pair}
-    echo; echo "=== $1 vs $2 overlap ==="
-    "${RUST_LLVM_PROFDATA}" overlap "/src/pgo-data/$1.profdata" "/src/pgo-data/$2.profdata" || true
-  done
+  if [[ "${PGO_TRAIN_FAST:-off}" != on ]]; then
+    for pair in 'h2 h3' 'h3 upstream-h3-bbr2' 'upstream-h3-bbr2 upstream-h3-cubic' 'upstream-h3-bbr2 tls' 'h3 tail'; do
+      set -- ${pair}
+      echo; echo "=== $1 vs $2 overlap ==="
+      "${RUST_LLVM_PROFDATA}" overlap "/src/pgo-data/$1.profdata" "/src/pgo-data/$2.profdata" || true
+    done
+  fi
 } > /src/pgo-data/profile-summary.txt
 
 RUST_PROFILE_SHA="$(sha256sum /src/pgo-data/merged.profdata | cut -d ' ' -f 1)"

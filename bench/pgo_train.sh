@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# shellcheck source=bench/pgo_train_scale.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pgo_train_scale.sh"
+
 PINGORA_BIN=${1:?usage: pgo_train.sh PINGORA_BIN BACKEND_BIN CLIENT_BIN OUTPUT_DIR SCENARIO}
 BACKEND_BIN=${2:?usage: pgo_train.sh PINGORA_BIN BACKEND_BIN CLIENT_BIN OUTPUT_DIR SCENARIO}
 CLIENT_BIN=${3:?usage: pgo_train.sh PINGORA_BIN BACKEND_BIN CLIENT_BIN OUTPUT_DIR SCENARIO}
@@ -80,29 +83,29 @@ run_h2load() {
 }
 
 train_h1() {
-  "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 1 --requests-per-thread 16000
-  "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 8 --requests-per-thread 10000
-  "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 4 --requests-per-thread 7000 \
+  "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 1 --requests-per-thread "$(pgo_train_scale 16000)"
+  "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 8 --requests-per-thread "$(pgo_train_scale 10000)"
+  "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 4 --requests-per-thread "$(pgo_train_scale 7000)" \
     --path /json/512 --expected-length 512 --body-validation any
-  "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 2 --requests-per-thread 1500 \
+  "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 2 --requests-per-thread "$(pgo_train_scale 1500)" \
     --path /json/65536 --expected-length 65536 --body-validation any
 
-  for _ in $(seq 1 48); do
+  for _ in $(seq 1 "$(pgo_train_scale 48)"); do
     "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 16 --requests-per-thread 16
   done
 
-  run_h2load h1-tls --h1 -n 48000 -c 16 -m 1 --sni pgo.test \
+  run_h2load h1-tls --h1 -n "$(pgo_train_scale 48000)" -c 16 -m 1 --sni pgo.test \
     -H 'host: pgo.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/json/512"
 
-  for _ in $(seq 1 800); do
+  for _ in $(seq 1 "$(pgo_train_scale 800)"); do
     printf '\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00' | \
       curl --noproxy '*' --http1.1 --silent --show-error --output /dev/null \
         -H 'Host: dns.test' -H 'Content-Type: application/dns-message' \
         --data-binary @- "http://127.0.0.1:${HTTP_PORT}/dns-query"
   done
 
-  for _ in $(seq 1 1000); do
+  for _ in $(seq 1 "$(pgo_train_scale 1000)"); do
     curl --noproxy '*' --http1.1 --fail --silent --show-error --output /dev/null \
       -H 'Host: cdn.test' -H 'Range: bytes=4096-8191' \
       "http://127.0.0.1:${HTTP_PORT}/bytes/1048576"
@@ -115,7 +118,7 @@ train_h1() {
   done
 
   for host in pgo.test couch.test; do
-    for _ in $(seq 1 1000); do
+    for _ in $(seq 1 "$(pgo_train_scale 1000)"); do
       curl --noproxy '*' --http1.1 --compressed --fail --silent --show-error --output /dev/null \
         -H "Host: ${host}" -H 'Accept-Encoding: gzip' \
         "http://127.0.0.1:${HTTP_PORT}/json/65536"
@@ -124,37 +127,37 @@ train_h1() {
 }
 
 train_h2() {
-  run_h2load h2-low -n 12000 -c 1 -m 1 -w 16 -W 16 --sni pgo.test \
+  run_h2load h2-low -n "$(pgo_train_scale 12000)" -c 1 -m 1 -w 16 -W 16 --sni pgo.test \
     -H 'host: pgo.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/json/512"
 
-  run_h2load h2-normal -n 48000 -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
+  run_h2load h2-normal -n "$(pgo_train_scale 48000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
     -H 'host: pgo.test' -H 'accept-encoding: identity' \
     -H 'authorization: Bearer pgo-training-token' \
     -H 'cookie: session=pgo; preferences=h2' \
     "https://127.0.0.1:${HTTPS_PORT}/json/512"
 
-  run_h2load h2-high -n 64000 -c 16 -m 32 -w 16 -W 20 --sni pgo.test \
+  run_h2load h2-high -n "$(pgo_train_scale 64000)" -c 16 -m 32 -w 16 -W 20 --sni pgo.test \
     -H 'host: pgo.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/bytes/4096"
 
-  run_h2load h2-large-json -n 8000 -c 4 -m 8 -w 16 -W 20 --sni pgo.test \
+  run_h2load h2-large-json -n "$(pgo_train_scale 8000)" -c 4 -m 8 -w 16 -W 20 --sni pgo.test \
     -H 'host: pgo.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/json/65536"
 
-  run_h2load h2-stream -n 512 -c 4 -m 4 -w 16 -W 20 --sni music.test \
+  run_h2load h2-stream -n "$(pgo_train_scale 512)" -c 4 -m 4 -w 16 -W 20 --sni music.test \
     -H 'host: music.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/stream/1048576"
 
-  run_h2load h2-static -n 24000 -c 4 -m 32 -w 16 -W 20 --sni static.test \
+  run_h2load h2-static -n "$(pgo_train_scale 24000)" -c 4 -m 32 -w 16 -W 20 --sni static.test \
     -H 'host: static.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/hot.bin"
 
-  run_h2load h2-couch -n 12000 -c 4 -m 16 -w 16 -W 20 --sni couch.test \
+  run_h2load h2-couch -n "$(pgo_train_scale 12000)" -c 4 -m 16 -w 16 -W 20 --sni couch.test \
     -H 'host: couch.test' -H 'accept-encoding: gzip' \
     "https://127.0.0.1:${HTTPS_PORT}/json/65536"
 
-  run_h2load h2-doh -n 16000 -c 4 -m 32 -w 16 -W 20 --sni dns.test \
+  run_h2load h2-doh -n "$(pgo_train_scale 16000)" -c 4 -m 32 -w 16 -W 20 --sni dns.test \
     -H 'host: dns.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/dns-query"
 
@@ -186,7 +189,7 @@ tls_cipher() {
 }
 
 train_tls() {
-  for index in $(seq 1 12); do
+  for index in $(seq 1 "$(pgo_train_scale 12)"); do
     run_h2load "tls-fresh-h1-${index}" --h1 -n 128 -c 128 -m 1 --sni pgo.test \
       -H 'host: pgo.test' -H 'accept-encoding: identity' \
       "https://127.0.0.1:${HTTPS_PORT}/json/512"
@@ -215,7 +218,7 @@ train_tls() {
   fi
 
   : >"${OUTPUT_DIR}/tls-resumption.log"
-  for _ in $(seq 1 256); do
+  for _ in $(seq 1 "$(pgo_train_scale 256)"); do
     set +e
     rm -f "${OUTPUT_DIR}/tls-session-next.pem"
     { printf 'GET /json/512 HTTP/1.1\r\nHost: pgo.test\r\nConnection: keep-alive\r\n\r\n'; sleep 0.2; } | \
@@ -239,8 +242,9 @@ train_tls() {
   done
 
   reused_count=$(grep -c '^Reused, TLSv1.3' "${OUTPUT_DIR}/tls-resumption.log" || true)
-  if ((reused_count != 256)); then
-    echo "TLS sessions were not actually resumed: ${reused_count}/256" >&2
+  expected_reuse="$(pgo_train_scale 256)"
+  if ((reused_count != expected_reuse)); then
+    echo "TLS sessions were not actually resumed: ${reused_count}/${expected_reuse}" >&2
     exit 1
   fi
 }
@@ -268,7 +272,7 @@ train_tail() {
   "${CLIENT_BIN}" --port "${HTTP_PORT}" --threads 4 --requests-per-thread 1000 \
     --path /status/500 --expected-status 500 --expected-length 14 --body-validation any
 
-  for _ in $(seq 1 256); do
+  for _ in $(seq 1 "$(pgo_train_scale 256)"); do
     curl --noproxy '*' --silent --show-error --max-time 2 --output /dev/null \
       -H 'Host: pgo.test' "http://127.0.0.1:${HTTP_PORT}/reset" || true
   done
@@ -291,7 +295,7 @@ train_tail() {
   done
 
   large_cookie="session=$(printf 'a%.0s' {1..4096})"
-  for _ in $(seq 1 256); do
+  for _ in $(seq 1 "$(pgo_train_scale 256)"); do
     curl --noproxy '*' --http1.1 --fail --silent --show-error --output /dev/null \
       -H 'Host: pgo.test' -H "Cookie: ${large_cookie}" \
       -H 'Authorization: Bearer tail-latency-training-token' \
@@ -306,10 +310,10 @@ train_tail() {
   # accidental 5xx overloads and made the build nondeterministic. Keep strict
   # zero-failure validation, but train two complementary bursts capped at 320
   # simultaneous streams with more total requests than before.
-  run_h2load tail-h2-connection-burst -n 10000 -c 20 -m 16 -w 15 -W 18 \
+  run_h2load tail-h2-connection-burst -n "$(pgo_train_scale 10000)" -c 20 -m 16 -w 15 -W 18 \
     --sni pgo.test -H 'host: pgo.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/json/512"
-  run_h2load tail-h2-stream-burst -n 10000 -c 10 -m 32 -w 15 -W 18 \
+  run_h2load tail-h2-stream-burst -n "$(pgo_train_scale 10000)" -c 10 -m 32 -w 15 -W 18 \
     --sni pgo.test -H 'host: pgo.test' -H 'accept-encoding: identity' \
     "https://127.0.0.1:${HTTPS_PORT}/json/512"
 }

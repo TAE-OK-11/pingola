@@ -19,7 +19,8 @@ ARG PGO_WEIGHT_UPSTREAM_H3_BBR2=700
 ARG PGO_WEIGHT_UPSTREAM_H3_CUBIC=250
 ARG PGO_WEIGHT_TLS=300
 ARG PGO_WEIGHT_TAIL=80
-ARG PGO_TRAIN_ROUNDS=2
+ARG PGO_TRAIN_ROUNDS=1
+ARG PGO_TRAIN_FAST=on
 ARG PGO_ECDSA_CURVE=prime256v1
 # Native Clang PGO stays off by default. Rust/Clang profile formats must not be
 # merged; enabling native PGO requires Debian llvm-profdata and longer builds.
@@ -86,6 +87,7 @@ ARG PGO_WEIGHT_UPSTREAM_H3_CUBIC
 ARG PGO_WEIGHT_TLS
 ARG PGO_WEIGHT_TAIL
 ARG PGO_TRAIN_ROUNDS
+ARG PGO_TRAIN_FAST
 ARG PGO_ECDSA_CURVE
 ARG PGO_NATIVE_TRAIN_ROUNDS
 ARG BORING_PGO_WEIGHT_H2
@@ -115,7 +117,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
 COPY --link src ./src
 COPY --link examples/http3_probe.rs ./examples/
 COPY --link bench/backend.rs bench/pgo_client.rs bench/pgo_train.sh bench/pgo_train_h3.sh \
-    bench/pgo_train_upstream_h3.sh bench/build_pgo.sh bench/clang_rust_pgo_filter.sh \
+    bench/pgo_train_upstream_h3.sh bench/pgo_train_scale.sh bench/build_pgo.sh bench/clang_rust_pgo_filter.sh \
     bench/clangxx_rust_pgo_filter.sh ./bench/
 
 RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
@@ -128,7 +130,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
     case "${PGO_NATIVE_BORING}" in on|off) ;; *) echo "unsupported native PGO mode: ${PGO_NATIVE_BORING}" >&2; exit 2 ;; esac; \
     case "${RUST_LTO}" in thin|fat) ;; *) echo "unsupported Rust LTO mode: ${RUST_LTO}" >&2; exit 2 ;; esac; \
     case "${RUST_CODEGEN_UNITS}" in 1|2|4|8|16) ;; *) echo "unsupported codegen units: ${RUST_CODEGEN_UNITS}" >&2; exit 2 ;; esac; \
-    chmod 755 bench/pgo_train.sh bench/pgo_train_h3.sh bench/pgo_train_upstream_h3.sh bench/build_pgo.sh \
+    chmod 755 bench/pgo_train.sh bench/pgo_train_h3.sh bench/pgo_train_upstream_h3.sh bench/pgo_train_scale.sh bench/build_pgo.sh \
       bench/clang_rust_pgo_filter.sh bench/clangxx_rust_pgo_filter.sh; \
     if [ "${PGO_MODE}" = off ]; then \
       case "${RUST_TARGET_CPU}" in \
@@ -146,7 +148,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       export RUST_TARGET_TRIPLE RUST_TARGET_CPU RUST_LTO RUST_CODEGEN_UNITS ALLOCATOR TLS_PROVIDER; \
       export PGO_TRAIN_TARGET_CPU PGO_NATIVE_BORING PGO_WEIGHT_H1 PGO_WEIGHT_H2 PGO_WEIGHT_H3; \
       export PGO_WEIGHT_UPSTREAM_H3_BBR2 PGO_WEIGHT_UPSTREAM_H3_CUBIC PGO_WEIGHT_TLS PGO_WEIGHT_TAIL; \
-      export PGO_TRAIN_ROUNDS PGO_ECDSA_CURVE PGO_NATIVE_TRAIN_ROUNDS; \
+      export PGO_TRAIN_ROUNDS PGO_TRAIN_FAST PGO_ECDSA_CURVE PGO_NATIVE_TRAIN_ROUNDS; \
       export BORING_PGO_WEIGHT_H2 BORING_PGO_WEIGHT_H3 BORING_PGO_WEIGHT_UPSTREAM_H3_BBR2; \
       export BORING_PGO_WEIGHT_UPSTREAM_H3_CUBIC BORING_PGO_WEIGHT_TLS RUSTFLAGS_COMMON; \
       bench/build_pgo.sh; \
