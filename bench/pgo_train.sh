@@ -22,7 +22,7 @@ BACKEND_PID=
 PINGORA_PID=
 
 case "${SCENARIO}" in
-  h1|h2|tls|tail|zstd|light-json|bulk|internal|compress_br) ;;
+  h1|h2|tls|tail|zstd|light_json|bulk|internal|compress_br) ;;
   *)
     echo "unsupported PGO scenario: ${SCENARIO}" >&2
     exit 2
@@ -580,7 +580,25 @@ if ! wait_tcp "${HTTP_PORT}" "${PINGORA_PID}" Pingora; then
   exit 1
 fi
 
-"train_${SCENARIO}"
+run_train_scenario() {
+  case "${SCENARIO}" in
+    h1) train_h1 ;;
+    h2) train_h2 ;;
+    tls) train_tls ;;
+    tail) train_tail ;;
+    zstd) train_zstd ;;
+    light_json) train_light_json ;;
+    bulk) train_bulk ;;
+    internal) train_internal ;;
+    compress_br) train_compress_br ;;
+    *)
+      echo "unsupported PGO scenario dispatch: ${SCENARIO}" >&2
+      exit 2
+      ;;
+  esac
+}
+
+run_train_scenario
 
 upstream_connections=$(curl --noproxy '*' --fail --silent --show-error \
   "http://127.0.0.1:${BACKEND_PORT}/stats/connections")
