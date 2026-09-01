@@ -549,6 +549,7 @@ hosts:
   cdn: { domains: ["cdn.test"], handler: navidrome-cdn, upstream: backend }
 route_limits:
   vaultwarden: { rate_per_second: 0, active_requests: 0 }
+  vaultwarden_auth: { rate_per_second: 0, active_requests: 0 }
   navidrome_api: { rate_per_second: 0, active_requests: 0 }
   navidrome_stream: { rate_per_second: 0, active_requests: 0 }
   navidrome_cover: { rate_per_second: 0, active_requests: 0 }
