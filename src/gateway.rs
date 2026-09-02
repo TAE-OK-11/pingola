@@ -2732,7 +2732,7 @@ write_timeout_seconds: 9
         );
         assert_eq!(
             prepared.peer.options.h2_connection_window_size,
-            Some(16 * 1024 * 1024)
+            Some(8 * 1024 * 1024)
         );
         assert_eq!(
             prepared.peer.options.h2_ping_interval,

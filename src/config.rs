@@ -84,7 +84,7 @@ fn default_http2_stream_window_bytes() -> u32 {
 }
 
 fn default_http2_connection_window_bytes() -> u32 {
-    8 * 1024 * 1024
+    4 * 1024 * 1024
 }
 
 fn default_quic_initial_max_data() -> u64 {
@@ -96,7 +96,7 @@ fn default_quic_stream_window() -> u64 {
 }
 
 fn default_quic_max_connection_window() -> u64 {
-    8 * 1024 * 1024
+    4 * 1024 * 1024
 }
 
 fn default_quic_max_stream_window() -> u64 {
@@ -162,7 +162,7 @@ fn default_upstream_http2_stream_window_bytes() -> u32 {
 }
 
 fn default_upstream_http2_connection_window_bytes() -> u32 {
-    16 * 1024 * 1024
+    8 * 1024 * 1024
 }
 
 fn default_upstream_http2_ping_interval_seconds() -> u64 {
@@ -913,7 +913,7 @@ hosts:
         assert_eq!(automatic.protocol, UpstreamProtocol::Auto);
         assert_eq!(automatic.http2_max_concurrent_streams, 128);
         assert_eq!(automatic.http2_stream_window_bytes, 2 * 1024 * 1024);
-        assert_eq!(automatic.http2_connection_window_bytes, 16 * 1024 * 1024);
+        assert_eq!(automatic.http2_connection_window_bytes, 8 * 1024 * 1024);
         assert_eq!(automatic.http2_ping_interval_seconds, 30);
         assert!(!automatic.http3_bbr2);
 

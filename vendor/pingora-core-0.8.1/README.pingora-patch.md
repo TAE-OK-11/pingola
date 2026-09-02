@@ -72,6 +72,10 @@ small set of documented local changes.
   SO_SNDBUF and TCP_NOTSENT_LOWAT for streaming.
 - Reason: keep kernel send/receive pipelines fed without extra userspace
   buffering on Navidrome-sized transfers.
+- Local change: raise L4 `BufStream` write capacity from 1460 B to 16 KiB.
+- Reason: the previous MSS-sized userspace write buffer forced one syscall per
+  small TLS record on large fixed responses; 16 KiB batches writes while
+  TCP_NODELAY still governs kernel packetization.
 
 Remove dependency patches after a released Pingora version adopts equivalent
 versions. Re-evaluate the reuse-hash cache whenever `HttpPeer` changes.
