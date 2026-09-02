@@ -94,10 +94,25 @@ run_h3_probe() {
   local authority=$2
   local path=$3
   local requests=$4
-  local accept_encoding=${5:-}
+  local optional1=${5:-}
+  local optional2=${6:-}
   local attempt
+  local concurrency=1
+  local accept_encoding=
   local -a probe_args=("127.0.0.1:${TARGET_H3_PORT}" "${authority}" "${path}" "${requests}")
 
+  if [[ -n "${optional2}" ]]; then
+    concurrency="${optional1}"
+    accept_encoding="${optional2}"
+  elif [[ -n "${optional1}" ]]; then
+    if [[ "${optional1}" =~ ^[0-9]+$ ]]; then
+      concurrency="${optional1}"
+    else
+      accept_encoding="${optional1}"
+    fi
+  fi
+
+  probe_args+=("${concurrency}")
   if [[ -n "${accept_encoding}" ]]; then
     probe_args+=("${accept_encoding}")
   fi
