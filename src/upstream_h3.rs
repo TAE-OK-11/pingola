@@ -30,7 +30,7 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_UDP_PAYLOAD: usize = 1452;
 const MAX_H3_HEADER_BYTES: u64 = 64 * 1024;
 const MAX_REQUEST_COMMANDS: usize = 128;
-const MAX_PENDING_REQUESTS: usize = 128;
+const MAX_PENDING_REQUESTS: usize = 512;
 const MAX_BODY_FRAMES: usize = 12;
 const H3_BODY_RECV_BUFFER: usize = 64 * 1024;
 const H3_CONTROL_STREAMS: u64 = 8;
@@ -492,7 +492,7 @@ async fn pool_manager(
                 Some(command) => Some(command),
                 None => return,
             }
-        } else if !connected_once {
+        } else if !connected_once && settings.warmup_path.is_none() {
             // Avoid a startup handshake race against a still-booting origin and
             // defer TLS work until the first proxied request actually needs H3.
             match commands.recv().await {
@@ -500,6 +500,8 @@ async fn pool_manager(
                 None => return,
             }
         } else {
+            // Warmup-configured upstreams connect eagerly at boot; reconnects
+            // after a failure also enter run_connection without waiting.
             None
         };
 

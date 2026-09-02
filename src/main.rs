@@ -10,6 +10,7 @@ mod kernel_offload;
 mod kernel_socket;
 mod limits;
 mod preflight;
+mod routing;
 mod static_files;
 mod tls_policy;
 mod upstream_h3;
@@ -316,7 +317,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
             .checked_sub(1)
             .ok_or_else(|| anyhow!("server.downstream_keepalive_requests must be positive"))?,
     );
-    let mut service = ProxyServiceBuilder::new(&server.configuration, gateway)
+    let mut service = ProxyServiceBuilder::new(&server.configuration, gateway.clone())
         .name("pingora-gateway")
         .server_options(http_options)
         .custom(h3_connector.clone(), noop_custom_downstream())
@@ -369,8 +370,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         let h3_runtime = h3_runtime
             .as_ref()
             .expect("HTTP/3 listeners require the shared HTTP/3 runtime");
-        let h3_gateway = Gateway::with_shared(runtime.clone(), upstream_h3.clone(), shared.clone())
-            .context("HTTP/3 gateway bootstrap failed")?;
+        let h3_gateway = gateway.clone();
         http3::start(
             runtime.clone(),
             h3_runtime,
