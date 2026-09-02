@@ -111,6 +111,14 @@ fn default_http3_warmup_path() -> String {
     "/rest/ping".to_string()
 }
 
+fn default_http3_pool_connections() -> u16 {
+    1
+}
+
+fn default_warmup_path() -> String {
+    "/".to_string()
+}
+
 fn default_downstream_request_header_timeout() -> u64 {
     15
 }
@@ -305,6 +313,17 @@ pub struct UpstreamConfig {
     pub http3_warmup: bool,
     #[serde(default = "default_http3_warmup_path")]
     pub http3_warmup_path: String,
+    /// Number of parallel QUIC connections per HTTP/3 upstream pool. Shards
+    /// round-robin new streams to reduce head-of-line blocking on concurrent
+    /// Navidrome transfers.
+    #[serde(default = "default_http3_pool_connections")]
+    pub http3_pool_connections: u16,
+    /// Warm TCP/TLS for H1/H2/TLS upstreams at process start. HTTP/3 origins
+    /// use `http3_warmup` instead.
+    #[serde(default)]
+    pub warmup_on_start: bool,
+    #[serde(default = "default_warmup_path")]
+    pub warmup_path: String,
 }
 
 /// HTTP version policy for a single upstream.
@@ -719,6 +738,12 @@ fn validate(config: &Config) -> Result<()> {
             bail!(
                 "upstream {name} http3_warmup_path must not be empty when http3_warmup is enabled"
             );
+        }
+        if !(1..=8).contains(&upstream.http3_pool_connections) {
+            bail!("upstream {name} http3_pool_connections must be between 1 and 8");
+        }
+        if upstream.warmup_on_start && upstream.warmup_path.is_empty() {
+            bail!("upstream {name} warmup_path must not be empty when warmup_on_start is enabled");
         }
     }
 

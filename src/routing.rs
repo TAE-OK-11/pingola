@@ -4,6 +4,12 @@
 //! selects a prepared upstream plan (TCP/H1/H2 pool group or HTTP/3 bridge).
 //! See `upstream_name_for_route()` for cross-upstream hops such as AdGuard DoH.
 
+//! AdGuard DNS hosts use two upstream definitions when DoH is served on a
+//! separate TLS port from the UI (`adguard_dns` on :3333 vs `adguard_dns_doh`
+//! on :1852). [`upstream_name_for_route`] maps `/dns-query` to the DoH upstream;
+//! all other paths stay on the UI upstream. This mirrors AdGuard Home's split
+//! listener layout and cannot be collapsed without changing the origin ports.
+
 use crate::config::HandlerKind;
 use crate::limits::LimitZone;
 

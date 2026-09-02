@@ -26,8 +26,7 @@ use cloudflare_pingora::proxy::{
     default_fail_to_proxy,
 };
 use http::header::{
-    ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
-    CONTENT_TYPE, EXPIRES, FORWARDED, HOST, HeaderName, HeaderValue, LAST_MODIFIED, PRAGMA,
+    ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, FORWARDED, HOST, HeaderName, HeaderValue,
     STRICT_TRANSPORT_SECURITY, TRANSFER_ENCODING, UPGRADE,
 };
 use http::{Method, Version};
@@ -36,16 +35,21 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_host};
-use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
+use crate::content_encoding::{ContentCoding, EncodingNegotiation};
 use crate::h3_wire;
+use crate::handlers::adguard::{
+    response_allows_compression, response_status_has_no_body, response_status_is_interim,
+    strip_doh_caching_headers,
+};
+use crate::handlers::compression::{
+    configure_downstream_compression, forwards_accept_encoding, uses_downstream_compression,
+};
 use crate::kernel_socket::{self, PROXY_TCP_RCVBUF};
 use crate::limits::{
     ActiveRequestLimiter, ActiveRequestPermit, GlobalConcurrentLimiter, GlobalConcurrentPermit,
     LimitZone, RateLimiter,
 };
-use crate::routing::{
-    RouteClass, classify_route, default_active_limit, upstream_name_for_route,
-};
+use crate::routing::{RouteClass, classify_route, default_active_limit, upstream_name_for_route};
 use crate::static_files::StaticFiles;
 use crate::upstream_h3::{H3_UPSTREAM_ALPN, H3Route, UpstreamH3Registry};
 static LEGACY_HEALTH_WARNING: Once = Once::new();
@@ -95,7 +99,6 @@ const HTTP: HeaderValue = HeaderValue::from_static("http");
 const ON: HeaderValue = HeaderValue::from_static("on");
 const OFF: HeaderValue = HeaderValue::from_static("off");
 const UPGRADE_VALUE: HeaderValue = HeaderValue::from_static("upgrade");
-const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 const HSTS_VALUE: HeaderValue =
     HeaderValue::from_static("max-age=63072000; includeSubDomains; preload");
@@ -1035,12 +1038,7 @@ impl ProxyHttp for Gateway {
             }
         }
         if plan.route == RouteClass::Doh {
-            response.remove_header(&CACHE_CONTROL);
-            response.remove_header(&EXPIRES);
-            response.remove_header(&PRAGMA);
-            response.remove_header(&http::header::ETAG);
-            response.remove_header(&LAST_MODIFIED);
-            response.insert_typed_header(CACHE_CONTROL, NO_STORE);
+            strip_doh_caching_headers(response);
         }
         Ok(())
     }
@@ -1207,164 +1205,6 @@ impl ProxyHttp for Gateway {
             );
         }
     }
-}
-
-/// Let selected application origins negotiate their own response encoding.
-///
-/// Audio, binary DoH, authentication responses and upgraded/long-lived
-/// connections deliberately stay uncompressed. Vaultwarden UI responses use a
-/// separate bounded streaming compressor in the downstream response path.
-fn forwards_accept_encoding(route: RouteClass) -> bool {
-    matches!(route, RouteClass::NavidromeApi | RouteClass::NavidromeCover)
-}
-
-fn uses_downstream_compression(route: RouteClass) -> bool {
-    matches!(
-        route,
-        RouteClass::Vaultwarden | RouteClass::Couchdb | RouteClass::AdguardUi
-    )
-}
-
-fn configure_downstream_compression(
-    session: &mut Session,
-    route: RouteClass,
-    compression_modules: &HttpModules,
-) -> Result<EncodingNegotiation> {
-    let encoding = negotiate_downstream_compression(session, route)?;
-    if encoding.preferred == ContentCoding::NotAcceptable {
-        return Ok(encoding);
-    }
-    if let Some(preferred) = encoding.preferred.as_str() {
-        install_downstream_compression(session, preferred, compression_modules)?;
-    }
-    Ok(encoding)
-}
-
-fn negotiate_downstream_compression(
-    session: &Session,
-    route: RouteClass,
-) -> Result<EncodingNegotiation> {
-    if !uses_downstream_compression(route) {
-        return Ok(EncodingNegotiation {
-            preferred: ContentCoding::Identity,
-            identity_acceptable: true,
-        });
-    }
-
-    let mut values = session.req_header().headers.get_all(ACCEPT_ENCODING).iter();
-    if let Some(first) = values.next()
-        && values.next().is_none()
-        && first.as_bytes().eq_ignore_ascii_case(b"identity")
-    {
-        return Ok(EncodingNegotiation {
-            preferred: ContentCoding::Identity,
-            identity_acceptable: true,
-        });
-    }
-
-    Ok(negotiate(
-        session.req_header().headers.get_all(ACCEPT_ENCODING).iter(),
-    ))
-}
-
-fn install_downstream_compression(
-    session: &mut Session,
-    preferred_encoding: &'static str,
-    compression_modules: &HttpModules,
-) -> Result<()> {
-    session
-        .downstream_session
-        .req_header_mut()
-        .insert_typed_header(
-            ACCEPT_ENCODING,
-            HeaderValue::from_static(preferred_encoding),
-        );
-    session.downstream_modules_ctx = compression_modules.build_ctx();
-    let request = session.downstream_session.req_header();
-    let Some(compression) = session
-        .downstream_modules_ctx
-        .get_mut::<ResponseCompression>()
-    else {
-        return Error::e_explain(
-            ErrorType::InternalError,
-            "failed to initialize selected response compressor",
-        );
-    };
-    compression.request_filter(request);
-    Ok(())
-}
-fn response_allows_compression(response: &ResponseHeader) -> bool {
-    if response_status_has_no_body(response.status.as_u16())
-        || response.status.as_u16() == 206
-        || response.headers.contains_key(CONTENT_RANGE)
-        || response.headers.contains_key(CONTENT_ENCODING)
-    {
-        return false;
-    }
-    if response.headers.get_all(CACHE_CONTROL).iter().any(|value| {
-        value.to_str().is_ok_and(|value| {
-            value.split(',').any(|directive| {
-                directive
-                    .trim()
-                    .split_once('=')
-                    .map_or(directive.trim(), |(name, _)| name.trim())
-                    .eq_ignore_ascii_case("no-transform")
-            })
-        })
-    }) {
-        return false;
-    }
-    if let Some(length) = response.headers.get(CONTENT_LENGTH)
-        && length
-            .to_str()
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .is_none_or(|length| length < 1024)
-    {
-        return false;
-    }
-
-    response
-        .headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(compressible_proxy_content_type)
-}
-
-fn response_status_has_no_body(status: u16) -> bool {
-    (100..200).contains(&status) || status == 204 || status == 205 || status == 304
-}
-
-fn response_status_is_interim(status: u16) -> bool {
-    (100..200).contains(&status) && status != 101
-}
-
-fn compressible_proxy_content_type(value: &str) -> bool {
-    let essence = value.split(';').next().unwrap_or_default().trim();
-    if essence
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/"))
-    {
-        return true;
-    }
-    if [
-        "application/javascript",
-        "application/json",
-        "application/ld+json",
-        "application/manifest+json",
-        "application/xhtml+xml",
-        "application/xml",
-        "application/rss+xml",
-        "image/svg+xml",
-    ]
-    .iter()
-    .any(|candidate| essence.eq_ignore_ascii_case(candidate))
-    {
-        return true;
-    }
-    essence.rsplit_once('+').is_some_and(|(_, suffix)| {
-        suffix.eq_ignore_ascii_case("json") || suffix.eq_ignore_ascii_case("xml")
-    })
 }
 
 fn connection_option_names(
@@ -2087,6 +1927,9 @@ async fn send_health_details(
 mod tests {
     use super::*;
     use crate::config::{Config, RuntimeConfig};
+    use http::header::{
+        CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    };
 
     fn runtime() -> RuntimeConfig {
         let config: Config = serde_saphyr::from_str(

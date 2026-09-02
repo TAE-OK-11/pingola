@@ -5,6 +5,7 @@ mod gateway;
 mod h3_runtime;
 mod h3_session;
 mod h3_wire;
+mod handlers;
 mod http3;
 mod kernel_offload;
 mod kernel_socket;
@@ -15,6 +16,7 @@ mod static_files;
 mod tls_policy;
 mod upstream_h3;
 mod upstream_h3_connector;
+mod upstream_warmup;
 
 use std::fs::{self, Permissions};
 use std::io::{Read, Write};
@@ -298,6 +300,9 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         .context("shared HTTP/3 runtime startup failed")?;
     let upstream_h3 = upstream_h3::start(runtime.clone(), h3_runtime.as_ref())
         .context("upstream HTTP/3 pool startup failed")?;
+    if let Some(handle) = h3_runtime.as_ref() {
+        upstream_warmup::spawn(runtime.clone(), handle);
+    }
     let h3_connector = H3UpstreamConnector::new(upstream_h3.clone());
     let shared = Arc::new(
         GatewayShared::from_runtime(&runtime).context("shared gateway state bootstrap failed")?,
