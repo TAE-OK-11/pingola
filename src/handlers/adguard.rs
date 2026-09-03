@@ -67,6 +67,10 @@ pub fn response_allows_compression(response: &ResponseHeader) -> bool {
 
 fn compressible_proxy_content_type(value: &str) -> bool {
     let essence = value.split(';').next().unwrap_or_default().trim();
+    // `application/grpc+json` would otherwise match the `+json` suffix.
+    if crate::handlers::grpc::classify_content_type(essence.as_bytes()).is_some() {
+        return false;
+    }
     if essence
         .get(..5)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/"))

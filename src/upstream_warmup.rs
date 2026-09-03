@@ -63,7 +63,7 @@ async fn warmup_tls_upstream(
     let alpn: Vec<Vec<u8>> = match upstream.protocol {
         UpstreamProtocol::Auto if upstream.tls => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
         UpstreamProtocol::Auto | UpstreamProtocol::Http1 => vec![b"http/1.1".to_vec()],
-        UpstreamProtocol::Http2 => vec![b"h2".to_vec()],
+        UpstreamProtocol::Http2 | UpstreamProtocol::Grpc => vec![b"h2".to_vec()],
         UpstreamProtocol::Http3 | UpstreamProtocol::Http3Preferred => vec![b"http/1.1".to_vec()],
     };
 
