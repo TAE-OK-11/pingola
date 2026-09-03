@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, bail};
 use http::HeaderValue;
 use ipnet::IpNet;
+use log::warn;
 use serde::Deserialize;
 
 const TRUSTED_PROXY_CACHE_SLOTS: usize = 4;
@@ -199,6 +200,10 @@ pub struct ServerConfig {
     pub https_listen: Vec<String>,
     #[serde(default)]
     pub http3_listen: Vec<String>,
+    /// Deprecated: HTTP/3 no longer uses an internal h2c bridge (`direct-gateway`
+    /// since 2026-08). Accepted for one release and ignored.
+    #[serde(default)]
+    pub http3_internal_listen: Option<String>,
     #[serde(default = "default_http3_max_idle_timeout")]
     pub http3_max_idle_timeout_seconds: u64,
     #[serde(default = "default_http3_max_requests_per_connection")]
@@ -418,6 +423,11 @@ impl RuntimeConfig {
     }
 
     pub fn new(config: Config) -> Result<Self> {
+        if let Some(address) = config.server.http3_internal_listen.as_deref() {
+            warn!(
+                "server.http3_internal_listen={address} is deprecated and ignored; HTTP/3 uses direct-gateway (field will be removed after one release)"
+            );
+        }
         validate(&config)?;
         // Validation guarantees every listener is a SocketAddr and all HTTP/3
         // listeners use the same non-zero port. Cache both derived values once
@@ -818,6 +828,33 @@ hosts:
 "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn accepts_deprecated_http3_internal_listen() {
+        let config: Config = serde_saphyr::from_str(
+            r#"
+server:
+  http_listen: ["127.0.0.1:8080"]
+  https_listen: []
+  http3_internal_listen: "127.0.0.1:18080"
+trusted_proxies: ["127.0.0.0/8"]
+upstreams:
+  app:
+    address: "127.0.0.1:9000"
+hosts:
+  app:
+    domains: ["app.example.com"]
+    handler: navidrome-main
+    upstream: app
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.server.http3_internal_listen.as_deref(),
+            Some("127.0.0.1:18080")
+        );
+        assert!(RuntimeConfig::new(config).is_ok());
     }
 
     #[test]

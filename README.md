@@ -50,6 +50,7 @@ notifications/WebSocket Hub, 본문 없는 응답과 DoH `application/dns-messag
 | config | `/etc/pingora/pingora.yaml` | `/etc/pingola/pingola.yaml` 경고 후 fallback |
 | working directory | `/tmp/pingora` | 없음 |
 | health | `/pingora-health` | `/pingola-health` 경고 후 alias |
+| HTTP/3 internal bridge | `direct-gateway` (내부 h2c 없음) | `server.http3_internal_listen` 경고 후 무시 |
 
 구 config/env/health alias는 한 릴리스 뒤 제거할 예정입니다. 새 이름을 먼저
 검색하고 구 이름을 실제로 사용할 때 프로세스당 한 번만 deprecated 경고를 냅니다.
