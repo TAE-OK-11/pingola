@@ -330,7 +330,8 @@ pub struct UpstreamConfig {
 ///
 /// `auto` negotiates HTTP/2 with ALPN for TLS origins and retains HTTP/1.1 for
 /// plaintext origins. Plaintext HTTP/2 has no ALPN, so h2c prior knowledge must
-/// be explicitly selected with `http2`.
+/// be explicitly selected with `http2`. `grpc` is the same H2-only policy for
+/// gRPC origins.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpstreamProtocol {
@@ -338,6 +339,10 @@ pub enum UpstreamProtocol {
     Auto,
     Http1,
     Http2,
+    /// HTTP/2 only. Same wire as `http2`, but documents a gRPC origin: no H1
+    /// downgrade, and request-time gRPC policy (`te: trailers`, empty DATA EOS,
+    /// optional gRPC-web bridge) applies when Content-Type matches.
+    Grpc,
     Http3,
     Http3Preferred,
 }
@@ -948,6 +953,10 @@ hosts:
         .unwrap();
         assert_eq!(h2c.protocol, UpstreamProtocol::Http2);
         assert_eq!(h2c.http2_max_concurrent_streams, 64);
+
+        let grpc: UpstreamConfig =
+            serde_saphyr::from_str("address: 127.0.0.1:50051\nprotocol: grpc").unwrap();
+        assert_eq!(grpc.protocol, UpstreamProtocol::Grpc);
     }
 
     #[test]

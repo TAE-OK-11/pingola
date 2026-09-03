@@ -2,3 +2,4 @@
 
 pub mod adguard;
 pub mod compression;
+pub mod grpc;

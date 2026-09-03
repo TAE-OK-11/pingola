@@ -19,6 +19,7 @@ use cloudflare_pingora::modules::http::compression::{
     ResponseCompression, ResponseCompressionBuilder,
 };
 use cloudflare_pingora::prelude::HttpPeer;
+use cloudflare_pingora::protocols::http::bridge::grpc_web::GrpcWebCtx;
 use cloudflare_pingora::protocols::tls::CustomALPN;
 use cloudflare_pingora::protocols::{ALPN, Digest, TcpKeepalive};
 use cloudflare_pingora::proxy::{
@@ -27,7 +28,7 @@ use cloudflare_pingora::proxy::{
 };
 use http::header::{
     ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, FORWARDED, HOST, HeaderName, HeaderValue,
-    STRICT_TRANSPORT_SECURITY, TRANSFER_ENCODING, UPGRADE,
+    STRICT_TRANSPORT_SECURITY, TE, TRANSFER_ENCODING, UPGRADE,
 };
 use http::{Method, Version};
 use log::{debug, info, warn};
@@ -44,6 +45,7 @@ use crate::handlers::adguard::{
 use crate::handlers::compression::{
     configure_downstream_compression, forwards_accept_encoding, uses_downstream_compression,
 };
+use crate::handlers::grpc;
 use crate::kernel_socket::{self, PROXY_TCP_RCVBUF};
 use crate::limits::{
     ActiveRequestLimiter, ActiveRequestPermit, GlobalConcurrentLimiter, GlobalConcurrentPermit,
@@ -99,6 +101,7 @@ const HTTP: HeaderValue = HeaderValue::from_static("http");
 const ON: HeaderValue = HeaderValue::from_static("on");
 const OFF: HeaderValue = HeaderValue::from_static("off");
 const UPGRADE_VALUE: HeaderValue = HeaderValue::from_static("upgrade");
+const TE_TRAILERS: HeaderValue = HeaderValue::from_static("trailers");
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 const HSTS_VALUE: HeaderValue =
     HeaderValue::from_static("max-age=63072000; includeSubDomains; preload");
@@ -167,6 +170,7 @@ pub struct RequestContext {
     retries: usize,
     identity_acceptable: bool,
     compression_selected: bool,
+    grpc_web: GrpcWebCtx,
     started_at: Option<Instant>,
     upstream_h3_tcp_fallback: bool,
     _active_request_permit: Option<ActiveRequestPermit>,
@@ -188,6 +192,7 @@ impl Default for RequestContext {
             retries: 0,
             identity_acceptable: true,
             compression_selected: false,
+            grpc_web: GrpcWebCtx::Disabled,
             started_at: None,
             upstream_h3_tcp_fallback: false,
             _active_request_permit: None,
@@ -699,7 +704,8 @@ impl ProxyHttp for Gateway {
             .await;
         };
         let plan = &self.routing.plans[plan_index];
-        let encoding = if uses_downstream_compression(plan.route) {
+        let grpc = grpc::classify_request(session.req_header()).is_some();
+        let encoding = if uses_downstream_compression(plan.route) && !grpc {
             configure_downstream_compression(
                 session,
                 plan.route,
@@ -871,6 +877,7 @@ impl ProxyHttp for Gateway {
     ) -> Result<()> {
         let plan = self.request_plan(ctx)?;
         strip_request_hop_headers(session.req_header(), upstream_request)?;
+        grpc::prepare_upstream_request(upstream_request, &mut ctx.grpc_web);
         upstream_request.headers.reserve(10);
         let client_ip = ctx.upstream_forwarded_for.as_ref().ok_or_else(|| {
             Error::explain(HTTPStatus(500), "upstream forwarded client IP is missing")
@@ -890,7 +897,9 @@ impl ProxyHttp for Gateway {
         upstream_request.insert_typed_header(X_FORWARDED_PROTO, if ctx.tls { HTTPS } else { HTTP });
         upstream_request.insert_typed_header(X_FORWARDED_SSL, if ctx.tls { ON } else { OFF });
 
-        if forwards_accept_encoding(plan.route) {
+        if forwards_accept_encoding(plan.route)
+            && grpc::classify_request(upstream_request).is_none()
+        {
             if let Some(value) = session.req_header().headers.get(ACCEPT_ENCODING) {
                 upstream_request.insert_typed_header(ACCEPT_ENCODING, value.clone());
             } else {
@@ -1005,6 +1014,7 @@ impl ProxyHttp for Gateway {
             && session.req_header().version == Version::HTTP_11
             && session.is_upgrade_req();
         strip_response_hop_headers(response, forwards_upgrade)?;
+        grpc::apply_web_response(&mut ctx.grpc_web, response);
         if self.runtime.config.server.security_headers {
             insert_security_headers(response, plan.handler, ctx.tls)?;
         }
@@ -1046,10 +1056,10 @@ impl ProxyHttp for Gateway {
     async fn response_trailer_filter(
         &self,
         _session: &mut Session,
-        _upstream_trailers: &mut http::HeaderMap,
-        _ctx: &mut Self::CTX,
+        upstream_trailers: &mut http::HeaderMap,
+        ctx: &mut Self::CTX,
     ) -> Result<Option<Bytes>> {
-        Ok(None)
+        ctx.grpc_web.response_trailer_filter(upstream_trailers)
     }
 
     async fn fail_to_proxy(
@@ -1249,6 +1259,23 @@ fn strip_request_hop_headers(
     downstream: &RequestHeader,
     upstream: &mut RequestHeader,
 ) -> Result<()> {
+    // Scan keys before Connection nominations can hide TE. Hub and ordinary
+    // requests have no TE, so this branch is not taken on that path.
+    let mut saw_te = false;
+    let fixed: arrayvec::ArrayVec<HeaderName, 8> = upstream
+        .headers
+        .keys()
+        .filter(|name| {
+            if *name == TE {
+                saw_te = true;
+                true
+            } else {
+                is_fixed_request_hop_header(name)
+            }
+        })
+        .cloned()
+        .collect();
+    let keep_te_trailers = saw_te && te_includes_trailers(&upstream.headers);
     // HTTP/3 requests do not carry HTTP/1-style Connection options.
     if downstream.headers.contains_key(CONNECTION)
         || downstream.headers.contains_key(PROXY_CONNECTION)
@@ -1284,17 +1311,23 @@ fn strip_request_hop_headers(
     }
     // A small normal request usually has fewer headers than this fixed list.
     // One linear scan avoids eight absent-key hash lookups on every request.
-    let fixed: arrayvec::ArrayVec<HeaderName, 8> = upstream
-        .headers
-        .keys()
-        .filter(|name| is_fixed_request_hop_header(name))
-        .cloned()
-        .collect();
     for name in fixed {
         upstream.remove_header(&name);
     }
+    if keep_te_trailers {
+        upstream.insert_typed_header(TE, TE_TRAILERS);
+    }
     normalize_content_length_headers(&mut upstream.headers, 400)?;
     Ok(())
+}
+
+fn te_includes_trailers(headers: &http::HeaderMap) -> bool {
+    headers.get_all(TE).iter().any(|value| {
+        value
+            .as_bytes()
+            .split(|byte| *byte == b',')
+            .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"trailers"))
+    })
 }
 
 fn strip_response_hop_headers(response: &mut ResponseHeader, forwards_upgrade: bool) -> Result<()> {
@@ -1723,7 +1756,7 @@ fn prepare_upstream(
             ALPN::H2H1
         }
         UpstreamProtocol::Auto | UpstreamProtocol::Http1 => ALPN::H1,
-        UpstreamProtocol::Http2 => ALPN::H2,
+        UpstreamProtocol::Http2 | UpstreamProtocol::Grpc => ALPN::H2,
         UpstreamProtocol::Http3 | UpstreamProtocol::Http3Preferred => ALPN::H1,
     };
     peer.options.max_h2_streams = upstream.http2_max_concurrent_streams;
@@ -2186,6 +2219,10 @@ hosts:
             .insert_header(CONTENT_TYPE, "application/octet-stream")
             .unwrap();
         assert!(!response_allows_compression(&response));
+        response
+            .insert_header(CONTENT_TYPE, "application/grpc+json")
+            .unwrap();
+        assert!(!response_allows_compression(&response));
         response.status = http::StatusCode::PARTIAL_CONTENT;
         assert!(!response_allows_compression(&response));
         response.status = http::StatusCode::OK;
@@ -2229,6 +2266,30 @@ hosts:
         ] {
             assert!(!upstream.headers.contains_key(name));
         }
+    }
+
+    #[test]
+    fn te_trailers_survives_hop_stripping_and_other_te_tokens_do_not() {
+        let mut downstream = RequestHeader::build(Method::POST, b"/pkg.Svc/Method", None).unwrap();
+        downstream.insert_header(TE, "trailers").unwrap();
+        let mut upstream = downstream.clone();
+        strip_request_hop_headers(&downstream, &mut upstream).unwrap();
+        assert_eq!(upstream.headers.get(TE).unwrap(), "trailers");
+
+        let mut mixed = RequestHeader::build(Method::POST, b"/pkg.Svc/Method", None).unwrap();
+        mixed.insert_header(TE, "gzip, trailers").unwrap();
+        mixed.insert_header(CONNECTION, "te, keep-alive").unwrap();
+        let mut upstream = mixed.clone();
+        strip_request_hop_headers(&mixed, &mut upstream).unwrap();
+        assert_eq!(upstream.headers.get(TE).unwrap(), "trailers");
+        assert!(!upstream.headers.contains_key(CONNECTION));
+        assert!(!upstream.headers.contains_key(KEEP_ALIVE));
+
+        let mut gzip_only = RequestHeader::build(Method::GET, b"/", None).unwrap();
+        gzip_only.insert_header(TE, "gzip").unwrap();
+        let mut upstream = gzip_only.clone();
+        strip_request_hop_headers(&gzip_only, &mut upstream).unwrap();
+        assert!(!upstream.headers.contains_key(TE));
     }
 
     #[test]
@@ -2444,6 +2505,15 @@ write_timeout_seconds: 9
         let h2c = prepare_upstream("h2c", &h2c, &UpstreamH3Registry::default()).unwrap();
         assert_eq!(h2c.peer.options.alpn, ALPN::H2);
         assert_eq!(h2c.peer.options.max_h2_streams, 64);
+
+        let grpc: crate::config::UpstreamConfig =
+            serde_saphyr::from_str("address: 127.0.0.1:50051\nprotocol: grpc").unwrap();
+        let grpc = prepare_upstream("grpc", &grpc, &UpstreamH3Registry::default()).unwrap();
+        assert_eq!(grpc.peer.options.alpn, ALPN::H2);
+        let hub = prepare_route_peer(&grpc, RouteClass::VaultwardenHub);
+        assert_eq!(hub.options.alpn, ALPN::H1);
+        assert_eq!(hub.options.max_h2_streams, 1);
+        assert!(prepare_route_h3(&grpc, RouteClass::VaultwardenHub).is_none());
     }
 
     #[test]

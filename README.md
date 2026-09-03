@@ -231,7 +231,7 @@ pingora --healthcheck tcp:'[::1]:8080'
 
 ## Upstream HTTP/1.1과 HTTP/2
 
-각 upstream은 `protocol: auto | http1 | http2`를 지원합니다. 기본 `auto`는 TLS
+각 upstream은 `protocol: auto | http1 | http2 | grpc`를 지원합니다. 기본 `auto`는 TLS
 origin에 `h2, http/1.1` ALPN을 제안하고 HTTP/2를 우선 사용합니다. Origin이 H2를
 지원하지 않거나 잘못된 H2 응답을 반환하면 Pingora core가 H1으로 downgrade하고 해당
 peer의 H1 선호를 기억합니다. Plaintext `auto`는 협상 수단이 없으므로 안전하게 H1을
@@ -248,7 +248,16 @@ upstreams:
   trusted_h2c:
     address: "10.0.0.11:8080"
     protocol: http2 # 명시적 h2c prior knowledge; H1 fallback 없음
+  grpc:
+    address: "10.0.0.12:50051"
+    protocol: grpc # H2 only; te: trailers, empty DATA EOS, optional gRPC-web
 ```
+
+`protocol: grpc`는 `http2`와 같은 H2-only ALPN입니다. native gRPC(`application/grpc`)와
+gRPC-web은 `Content-Type`으로만 구분하며 Vaultwarden Hub 경로 분류·H1 WebSocket
+강제·pool group은 그대로입니다. native 요청은 `te: trailers`를 유지하고 HEADERS가
+아니라 empty DATA로 EOS를 보내며, gRPC-web은 Pingora bridge로 H2 gRPC로 변환합니다.
+gRPC 응답은 압축하지 않습니다.
 
 `http2_max_concurrent_streams`는 upstream H2 connection 하나에서 Pingora가 허용하는
 동시 stream 상한이며 1~1024만 허용합니다. 기본값은 128이고 DoH 운영 설정은 짧은
