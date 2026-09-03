@@ -96,7 +96,6 @@ jobs:
         run: |
           cargo test --all-targets --locked
           cargo build --locked
-          sudo setcap cap_net_bind_service=+ep target/debug/pingora
           cargo clippy --all-targets --locked -- -D warnings
 
       - name: Allocator fallback builds
@@ -106,6 +105,7 @@ jobs:
 
       - name: Protocol, security, and HTTP/3 integration
         run: |
+          sudo setcap cap_net_bind_service=+ep target/debug/pingora
           sudo tests/runtime_preflight.sh
           tests/listeners_health.sh
           tests/retries.sh
