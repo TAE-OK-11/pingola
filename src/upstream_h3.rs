@@ -4,7 +4,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
@@ -30,9 +30,10 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_UDP_PAYLOAD: usize = 1452;
 const MAX_H3_HEADER_BYTES: u64 = 64 * 1024;
 const MAX_REQUEST_COMMANDS: usize = 128;
-const MAX_PENDING_REQUESTS: usize = 128;
+const MAX_PENDING_REQUESTS: usize = 512;
+const MAX_H3_POOL_CONNECTIONS: usize = 8;
 const MAX_BODY_FRAMES: usize = 12;
-const H3_BODY_RECV_BUFFER: usize = 24 * 1024;
+const H3_BODY_RECV_BUFFER: usize = 64 * 1024;
 const H3_CONTROL_STREAMS: u64 = 8;
 const CC_CUBIC: &str = "cubic";
 const CC_BBR2: &str = "bbr2";
@@ -102,6 +103,7 @@ struct BridgeSettings {
     quic_max_stream_window: u64,
     quic_send_capacity_factor: f64,
     warmup_path: Option<String>,
+    pool_connections: usize,
 }
 
 pub fn start(
@@ -149,10 +151,12 @@ pub fn start(
             warmup_path: upstream
                 .http3_warmup
                 .then(|| upstream.http3_warmup_path.clone()),
+            pool_connections: usize::from(upstream.http3_pool_connections)
+                .clamp(1, MAX_H3_POOL_CONNECTIONS),
         };
-        let (pool, receiver) = H3Pool::new(&settings);
+        let (pool, receivers) = H3Pool::new(&settings);
         pools.insert(name.clone(), pool);
-        pool_workers.push((settings, receiver, available.clone()));
+        pool_workers.push((settings, receivers, available.clone()));
         routes.insert(
             name.clone(),
             H3Route {
@@ -171,8 +175,15 @@ pub fn start(
     let h3_runtime = h3_runtime
         .ok_or_else(|| anyhow!("upstream HTTP/3 routes require the shared HTTP/3 runtime"))?
         .clone();
-    for (settings, receiver, available) in pool_workers {
-        h3_runtime.spawn(pool_manager(settings, receiver, available));
+    for (settings, receivers, available) in pool_workers {
+        info!(
+            "upstream HTTP/3 pool shards starting: upstream={} shards={}",
+            settings.name,
+            receivers.len()
+        );
+        for receiver in receivers {
+            h3_runtime.spawn(pool_manager(settings.clone(), receiver, available.clone()));
+        }
     }
 
     for (name, route) in &registry.routes {
@@ -214,24 +225,49 @@ fn upstream_server_name(name: &str, upstream: &UpstreamConfig) -> Result<String>
 }
 
 pub(crate) struct H3Pool {
+    shards: Vec<PoolShard>,
+    round_robin: AtomicUsize,
+}
+
+struct PoolShard {
     commands: mpsc::Sender<Command>,
     next_id: AtomicU64,
     request_slots: Arc<Semaphore>,
 }
 
 impl H3Pool {
-    fn new(settings: &BridgeSettings) -> (Arc<Self>, mpsc::Receiver<Command>) {
-        let request_capacity = usize::try_from(settings.max_streams)
+    fn new(settings: &BridgeSettings) -> (Arc<Self>, Vec<mpsc::Receiver<Command>>) {
+        let pool_connections = settings.pool_connections.clamp(1, MAX_H3_POOL_CONNECTIONS);
+        let max_streams = usize::try_from(settings.max_streams)
             .unwrap_or(MAX_PENDING_REQUESTS)
             .clamp(1, MAX_PENDING_REQUESTS);
-        let command_capacity = request_capacity.saturating_mul(2).min(MAX_REQUEST_COMMANDS);
-        let (commands, receiver) = mpsc::channel(command_capacity);
+        let per_shard_capacity = max_streams
+            .div_ceil(pool_connections)
+            .clamp(1, MAX_PENDING_REQUESTS);
+        let command_capacity = per_shard_capacity
+            .saturating_mul(2)
+            .min(MAX_REQUEST_COMMANDS);
+        let mut shards = Vec::with_capacity(pool_connections);
+        let mut receivers = Vec::with_capacity(pool_connections);
+        for _ in 0..pool_connections {
+            let (commands, receiver) = mpsc::channel(command_capacity);
+            shards.push(PoolShard {
+                commands,
+                next_id: AtomicU64::new(1),
+                request_slots: Arc::new(Semaphore::new(per_shard_capacity)),
+            });
+            receivers.push(receiver);
+        }
         let pool = Arc::new(Self {
-            commands,
-            next_id: AtomicU64::new(1),
-            request_slots: Arc::new(Semaphore::new(request_capacity)),
+            shards,
+            round_robin: AtomicUsize::new(0),
         });
-        (pool, receiver)
+        (pool, receivers)
+    }
+
+    fn select_shard(&self) -> &PoolShard {
+        let index = self.round_robin.fetch_add(1, Ordering::Relaxed);
+        &self.shards[index % self.shards.len()]
     }
 
     pub(crate) async fn open(
@@ -240,12 +276,13 @@ impl H3Pool {
         has_body: bool,
         allow_early_data: bool,
     ) -> Result<RequestHandle, BoxError> {
-        let permit = self
+        let shard = self.select_shard();
+        let permit = shard
             .request_slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| boxed_error("upstream HTTP/3 request capacity is exhausted"))?;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = shard.next_id.fetch_add(1, Ordering::Relaxed);
         // Bodyless requests can wait directly on the response. Only streaming
         // uploads need a separate acknowledgement before body frames may be
         // queued, so avoid one allocation and wakeup on the common GET/HEAD/DoH
@@ -257,13 +294,14 @@ impl H3Pool {
             (None, None)
         };
         let (response_tx, response_rx) = oneshot::channel();
-        self.commands
+        shard
+            .commands
             .send(Command::Open {
                 id,
                 headers,
                 has_body,
                 allow_early_data,
-                cancel: self.commands.clone(),
+                cancel: shard.commands.clone(),
                 opened: opened_tx,
                 response: response_tx,
                 permit,
@@ -272,7 +310,7 @@ impl H3Pool {
             .map_err(|_| boxed_error("upstream HTTP/3 worker is unavailable"))?;
         Ok(RequestHandle {
             id,
-            commands: self.commands.clone(),
+            commands: shard.commands.clone(),
             opened: opened_rx,
             response: Some(response_rx),
             cancel_on_drop: true,
@@ -492,7 +530,7 @@ async fn pool_manager(
                 Some(command) => Some(command),
                 None => return,
             }
-        } else if !connected_once {
+        } else if !connected_once && settings.warmup_path.is_none() {
             // Avoid a startup handshake race against a still-booting origin and
             // defer TLS work until the first proxied request actually needs H3.
             match commands.recv().await {
@@ -500,6 +538,8 @@ async fn pool_manager(
                 None => return,
             }
         } else {
+            // Warmup-configured upstreams connect eagerly at boot; reconnects
+            // after a failure also enter run_connection without waiting.
             None
         };
 

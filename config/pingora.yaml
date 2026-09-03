@@ -29,10 +29,10 @@ server:
   static_active_requests_per_client: 16
   http2_max_concurrent_streams: 32
   http2_stream_window_bytes: 1048576
-  http2_connection_window_bytes: 8388608
+  http2_connection_window_bytes: 4194304
   quic_initial_max_data: 4194304
   quic_stream_window: 1048576
-  quic_max_connection_window: 8388608
+  quic_max_connection_window: 4194304
   quic_max_stream_window: 2097152
   quic_send_capacity_factor: 2.0
   downstream_max_connections: 384
@@ -71,9 +71,10 @@ upstreams:
     verify_certificate: true
     http3_bbr2: true
     http3_max_concurrent_streams: 64
+    http3_pool_connections: 2
     http2_max_concurrent_streams: 64
     http2_stream_window_bytes: 1048576
-    http2_connection_window_bytes: 8388608
+    http2_connection_window_bytes: 4194304
     http3_warmup: true
     http3_warmup_path: /rest/ping
     connect_timeout_seconds: 5
@@ -99,8 +100,10 @@ upstreams:
     protocol: auto
     http2_max_concurrent_streams: 256
     http2_stream_window_bytes: 2097152
-    http2_connection_window_bytes: 16777216
+    http2_connection_window_bytes: 8388608
     http2_ping_interval_seconds: 30
+    warmup_on_start: true
+    warmup_path: /
     sni: direct.tae00217.cloud
     verify_certificate: true
     connect_timeout_seconds: 2
@@ -116,8 +119,10 @@ upstreams:
     protocol: auto
     http2_max_concurrent_streams: 256
     http2_stream_window_bytes: 2097152
-    http2_connection_window_bytes: 16777216
+    http2_connection_window_bytes: 8388608
     http2_ping_interval_seconds: 30
+    warmup_on_start: true
+    warmup_path: /
     sni: direct.tae00217.cloud
     verify_certificate: true
     connect_timeout_seconds: 2

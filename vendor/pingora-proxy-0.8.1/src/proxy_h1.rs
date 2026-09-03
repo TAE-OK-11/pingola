@@ -111,6 +111,7 @@ where
         }
 
         let use_bodyless_fast_path = (session.downstream_session.as_http1().is_some()
+            || session.downstream_session.as_http2().is_some()
             || session.downstream_session.is_custom())
             && matches!(session.req_header().method, Method::GET | Method::HEAD)
             && session.as_mut().is_body_empty()
@@ -250,7 +251,9 @@ where
             HttpTask::Header(mut header, end) => {
                 let no_body = session.req_header().method == Method::HEAD
                     || matches!(header.status.as_u16(), 204 | 304);
+                let h2_downstream = session.downstream_session.as_http2().is_some();
                 if !session.downstream_session.is_custom()
+                    && !h2_downstream
                     && !no_body
                     && !header.status.is_informational()
                     && header.headers.get(header::TRANSFER_ENCODING).is_none()

@@ -357,11 +357,11 @@ impl AsRawSocket for RawStreamWrapper {
 // Large read buffering helps reducing syscalls with little trade-off
 // Ssl layer always does "small" reads in 16k (TLS record size) so L4 read buffer helps a lot.
 const BUF_READ_SIZE: usize = 64 * 1024;
-// Small write buf to match MSS. Too large write buf delays real time communication.
-// This buffering effectively implements something similar to Nagle's algorithm.
-// The benefit is that user space can control when to flush, where Nagle's can't be controlled.
-// And userspace buffering reduce both syscalls and small packets.
-const BUF_WRITE_SIZE: usize = 1460;
+// Write buffering trades latency for syscall efficiency. 16 KiB matches the TLS
+// record size used by the SSL layer's small reads and keeps bulk proxy transfers
+// from flushing one MSS per syscall. TCP_NODELAY still controls when packets leave
+// the kernel; this only batches userspace writes into the socket buffer.
+const BUF_WRITE_SIZE: usize = 16 * 1024;
 
 // NOTE: with writer buffering, users need to call flush() to make sure the data is actually
 // sent. Otherwise data could be stuck in the buffer forever or get lost when stream is closed.

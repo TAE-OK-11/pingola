@@ -185,7 +185,7 @@ struct H3RequestBodyWriter {
     pending: BytesMut,
 }
 
-const UPSTREAM_BODY_BATCH_THRESHOLD: usize = 24 * 1024;
+const UPSTREAM_BODY_BATCH_THRESHOLD: usize = 64 * 1024;
 
 #[async_trait]
 impl BodyWrite for H3RequestBodyWriter {

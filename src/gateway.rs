@@ -26,8 +26,7 @@ use cloudflare_pingora::proxy::{
     default_fail_to_proxy,
 };
 use http::header::{
-    ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
-    CONTENT_TYPE, EXPIRES, FORWARDED, HOST, HeaderName, HeaderValue, LAST_MODIFIED, PRAGMA,
+    ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, FORWARDED, HOST, HeaderName, HeaderValue,
     STRICT_TRANSPORT_SECURITY, TRANSFER_ENCODING, UPGRADE,
 };
 use http::{Method, Version};
@@ -36,24 +35,23 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_host};
-use crate::content_encoding::{ContentCoding, EncodingNegotiation, negotiate};
+use crate::content_encoding::{ContentCoding, EncodingNegotiation};
 use crate::h3_wire;
+use crate::handlers::adguard::{
+    response_allows_compression, response_status_has_no_body, response_status_is_interim,
+    strip_doh_caching_headers,
+};
+use crate::handlers::compression::{
+    configure_downstream_compression, forwards_accept_encoding, uses_downstream_compression,
+};
 use crate::kernel_socket::{self, PROXY_TCP_RCVBUF};
 use crate::limits::{
     ActiveRequestLimiter, ActiveRequestPermit, GlobalConcurrentLimiter, GlobalConcurrentPermit,
     LimitZone, RateLimiter,
 };
+use crate::routing::{RouteClass, classify_route, default_active_limit, upstream_name_for_route};
 use crate::static_files::StaticFiles;
 use crate::upstream_h3::{H3_UPSTREAM_ALPN, H3Route, UpstreamH3Registry};
-
-const STREAM_PREFIXES: &[&str] = &[
-    "/rest/stream",
-    "/rest/download",
-    "/stream",
-    "/play",
-    "/ext/stream",
-];
-const COVER_PREFIXES: &[&str] = &["/rest/getCoverArt", "/api/artwork", "/coverart", "/artwork"];
 static LEGACY_HEALTH_WARNING: Once = Once::new();
 thread_local! {
     // A keep-alive or H2 connection normally sends many requests for the same
@@ -101,116 +99,17 @@ const HTTP: HeaderValue = HeaderValue::from_static("http");
 const ON: HeaderValue = HeaderValue::from_static("on");
 const OFF: HeaderValue = HeaderValue::from_static("off");
 const UPGRADE_VALUE: HeaderValue = HeaderValue::from_static("upgrade");
-const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 const HSTS_VALUE: HeaderValue =
     HeaderValue::from_static("max-age=63072000; includeSubDomains; preload");
 const SAMEORIGIN: HeaderValue = HeaderValue::from_static("SAMEORIGIN");
 const REFERRER_POLICY_VALUE: HeaderValue =
     HeaderValue::from_static("strict-origin-when-cross-origin");
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(usize)]
-enum RouteClass {
-    NavidromeStream,
-    NavidromeCover,
-    NavidromeApi,
-    VaultwardenAuth,
-    VaultwardenHub,
-    Vaultwarden,
-    Couchdb,
-    Doh,
-    AdguardUi,
-}
 
-impl RouteClass {
-    const ALL: [Self; 9] = [
-        Self::NavidromeStream,
-        Self::NavidromeCover,
-        Self::NavidromeApi,
-        Self::VaultwardenAuth,
-        Self::VaultwardenHub,
-        Self::Vaultwarden,
-        Self::Couchdb,
-        Self::Doh,
-        Self::AdguardUi,
-    ];
-
-    fn index(self) -> usize {
-        self as usize
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::NavidromeStream => "navidrome_stream",
-            Self::NavidromeCover => "navidrome_cover",
-            Self::NavidromeApi => "navidrome_api",
-            Self::VaultwardenAuth => "vaultwarden_auth",
-            Self::VaultwardenHub => "vaultwarden_hub",
-            Self::Vaultwarden => "vaultwarden",
-            Self::Couchdb => "couchdb",
-            Self::Doh => "doh",
-            Self::AdguardUi => "adguard_ui",
-        }
-    }
-
-    fn default_rate_limit(self) -> Option<(f64, u32)> {
-        match self {
-            Self::NavidromeStream => Some((40.0, 15)),
-            Self::NavidromeCover => Some((20.0, 20)),
-            Self::NavidromeApi => Some((20.0, 30)),
-            Self::VaultwardenAuth => Some((5.0 / 60.0, 3)),
-            Self::Doh => Some((100.0, 200)),
-            _ => None,
-        }
-    }
-
-    fn timeout_seconds(self) -> u64 {
-        match self {
-            Self::NavidromeStream | Self::Couchdb => 3600,
-            Self::VaultwardenHub => 86_400,
-            Self::Vaultwarden | Self::AdguardUi => 300,
-            Self::Doh => 30,
-            _ => 60,
-        }
-    }
-
-    fn upstream_pool_group(self) -> u64 {
-        match self {
-            Self::NavidromeStream => 1,
-            Self::NavidromeCover => 2,
-            Self::NavidromeApi => 3,
-            Self::VaultwardenAuth => 4,
-            Self::VaultwardenHub => 5,
-            Self::Vaultwarden => 6,
-            Self::Couchdb => 7,
-            Self::Doh => 8,
-            Self::AdguardUi => 9,
-        }
-    }
-
-    fn supports_h1_bodyless_fast_path(self) -> bool {
-        // The proxy core independently requires a GET/HEAD with an empty
-        // request body and no Upgrade. HTTP/1 and HTTP/2 share this opt-in.
-        // Response streaming remains bounded to one awaited chunk, so
-        // Navidrome streams and bodyless CouchDB reads retain backpressure
-        // and prompt disconnect propagation without the per-request duplex
-        // channels needed by POST/PUT replication.
-        self != Self::VaultwardenHub
-    }
-
-    fn limit_zone(self) -> LimitZone {
-        match self {
-            Self::NavidromeStream => LimitZone::NavidromeStream,
-            Self::NavidromeCover => LimitZone::NavidromeCover,
-            Self::NavidromeApi => LimitZone::NavidromeApi,
-            Self::VaultwardenAuth => LimitZone::VaultwardenAuth,
-            Self::VaultwardenHub => LimitZone::VaultwardenHub,
-            Self::Vaultwarden => LimitZone::Vaultwarden,
-            Self::Couchdb => LimitZone::Couchdb,
-            Self::Doh => LimitZone::Doh,
-            Self::AdguardUi => LimitZone::AdguardUi,
-        }
-    }
+struct PreparedRouting {
+    hosts: AHashMap<Arc<str>, PreparedHost>,
+    plans: Box<[PreparedPlan]>,
+    compression_modules: HttpModules,
 }
 
 #[derive(Clone, Debug)]
@@ -251,39 +150,7 @@ struct PreparedHost {
 
 impl PreparedHost {
     fn plan(&self, path: &str) -> Option<usize> {
-        let route = match self.handler {
-            HandlerKind::Static => return None,
-            HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn => {
-                if STREAM_PREFIXES
-                    .iter()
-                    .any(|prefix| path.starts_with(prefix))
-                {
-                    RouteClass::NavidromeStream
-                } else if COVER_PREFIXES.iter().any(|prefix| path.starts_with(prefix)) {
-                    RouteClass::NavidromeCover
-                } else {
-                    RouteClass::NavidromeApi
-                }
-            }
-            HandlerKind::Vaultwarden => {
-                if vaultwarden_auth_path(path) {
-                    RouteClass::VaultwardenAuth
-                } else if path.starts_with("/notifications/hub") {
-                    RouteClass::VaultwardenHub
-                } else {
-                    RouteClass::Vaultwarden
-                }
-            }
-            HandlerKind::Couchdb => RouteClass::Couchdb,
-            HandlerKind::AdguardDns | HandlerKind::AdguardKorea => {
-                if path == "/dns-query" {
-                    RouteClass::Doh
-                } else {
-                    RouteClass::AdguardUi
-                }
-            }
-        };
-        self.plans[route.index()]
+        classify_route(self.handler, path).and_then(|route| self.plans[route.index()])
     }
 }
 
@@ -391,9 +258,18 @@ pub struct Gateway {
     runtime: Arc<RuntimeConfig>,
     upstream_h3: Arc<UpstreamH3Registry>,
     shared: Arc<GatewayShared>,
-    hosts: AHashMap<Arc<str>, PreparedHost>,
-    plans: Box<[PreparedPlan]>,
-    compression_modules: HttpModules,
+    routing: Arc<PreparedRouting>,
+}
+
+impl Clone for Gateway {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+            upstream_h3: self.upstream_h3.clone(),
+            shared: self.shared.clone(),
+            routing: self.routing.clone(),
+        }
+    }
 }
 
 impl Gateway {
@@ -480,24 +356,26 @@ impl Gateway {
             runtime,
             upstream_h3,
             shared,
-            hosts,
-            plans: prepared_plans.into_boxed_slice(),
-            compression_modules: {
-                let mut modules = HttpModules::new();
-                modules.add_module(ResponseCompressionBuilder::enable(1));
-                modules
-            },
+            routing: Arc::new(PreparedRouting {
+                hosts,
+                plans: prepared_plans.into_boxed_slice(),
+                compression_modules: {
+                    let mut modules = HttpModules::new();
+                    modules.add_module(ResponseCompressionBuilder::enable(1));
+                    modules
+                },
+            }),
         })
     }
 
     fn host(&self, authority: &str) -> Option<&PreparedHost> {
-        if let Some(host) = self.hosts.get(authority) {
+        if let Some(host) = self.routing.hosts.get(authority) {
             return Some(host);
         }
         let domain = normalized_host(authority);
         match domain {
             std::borrow::Cow::Borrowed(same) if same == authority => None,
-            other => self.hosts.get::<str>(other.as_ref()),
+            other => self.routing.hosts.get::<str>(other.as_ref()),
         }
     }
 
@@ -514,7 +392,8 @@ impl Gateway {
     }
 
     fn request_plan(&self, ctx: &RequestContext) -> Result<&PreparedPlan> {
-        self.plans
+        self.routing
+            .plans
             .get(ctx.plan_index)
             .ok_or_else(|| Error::explain(HTTPStatus(500), "request plan is missing"))
     }
@@ -557,7 +436,7 @@ impl Gateway {
             return false;
         }
         session.response_written().is_some()
-            || self.plans.get(ctx.plan_index).is_some_and(|plan| {
+            || self.routing.plans.get(ctx.plan_index).is_some_and(|plan| {
                 matches!(
                     plan.route,
                     RouteClass::NavidromeStream | RouteClass::NavidromeCover
@@ -637,7 +516,7 @@ impl ProxyHttp for Gateway {
                 return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
             }
         };
-        let path = session.req_header().uri.path();
+        let path = session.req_header().uri.path().to_owned();
 
         if path == "/pingora-health" || path == "/pingora-live" || path == "/pingora-ready" {
             return send_empty(
@@ -807,7 +686,7 @@ impl ProxyHttp for Gateway {
             .await;
         }
 
-        let Some(plan_index) = host.plan(path) else {
+        let Some(plan_index) = host.plan(&path) else {
             return send_empty(
                 &self.runtime,
                 session,
@@ -819,9 +698,13 @@ impl ProxyHttp for Gateway {
             )
             .await;
         };
-        let plan = &self.plans[plan_index];
+        let plan = &self.routing.plans[plan_index];
         let encoding = if uses_downstream_compression(plan.route) {
-            configure_downstream_compression(session, plan.route, &self.compression_modules)?
+            configure_downstream_compression(
+                session,
+                plan.route,
+                &self.routing.compression_modules,
+            )?
         } else {
             EncodingNegotiation {
                 preferred: ContentCoding::Identity,
@@ -919,6 +802,15 @@ impl ProxyHttp for Gateway {
         session.set_write_timeout(Some(plan.downstream_timeout));
         session.set_keepalive(Some(30));
         ctx.plan_index = plan_index;
+        debug!(
+            "integration route host={} path={} route={} handler={:?} upstream_pool_group={} h3_eligible={}",
+            host.name,
+            path,
+            plan.route.name(),
+            plan.handler,
+            plan.route.upstream_pool_group(),
+            plan.h3.is_some(),
+        );
 
         Ok(false)
     }
@@ -938,7 +830,7 @@ impl ProxyHttp for Gateway {
     }
 
     fn precomputed_upstream_peer<'a>(&'a self, ctx: &Self::CTX) -> Option<&'a HttpPeer> {
-        let plan = self.plans.get(ctx.plan_index)?;
+        let plan = self.routing.plans.get(ctx.plan_index)?;
         match plan.h3.as_ref() {
             Some(h3) if h3.route.should_use_direct_h3(ctx.upstream_h3_tcp_fallback) => {
                 Some(&h3.peer)
@@ -948,7 +840,7 @@ impl ProxyHttp for Gateway {
     }
 
     fn h1_bodyless_fast_path(&self, session: &Session, ctx: &Self::CTX) -> bool {
-        let Some(plan) = self.plans.get(ctx.plan_index) else {
+        let Some(plan) = self.routing.plans.get(ctx.plan_index) else {
             return false;
         };
         plan.route.supports_h1_bodyless_fast_path() && !session.is_upgrade_req()
@@ -963,7 +855,7 @@ impl ProxyHttp for Gateway {
     }
 
     fn h1_bodyless_poll_downstream(&self, _session: &Session, ctx: &Self::CTX) -> bool {
-        self.plans.get(ctx.plan_index).is_some_and(|plan| {
+        self.routing.plans.get(ctx.plan_index).is_some_and(|plan| {
             matches!(
                 plan.route,
                 RouteClass::NavidromeStream | RouteClass::NavidromeCover
@@ -1084,6 +976,7 @@ impl ProxyHttp for Gateway {
             .body_bytes
             .saturating_add(body.as_ref().map_or(0, Bytes::len));
         if self
+            .routing
             .plans
             .get(ctx.plan_index)
             .is_some_and(|plan| ctx.body_bytes > plan.max_body_bytes)
@@ -1092,7 +985,7 @@ impl ProxyHttp for Gateway {
         }
         if end_of_stream {
             ctx.body_deadline = None;
-            if let Some(plan) = self.plans.get(ctx.plan_index) {
+            if let Some(plan) = self.routing.plans.get(ctx.plan_index) {
                 session.set_read_timeout(Some(plan.downstream_timeout));
             }
         }
@@ -1105,7 +998,7 @@ impl ProxyHttp for Gateway {
         response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let Some(plan) = self.plans.get(ctx.plan_index) else {
+        let Some(plan) = self.routing.plans.get(ctx.plan_index) else {
             return Ok(());
         };
         let forwards_upgrade = response.status.as_u16() == 101
@@ -1145,12 +1038,7 @@ impl ProxyHttp for Gateway {
             }
         }
         if plan.route == RouteClass::Doh {
-            response.remove_header(&CACHE_CONTROL);
-            response.remove_header(&EXPIRES);
-            response.remove_header(&PRAGMA);
-            response.remove_header(&http::header::ETAG);
-            response.remove_header(&LAST_MODIFIED);
-            response.insert_typed_header(CACHE_CONTROL, NO_STORE);
+            strip_doh_caching_headers(response);
         }
         Ok(())
     }
@@ -1317,164 +1205,6 @@ impl ProxyHttp for Gateway {
             );
         }
     }
-}
-
-/// Let selected application origins negotiate their own response encoding.
-///
-/// Audio, binary DoH, authentication responses and upgraded/long-lived
-/// connections deliberately stay uncompressed. Vaultwarden UI responses use a
-/// separate bounded streaming compressor in the downstream response path.
-fn forwards_accept_encoding(route: RouteClass) -> bool {
-    matches!(route, RouteClass::NavidromeApi | RouteClass::NavidromeCover)
-}
-
-fn uses_downstream_compression(route: RouteClass) -> bool {
-    matches!(
-        route,
-        RouteClass::Vaultwarden | RouteClass::Couchdb | RouteClass::AdguardUi
-    )
-}
-
-fn configure_downstream_compression(
-    session: &mut Session,
-    route: RouteClass,
-    compression_modules: &HttpModules,
-) -> Result<EncodingNegotiation> {
-    let encoding = negotiate_downstream_compression(session, route)?;
-    if encoding.preferred == ContentCoding::NotAcceptable {
-        return Ok(encoding);
-    }
-    if let Some(preferred) = encoding.preferred.as_str() {
-        install_downstream_compression(session, preferred, compression_modules)?;
-    }
-    Ok(encoding)
-}
-
-fn negotiate_downstream_compression(
-    session: &Session,
-    route: RouteClass,
-) -> Result<EncodingNegotiation> {
-    if !uses_downstream_compression(route) {
-        return Ok(EncodingNegotiation {
-            preferred: ContentCoding::Identity,
-            identity_acceptable: true,
-        });
-    }
-
-    let mut values = session.req_header().headers.get_all(ACCEPT_ENCODING).iter();
-    if let Some(first) = values.next()
-        && values.next().is_none()
-        && first.as_bytes().eq_ignore_ascii_case(b"identity")
-    {
-        return Ok(EncodingNegotiation {
-            preferred: ContentCoding::Identity,
-            identity_acceptable: true,
-        });
-    }
-
-    Ok(negotiate(
-        session.req_header().headers.get_all(ACCEPT_ENCODING).iter(),
-    ))
-}
-
-fn install_downstream_compression(
-    session: &mut Session,
-    preferred_encoding: &'static str,
-    compression_modules: &HttpModules,
-) -> Result<()> {
-    session
-        .downstream_session
-        .req_header_mut()
-        .insert_typed_header(
-            ACCEPT_ENCODING,
-            HeaderValue::from_static(preferred_encoding),
-        );
-    session.downstream_modules_ctx = compression_modules.build_ctx();
-    let request = session.downstream_session.req_header();
-    let Some(compression) = session
-        .downstream_modules_ctx
-        .get_mut::<ResponseCompression>()
-    else {
-        return Error::e_explain(
-            ErrorType::InternalError,
-            "failed to initialize selected response compressor",
-        );
-    };
-    compression.request_filter(request);
-    Ok(())
-}
-fn response_allows_compression(response: &ResponseHeader) -> bool {
-    if response_status_has_no_body(response.status.as_u16())
-        || response.status.as_u16() == 206
-        || response.headers.contains_key(CONTENT_RANGE)
-        || response.headers.contains_key(CONTENT_ENCODING)
-    {
-        return false;
-    }
-    if response.headers.get_all(CACHE_CONTROL).iter().any(|value| {
-        value.to_str().is_ok_and(|value| {
-            value.split(',').any(|directive| {
-                directive
-                    .trim()
-                    .split_once('=')
-                    .map_or(directive.trim(), |(name, _)| name.trim())
-                    .eq_ignore_ascii_case("no-transform")
-            })
-        })
-    }) {
-        return false;
-    }
-    if let Some(length) = response.headers.get(CONTENT_LENGTH)
-        && length
-            .to_str()
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .is_none_or(|length| length < 1024)
-    {
-        return false;
-    }
-
-    response
-        .headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(compressible_proxy_content_type)
-}
-
-fn response_status_has_no_body(status: u16) -> bool {
-    (100..200).contains(&status) || status == 204 || status == 205 || status == 304
-}
-
-fn response_status_is_interim(status: u16) -> bool {
-    (100..200).contains(&status) && status != 101
-}
-
-fn compressible_proxy_content_type(value: &str) -> bool {
-    let essence = value.split(';').next().unwrap_or_default().trim();
-    if essence
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/"))
-    {
-        return true;
-    }
-    if [
-        "application/javascript",
-        "application/json",
-        "application/ld+json",
-        "application/manifest+json",
-        "application/xhtml+xml",
-        "application/xml",
-        "application/rss+xml",
-        "image/svg+xml",
-    ]
-    .iter()
-    .any(|candidate| essence.eq_ignore_ascii_case(candidate))
-    {
-        return true;
-    }
-    essence.rsplit_once('+').is_some_and(|(_, suffix)| {
-        suffix.eq_ignore_ascii_case("json") || suffix.eq_ignore_ascii_case("xml")
-    })
 }
 
 fn connection_option_names(
@@ -1895,34 +1625,6 @@ fn forwarded_client_ip_value(ip: IpAddr) -> Result<HeaderValue> {
     Ok(value)
 }
 
-fn vaultwarden_auth_path(path: &str) -> bool {
-    [
-        "/api/accounts/login",
-        "/api/accounts/prelogin",
-        "/identity/connect/token",
-    ]
-    .iter()
-    .any(|prefix| {
-        path == *prefix
-            || path
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.starts_with('/'))
-    })
-}
-
-fn default_active_limit(handler: HandlerKind, route: RouteClass) -> usize {
-    match handler {
-        HandlerKind::NavidromeCdn if route == RouteClass::NavidromeStream => 12,
-        HandlerKind::NavidromeCdn => 48,
-        HandlerKind::NavidromeMain if route == RouteClass::NavidromeStream => 10,
-        HandlerKind::NavidromeMain => 24,
-        HandlerKind::Vaultwarden => 12,
-        HandlerKind::Couchdb => 24,
-        HandlerKind::AdguardDns | HandlerKind::AdguardKorea => 96,
-        HandlerKind::Static => 0,
-    }
-}
-
 fn effective_rate_limit(runtime: &RuntimeConfig, route: RouteClass) -> Option<(f64, u32)> {
     let defaults = route.default_rate_limit();
     let configured = runtime.config.route_limits.get(route.name());
@@ -1951,30 +1653,6 @@ fn upstream_timeouts(route: RouteClass, upstream: &PreparedUpstream) -> (Duratio
             .map(Duration::from_secs)
             .unwrap_or(route_default),
     )
-}
-
-fn upstream_name_for_route(
-    handler: HandlerKind,
-    configured: Option<&str>,
-    route: RouteClass,
-) -> Option<&str> {
-    match (handler, route) {
-        (
-            HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn,
-            RouteClass::NavidromeStream | RouteClass::NavidromeCover | RouteClass::NavidromeApi,
-        )
-        | (
-            HandlerKind::Vaultwarden,
-            RouteClass::VaultwardenAuth | RouteClass::VaultwardenHub | RouteClass::Vaultwarden,
-        )
-        | (HandlerKind::Couchdb, RouteClass::Couchdb)
-        | (HandlerKind::AdguardDns | HandlerKind::AdguardKorea, RouteClass::AdguardUi) => {
-            configured
-        }
-        (HandlerKind::AdguardDns, RouteClass::Doh) => Some("adguard_dns_doh"),
-        (HandlerKind::AdguardKorea, RouteClass::Doh) => Some("adguard_korea_doh"),
-        _ => None,
-    }
 }
 
 fn prepare_route_h3(upstream: &PreparedUpstream, route: RouteClass) -> Option<PreparedH3Peer> {
@@ -2249,6 +1927,9 @@ async fn send_health_details(
 mod tests {
     use super::*;
     use crate::config::{Config, RuntimeConfig};
+    use http::header::{
+        CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    };
 
     fn runtime() -> RuntimeConfig {
         let config: Config = serde_saphyr::from_str(
@@ -2308,7 +1989,7 @@ hosts:
             plan_index: host.plan("/headers").unwrap(),
             ..RequestContext::default()
         };
-        let plan = &gateway.plans[ctx.plan_index];
+        let plan = &gateway.routing.plans[ctx.plan_index];
         let h3 = plan
             .h3
             .as_ref()
@@ -2342,7 +2023,7 @@ hosts:
             gateway.host("app.example.com.").unwrap().domain.as_ref(),
             "app.example.com"
         );
-        let plan = &gateway.plans[host.plan("/rest/stream").unwrap()];
+        let plan = &gateway.routing.plans[host.plan("/rest/stream").unwrap()];
         assert!(plan.peer.cached_reuse_hash.is_some());
     }
 
@@ -2406,7 +2087,10 @@ hosts:
         let peer = gateway
             .precomputed_upstream_peer(&ctx)
             .expect("H1 route must expose a prepared peer");
-        assert!(std::ptr::eq(peer, &gateway.plans[ctx.plan_index].peer));
+        assert!(std::ptr::eq(
+            peer,
+            &gateway.routing.plans[ctx.plan_index].peer
+        ));
     }
 
     #[test]
@@ -2421,6 +2105,7 @@ hosts:
 
     #[test]
     fn recognizes_only_complete_vaultwarden_auth_prefixes() {
+        use crate::routing::vaultwarden_auth_path;
         assert!(vaultwarden_auth_path("/api/accounts/login"));
         assert!(vaultwarden_auth_path("/identity/connect/token/extra"));
         assert!(!vaultwarden_auth_path("/api/accounts/login-evil"));
@@ -2732,7 +2417,7 @@ write_timeout_seconds: 9
         );
         assert_eq!(
             prepared.peer.options.h2_connection_window_size,
-            Some(16 * 1024 * 1024)
+            Some(8 * 1024 * 1024)
         );
         assert_eq!(
             prepared.peer.options.h2_ping_interval,
