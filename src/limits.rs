@@ -31,6 +31,7 @@ pub enum LimitZone {
     NavidromeStream = 3,
     NavidromeCover = 4,
     NavidromeApi = 5,
+    NavidromeGrpc = 12,
     VaultwardenAuth = 6,
     VaultwardenHub = 7,
     Vaultwarden = 8,

@@ -164,6 +164,7 @@ route_limits:
   navidrome_api: { rate_per_second: 0, active_requests: 0 }
   navidrome_stream: { rate_per_second: 0, active_requests: 0 }
   navidrome_cover: { rate_per_second: 0, active_requests: 0 }
+  navidrome_grpc: { rate_per_second: 0, active_requests: 0 }
   couchdb: { rate_per_second: 0, active_requests: 0 }
 EOF_YAML
 

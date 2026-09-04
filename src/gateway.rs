@@ -51,7 +51,10 @@ use crate::limits::{
     ActiveRequestLimiter, ActiveRequestPermit, GlobalConcurrentLimiter, GlobalConcurrentPermit,
     LimitZone, RateLimiter,
 };
-use crate::routing::{RouteClass, classify_route, default_active_limit, upstream_name_for_route};
+use crate::routing::{
+    NAVIDROME_GRPC_UPSTREAM, RouteClass, classify_route, default_active_limit,
+    upstream_name_for_route,
+};
 use crate::static_files::StaticFiles;
 use crate::upstream_h3::{H3_UPSTREAM_ALPN, H3Route, UpstreamH3Registry};
 static LEGACY_HEALTH_WARNING: Once = Once::new();
@@ -319,8 +322,22 @@ impl Gateway {
                     )
                 })?;
                 let plans = RouteClass::ALL.map(|route| {
-                    let upstream_name =
-                        upstream_name_for_route(host.handler, host.upstream.as_deref(), route)?;
+                    // Navidrome gRPC prefers the dedicated plaintext-H2C
+                    // upstream (WireGuard overlay, no second TLS layer).
+                    // Falls back to the handler's configured upstream when it
+                    // is not defined, so older configs keep working over
+                    // TLS H2/H3 against Navidrome's main listener.
+                    let dedicated_grpc = route == RouteClass::NavidromeGrpc
+                        && matches!(
+                            host.handler,
+                            HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn
+                        )
+                        && upstreams.contains_key(NAVIDROME_GRPC_UPSTREAM);
+                    let upstream_name = if dedicated_grpc {
+                        NAVIDROME_GRPC_UPSTREAM
+                    } else {
+                        upstream_name_for_route(host.handler, host.upstream.as_deref(), route)?
+                    };
                     let upstream = upstreams.get(upstream_name)?;
                     let plan_index = prepared_plans.len();
                     prepared_plans.push(PreparedPlan {
@@ -691,7 +708,23 @@ impl ProxyHttp for Gateway {
             .await;
         }
 
-        let Some(plan_index) = host.plan(&path) else {
+        let Some(plan_index) = ({
+            // application/grpc* to Navidrome rides the dedicated plaintext-H2C
+            // plan (prior-knowledge H2, no TLS under WireGuard). Everything
+            // else keeps the existing path-based plan; when the dedicated
+            // upstream is not configured the gRPC plan already falls back to
+            // the handler's upstream, and path routing is the final fallback.
+            let grpc_to_navidrome = grpc::classify_request(session.req_header()).is_some()
+                && matches!(
+                    host.handler,
+                    HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn
+                );
+            if grpc_to_navidrome {
+                host.plans[RouteClass::NavidromeGrpc.index()].or_else(|| host.plan(&path))
+            } else {
+                host.plan(&path)
+            }
+        }) else {
             return send_empty(
                 &self.runtime,
                 session,
@@ -2169,6 +2202,7 @@ hosts:
         }
         for route in [
             RouteClass::NavidromeStream,
+            RouteClass::NavidromeGrpc,
             RouteClass::VaultwardenAuth,
             RouteClass::VaultwardenHub,
             RouteClass::Vaultwarden,
@@ -2190,6 +2224,7 @@ hosts:
             RouteClass::NavidromeStream,
             RouteClass::NavidromeCover,
             RouteClass::NavidromeApi,
+            RouteClass::NavidromeGrpc,
             RouteClass::VaultwardenAuth,
             RouteClass::VaultwardenHub,
             RouteClass::Doh,
@@ -2454,6 +2489,74 @@ write_timeout_seconds: 9
     }
 
     #[test]
+    fn navidrome_grpc_route_prefers_dedicated_h2c_upstream() {
+        let config: Config = serde_saphyr::from_str(
+            r#"
+server:
+  http_listen: ["127.0.0.1:38082"]
+  https_listen: []
+trusted_proxies: ["127.0.0.0/8"]
+upstreams:
+  app:
+    address: "127.0.0.1:9000"
+  navidrome_grpc:
+    address: "127.0.0.1:50051"
+    protocol: grpc
+hosts:
+  app:
+    domains: ["app.example.com"]
+    handler: navidrome-main
+    upstream: app
+"#,
+        )
+        .unwrap();
+        let gateway = Gateway::new(
+            Arc::new(RuntimeConfig::new(config).unwrap()),
+            Arc::new(UpstreamH3Registry::default()),
+        )
+        .unwrap();
+        let host = gateway.host("app.example.com").unwrap();
+        let grpc_plan =
+            &gateway.routing.plans[host.plans[RouteClass::NavidromeGrpc.index()].unwrap()];
+        assert_eq!(grpc_plan.route, RouteClass::NavidromeGrpc);
+        assert_eq!(grpc_plan.peer.options.alpn, ALPN::H2);
+        let api_plan = &gateway.routing.plans[host.plan("/api/playlists").unwrap()];
+        assert_eq!(api_plan.route, RouteClass::NavidromeApi);
+        assert_eq!(api_plan.peer.options.alpn, ALPN::H1);
+    }
+
+    #[test]
+    fn navidrome_grpc_route_falls_back_to_configured_upstream() {
+        let config: Config = serde_saphyr::from_str(
+            r#"
+server:
+  http_listen: ["127.0.0.1:38083"]
+  https_listen: []
+trusted_proxies: ["127.0.0.0/8"]
+upstreams:
+  app:
+    address: "127.0.0.1:9000"
+hosts:
+  app:
+    domains: ["app.example.com"]
+    handler: navidrome-main
+    upstream: app
+"#,
+        )
+        .unwrap();
+        let gateway = Gateway::new(
+            Arc::new(RuntimeConfig::new(config).unwrap()),
+            Arc::new(UpstreamH3Registry::default()),
+        )
+        .unwrap();
+        let host = gateway.host("app.example.com").unwrap();
+        let grpc_plan =
+            &gateway.routing.plans[host.plans[RouteClass::NavidromeGrpc.index()].unwrap()];
+        assert_eq!(grpc_plan.route, RouteClass::NavidromeGrpc);
+        assert_eq!(grpc_plan.peer.options.alpn, ALPN::H1);
+    }
+
+    #[test]
     fn invalid_upstream_address_is_rejected_before_serving_requests() {
         let upstream: crate::config::UpstreamConfig =
             serde_saphyr::from_str("address: '127.0.0.1:not-a-port'").unwrap();
@@ -2560,6 +2663,7 @@ write_timeout_seconds: 9
             RouteClass::NavidromeStream,
             RouteClass::NavidromeCover,
             RouteClass::NavidromeApi,
+            RouteClass::NavidromeGrpc,
             RouteClass::VaultwardenAuth,
             RouteClass::Vaultwarden,
             RouteClass::Couchdb,
@@ -2575,6 +2679,7 @@ write_timeout_seconds: 9
         for (route, expected) in [
             (RouteClass::NavidromeStream, true),
             (RouteClass::NavidromeCover, true),
+            (RouteClass::NavidromeGrpc, false),
             (RouteClass::Vaultwarden, false),
             (RouteClass::NavidromeApi, false),
         ] {

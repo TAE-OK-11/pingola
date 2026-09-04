@@ -766,6 +766,7 @@ fn validate(config: &Config) -> Result<()> {
         "navidrome_stream",
         "navidrome_cover",
         "navidrome_api",
+        "navidrome_grpc",
         "vaultwarden_auth",
         "vaultwarden_hub",
         "vaultwarden",

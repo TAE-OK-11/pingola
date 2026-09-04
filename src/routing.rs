@@ -22,12 +22,19 @@ pub const STREAM_PREFIXES: &[&str] = &[
 ];
 pub const COVER_PREFIXES: &[&str] = &["/rest/getCoverArt", "/api/artwork", "/coverart", "/artwork"];
 
+/// Dedicated plaintext-H2C upstream for Navidrome gRPC over WireGuard.
+/// WireGuard already encrypts the overlay, so gRPC rides prior-knowledge H2C
+/// (`protocol: grpc`, `tls: false`) instead of paying a second TLS layer via
+/// H2/H3. Mirrors the split-listener pattern of AdGuard DoH upstreams.
+pub const NAVIDROME_GRPC_UPSTREAM: &str = "navidrome_grpc";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub enum RouteClass {
     NavidromeStream,
     NavidromeCover,
     NavidromeApi,
+    NavidromeGrpc,
     VaultwardenAuth,
     VaultwardenHub,
     Vaultwarden,
@@ -37,10 +44,11 @@ pub enum RouteClass {
 }
 
 impl RouteClass {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::NavidromeStream,
         Self::NavidromeCover,
         Self::NavidromeApi,
+        Self::NavidromeGrpc,
         Self::VaultwardenAuth,
         Self::VaultwardenHub,
         Self::Vaultwarden,
@@ -58,6 +66,7 @@ impl RouteClass {
             Self::NavidromeStream => "navidrome_stream",
             Self::NavidromeCover => "navidrome_cover",
             Self::NavidromeApi => "navidrome_api",
+            Self::NavidromeGrpc => "navidrome_grpc",
             Self::VaultwardenAuth => "vaultwarden_auth",
             Self::VaultwardenHub => "vaultwarden_hub",
             Self::Vaultwarden => "vaultwarden",
@@ -71,7 +80,7 @@ impl RouteClass {
         match self {
             Self::NavidromeStream => Some((40.0, 15)),
             Self::NavidromeCover => Some((20.0, 20)),
-            Self::NavidromeApi => Some((20.0, 30)),
+            Self::NavidromeApi | Self::NavidromeGrpc => Some((20.0, 30)),
             Self::VaultwardenAuth => Some((5.0 / 60.0, 3)),
             Self::Doh => Some((100.0, 200)),
             _ => None,
@@ -80,7 +89,7 @@ impl RouteClass {
 
     pub fn timeout_seconds(self) -> u64 {
         match self {
-            Self::NavidromeStream | Self::Couchdb => 3600,
+            Self::NavidromeStream | Self::NavidromeGrpc | Self::Couchdb => 3600,
             Self::VaultwardenHub => 86_400,
             Self::Vaultwarden | Self::AdguardUi => 300,
             Self::Doh => 30,
@@ -93,6 +102,7 @@ impl RouteClass {
             Self::NavidromeStream => 1,
             Self::NavidromeCover => 2,
             Self::NavidromeApi => 3,
+            Self::NavidromeGrpc => 10,
             Self::VaultwardenAuth => 4,
             Self::VaultwardenHub => 5,
             Self::Vaultwarden => 6,
@@ -111,6 +121,7 @@ impl RouteClass {
             Self::NavidromeStream => LimitZone::NavidromeStream,
             Self::NavidromeCover => LimitZone::NavidromeCover,
             Self::NavidromeApi => LimitZone::NavidromeApi,
+            Self::NavidromeGrpc => LimitZone::NavidromeGrpc,
             Self::VaultwardenAuth => LimitZone::VaultwardenAuth,
             Self::VaultwardenHub => LimitZone::VaultwardenHub,
             Self::Vaultwarden => LimitZone::Vaultwarden,
@@ -181,7 +192,10 @@ pub fn upstream_name_for_route(
     match (handler, route) {
         (
             HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn,
-            RouteClass::NavidromeStream | RouteClass::NavidromeCover | RouteClass::NavidromeApi,
+            RouteClass::NavidromeStream
+            | RouteClass::NavidromeCover
+            | RouteClass::NavidromeApi
+            | RouteClass::NavidromeGrpc,
         )
         | (
             HandlerKind::Vaultwarden,

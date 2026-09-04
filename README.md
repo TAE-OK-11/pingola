@@ -260,6 +260,16 @@ gRPC-web은 `Content-Type`으로만 구분하며 Vaultwarden Hub 경로 분류·
 아니라 empty DATA로 EOS를 보내며, gRPC-web은 Pingora bridge로 H2 gRPC로 변환합니다.
 gRPC 응답은 압축하지 않습니다.
 
+Navidrome gRPC는 WireGuard 오버레이에서 전용 plaintext H2C upstream
+(`navidrome_grpc`, `tls: false`, `protocol: grpc`, `10.77.0.1:50051`)으로
+나갑니다. WireGuard가 이미 암호화하므로 H2/H3 TLS의 이중 암호화를 피합니다.
+`Content-Type: application/grpc*`인 Navidrome 요청은 path와 무관하게 이 plan으로
+(pool group 10, 3600s timeout) 라우팅되고, 나머지는 기존 path 기반 plan을
+유지합니다. `navidrome_grpc`가 없으면 handler의 기존 upstream으로 fallback되어
+TLS H2/H3로 동작합니다. Navidrome 측은 `ND_PUBLICGRPCADDRESS` /
+`ND_PUBLICGRPCPORT`(기본 `127.0.0.1:50051`) H2C 리스너로 같은 핸들러를
+평문 서빙합니다.
+
 `http2_max_concurrent_streams`는 upstream H2 connection 하나에서 Pingora가 허용하는
 동시 stream 상한이며 1~1024만 허용합니다. 기본값은 128이고 DoH 운영 설정은 짧은
 요청의 multiplexing을 위해 256입니다. 기본 receive window는 stream 2 MiB / connection

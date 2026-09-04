@@ -81,6 +81,26 @@ upstreams:
     idle_timeout_seconds: 300
     read_timeout_seconds: 3600
     write_timeout_seconds: 3600
+  # Plaintext H2C gRPC to Navidrome over WireGuard (ND_PUBLICGRPCADDRESS /
+  # ND_PUBLICGRPCPORT, default 127.0.0.1:50051 -> deploy binds 10.77.0.1:50051).
+  # WireGuard already encrypts the overlay, so prior-knowledge H2C avoids the
+  # double TLS of H2/H3 upstreams. Serves the full public surface
+  # (Ping/Login/CreateAdmin/Invoke/InvokeNative/Open/Subscribe) plus health
+  # and reflection.
+  navidrome_grpc:
+    address: "10.77.0.1:50051"
+    tls: false
+    protocol: grpc
+    http2_max_concurrent_streams: 128
+    http2_stream_window_bytes: 2097152
+    http2_connection_window_bytes: 8388608
+    http2_ping_interval_seconds: 30
+    warmup_on_start: true
+    warmup_path: /rest/ping
+    connect_timeout_seconds: 5
+    idle_timeout_seconds: 300
+    read_timeout_seconds: 3600
+    write_timeout_seconds: 3600
   vaultwarden:
     address: "10.77.0.1:8081"
     protocol: http1
@@ -140,6 +160,10 @@ route_limits:
     burst: 20
     active_requests: 24
   navidrome_api:
+    rate_per_second: 20
+    burst: 30
+    active_requests: 24
+  navidrome_grpc:
     rate_per_second: 20
     burst: 30
     active_requests: 24

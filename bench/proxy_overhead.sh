@@ -96,6 +96,7 @@ route_limits:
   navidrome_stream: { rate_per_second: 0, active_requests: ${ACTIVE_LIMIT} }
   navidrome_cover: { rate_per_second: 0, active_requests: ${ACTIVE_LIMIT} }
   navidrome_api: { rate_per_second: 0, active_requests: ${ACTIVE_LIMIT} }
+  navidrome_grpc: { rate_per_second: 0, active_requests: ${ACTIVE_LIMIT} }
   vaultwarden_auth: { rate_per_second: 0, active_requests: ${ACTIVE_LIMIT} }
   vaultwarden_hub: { rate_per_second: 0, active_requests: ${ACTIVE_LIMIT} }
   vaultwarden: { rate_per_second: 0, active_requests: ${ACTIVE_LIMIT} }
