@@ -223,7 +223,7 @@ jobs:
             TLS_PROVIDER=boringssl
             PGO_MODE=train
             PGO_NATIVE_BORING=on
-            PGO_TRAIN_TARGET_CPU=cascadelake
+            PGO_TRAIN_TARGET_CPU=x86-64-v2
             PGO_TRAIN_ROUNDS=3
             PGO_TRAIN_FAST=off
             PGO_NATIVE_TRAIN_ROUNDS=2

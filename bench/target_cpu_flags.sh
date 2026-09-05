@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared Rust target-cpu validation and matching Clang C/C++ flags for BoringSSL,
-# quiche, and jemalloc native objects. PGO train and final link must use the same
-# RUST_TARGET_CPU so LLVM profiles match the emitted ISA.
+# quiche, and jemalloc native objects. PGO training runs on GitHub Actions
+# (x86-64-v2); final release images may target cascadelake for the proxy VM.
 set -euo pipefail
 
 validate_rust_target_cpu() {
