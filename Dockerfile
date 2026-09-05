@@ -8,7 +8,7 @@ ARG RUST_LTO=fat
 ARG RUST_CODEGEN_UNITS=1
 ARG TLS_PROVIDER=boringssl
 ARG PGO_MODE=off
-ARG PGO_TRAIN_TARGET_CPU=cascadelake
+ARG PGO_TRAIN_TARGET_CPU=x86-64-v2
 ARG PGO_NATIVE_BORING=off
 # Rust PGO: downstream H3 uses direct Gateway integration (no loopback h2c).
 # Weight H3 and upstream H3 heavily; keep H2 for public TLS but below H3.

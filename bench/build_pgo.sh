@@ -52,8 +52,7 @@ esac
 validate_rust_target_cpu "${RUST_TARGET_CPU}"
 validate_rust_target_cpu "${PGO_TRAIN_TARGET_CPU}"
 if [[ "${RUST_TARGET_CPU}" != "${PGO_TRAIN_TARGET_CPU}" ]]; then
-  echo "PGO target mismatch: train=${PGO_TRAIN_TARGET_CPU} final=${RUST_TARGET_CPU}. Per-CPU PGO profiles may not be shared." >&2
-  exit 2
+  echo "PGO cross-CPU training: train=${PGO_TRAIN_TARGET_CPU} final=${RUST_TARGET_CPU} (expected on GHA when shipping cascadelake)" >&2
 fi
 case "${PGO_NATIVE_BORING}" in on|off) ;; *) echo "PGO_NATIVE_BORING must be on or off" >&2; exit 2 ;; esac
 case "${PGO_ECDSA_CURVE}" in prime256v1|secp384r1) ;; *) echo "unsupported ECDSA curve: ${PGO_ECDSA_CURVE}" >&2; exit 2 ;; esac
@@ -184,7 +183,7 @@ done
 test -s /src/pgo-data/merged.profdata
 
 {
-  echo "cpu=${PGO_TRAIN_TARGET_CPU} rounds=${PGO_TRAIN_ROUNDS}"
+  echo "train_cpu=${PGO_TRAIN_TARGET_CPU} final_cpu=${RUST_TARGET_CPU} rounds=${PGO_TRAIN_ROUNDS}"
   echo "weights h1=${PGO_WEIGHT_H1} h2=${PGO_WEIGHT_H2} h3=${PGO_WEIGHT_H3} upstream_h2=${PGO_WEIGHT_UPSTREAM_H2} upstream_h3_bbr2=${PGO_WEIGHT_UPSTREAM_H3_BBR2} upstream_h3_cubic=${PGO_WEIGHT_UPSTREAM_H3_CUBIC} zstd=${PGO_WEIGHT_ZSTD} compress_br=${PGO_WEIGHT_COMPRESS_BR} internal=${PGO_WEIGHT_INTERNAL} bulk=${PGO_WEIGHT_BULK} light_json=${PGO_WEIGHT_LIGHT_JSON} tls=${PGO_WEIGHT_TLS} tail=${PGO_WEIGHT_TAIL} grpc=${PGO_WEIGHT_GRPC}"
   "${RUST_LLVM_PROFDATA}" show --counts --covered --topn=150 /src/pgo-data/merged.profdata
   if [[ "${PGO_TRAIN_FAST:-off}" != on ]]; then
@@ -258,7 +257,7 @@ if [[ "${PGO_NATIVE_BORING}" == on ]]; then
     -o /src/pgo-native/merged.profdata
   test -s /src/pgo-native/merged.profdata
   {
-    echo "cpu=${PGO_TRAIN_TARGET_CPU} rounds=${PGO_NATIVE_TRAIN_ROUNDS}"
+    echo "train_cpu=${PGO_TRAIN_TARGET_CPU} final_cpu=${RUST_TARGET_CPU} rounds=${PGO_NATIVE_TRAIN_ROUNDS}"
     echo "weights h2=${BORING_PGO_WEIGHT_H2} h3=${BORING_PGO_WEIGHT_H3} upstream_h3_bbr2=${BORING_PGO_WEIGHT_UPSTREAM_H3_BBR2} upstream_h3_cubic=${BORING_PGO_WEIGHT_UPSTREAM_H3_CUBIC} tls=${BORING_PGO_WEIGHT_TLS}"
     clang --version | head -n1
     "${NATIVE_LLVM_PROFDATA}" --version | head -n1
