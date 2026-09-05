@@ -145,7 +145,6 @@ start_container pingora-test-https-ipv6 "${RUNTIME}/ipv6.yaml" \
 assert_container_hardening pingora-test-https-ipv6
 curl --noproxy '*' -gkfsS --http2 --resolve health.test:443:[::1] \
   https://health.test:443/pingora-ready -o /dev/null
-local https_logs
 https_logs=$(docker logs pingora-test-https-ipv6 2>&1)
 grep -q 'HTTP/3 frontend started: udp=\["\[::1\]:8443"\]' <<<"${https_logs}"
 
