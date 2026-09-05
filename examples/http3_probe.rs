@@ -166,10 +166,13 @@ async fn main() -> Result<()> {
     }
 
     if let Some(body) = single_body {
-        print!(
-            "{}",
-            String::from_utf8(body).context("HTTP/3 body is not UTF-8")?
-        );
+        match String::from_utf8(body) {
+            Ok(text) => print!("{}", text),
+            Err(err) => eprintln!(
+                "HTTP/3 probe completed 1 request with {} byte binary body",
+                err.into_bytes().len()
+            ),
+        }
     } else {
         eprintln!(
             "HTTP/3 probe completed {requests} requests over one QUIC connection concurrency={concurrency}"
