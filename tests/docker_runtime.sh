@@ -92,8 +92,9 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "${name}") == true ]]
   [[ $(docker inspect --format '{{json .HostConfig.CapDrop}}' "${name}") == '["ALL"]' ]]
   [[ $(docker inspect --format '{{json .HostConfig.CapAdd}}' "${name}") == '["CAP_NET_BIND_SERVICE"]' ]]
-  docker exec "${name}" /usr/local/bin/pingora --allocator-info \
-    | grep -q "^allocator=${EXPECTED_ALLOCATOR} "
+  local allocator_info
+  allocator_info=$(docker exec "${name}" /usr/local/bin/pingora --allocator-info)
+  grep -q "^allocator=${EXPECTED_ALLOCATOR} " <<<"${allocator_info}"
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.allocator"}}' "${name}") == "${EXPECTED_ALLOCATOR}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.target-cpu"}}' "${name}") == "${EXPECTED_TARGET_CPU}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.lto"}}' "${name}") == "${EXPECTED_LTO}" ]]
@@ -144,8 +145,9 @@ start_container pingora-test-https-ipv6 "${RUNTIME}/ipv6.yaml" \
 assert_container_hardening pingora-test-https-ipv6
 curl --noproxy '*' -gkfsS --http2 --resolve health.test:443:[::1] \
   https://health.test:443/pingora-ready -o /dev/null
-docker logs pingora-test-https-ipv6 2>&1 \
-  | grep -q 'HTTP/3 frontend started: udp=\["\[::1\]:8443"\]'
+local https_logs
+https_logs=$(docker logs pingora-test-https-ipv6 2>&1)
+grep -q 'HTTP/3 frontend started: udp=\["\[::1\]:8443"\]' <<<"${https_logs}"
 
 docker exec pingora-test-https-ipv6 /usr/local/bin/pingora \
   --config /etc/pingora/pingora.yaml --check >/dev/null
