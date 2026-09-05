@@ -89,6 +89,18 @@ ensure_h3_ready() {
   return 1
 }
 
+wait_origin_h3_ready() {
+  for _ in {1..200}; do
+    if "${HTTP3_PROBE_BIN}" "127.0.0.1:${ORIGIN_H3_PORT}" origin.test /json/512 1 \
+      >"${OUTPUT_DIR}/origin-h3-ready.out" 2>"${OUTPUT_DIR}/origin-h3-ready.log"; then
+      return 0
+    fi
+    kill -0 "${ORIGIN_PID}" 2>/dev/null || return 1
+    sleep 0.05
+  done
+  return 1
+}
+
 wait_target_h3_ready() {
   for _ in {1..200}; do
     if "${HTTP3_PROBE_BIN}" "127.0.0.1:${TARGET_H3_PORT}" pgo.test /json/512 1 \
@@ -99,6 +111,18 @@ wait_target_h3_ready() {
     sleep 0.05
   done
   return 1
+}
+
+restart_origin_h3_listener() {
+  echo "restarting origin Pingora for a fresh upstream HTTP/3 listener" >&2
+  if [[ -n "${ORIGIN_PID}" ]]; then
+    kill -TERM "${ORIGIN_PID}" >/dev/null 2>&1 || true
+    wait "${ORIGIN_PID}" >/dev/null 2>&1 || true
+    ORIGIN_PID=
+  fi
+  "${ORIGIN_BIN}" --config "${OUTPUT_DIR}/origin.yaml" >>"${OUTPUT_DIR}/origin.log" 2>&1 &
+  ORIGIN_PID=$!
+  wait_origin_h3_ready
 }
 
 restart_target_h3_listener() {
@@ -113,6 +137,11 @@ restart_target_h3_listener() {
   PINGORA_PID=$!
   wait_tcp "${TARGET_HTTPS_PORT}" "${PINGORA_PID}" target
   wait_target_h3_ready
+}
+
+restart_h3_stack() {
+  restart_origin_h3_listener
+  restart_target_h3_listener
 }
 
 run_h3_probe() {
@@ -143,16 +172,17 @@ run_h3_probe() {
     probe_args+=("${accept_encoding}")
   fi
 
-  for attempt in 1 2 3 4 5; do
+  for attempt in 1 2 3 4 5 6 7 8; do
     if ! ensure_h3_ready; then
-      restart_target_h3_listener || exit 1
+      restart_h3_stack || exit 1
     fi
     if "${HTTP3_PROBE_BIN}" "${probe_args[@]}" \
       >"${OUTPUT_DIR}/${name}.out" 2>"${OUTPUT_DIR}/${name}.log"; then
       return 0
     fi
-    if grep -q 'controller is closed' "${OUTPUT_DIR}/${name}.log" 2>/dev/null; then
-      restart_target_h3_listener || exit 1
+    if grep -Eq 'controller is closed|connection closed before all responses' \
+      "${OUTPUT_DIR}/${name}.log" 2>/dev/null; then
+      restart_h3_stack || exit 1
       sleep 1
     else
       sleep 0.5
@@ -256,8 +286,7 @@ wait_tcp "${BACKEND_PORT}" "${BACKEND_PID}" backend
 ORIGIN_PID=$!
 ready=false
 for _ in {1..200}; do
-  if "${HTTP3_PROBE_BIN}" "127.0.0.1:${ORIGIN_H3_PORT}" origin.test /json/512 \
-      >"${OUTPUT_DIR}/origin-readiness.out" 2>"${OUTPUT_DIR}/origin-readiness.log"; then
+  if wait_origin_h3_ready; then
     ready=true; break
   fi
   kill -0 "${ORIGIN_PID}" 2>/dev/null || { sed -n '1,220p' "${OUTPUT_DIR}/origin.log" >&2; exit 1; }
@@ -299,10 +328,15 @@ fi
 for index in $(seq 1 "${H3_JSON_PROBES}"); do
   run_h3_probe "h3-downstream-json-${index}" pgo.test /json/512 "${H3_JSON_REQUESTS}"
 done
-restart_target_h3_listener
-run_h3_probe h3-downstream-stream music.test /stream/524288 "$(pgo_train_scale 8)"
+restart_h3_stack
+H3_STREAM_PROBES="$(pgo_train_scale 8)"
+for index in $(seq 1 "${H3_STREAM_PROBES}"); do
+  # One stream per fresh QUIC session: long bodies on a reused connection can
+  # close the downstream controller before the next request is queued.
+  run_h3_probe "h3-downstream-stream-${index}" music.test /stream/524288 1
+done
 run_h3_probe h3-downstream-bulk pgo.test /bytes/262144 "$(pgo_train_scale 32)"
-restart_target_h3_listener
+restart_h3_stack
 run_h3_probe h3-downstream-compress pgo.test /json/65536 "$(pgo_train_scale 32)" "zstd"
 
 run_h2load small -n "$(pgo_train_scale 6000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
@@ -364,7 +398,7 @@ large_json_requests=1000
 bulk_512k_requests=160
 chunked_128k_requests=256
 h3_downstream_json_requests=$((H3_JSON_PROBES * H3_JSON_REQUESTS))
-h3_downstream_stream_requests=8
+h3_downstream_stream_requests=${H3_STREAM_PROBES}
 h3_downstream_bulk_requests=32
 h3_downstream_compress_requests=32
 resumption_cycles=8
