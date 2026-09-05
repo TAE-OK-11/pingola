@@ -22,6 +22,39 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+release_listen_port() {
+  local port=$1
+  local pid
+  if ! command -v ss >/dev/null 2>&1; then
+    return 0
+  fi
+  while read -r pid; do
+    [[ -n "${pid}" ]] || continue
+    kill -TERM "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+  done < <(ss -H -ltn "sport = :${port}" 2>/dev/null \
+    | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u)
+}
+
+wait_pingora_ready() {
+  local port=$1
+  local pid=$2
+  local log=$3
+  for _ in {1..100}; do
+    if curl --noproxy '*' -fsS "http://127.0.0.1:${port}/pingora-ready" -o /dev/null 2>/dev/null; then
+      return 0
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      cat "${log}" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  echo "Pingora did not become ready on port ${port}" >&2
+  cat "${log}" >&2
+  return 1
+}
+
 rm -rf "${RUNTIME}"
 install -d -m 0755 "${RUNTIME}"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
@@ -54,32 +87,19 @@ for _ in {1..100}; do
 done
 kill -0 "${ORIGIN_PID}"
 
+for port in 28081 38081 38082; do
+  release_listen_port "${port}"
+done
+
 RUST_LOG=info "${PINGORA}" \
   --config "${ROOT}/tests/fixtures/upstream_http3_front.yaml" >"${FRONT_LOG}" 2>&1 &
 FRONT_PID=$!
+wait_pingora_ready 38081 "${FRONT_PID}" "${FRONT_LOG}"
+
 RUST_LOG=info "${PINGORA}" \
   --config "${ROOT}/tests/fixtures/upstream_http3_fallback.yaml" >"${FALLBACK_LOG}" 2>&1 &
 FALLBACK_PID=$!
-
-for port in 38081 38082; do
-  log=${FRONT_LOG}
-  pid=${FRONT_PID}
-  if [[ "${port}" == 38082 ]]; then
-    log=${FALLBACK_LOG}
-    pid=${FALLBACK_PID}
-  fi
-  for _ in {1..100}; do
-    if curl --noproxy '*' -fsS "http://127.0.0.1:${port}/pingora-ready" -o /dev/null 2>/dev/null; then
-      break
-    fi
-    if ! kill -0 "${pid}" 2>/dev/null; then
-      cat "${log}" >&2
-      exit 1
-    fi
-    sleep 0.1
-  done
-  kill -0 "${pid}"
-done
+wait_pingora_ready 38082 "${FALLBACK_PID}" "${FALLBACK_LOG}"
 
 # Strict upstream HTTP/3: a normal Pingora downstream request must traverse the
 # direct upstream HTTP/3 connector and then the persistent QUIC/H3 connection
