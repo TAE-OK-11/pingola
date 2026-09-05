@@ -77,7 +77,7 @@ run_h2load() {
 }
 
 ensure_h3_ready() {
-  for _ in {1..80}; do
+  for _ in {1..120}; do
     if "${HTTP3_PROBE_BIN}" "127.0.0.1:${TARGET_H3_PORT}" pgo.test /json/512 1 \
       >"${OUTPUT_DIR}/h3-ready.out" 2>"${OUTPUT_DIR}/h3-ready.log"; then
       return 0
@@ -117,13 +117,17 @@ run_h3_probe() {
     probe_args+=("${accept_encoding}")
   fi
 
-  for attempt in 1 2 3; do
+  for attempt in 1 2 3 4 5; do
     ensure_h3_ready || exit 1
     if "${HTTP3_PROBE_BIN}" "${probe_args[@]}" \
       >"${OUTPUT_DIR}/${name}.out" 2>"${OUTPUT_DIR}/${name}.log"; then
       return 0
     fi
-    sleep 0.5
+    if grep -q 'controller is closed' "${OUTPUT_DIR}/${name}.log" 2>/dev/null; then
+      sleep 1
+    else
+      sleep 0.5
+    fi
   done
 
   echo "upstream H3 direct-gateway workload failed: ${name}" >&2
@@ -257,16 +261,9 @@ done
   exit 1
 }
 
-run_h2load small -n "$(pgo_train_scale 6000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
-  -H 'host: pgo.test' -H 'accept-encoding: identity' \
-  "https://127.0.0.1:${TARGET_HTTPS_PORT}/json/512"
-run_h2load medium -n "$(pgo_train_scale 3000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
-  -H 'host: pgo.test' -H 'accept-encoding: identity' \
-  "https://127.0.0.1:${TARGET_HTTPS_PORT}/bytes/4096"
-
-# Run direct-gateway H3 probes before long serial bulk transfers. After ~30+
-# minutes of HTTPS/H2 load the downstream QUIC controller can close and later
-# probes fail with "controller is closed" even though the listener is up.
+# Run direct-gateway H3 probes while the downstream QUIC controller is fresh.
+# Long HTTPS/H2 upstream loads first can take several minutes and leave later
+# probes failing with "controller is closed" even though the UDP listener is up.
 H3_JSON_PROBES=4
 H3_JSON_REQUESTS=256
 if [[ "${PGO_TRAIN_FAST:-off}" == on ]]; then
@@ -279,6 +276,13 @@ done
 run_h3_probe h3-downstream-compress pgo.test /json/65536 "$(pgo_train_scale 64)" "zstd"
 run_h3_probe h3-downstream-stream music.test /stream/524288 "$(pgo_train_scale 8)"
 run_h3_probe h3-downstream-bulk pgo.test /bytes/262144 "$(pgo_train_scale 32)"
+
+run_h2load small -n "$(pgo_train_scale 6000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
+  -H 'host: pgo.test' -H 'accept-encoding: identity' \
+  "https://127.0.0.1:${TARGET_HTTPS_PORT}/json/512"
+run_h2load medium -n "$(pgo_train_scale 3000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
+  -H 'host: pgo.test' -H 'accept-encoding: identity' \
+  "https://127.0.0.1:${TARGET_HTTPS_PORT}/bytes/4096"
 
 run_h2load large-json -n "$(pgo_train_scale 1000)" -c 4 -m 8 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
