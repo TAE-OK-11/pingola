@@ -69,6 +69,7 @@ jobs:
         run: |
           bash -n bench/pgo_train_scale.sh
           bash -n bench/target_cpu_flags.sh
+          bash -n bench/rust_lto_flags.sh
           bash -n bench/build_pgo.sh
           bash -n bench/pgo_train.sh
           bash -n bench/pgo_train_h3.sh
@@ -221,10 +222,11 @@ jobs:
             ALLOCATOR=jemalloc
             TLS_PROVIDER=boringssl
             PGO_MODE=train
-            PGO_NATIVE_BORING=off
+            PGO_NATIVE_BORING=on
             PGO_TRAIN_TARGET_CPU=cascadelake
-            PGO_TRAIN_ROUNDS=2
+            PGO_TRAIN_ROUNDS=3
             PGO_TRAIN_FAST=off
+            PGO_NATIVE_TRAIN_ROUNDS=2
             PGO_WEIGHT_H1=60
             PGO_WEIGHT_H2=120
             PGO_WEIGHT_H3=900

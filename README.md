@@ -392,7 +392,7 @@ path로의 해석은 1초 TTL 캐시를 쓰되, miss와 만료 때는 계속 can
 Builder와 runtime은 Debian 13 `trixie-slim`을 사용하고 Actions build마다 base
 manifest를 다시 확인합니다. Rust link는 GNU ld 대신 LLVM `lld`를 사용합니다.
 기본 release profile은 `codegen-units=1`, `opt-level=3`, `panic=abort`, symbol strip,
-Fat LTO (`lto=fat`, `codegen-units=1`), lld `--icf=safe`, linker `-O3`, and
+Fat LTO (`lto=fat`, `codegen-units=1`), lld `--icf=safe`, linker `-O3`/`--lto-O3`, and
 `--lto-partitions=1`입니다. 동일한 0.5 CPU/1 GiB 5라운드 비교에서 Fat은 Thin보다 RPS 6.20%,
 CPU 효율 6.92%가 높고 p99 중앙값 3.62%, peak RSS 중앙값 3.44%가 낮아 기본값으로
 선택했습니다. `RUST_LTO=thin`은 회귀 rollback용으로 계속 지원합니다. `libcap2-bin`은 build 중 file
@@ -419,7 +419,8 @@ upstream keepalive가 실제로 재사용됐음을 검증합니다. curl/h2load/
 `org.opencontainers.image.rust.pgo-train-target-cpu=cascadelake`,
 `org.opencontainers.image.rust.target-cpu` label로 적용 여부를 확인할 수 있습니다.
 PGO 훈련과 최종 code generation은 모두 `cascadelake`를 사용합니다(게시 워크플로:
-`PGO_TRAIN_ROUNDS=2`, `PGO_TRAIN_FAST=off`). BOLT는 build와
+`PGO_TRAIN_ROUNDS=3`, `PGO_TRAIN_FAST=off`, `PGO_NATIVE_BORING=on`으로 BoringSSL/quiche
+Clang instrumentation PGO 포함). BOLT는 build와
 runtime에서 사용하지 않습니다.
 
 ```bash

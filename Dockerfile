@@ -120,7 +120,10 @@ ENV CC=/src/bench/clang_rust_pgo_filter.sh \
     CARGO_PROFILE_RELEASE_LTO=${RUST_LTO} \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang \
     CMAKE_GENERATOR=Ninja \
-    RUSTFLAGS_COMMON="-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections -C link-arg=-Wl,--icf=safe -C link-arg=-Wl,-O3 -C link-arg=-Wl,--lto-partitions=1"
+    RUSTFLAGS_COMMON="-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections -C link-arg=-Wl,--icf=safe -C link-arg=-Wl,-O3 -C link-arg=-Wl,--lto-O3 -C link-arg=-Wl,--lto-partitions=1" \
+    CARGO_PROFILE_PGO_CODEGEN_UNITS=1 \
+    CARGO_PROFILE_PGO_LTO=fat \
+    CARGO_PROFILE_PGO_OPT_LEVEL=3
 
 # Keep dependency downloads in a source-independent layer. BuildKit exports
 # these caches to GitHub Actions, so source-only changes avoid registry churn.
@@ -131,7 +134,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
 COPY --link src ./src
 COPY --link examples ./examples
 COPY --link bench/backend.rs bench/pgo_client.rs bench/pgo_train.sh bench/pgo_train_h3.sh \
-    bench/pgo_train_upstream_h2.sh bench/pgo_train_upstream_h3.sh bench/pgo_train_grpc.sh bench/pgo_train_scale.sh bench/build_pgo.sh bench/target_cpu_flags.sh bench/clang_rust_pgo_filter.sh \
+    bench/pgo_train_upstream_h2.sh bench/pgo_train_upstream_h3.sh bench/pgo_train_grpc.sh bench/pgo_train_scale.sh bench/build_pgo.sh bench/target_cpu_flags.sh bench/rust_lto_flags.sh bench/clang_rust_pgo_filter.sh \
     bench/clangxx_rust_pgo_filter.sh ./bench/
 
 RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
@@ -144,7 +147,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
     case "${PGO_NATIVE_BORING}" in on|off) ;; *) echo "unsupported native PGO mode: ${PGO_NATIVE_BORING}" >&2; exit 2 ;; esac; \
     case "${RUST_LTO}" in thin|fat) ;; *) echo "unsupported Rust LTO mode: ${RUST_LTO}" >&2; exit 2 ;; esac; \
     case "${RUST_CODEGEN_UNITS}" in 1|2|4|8|16) ;; *) echo "unsupported codegen units: ${RUST_CODEGEN_UNITS}" >&2; exit 2 ;; esac; \
-    chmod 755 bench/pgo_train.sh bench/pgo_train_h3.sh bench/pgo_train_upstream_h2.sh bench/pgo_train_upstream_h3.sh bench/pgo_train_grpc.sh bench/pgo_train_scale.sh bench/build_pgo.sh bench/target_cpu_flags.sh \
+    chmod 755 bench/pgo_train.sh bench/pgo_train_h3.sh bench/pgo_train_upstream_h2.sh bench/pgo_train_upstream_h3.sh bench/pgo_train_grpc.sh bench/pgo_train_scale.sh bench/build_pgo.sh bench/target_cpu_flags.sh bench/rust_lto_flags.sh \
       bench/clang_rust_pgo_filter.sh bench/clangxx_rust_pgo_filter.sh; \
     if [ "${PGO_MODE}" = off ]; then \
       # shellcheck source=bench/target_cpu_flags.sh

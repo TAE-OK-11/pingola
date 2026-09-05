@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 # shellcheck source=bench/target_cpu_flags.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/target_cpu_flags.sh"
+# shellcheck source=bench/rust_lto_flags.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rust_lto_flags.sh"
 
 : "${RUST_TARGET_TRIPLE:?}"
 : "${RUST_TARGET_CPU:?}"
@@ -265,7 +267,7 @@ if [[ "${PGO_NATIVE_BORING}" == on ]]; then
   NATIVE_USE_FLAGS="${TARGET_NATIVE_FLAGS} -fprofile-instr-use=/src/pgo-native/merged.profdata -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
 fi
 
-FINAL_RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU} -C profile-use=${RUST_PROFILE_PATH} -C llvm-args=-pgo-warn-missing-function"
+FINAL_RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU} -C profile-use=${RUST_PROFILE_PATH} $(rust_pgo_final_codegen_flags)"
 CARGO_TARGET_DIR=/src/target/pgo-use \
 CFLAGS="${NATIVE_USE_FLAGS}" \
 CXXFLAGS="${NATIVE_USE_FLAGS}" \
