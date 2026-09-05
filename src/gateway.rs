@@ -1730,7 +1730,10 @@ fn prepare_route_h3(upstream: &PreparedUpstream, route: RouteClass) -> Option<Pr
     // gRPC requires HTTP/2 trailers (and the gRPC-web bridge). Navidrome's
     // dedicated gRPC listener is plaintext H2C; do not send those RPCs over
     // the music origin's HTTP/3 pool even when that upstream is preferred.
-    if matches!(route, RouteClass::VaultwardenHub | RouteClass::NavidromeGrpc) {
+    if matches!(
+        route,
+        RouteClass::VaultwardenHub | RouteClass::NavidromeGrpc
+    ) {
         return None;
     }
     let mut h3 = upstream.h3.clone()?;
