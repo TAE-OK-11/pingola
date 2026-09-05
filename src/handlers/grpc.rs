@@ -125,11 +125,8 @@ mod tests {
     fn native_grpc_keeps_te_trailers_and_disables_header_eos() {
         let mut request = request_with_type("application/grpc+proto");
         let mut grpc_web = GrpcWebCtx::default();
-        assert!(!prepare_upstream_request(
-            &mut request,
-            &mut grpc_web,
-            classify_request(&request)
-        ));
+        let kind = classify_request(&request);
+        assert!(!prepare_upstream_request(&mut request, &mut grpc_web, kind));
         assert_eq!(request.headers.get(TE).unwrap(), "trailers");
         assert_eq!(request.send_end_stream(), Some(false));
         assert_eq!(grpc_web, GrpcWebCtx::Disabled);
@@ -139,11 +136,8 @@ mod tests {
     fn grpc_web_converts_to_native_grpc() {
         let mut request = request_with_type("application/grpc-web+proto");
         let mut grpc_web = GrpcWebCtx::default();
-        assert!(prepare_upstream_request(
-            &mut request,
-            &mut grpc_web,
-            classify_request(&request)
-        ));
+        let kind = classify_request(&request);
+        assert!(prepare_upstream_request(&mut request, &mut grpc_web, kind));
         assert_eq!(
             request.headers.get(CONTENT_TYPE).unwrap(),
             "application/grpc+proto"
@@ -157,11 +151,8 @@ mod tests {
     fn non_grpc_requests_are_untouched() {
         let mut request = request_with_type("application/json");
         let mut grpc_web = GrpcWebCtx::default();
-        assert!(!prepare_upstream_request(
-            &mut request,
-            &mut grpc_web,
-            classify_request(&request)
-        ));
+        let kind = classify_request(&request);
+        assert!(!prepare_upstream_request(&mut request, &mut grpc_web, kind));
         assert!(request.headers.get(TE).is_none());
         assert_eq!(request.send_end_stream(), Some(true));
         assert_eq!(grpc_web, GrpcWebCtx::Disabled);
