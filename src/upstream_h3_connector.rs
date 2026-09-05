@@ -198,6 +198,12 @@ impl BodyWrite for H3RequestBodyWriter {
         if data.is_empty() {
             return Ok(());
         }
+        if self.pending.is_empty() && data.len() >= UPSTREAM_BODY_BATCH_THRESHOLD {
+            let chunk = data.split_to(data.len());
+            return send_body_command(&self.commands, self.id, chunk, false)
+                .await
+                .map_err(Self::write_err);
+        }
         self.pending.extend_from_slice(data);
         data.clear();
         if self.pending.len() >= UPSTREAM_BODY_BATCH_THRESHOLD {

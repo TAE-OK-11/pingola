@@ -484,7 +484,7 @@ async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionCont
         return;
     }
 
-    let request_wire = h3_wire::capture_request_wire(&headers);
+    let request_wire = h3_wire::headers_to_bytes_pairs(headers);
     let session = ServerSession::new_custom(Box::new(H3Session::new(
         request,
         request_wire,

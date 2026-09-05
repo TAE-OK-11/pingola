@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::h3_wire;
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
@@ -44,14 +43,14 @@ pub struct H3Session {
     digest: Digest,
     alt_svc: Option<Arc<HeaderValue>>,
     wire_headers: Vec<h3::Header>,
-    request_wire: Option<Vec<h3::Header>>,
+    request_wire: Option<Vec<(Bytes, Bytes)>>,
 }
 
 impl H3Session {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         request_header: RequestHeader,
-        request_wire: Vec<h3::Header>,
+        request_wire: Vec<(Bytes, Bytes)>,
         send: OutboundFrameSender,
         recv: InboundFrameStream,
         request_fin: bool,
@@ -574,8 +573,6 @@ impl CustomSession for H3Session {
     }
 
     fn take_upstream_request_wire(&mut self) -> Option<Vec<(Bytes, Bytes)>> {
-        self.request_wire
-            .take()
-            .map(h3_wire::headers_to_bytes_pairs)
+        self.request_wire.take()
     }
 }
