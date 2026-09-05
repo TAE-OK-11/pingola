@@ -89,6 +89,32 @@ ensure_h3_ready() {
   return 1
 }
 
+wait_target_h3_ready() {
+  for _ in {1..200}; do
+    if "${HTTP3_PROBE_BIN}" "127.0.0.1:${TARGET_H3_PORT}" pgo.test /json/512 1 \
+      >"${OUTPUT_DIR}/target-h3-ready.out" 2>"${OUTPUT_DIR}/target-h3-ready.log"; then
+      return 0
+    fi
+    kill -0 "${PINGORA_PID}" 2>/dev/null || return 1
+    sleep 0.05
+  done
+  return 1
+}
+
+restart_target_h3_listener() {
+  echo "restarting target Pingora for a fresh downstream HTTP/3 listener" >&2
+  if [[ -n "${PINGORA_PID}" ]]; then
+    kill -TERM "${PINGORA_PID}" >/dev/null 2>&1 || true
+    wait "${PINGORA_PID}" >/dev/null 2>&1 || true
+    PINGORA_PID=
+  fi
+  LLVM_PROFILE_FILE="${OUTPUT_DIR}/pingora-upstream-${CC}-r${ROUND}-%p-%m.profraw" \
+    "${PINGORA_BIN}" --config "${OUTPUT_DIR}/target.yaml" >>"${OUTPUT_DIR}/target.log" 2>&1 &
+  PINGORA_PID=$!
+  wait_tcp "${TARGET_HTTPS_PORT}" "${PINGORA_PID}" target
+  wait_target_h3_ready
+}
+
 run_h3_probe() {
   local name=$1
   local authority=$2
@@ -118,12 +144,15 @@ run_h3_probe() {
   fi
 
   for attempt in 1 2 3 4 5; do
-    ensure_h3_ready || exit 1
+    if ! ensure_h3_ready; then
+      restart_target_h3_listener || exit 1
+    fi
     if "${HTTP3_PROBE_BIN}" "${probe_args[@]}" \
       >"${OUTPUT_DIR}/${name}.out" 2>"${OUTPUT_DIR}/${name}.log"; then
       return 0
     fi
     if grep -q 'controller is closed' "${OUTPUT_DIR}/${name}.log" 2>/dev/null; then
+      restart_target_h3_listener || exit 1
       sleep 1
     else
       sleep 0.5
@@ -248,8 +277,7 @@ wait_tcp "${TARGET_HTTPS_PORT}" "${PINGORA_PID}" target
 
 h3_ready=false
 for _ in {1..200}; do
-  if "${HTTP3_PROBE_BIN}" "127.0.0.1:${TARGET_H3_PORT}" pgo.test /json/512 \
-    >"${OUTPUT_DIR}/target-h3-readiness.out" 2>"${OUTPUT_DIR}/target-h3-readiness.log"; then
+  if wait_target_h3_ready; then
     h3_ready=true
     break
   fi
@@ -262,20 +290,20 @@ done
 }
 
 # Run direct-gateway H3 probes while the downstream QUIC controller is fresh.
-# Long HTTPS/H2 upstream loads first can take several minutes and leave later
-# probes failing with "controller is closed" even though the UDP listener is up.
-H3_JSON_PROBES=4
-H3_JSON_REQUESTS=256
+# Heavy zstd/json probes can leave the listener up but reject new QUIC sessions.
+H3_JSON_PROBES=2
+H3_JSON_REQUESTS=128
 if [[ "${PGO_TRAIN_FAST:-off}" == on ]]; then
-  H3_JSON_PROBES=2
-  H3_JSON_REQUESTS=128
+  H3_JSON_REQUESTS=64
 fi
 for index in $(seq 1 "${H3_JSON_PROBES}"); do
   run_h3_probe "h3-downstream-json-${index}" pgo.test /json/512 "${H3_JSON_REQUESTS}"
 done
-run_h3_probe h3-downstream-compress pgo.test /json/65536 "$(pgo_train_scale 64)" "zstd"
+restart_target_h3_listener
 run_h3_probe h3-downstream-stream music.test /stream/524288 "$(pgo_train_scale 8)"
 run_h3_probe h3-downstream-bulk pgo.test /bytes/262144 "$(pgo_train_scale 32)"
+restart_target_h3_listener
+run_h3_probe h3-downstream-compress pgo.test /json/65536 "$(pgo_train_scale 32)" "zstd"
 
 run_h2load small -n "$(pgo_train_scale 6000)" -c 4 -m 16 -w 16 -W 20 --sni pgo.test \
   -H 'host: pgo.test' -H 'accept-encoding: identity' \
@@ -335,9 +363,10 @@ medium_requests=3000
 large_json_requests=1000
 bulk_512k_requests=160
 chunked_128k_requests=256
-h3_downstream_json_requests=1024
+h3_downstream_json_requests=$((H3_JSON_PROBES * H3_JSON_REQUESTS))
 h3_downstream_stream_requests=8
 h3_downstream_bulk_requests=32
+h3_downstream_compress_requests=32
 resumption_cycles=8
 resumption_requests=256
 early_data_client=true
