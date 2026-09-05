@@ -540,7 +540,7 @@ impl ProxyHttp for Gateway {
                 return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
             }
         };
-        let path = session.req_header().uri.path().to_owned();
+        let path = session.req_header().uri.path();
 
         if path == "/pingora-health" || path == "/pingora-live" || path == "/pingora-ready" {
             return send_empty(
@@ -1753,6 +1753,10 @@ fn prepare_route_peer(upstream: &PreparedUpstream, route: RouteClass) -> HttpPee
     if route == RouteClass::VaultwardenHub {
         peer.options.alpn = ALPN::H1;
         peer.options.max_h2_streams = 1;
+    } else if route == RouteClass::NavidromeGrpc {
+        // Navidrome's Go gRPC server expects prior-knowledge HTTP/2 without
+        // HTTP/1 upgrade or ALPN negotiation on plaintext H2C.
+        peer.options.alpn = ALPN::H2;
     }
     let (read_timeout, write_timeout) = upstream_timeouts(route, upstream);
     peer.options.read_timeout = Some(read_timeout);

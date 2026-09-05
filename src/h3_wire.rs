@@ -32,11 +32,10 @@ fn lowercase_key<'a>(name: &[u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
     scratch
 }
 
-/// Capture the downstream HTTP/3 request header block for upstream passthrough.
-pub fn capture_request_wire(headers: &[h3::Header]) -> Vec<h3::Header> {
-    headers.to_vec()
-}
-
+/// Convert the downstream HTTP/3 request header block into byte pairs once.
+///
+/// The QUIC stack hands us an owned header block; keep that single allocation
+/// instead of cloning into `h3::Header` and converting again at upstream open.
 pub fn headers_to_bytes_pairs(headers: Vec<h3::Header>) -> Vec<(Bytes, Bytes)> {
     headers
         .into_iter()
