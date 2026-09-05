@@ -107,3 +107,7 @@ codegen-units = 8
 inherits = "release"
 codegen-units = 1
 lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "symbols"
+incremental = false
