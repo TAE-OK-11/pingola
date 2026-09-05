@@ -173,6 +173,7 @@ pub struct RequestContext {
     retries: usize,
     identity_acceptable: bool,
     compression_selected: bool,
+    grpc: Option<grpc::GrpcKind>,
     grpc_web: GrpcWebCtx,
     started_at: Option<Instant>,
     upstream_h3_tcp_fallback: bool,
@@ -195,6 +196,7 @@ impl Default for RequestContext {
             retries: 0,
             identity_acceptable: true,
             compression_selected: false,
+            grpc: None,
             grpc_web: GrpcWebCtx::Disabled,
             started_at: None,
             upstream_h3_tcp_fallback: false,
@@ -708,13 +710,15 @@ impl ProxyHttp for Gateway {
             .await;
         }
 
+        let grpc_kind = grpc::classify_request(session.req_header());
+        ctx.grpc = grpc_kind;
         let Some(plan_index) = ({
             // application/grpc* to Navidrome rides the dedicated plaintext-H2C
             // plan (prior-knowledge H2, no TLS under WireGuard). Everything
             // else keeps the existing path-based plan; when the dedicated
             // upstream is not configured the gRPC plan already falls back to
             // the handler's upstream, and path routing is the final fallback.
-            let grpc_to_navidrome = grpc::classify_request(session.req_header()).is_some()
+            let grpc_to_navidrome = grpc_kind.is_some()
                 && matches!(
                     host.handler,
                     HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn
@@ -737,8 +741,7 @@ impl ProxyHttp for Gateway {
             .await;
         };
         let plan = &self.routing.plans[plan_index];
-        let grpc = grpc::classify_request(session.req_header()).is_some();
-        let encoding = if uses_downstream_compression(plan.route) && !grpc {
+        let encoding = if uses_downstream_compression(plan.route) && grpc_kind.is_none() {
             configure_downstream_compression(
                 session,
                 plan.route,
@@ -860,7 +863,8 @@ impl ProxyHttp for Gateway {
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let plan = self.request_plan(ctx)?;
-        if let Some(h3) = &plan.h3
+        if ctx.grpc.is_none()
+            && let Some(h3) = &plan.h3
             && h3.route.should_use_direct_h3(ctx.upstream_h3_tcp_fallback)
         {
             return Ok(Box::new(h3.peer.clone()));
@@ -870,6 +874,9 @@ impl ProxyHttp for Gateway {
 
     fn precomputed_upstream_peer<'a>(&'a self, ctx: &Self::CTX) -> Option<&'a HttpPeer> {
         let plan = self.routing.plans.get(ctx.plan_index)?;
+        if ctx.grpc.is_some() {
+            return Some(&plan.peer);
+        }
         match plan.h3.as_ref() {
             Some(h3) if h3.route.should_use_direct_h3(ctx.upstream_h3_tcp_fallback) => {
                 Some(&h3.peer)
@@ -910,7 +917,7 @@ impl ProxyHttp for Gateway {
     ) -> Result<()> {
         let plan = self.request_plan(ctx)?;
         strip_request_hop_headers(session.req_header(), upstream_request)?;
-        grpc::prepare_upstream_request(upstream_request, &mut ctx.grpc_web);
+        grpc::prepare_upstream_request(upstream_request, &mut ctx.grpc_web, ctx.grpc);
         upstream_request.headers.reserve(10);
         let client_ip = ctx.upstream_forwarded_for.as_ref().ok_or_else(|| {
             Error::explain(HTTPStatus(500), "upstream forwarded client IP is missing")
@@ -930,9 +937,7 @@ impl ProxyHttp for Gateway {
         upstream_request.insert_typed_header(X_FORWARDED_PROTO, if ctx.tls { HTTPS } else { HTTP });
         upstream_request.insert_typed_header(X_FORWARDED_SSL, if ctx.tls { ON } else { OFF });
 
-        if forwards_accept_encoding(plan.route)
-            && grpc::classify_request(upstream_request).is_none()
-        {
+        if forwards_accept_encoding(plan.route) && ctx.grpc.is_none() {
             if let Some(value) = session.req_header().headers.get(ACCEPT_ENCODING) {
                 upstream_request.insert_typed_header(ACCEPT_ENCODING, value.clone());
             } else {
@@ -1722,7 +1727,10 @@ fn upstream_timeouts(route: RouteClass, upstream: &PreparedUpstream) -> (Duratio
 }
 
 fn prepare_route_h3(upstream: &PreparedUpstream, route: RouteClass) -> Option<PreparedH3Peer> {
-    if route == RouteClass::VaultwardenHub {
+    // gRPC requires HTTP/2 trailers (and the gRPC-web bridge). Navidrome's
+    // dedicated gRPC listener is plaintext H2C; do not send those RPCs over
+    // the music origin's HTTP/3 pool even when that upstream is preferred.
+    if matches!(route, RouteClass::VaultwardenHub | RouteClass::NavidromeGrpc) {
         return None;
     }
     let mut h3 = upstream.h3.clone()?;
@@ -2617,6 +2625,26 @@ hosts:
         assert_eq!(hub.options.alpn, ALPN::H1);
         assert_eq!(hub.options.max_h2_streams, 1);
         assert!(prepare_route_h3(&grpc, RouteClass::VaultwardenHub).is_none());
+        assert!(prepare_route_h3(&grpc, RouteClass::NavidromeGrpc).is_none());
+    }
+
+    #[test]
+    fn navidrome_grpc_never_selects_upstream_http3() {
+        let origin: std::net::SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let mut h3_peer = HttpPeer::new(origin, false, "navidrome".to_string());
+        h3_peer.options.alpn = ALPN::Custom(CustomALPN::new(H3_UPSTREAM_ALPN.to_vec()));
+        let upstream = PreparedUpstream {
+            peer: HttpPeer::new(origin, true, "music.example".to_string()),
+            h3: Some(PreparedH3Peer {
+                peer: h3_peer,
+                route: crate::upstream_h3::H3Route::preferred_for_tests(origin),
+            }),
+            read_timeout_seconds: None,
+            write_timeout_seconds: None,
+        };
+        assert!(prepare_route_h3(&upstream, RouteClass::NavidromeGrpc).is_none());
+        assert!(prepare_route_h3(&upstream, RouteClass::VaultwardenHub).is_none());
+        assert!(prepare_route_h3(&upstream, RouteClass::NavidromeApi).is_some());
     }
 
     #[test]

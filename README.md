@@ -18,6 +18,7 @@ HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항�
 - Cloudflare BoringSSL를 사용하는 rustls와 다운스트림 TLS 1.3 전용 정책
 - HTTP/1.1 및 HTTP/2, 기본 최대 32개 동시 H2 stream(설정으로 1~1024 override), stream window 256 KiB / connection window 2 MiB / frame 64 KiB
 - 다운스트림 QUIC은 BBRv2, 초기 1 MiB stream / 4 MiB connection window(최대 2/8 MiB), 1 스레드 호스트에서는 current-thread runtime
+- Rust global allocator는 정적 링크 jemalloc(unprefixed malloc, 1 arena, background purge)
 - upstream HTTP/3/QUIC (`http3`/`http3-preferred`) + connection reuse + replay-safe 0-RTT session resumption
 - QUIC Stateless Retry defaults ON; only a trusted private H3 origin should set `server.http3_stateless_retry: false` when accepted 0-RTT is required
 - IPv4/IPv6 listener와 IPv6 socket의 명시적 `IPV6_V6ONLY=true`
@@ -26,7 +27,6 @@ HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항�
 - Navidrome audio 무압축 streaming, Vaultwarden/CouchDB route 압축, DoH 정책
 - 선택적 정적 호스트의 gzip/Brotli/Zstd 동적·사전 압축, bounded asset LRU cache, URI path 1초 TTL 캐시
 - Cloudflare BoringSSL TLS 파일 사전 검사와 UID/GID/mode/symlink 대상 진단
-- Rust global allocator로 정적 링크된 Google TCMalloc(8 KiB logical page)
 - UID/GID `10001:10001`, read-only root filesystem, 최소 capability
 
 Pingora 0.8.1은 다운스트림 HTTP/3/QUIC server를 제공하지 않으므로 HTTP/3와
@@ -332,29 +332,27 @@ client는 계속 처리하고 새로운 client는 idle bucket 정리 전까지 f
 모든 limiter를 끈 [`config/benchmark.yaml`](config/benchmark.yaml)은 localhost
 benchmark 전용이며 운영에 사용하면 안 됩니다.
 
-## TCMalloc 선택과 진단
+## jemalloc 선택과 진단
 
-배포 binary는 `tcmalloc-better` 0.1.19가 포함한 Google TCMalloc/Abseil 소스를
-8 KiB logical page 설정으로 빌드하고 Rust global allocator로 명시적으로
-등록합니다. 빌드 중 별도 Git 저장소나 tarball을 받지 않으며 `LD_PRELOAD`에도
-의존하지 않습니다. 컨테이너가 CPU quota보다 많은 host CPU를 보는 경우에도 RSS가
-커지지 않도록 per-CPU cache를 256 KiB로 제한하고, idle page는 초당 8 MiB 속도로
-background release합니다. huge-page 정책은 image에서 변경하지 않습니다.
+배포 binary는 `tikv-jemallocator`가 정적 링크한 jemalloc을 Rust global allocator와
+C/C++ `malloc`/`free`(BoringSSL 포함)로 함께 사용합니다. unprefixed export가 없으면
+`MALLOC_CONF`가 무시되고 BoringSSL 할당은 glibc로 남습니다. 1 vCPU / 1 GiB
+cgroup에서도 host CPU 수만큼 arena가 생기지 않도록 `narenas:1`을 쓰고
+`percpu_arena`는 끕니다. idle dirty page는 1초 decay와 jemalloc background
+thread가 반환하며, muzzy 단계는 생략합니다.
 
 ```bash
 pingora --allocator-info
 PINGORA_ALLOCATOR_STATS=1 pingora --config config/pingora.yaml
 ```
 
-출력이 `allocator=tcmalloc implementation=google-tcmalloc`인지 CI와 Docker runtime
-test에서 검사합니다. `PINGORA_JEMALLOC_STATS`는 이전 배포와의 환경변수 호환을
-위한 deprecated fallback이며 새 배포에서는 사용하지 마십시오. TCMalloc의
-huge-page 관련 환경값은 운영 서버 측정 없이 고정하지 않습니다.
+출력이 `allocator=jemalloc`인지 CI와 Docker runtime test에서 검사합니다.
+`PINGORA_JEMALLOC_STATS`는 이전 배포와의 환경변수 호환을 위한 deprecated
+fallback이며 새 배포에서는 `PINGORA_ALLOCATOR_STATS`를 사용하십시오.
 
 `server.health_details: true`와 진단 환경변수를 모두 명시한 경우에만 실행 중인
 process의 allocator counter를 조회할 수 있습니다. 평상시 hot path에서는 수집하지
-않습니다. 진단값에는 current allocated bytes, heap size, physical/virtual memory,
-peak memory, realized fragmentation, per-CPU cache 활성 여부가 포함됩니다.
+않습니다.
 
 ```bash
 PINGORA_ALLOCATOR_STATS=1 pingora --config config/pingora.yaml
@@ -362,12 +360,12 @@ curl -H 'Host: health.invalid' \
   'http://127.0.0.1/pingora-health/details?allocator=1'
 ```
 
-system allocator와 기존 jemalloc은 배포 기본값이 아니라 회귀 비교와 즉시 rollback
-용 feature로만 유지합니다.
+system allocator와 Google TCMalloc은 배포 기본값이 아니라 회귀 비교와 즉시
+rollback용 feature로만 유지합니다.
 
 ```bash
 cargo build --release --no-default-features --features system-allocator
-cargo build --release --no-default-features --features jemalloc
+cargo build --release --no-default-features --features tcmalloc
 
 # 게시된 jemalloc/tcmalloc image를 0.5 CPU/1 GiB에서 5라운드 교대 비교
 ALLOCATOR_BENCH_CPUS=0.5 ALLOCATOR_BENCH_MEMORY=1g \
@@ -393,8 +391,8 @@ path로의 해석은 1초 TTL 캐시를 쓰되, miss와 만료 때는 계속 can
 
 Builder와 runtime은 Debian 13 `trixie-slim`을 사용하고 Actions build마다 base
 manifest를 다시 확인합니다. Rust link는 GNU ld 대신 LLVM `lld`를 사용합니다.
-기본 release profile은 `codegen-units=1`, `opt-level=3`, `panic=abort`, symbol strip과
-Fat LTO입니다. 동일한 0.5 CPU/1 GiB 5라운드 비교에서 Fat은 Thin보다 RPS 6.20%,
+기본 release profile은 `codegen-units=1`, `opt-level=3`, `panic=abort`, symbol strip,
+Fat LTO, lld `--icf=safe`입니다. 동일한 0.5 CPU/1 GiB 5라운드 비교에서 Fat은 Thin보다 RPS 6.20%,
 CPU 효율 6.92%가 높고 p99 중앙값 3.62%, peak RSS 중앙값 3.44%가 낮아 기본값으로
 선택했습니다. `RUST_LTO=thin`은 회귀 rollback용으로 계속 지원합니다. `libcap2-bin`은 build 중 file
 capability를 설정할 때만 mount layer 안에 설치했다가 제거하므로 runtime image에는
@@ -406,7 +404,8 @@ capability를 설정할 때만 mount layer 안에 설치했다가 제거하므�
 runner CPU에 따라 산출물이 달라지므로 배포 build에서 허용하지 않습니다.
 학습 workload는 동일한 synthetic backend를 대상으로 64 B/4096 B H1
 keepalive, 작은/큰 JSON API, 정적 파일 cold miss/hot hit, 1/10 MiB chunked stream,
-예상된 404/500, TLS 신규 연결, 검증된 TLS 1.3 session resumption, H2 다중 stream을
+예상된 404/500, TLS 신규 연결, 검증된 TLS 1.3 session resumption, H2 다중 stream,
+native gRPC와 gRPC-web(H2 trailers / empty DATA EOS / plaintext H2C warmup)을
 실행합니다. status, Content-Length, body pattern, H2 실패 수, session 재사용 여부를
 검사하고, 약 9만 건의 proxy 요청에서 backend 연결 수가 2,048 미만인지 확인해
 upstream keepalive가 실제로 재사용됐음을 검증합니다. curl/h2load/OpenSSL은 PGO
@@ -439,7 +438,7 @@ tests/http2_matrix.sh
 tests/http2_nginx_repro.sh
 tests/service_matrix.sh
 PINGORA_TEST_IMAGE=ghcr.io/tae-ok-11/pingora:local tests/docker_runtime.sh
-docker build --build-arg ALLOCATOR=tcmalloc \
+docker build --build-arg ALLOCATOR=jemalloc \
   --build-arg RUST_TARGET_CPU=x86-64-v2 \
   --build-arg RUST_LTO=fat \
   --build-arg RUST_CODEGEN_UNITS=1 \

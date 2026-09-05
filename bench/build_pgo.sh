@@ -21,6 +21,7 @@ set -Eeuo pipefail
 : "${PGO_WEIGHT_LIGHT_JSON:?}"
 : "${PGO_WEIGHT_TLS:?}"
 : "${PGO_WEIGHT_TAIL:?}"
+: "${PGO_WEIGHT_GRPC:?}"
 : "${PGO_TRAIN_ROUNDS:?}"
 : "${PGO_ECDSA_CURVE:?}"
 : "${PGO_NATIVE_BORING:?}"
@@ -63,7 +64,7 @@ for value in \
   "${PGO_WEIGHT_UPSTREAM_H2}" "${PGO_WEIGHT_UPSTREAM_H3_BBR2}" "${PGO_WEIGHT_UPSTREAM_H3_CUBIC}" \
   "${PGO_WEIGHT_ZSTD}" "${PGO_WEIGHT_INTERNAL}" "${PGO_WEIGHT_BULK}" \
   "${PGO_WEIGHT_COMPRESS_BR}" "${PGO_WEIGHT_LIGHT_JSON}" \
-  "${PGO_WEIGHT_TLS}" "${PGO_WEIGHT_TAIL}" "${PGO_TRAIN_ROUNDS}" \
+  "${PGO_WEIGHT_TLS}" "${PGO_WEIGHT_TAIL}" "${PGO_WEIGHT_GRPC}" "${PGO_TRAIN_ROUNDS}" \
   "${PGO_NATIVE_TRAIN_ROUNDS}" "${BORING_PGO_WEIGHT_H2}" "${BORING_PGO_WEIGHT_H3}" \
   "${BORING_PGO_WEIGHT_UPSTREAM_H3_BBR2}" "${BORING_PGO_WEIGHT_UPSTREAM_H3_CUBIC}" \
   "${BORING_PGO_WEIGHT_TLS}"; do
@@ -92,11 +93,13 @@ CFLAGS="${TRAIN_NATIVE_FLAGS}" \
 CXXFLAGS="${TRAIN_NATIVE_FLAGS}" \
 RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${PGO_TRAIN_TARGET_CPU}" \
   cargo build --locked --profile pgo-tools --target "${RUST_TARGET_TRIPLE}" \
-    --bin pingora --example http3_probe --no-default-features \
+    --bin pingora --example http3_probe --example grpc_origin --no-default-features \
     --features "${ALLOCATOR},tls-${TLS_PROVIDER}"
 H3_PROBE="/src/target/pgo-tools/${RUST_TARGET_TRIPLE}/pgo-tools/examples/http3_probe"
+GRPC_ORIGIN="/src/target/pgo-tools/${RUST_TARGET_TRIPLE}/pgo-tools/examples/grpc_origin"
 ORIGIN_BIN="/src/target/pgo-tools/${RUST_TARGET_TRIPLE}/pgo-tools/pingora"
 test -x "${H3_PROBE}"
+test -x "${GRPC_ORIGIN}"
 test -x "${ORIGIN_BIN}"
 
 rm -rf /src/pgo-data
@@ -105,7 +108,8 @@ install -d \
   /src/pgo-data/raw/upstream-h2 /src/pgo-data/raw/upstream-h3-bbr2 \
   /src/pgo-data/raw/upstream-h3-cubic   /src/pgo-data/raw/zstd /src/pgo-data/raw/compress_br \
   /src/pgo-data/raw/internal /src/pgo-data/raw/bulk \
-  /src/pgo-data/raw/light_json /src/pgo-data/raw/tls /src/pgo-data/raw/tail
+  /src/pgo-data/raw/light_json /src/pgo-data/raw/tls /src/pgo-data/raw/tail \
+  /src/pgo-data/raw/grpc
 
 # RUSTFLAGS is intentionally global: rustc applies instrumentation to JBS
 # Pingora plus Rust dependencies such as vendored Pingora, hyper/h2,
@@ -144,10 +148,15 @@ for round in $(seq 1 "${PGO_TRAIN_ROUNDS}"); do
       bench/pgo_train_upstream_h3.sh "${PGO_BIN}" "${ORIGIN_BIN}" /tmp/pgo-backend \
         "${H3_PROBE}" "/src/pgo-data/raw/upstream-h3-${cc}" "${cc}"
   done
+
+  echo "Rust PGO scenario=grpc round=${round}/${PGO_TRAIN_ROUNDS} cpu=${PGO_TRAIN_TARGET_CPU}"
+  PGO_ECDSA_CURVE="${PGO_ECDSA_CURVE}" PGO_TRAIN_ROUND="${round}" \
+    bench/pgo_train_grpc.sh "${PGO_BIN}" "${GRPC_ORIGIN}" /tmp/pgo-client \
+      /src/pgo-data/raw/grpc
 done
 
 for scenario in h1 h2 h3 upstream-h2 upstream-h3-bbr2 upstream-h3-cubic \
-  zstd compress_br internal bulk light_json tls tail; do
+  zstd compress_br internal bulk light_json tls tail grpc; do
   if [[ "${scenario}" == upstream-h3-cubic && "${PGO_TRAIN_FAST:-off}" == on ]] \
     && ! compgen -G "/src/pgo-data/raw/upstream-h3-cubic/*.profraw" >/dev/null; then
     cp "/src/pgo-data/upstream-h3-bbr2.profdata" "/src/pgo-data/upstream-h3-cubic.profdata"
@@ -171,12 +180,13 @@ done
   --weighted-input="${PGO_WEIGHT_LIGHT_JSON},/src/pgo-data/light_json.profdata" \
   --weighted-input="${PGO_WEIGHT_TLS},/src/pgo-data/tls.profdata" \
   --weighted-input="${PGO_WEIGHT_TAIL},/src/pgo-data/tail.profdata" \
+  --weighted-input="${PGO_WEIGHT_GRPC},/src/pgo-data/grpc.profdata" \
   -o /src/pgo-data/merged.profdata
 test -s /src/pgo-data/merged.profdata
 
 {
   echo "cpu=${PGO_TRAIN_TARGET_CPU} rounds=${PGO_TRAIN_ROUNDS}"
-  echo "weights h1=${PGO_WEIGHT_H1} h2=${PGO_WEIGHT_H2} h3=${PGO_WEIGHT_H3} upstream_h2=${PGO_WEIGHT_UPSTREAM_H2} upstream_h3_bbr2=${PGO_WEIGHT_UPSTREAM_H3_BBR2} upstream_h3_cubic=${PGO_WEIGHT_UPSTREAM_H3_CUBIC} zstd=${PGO_WEIGHT_ZSTD} compress_br=${PGO_WEIGHT_COMPRESS_BR} internal=${PGO_WEIGHT_INTERNAL} bulk=${PGO_WEIGHT_BULK} light_json=${PGO_WEIGHT_LIGHT_JSON} tls=${PGO_WEIGHT_TLS} tail=${PGO_WEIGHT_TAIL}"
+  echo "weights h1=${PGO_WEIGHT_H1} h2=${PGO_WEIGHT_H2} h3=${PGO_WEIGHT_H3} upstream_h2=${PGO_WEIGHT_UPSTREAM_H2} upstream_h3_bbr2=${PGO_WEIGHT_UPSTREAM_H3_BBR2} upstream_h3_cubic=${PGO_WEIGHT_UPSTREAM_H3_CUBIC} zstd=${PGO_WEIGHT_ZSTD} compress_br=${PGO_WEIGHT_COMPRESS_BR} internal=${PGO_WEIGHT_INTERNAL} bulk=${PGO_WEIGHT_BULK} light_json=${PGO_WEIGHT_LIGHT_JSON} tls=${PGO_WEIGHT_TLS} tail=${PGO_WEIGHT_TAIL} grpc=${PGO_WEIGHT_GRPC}"
   "${RUST_LLVM_PROFDATA}" show --counts --covered --topn=150 /src/pgo-data/merged.profdata
   if [[ "${PGO_TRAIN_FAST:-off}" != on ]]; then
     for pair in 'h2 h3' 'h3 upstream-h3-bbr2' 'upstream-h3-bbr2 upstream-h3-cubic' 'upstream-h3-bbr2 tls' 'h3 tail'; do

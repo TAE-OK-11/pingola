@@ -60,7 +60,13 @@ serde-saphyr = "1.2.0"
 socket2 = "0.6.5"
 tcmalloc-better = { version = "=0.1.19", optional = true, features = ["extension", "std"] }
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats", "use_std"], optional = true }
-tikv-jemallocator = { version = "0.7.0", features = ["stats", "background_threads"], optional = true }
+tikv-jemallocator = { version = "0.7.0", features = [
+    "stats",
+    "background_threads",
+    # Export unprefixed malloc/free so BoringSSL and other C/C++ objects share
+    # jemalloc with Rust, and so Docker MALLOC_CONF is actually applied.
+    "unprefixed_malloc_on_supported_platforms",
+], optional = true }
 tokio = { version = "1.53.1", features = ["fs", "net", "rt-multi-thread", "sync", "time"] }
 tokio-quiche = { version = "=0.19.1", default-features = false, features = ["gcongestion"] }
 zstd = { version = "0.13.3", default-features = false }
@@ -99,3 +105,5 @@ codegen-units = 8
 
 [profile.pgo]
 inherits = "release"
+codegen-units = 1
+lto = "fat"

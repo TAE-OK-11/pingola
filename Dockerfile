@@ -25,6 +25,7 @@ ARG PGO_WEIGHT_BULK=180
 ARG PGO_WEIGHT_LIGHT_JSON=80
 ARG PGO_WEIGHT_TLS=300
 ARG PGO_WEIGHT_TAIL=80
+ARG PGO_WEIGHT_GRPC=250
 ARG PGO_TRAIN_ROUNDS=1
 ARG PGO_TRAIN_FAST=on
 ARG PGO_ECDSA_CURVE=prime256v1
@@ -98,6 +99,7 @@ ARG PGO_WEIGHT_BULK
 ARG PGO_WEIGHT_LIGHT_JSON
 ARG PGO_WEIGHT_TLS
 ARG PGO_WEIGHT_TAIL
+ARG PGO_WEIGHT_GRPC
 ARG PGO_TRAIN_ROUNDS
 ARG PGO_TRAIN_FAST
 ARG PGO_ECDSA_CURVE
@@ -118,7 +120,7 @@ ENV CC=/src/bench/clang_rust_pgo_filter.sh \
     CARGO_PROFILE_RELEASE_LTO=${RUST_LTO} \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang \
     CMAKE_GENERATOR=Ninja \
-    RUSTFLAGS_COMMON="-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections"
+    RUSTFLAGS_COMMON="-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections -C link-arg=-Wl,--icf=safe"
 
 # Keep dependency downloads in a source-independent layer. BuildKit exports
 # these caches to GitHub Actions, so source-only changes avoid registry churn.
@@ -127,9 +129,9 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
     cargo fetch --locked --target "${RUST_TARGET_TRIPLE}"
 
 COPY --link src ./src
-COPY --link examples/http3_probe.rs ./examples/
+COPY --link examples ./examples
 COPY --link bench/backend.rs bench/pgo_client.rs bench/pgo_train.sh bench/pgo_train_h3.sh \
-    bench/pgo_train_upstream_h2.sh bench/pgo_train_upstream_h3.sh bench/pgo_train_scale.sh bench/build_pgo.sh bench/clang_rust_pgo_filter.sh \
+    bench/pgo_train_upstream_h2.sh bench/pgo_train_upstream_h3.sh bench/pgo_train_grpc.sh bench/pgo_train_scale.sh bench/build_pgo.sh bench/clang_rust_pgo_filter.sh \
     bench/clangxx_rust_pgo_filter.sh ./bench/
 
 RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
@@ -142,7 +144,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
     case "${PGO_NATIVE_BORING}" in on|off) ;; *) echo "unsupported native PGO mode: ${PGO_NATIVE_BORING}" >&2; exit 2 ;; esac; \
     case "${RUST_LTO}" in thin|fat) ;; *) echo "unsupported Rust LTO mode: ${RUST_LTO}" >&2; exit 2 ;; esac; \
     case "${RUST_CODEGEN_UNITS}" in 1|2|4|8|16) ;; *) echo "unsupported codegen units: ${RUST_CODEGEN_UNITS}" >&2; exit 2 ;; esac; \
-    chmod 755 bench/pgo_train.sh bench/pgo_train_h3.sh bench/pgo_train_upstream_h2.sh bench/pgo_train_upstream_h3.sh bench/pgo_train_scale.sh bench/build_pgo.sh \
+    chmod 755 bench/pgo_train.sh bench/pgo_train_h3.sh bench/pgo_train_upstream_h2.sh bench/pgo_train_upstream_h3.sh bench/pgo_train_grpc.sh bench/pgo_train_scale.sh bench/build_pgo.sh \
       bench/clang_rust_pgo_filter.sh bench/clangxx_rust_pgo_filter.sh; \
     if [ "${PGO_MODE}" = off ]; then \
       case "${RUST_TARGET_CPU}" in \
@@ -162,7 +164,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       export PGO_WEIGHT_UPSTREAM_H2 PGO_WEIGHT_UPSTREAM_H3_BBR2 PGO_WEIGHT_UPSTREAM_H3_CUBIC; \
       export PGO_WEIGHT_ZSTD PGO_WEIGHT_COMPRESS_BR PGO_WEIGHT_INTERNAL PGO_WEIGHT_BULK; \
       export PGO_WEIGHT_LIGHT_JSON; \
-      export PGO_WEIGHT_TLS PGO_WEIGHT_TAIL; \
+      export PGO_WEIGHT_TLS PGO_WEIGHT_TAIL PGO_WEIGHT_GRPC; \
       export PGO_TRAIN_ROUNDS PGO_TRAIN_FAST PGO_ECDSA_CURVE PGO_NATIVE_TRAIN_ROUNDS; \
       export BORING_PGO_WEIGHT_H2 BORING_PGO_WEIGHT_H3 BORING_PGO_WEIGHT_UPSTREAM_H3_BBR2; \
       export BORING_PGO_WEIGHT_UPSTREAM_H3_CUBIC BORING_PGO_WEIGHT_TLS RUSTFLAGS_COMMON; \
@@ -191,6 +193,7 @@ ARG PGO_WEIGHT_BULK
 ARG PGO_WEIGHT_LIGHT_JSON
 ARG PGO_WEIGHT_TLS
 ARG PGO_WEIGHT_TAIL
+ARG PGO_WEIGHT_GRPC
 ARG PGO_ECDSA_CURVE
 ARG PGO_TRAIN_ROUNDS
 ARG PGO_NATIVE_TRAIN_ROUNDS
@@ -227,6 +230,7 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.rust.pgo-weight-light-json="${PGO_WEIGHT_LIGHT_JSON}" \
       org.opencontainers.image.rust.pgo-weight-tls="${PGO_WEIGHT_TLS}" \
       org.opencontainers.image.rust.pgo-weight-tail="${PGO_WEIGHT_TAIL}" \
+      org.opencontainers.image.rust.pgo-weight-grpc="${PGO_WEIGHT_GRPC}" \
       org.opencontainers.image.rust.pgo-ecdsa-curve="${PGO_ECDSA_CURVE}" \
       org.opencontainers.image.rust.pgo-train-rounds="${PGO_TRAIN_ROUNDS}" \
       org.opencontainers.image.native.pgo-train-rounds="${PGO_NATIVE_TRAIN_ROUNDS}" \
@@ -270,7 +274,7 @@ COPY --link --chown=10001:10001 config/pingora.yaml /etc/pingora/pingora.yaml
 USER 10001:10001
 WORKDIR /tmp/pingora
 
-ENV MALLOC_CONF="narenas:1,percpu_arena:percpu,retain:false,dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:true,tcache_max:8192"
+ENV MALLOC_CONF="narenas:1,tcache:true,dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true,abort_conf:true,metadata_thp:disabled,thp:never,retain:false,tcache_max:8192"
 
 EXPOSE 80/tcp 443/tcp 443/udp
 

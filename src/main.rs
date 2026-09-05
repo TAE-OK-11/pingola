@@ -300,9 +300,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
         .context("shared HTTP/3 runtime startup failed")?;
     let upstream_h3 = upstream_h3::start(runtime.clone(), h3_runtime.as_ref())
         .context("upstream HTTP/3 pool startup failed")?;
-    if let Some(handle) = h3_runtime.as_ref() {
-        upstream_warmup::spawn(runtime.clone(), handle);
-    }
+    upstream_warmup::spawn(runtime.clone());
     let h3_connector = H3UpstreamConnector::new(upstream_h3.clone());
     let shared = Arc::new(
         GatewayShared::from_runtime(&runtime).context("shared gateway state bootstrap failed")?,

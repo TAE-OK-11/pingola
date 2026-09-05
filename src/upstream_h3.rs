@@ -63,6 +63,16 @@ impl H3Route {
     pub fn allows_tcp_fallback(&self) -> bool {
         self.preferred && !self.forced
     }
+
+    #[cfg(test)]
+    pub fn preferred_for_tests(origin: SocketAddr) -> Self {
+        Self {
+            origin,
+            available: Arc::new(AtomicBool::new(true)),
+            forced: false,
+            preferred: true,
+        }
+    }
 }
 
 #[derive(Default)]

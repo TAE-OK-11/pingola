@@ -33,12 +33,25 @@ const TCMALLOC_MAX_PER_CPU_CACHE_BYTES: i32 = 256 * 1024;
 #[cfg(feature = "tcmalloc")]
 const TCMALLOC_BACKGROUND_RELEASE_BYTES_PER_SECOND: usize = 8 * 1024 * 1024;
 
+/// jemalloc dirty-page decay for a 1 vCPU / 1 GiB proxy. Matches Docker
+/// `MALLOC_CONF`. Applied again at runtime so a missing env var cannot leave
+/// the process on jemalloc's multi-second defaults.
+#[cfg(feature = "jemalloc")]
+const JEMALLOC_DIRTY_DECAY_MS: isize = 1000;
+/// Skip the muzzy purge stage. Returning pages once via dirty decay keeps RSS
+/// bounded without a second scan on the background thread.
+#[cfg(feature = "jemalloc")]
+const JEMALLOC_MUZZY_DECAY_MS: isize = 0;
+
 /// Bound allocator-side retention before worker threads begin serving.
 ///
 /// Google TCMalloc defaults to as much as 1.5 MiB of cache per visible CPU.
 /// Containers can see far more host CPUs than their CPU quota, so the default
 /// can retain disproportionate RSS on a 1 GiB service. A 256 KiB cache keeps
 /// the fast per-CPU path while background release steadily returns idle pages.
+///
+/// jemalloc uses a single arena (`narenas:1` in `MALLOC_CONF`) for the same
+/// reason: `percpu_arena` would create one arena per *visible* host CPU.
 pub fn configure_for_proxy() {
     #[cfg(feature = "tcmalloc")]
     unsafe {
@@ -46,13 +59,28 @@ pub fn configure_for_proxy() {
         tcmalloc_set_background_release_rate(TCMALLOC_BACKGROUND_RELEASE_BYTES_PER_SECOND);
     }
     #[cfg(feature = "jemalloc")]
-    {
-        let _ = background_thread::write(true);
-    }
+    configure_jemalloc();
+}
+
+#[cfg(feature = "jemalloc")]
+fn configure_jemalloc() {
+    let _ = background_thread::write(true);
+    // Boot-time MALLOC_CONF is the source of truth for narenas/tcache. Decay
+    // intervals remain writable so a process started without the image env
+    // still returns idle pages on a 1 GiB cgroup.
+    let _ = unsafe {
+        tikv_jemalloc_ctl::raw::write(b"arenas.dirty_decay_ms\0", JEMALLOC_DIRTY_DECAY_MS)
+    };
+    let _ = unsafe {
+        tikv_jemalloc_ctl::raw::write(b"arenas.muzzy_decay_ms\0", JEMALLOC_MUZZY_DECAY_MS)
+    };
 }
 
 /// Start a lightweight background thread that returns idle TCMalloc pages to the
 /// OS. Without this, RSS can remain elevated long after QUIC/H3 load subsides.
+///
+/// jemalloc does not need a process thread here: `background_thread:true` plus
+/// dirty-page decay already purge unused extents.
 pub fn start_background_reclaimer() {
     #[cfg(feature = "tcmalloc")]
     if tcmalloc_better::TCMalloc::needs_process_background_actions() {
@@ -61,18 +89,6 @@ pub fn start_background_reclaimer() {
             .spawn(|| {
                 loop {
                     tcmalloc_better::TCMalloc::process_background_actions();
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                }
-            })
-            .ok();
-    }
-    #[cfg(feature = "jemalloc")]
-    {
-        std::thread::Builder::new()
-            .name("jemalloc-reclaim".into())
-            .spawn(|| {
-                loop {
-                    let _ = epoch::advance();
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 }
             })
@@ -88,7 +104,9 @@ pub fn hint_release_idle_pages() {
     }
     #[cfg(feature = "jemalloc")]
     {
-        let _ = epoch::advance();
+        // Purge unused dirty pages on every arena. `arena.MALLCTL_ARENAS_ALL`
+        // (`u32::MAX`) is the jemalloc all-arenas sentinel.
+        let _ = unsafe { tikv_jemalloc_ctl::raw::write(b"arena.4294967295.purge\0", ()) };
     }
 }
 
@@ -97,8 +115,12 @@ pub fn summary(include_stats: bool) -> Result<String> {
     let version = jemalloc_version::read()
         .context("failed to query jemalloc version")?
         .trim_end_matches('\0');
+    let narenas = tikv_jemalloc_ctl::opt::narenas::read().unwrap_or(0);
+    let background = background_thread::read().unwrap_or(false);
     if !include_stats {
-        return Ok(format!("allocator=jemalloc version={version}"));
+        return Ok(format!(
+            "allocator=jemalloc version={version} narenas={narenas} background_thread={background}"
+        ));
     }
 
     epoch::advance().context("failed to refresh jemalloc statistics")?;
@@ -113,7 +135,7 @@ pub fn summary(include_stats: bool) -> Result<String> {
         (resident.saturating_sub(active)) as f64 / active as f64
     };
     Ok(format!(
-        "allocator=jemalloc version={version} allocated={allocated} active={active} resident={resident} mapped={mapped} retained={retained} fragmentation_ratio={fragmentation:.4}"
+        "allocator=jemalloc version={version} narenas={narenas} background_thread={background} allocated={allocated} active={active} resident={resident} mapped={mapped} retained={retained} fragmentation_ratio={fragmentation:.4}"
     ))
 }
 
@@ -266,11 +288,22 @@ mod tests {
     fn process_uses_selected_allocator() {
         let result = summary(false).unwrap();
         #[cfg(feature = "jemalloc")]
-        assert!(result.starts_with("allocator=jemalloc version="));
+        {
+            assert!(result.starts_with("allocator=jemalloc version="));
+            assert!(result.contains("narenas="));
+            assert!(result.contains("background_thread="));
+        }
         #[cfg(feature = "tcmalloc")]
         assert!(result.starts_with("allocator=tcmalloc implementation=google-tcmalloc"));
         #[cfg(feature = "system-allocator")]
         assert_eq!(result, "allocator=system");
+    }
+
+    #[cfg(feature = "jemalloc")]
+    #[test]
+    fn jemalloc_background_thread_is_enabled() {
+        configure_jemalloc();
+        assert!(background_thread::read().unwrap());
     }
 
     #[cfg(feature = "jemalloc")]
