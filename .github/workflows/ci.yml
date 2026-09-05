@@ -73,6 +73,7 @@ jobs:
           bash -n bench/pgo_train_h3.sh
           bash -n bench/pgo_train_upstream_h2.sh
           bash -n bench/pgo_train_upstream_h3.sh
+          bash -n bench/pgo_train_grpc.sh
           rustc --edition=2024 -D warnings bench/backend.rs -o /tmp/pgo-backend
           rustc --edition=2024 -D warnings bench/pgo_client.rs -o /tmp/pgo-client
           cargo fmt --all --check
@@ -101,7 +102,7 @@ jobs:
       - name: Allocator fallback builds
         run: |
           cargo check --all-targets --locked --no-default-features --features system-allocator,tls-boringssl
-          cargo check --all-targets --locked --no-default-features --features jemalloc,tls-boringssl
+          cargo check --all-targets --locked --no-default-features --features tcmalloc,tls-boringssl
 
       - name: Protocol, security, and HTTP/3 integration
         run: |
@@ -235,6 +236,7 @@ jobs:
             PGO_WEIGHT_LIGHT_JSON=80
             PGO_WEIGHT_TLS=300
             PGO_WEIGHT_TAIL=80
+            PGO_WEIGHT_GRPC=250
             RUST_TARGET_CPU=x86-64-v2
             RUST_LTO=fat
             BUILD_VERSION=${{ steps.meta.outputs.version }}

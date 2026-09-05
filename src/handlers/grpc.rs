@@ -47,10 +47,16 @@ pub fn classify_content_type(value: &[u8]) -> Option<GrpcKind> {
 
 /// Convert gRPC-web to native gRPC, or mark a native gRPC request for H2 EOS.
 ///
-/// Returns whether the request used the gRPC-web bridge. Hub and every other
-/// content type take the `None` path with no extra headers or modules.
-pub fn prepare_upstream_request(request: &mut RequestHeader, grpc_web: &mut GrpcWebCtx) -> bool {
-    match classify_request(request) {
+/// `kind` is the already-classified request type from the downstream header
+/// scan. Re-parsing Content-Type here would repeat work on every upstream
+/// hop. Hub and every other content type take the `None` path with no extra
+/// headers or modules.
+pub fn prepare_upstream_request(
+    request: &mut RequestHeader,
+    grpc_web: &mut GrpcWebCtx,
+    kind: Option<GrpcKind>,
+) -> bool {
+    match kind {
         Some(GrpcKind::Web) => {
             grpc_web.init();
             grpc_web.request_header_filter(request);
@@ -119,7 +125,8 @@ mod tests {
     fn native_grpc_keeps_te_trailers_and_disables_header_eos() {
         let mut request = request_with_type("application/grpc+proto");
         let mut grpc_web = GrpcWebCtx::default();
-        assert!(!prepare_upstream_request(&mut request, &mut grpc_web));
+        let kind = classify_request(&request);
+        assert!(!prepare_upstream_request(&mut request, &mut grpc_web, kind));
         assert_eq!(request.headers.get(TE).unwrap(), "trailers");
         assert_eq!(request.send_end_stream(), Some(false));
         assert_eq!(grpc_web, GrpcWebCtx::Disabled);
@@ -129,7 +136,8 @@ mod tests {
     fn grpc_web_converts_to_native_grpc() {
         let mut request = request_with_type("application/grpc-web+proto");
         let mut grpc_web = GrpcWebCtx::default();
-        assert!(prepare_upstream_request(&mut request, &mut grpc_web));
+        let kind = classify_request(&request);
+        assert!(prepare_upstream_request(&mut request, &mut grpc_web, kind));
         assert_eq!(
             request.headers.get(CONTENT_TYPE).unwrap(),
             "application/grpc+proto"
@@ -143,7 +151,8 @@ mod tests {
     fn non_grpc_requests_are_untouched() {
         let mut request = request_with_type("application/json");
         let mut grpc_web = GrpcWebCtx::default();
-        assert!(!prepare_upstream_request(&mut request, &mut grpc_web));
+        let kind = classify_request(&request);
+        assert!(!prepare_upstream_request(&mut request, &mut grpc_web, kind));
         assert!(request.headers.get(TE).is_none());
         assert_eq!(request.send_end_stream(), Some(true));
         assert_eq!(grpc_web, GrpcWebCtx::Disabled);
