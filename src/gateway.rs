@@ -540,27 +540,8 @@ impl ProxyHttp for Gateway {
                 return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
             }
         };
-        let path = session.req_header().uri.path();
-
-        if path == "/pingora-health" || path == "/pingora-live" || path == "/pingora-ready" {
-            return send_empty(
-                &self.runtime,
-                session,
-                204,
-                None,
-                tls,
-                http3,
-                &[("x-proxy-product", "Pingora")],
-            )
-            .await;
-        }
-        if path == "/pingola-health" {
-            if self.runtime.config.server.legacy_pingola_health {
-                LEGACY_HEALTH_WARNING.call_once(|| {
-                    warn!(
-                        "/pingola-health is deprecated; migrate to /pingora-health (legacy support will be removed after one release)"
-                    );
-                });
+        match session.req_header().uri.path() {
+            "/pingora-health" | "/pingora-live" | "/pingora-ready" => {
                 return send_empty(
                     &self.runtime,
                     session,
@@ -568,39 +549,28 @@ impl ProxyHttp for Gateway {
                     None,
                     tls,
                     http3,
-                    &[("x-proxy-product", "Pingora"), ("deprecation", "true")],
+                    &[("x-proxy-product", "Pingora")],
                 )
                 .await;
             }
-            return send_empty(
-                &self.runtime,
-                session,
-                404,
-                None,
-                tls,
-                http3,
-                &[("x-proxy-product", "Pingora")],
-            )
-            .await;
-        }
-        if path == "/nginx-health" {
-            return send_empty(
-                &self.runtime,
-                session,
-                404,
-                None,
-                tls,
-                http3,
-                &[("x-proxy-product", "Pingora")],
-            )
-            .await;
-        }
-        if path == "/pingora-health/details" {
-            let unix_socket = session
-                .client_addr()
-                .and_then(|address| address.as_inet())
-                .is_none();
-            if !self.runtime.config.server.health_details || !unix_socket {
+            "/pingola-health" => {
+                if self.runtime.config.server.legacy_pingola_health {
+                    LEGACY_HEALTH_WARNING.call_once(|| {
+                        warn!(
+                            "/pingola-health is deprecated; migrate to /pingora-health (legacy support will be removed after one release)"
+                        );
+                    });
+                    return send_empty(
+                        &self.runtime,
+                        session,
+                        204,
+                        None,
+                        tls,
+                        http3,
+                        &[("x-proxy-product", "Pingora"), ("deprecation", "true")],
+                    )
+                    .await;
+                }
                 return send_empty(
                     &self.runtime,
                     session,
@@ -612,7 +582,38 @@ impl ProxyHttp for Gateway {
                 )
                 .await;
             }
-            return send_health_details(session, &self.runtime, &self.upstream_h3).await;
+            "/nginx-health" => {
+                return send_empty(
+                    &self.runtime,
+                    session,
+                    404,
+                    None,
+                    tls,
+                    http3,
+                    &[("x-proxy-product", "Pingora")],
+                )
+                .await;
+            }
+            "/pingora-health/details" => {
+                let unix_socket = session
+                    .client_addr()
+                    .and_then(|address| address.as_inet())
+                    .is_none();
+                if !self.runtime.config.server.health_details || !unix_socket {
+                    return send_empty(
+                        &self.runtime,
+                        session,
+                        404,
+                        None,
+                        tls,
+                        http3,
+                        &[("x-proxy-product", "Pingora")],
+                    )
+                    .await;
+                }
+                return send_health_details(session, &self.runtime, &self.upstream_h3).await;
+            }
+            _ => {}
         }
 
         let Some(authority) = request_authority(session.req_header()) else {
@@ -696,7 +697,7 @@ impl ProxyHttp for Gateway {
         ctx.client_ip = client_ip;
         self.prepare_upstream_forwarded_headers(session, ctx)?;
 
-        if host.handler == HandlerKind::NavidromeMain && path == "/" {
+        if host.handler == HandlerKind::NavidromeMain && session.req_header().uri.path() == "/" {
             let location = format!("https://{}/app/", host.domain.as_ref());
             return send_empty(
                 &self.runtime,
@@ -713,6 +714,7 @@ impl ProxyHttp for Gateway {
         let grpc_kind = grpc::classify_request(session.req_header());
         ctx.grpc = grpc_kind;
         let Some(plan_index) = ({
+            let path = session.req_header().uri.path();
             // application/grpc* to Navidrome rides the dedicated plaintext-H2C
             // plan (prior-knowledge H2, no TLS under WireGuard). Everything
             // else keeps the existing path-based plan; when the dedicated
@@ -724,9 +726,9 @@ impl ProxyHttp for Gateway {
                     HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn
                 );
             if grpc_to_navidrome {
-                host.plans[RouteClass::NavidromeGrpc.index()].or_else(|| host.plan(&path))
+                host.plans[RouteClass::NavidromeGrpc.index()].or_else(|| host.plan(path))
             } else {
-                host.plan(&path)
+                host.plan(path)
             }
         }) else {
             return send_empty(
@@ -847,7 +849,7 @@ impl ProxyHttp for Gateway {
         debug!(
             "integration route host={} path={} route={} handler={:?} upstream_pool_group={} h3_eligible={}",
             host.name,
-            path,
+            session.req_header().uri.path(),
             plan.route.name(),
             plan.handler,
             plan.route.upstream_pool_group(),
@@ -1179,6 +1181,12 @@ impl ProxyHttp for Gateway {
         client_reused: bool,
     ) -> Box<Error> {
         if self.is_benign_stream_disconnect(session, ctx, &error) {
+            error.set_retry(false);
+            return error;
+        }
+        if ctx.grpc.is_some() {
+            // gRPC POST bodies are not safely replayable on a reused HTTP/2
+            // connection; let the Go server surface errors to the client.
             error.set_retry(false);
             return error;
         }

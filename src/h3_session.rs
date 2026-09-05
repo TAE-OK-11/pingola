@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::h3_wire;
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use cloudflare_pingora::http::{RequestHeader, ResponseHeader};
