@@ -392,16 +392,21 @@ path로의 해석은 1초 TTL 캐시를 쓰되, miss와 만료 때는 계속 can
 Builder와 runtime은 Debian 13 `trixie-slim`을 사용하고 Actions build마다 base
 manifest를 다시 확인합니다. Rust link는 GNU ld 대신 LLVM `lld`를 사용합니다.
 기본 release profile은 `codegen-units=1`, `opt-level=3`, `panic=abort`, symbol strip,
-Fat LTO, lld `--icf=safe`입니다. 동일한 0.5 CPU/1 GiB 5라운드 비교에서 Fat은 Thin보다 RPS 6.20%,
+Fat LTO (`lto=fat`, `codegen-units=1`), lld `--icf=safe`, linker `-O3`, and
+`--lto-partitions=1`입니다. 동일한 0.5 CPU/1 GiB 5라운드 비교에서 Fat은 Thin보다 RPS 6.20%,
 CPU 효율 6.92%가 높고 p99 중앙값 3.62%, peak RSS 중앙값 3.44%가 낮아 기본값으로
 선택했습니다. `RUST_LTO=thin`은 회귀 rollback용으로 계속 지원합니다. `libcap2-bin`은 build 중 file
 capability를 설정할 때만 mount layer 안에 설치했다가 제거하므로 runtime image에는
 남지 않습니다. `RUST_LTO`, `RUST_CODEGEN_UNITS`, `RUST_TARGET_CPU`는 label로 기록되어
 실행 image의 build policy를 inspect할 수 있습니다.
 
-모든 배포 image는 GitHub Actions에서 `RUST_TARGET_CPU=x86-64-v2`로 재현 가능하게
-빌드하고 Fat LTO와 Rust/LLVM instrumentation PGO를 적용합니다. `native`는 hosted
-runner CPU에 따라 산출물이 달라지므로 배포 build에서 허용하지 않습니다.
+배포 image는 GitHub Actions에서 `RUST_TARGET_CPU=cascadelake`로 빌드합니다. Intel
+Cascade Lake / Cooper Lake(예: Xeon 8259CL, AVX-512) 프록시에 맞춘 ISA이며, PGO
+train과 최종 링크가 같은 `target-cpu`를 사용합니다. 구형 x86-64-v2-only 호스트나
+AVX-512가 비활성화된 VM에서는 `--build-arg RUST_TARGET_CPU=x86-64-v2`로 portable
+image를 빌드하십시오. `native`는 hosted runner CPU에 따라 산출물이 달라지므로 배포
+build에서 허용하지 않습니다. fat LTO/PGO 빌드는 수 GB RAM이 필요하므로 442 MiB
+같은 프록시 VM에서 빌드하지 말고 CI 또는 큰 builder에서 image만 pull하십시오.
 학습 workload는 동일한 synthetic backend를 대상으로 64 B/4096 B H1
 keepalive, 작은/큰 JSON API, 정적 파일 cold miss/hot hit, 1/10 MiB chunked stream,
 예상된 404/500, TLS 신규 연결, 검증된 TLS 1.3 session resumption, H2 다중 stream,
@@ -411,9 +416,10 @@ native gRPC와 gRPC-web(H2 trailers / empty DATA EOS / plaintext H2C warmup)을
 upstream keepalive가 실제로 재사용됐음을 검증합니다. curl/h2load/OpenSSL은 PGO
 학습용 builder에만 설치되며 runtime image에는 포함되지 않습니다. 최종 image label의
 `org.opencontainers.image.rust.pgo=train`,
-`org.opencontainers.image.rust.pgo-train-target-cpu=x86-64-v2`,
+`org.opencontainers.image.rust.pgo-train-target-cpu=cascadelake`,
 `org.opencontainers.image.rust.target-cpu` label로 적용 여부를 확인할 수 있습니다.
-PGO 훈련과 최종 code generation은 모두 x86-64-v2를 사용합니다. BOLT는 build와
+PGO 훈련과 최종 code generation은 모두 `cascadelake`를 사용합니다(게시 워크플로:
+`PGO_TRAIN_ROUNDS=2`, `PGO_TRAIN_FAST=off`). BOLT는 build와
 runtime에서 사용하지 않습니다.
 
 ```bash
@@ -439,10 +445,12 @@ tests/http2_nginx_repro.sh
 tests/service_matrix.sh
 PINGORA_TEST_IMAGE=ghcr.io/tae-ok-11/pingora:local tests/docker_runtime.sh
 docker build --build-arg ALLOCATOR=jemalloc \
-  --build-arg RUST_TARGET_CPU=x86-64-v2 \
+  --build-arg RUST_TARGET_CPU=cascadelake \
   --build-arg RUST_LTO=fat \
   --build-arg RUST_CODEGEN_UNITS=1 \
   -t pingora:local .
+# portable fallback (no AVX-512):
+# docker build --build-arg RUST_TARGET_CPU=x86-64-v2 ...
 
 ```
 
@@ -527,7 +535,8 @@ source symbol이 제한될 수 있어 `perf.data`와 `perf script` 입력을 모
 SHA-256을 먼저 비교합니다. `OVERHEAD_HANDLER`, `OVERHEAD_PATH`,
 `OVERHEAD_ACTIVE_LIMIT`으로 route와 limiter 비용을 분리할 수 있습니다.
 
-공식 image는 `x86-64-v2` 하나이며 `latest`, commit SHA, release tag로 게시됩니다.
+공식 image는 `cascadelake`(`latest`, `cascadelake` tag)이며 commit SHA, release
+tag로도 게시됩니다. `x86-64-v2`는 build-arg로만 지원합니다.
 운영 배포에서는 tag 대신 검증된 `ghcr.io/tae-ok-11/pingora@sha256:...` digest를
 `PINGORA_IMAGE`에 전달하십시오.
 

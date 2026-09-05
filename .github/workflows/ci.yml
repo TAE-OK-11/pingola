@@ -68,6 +68,7 @@ jobs:
       - name: Static and dependency checks
         run: |
           bash -n bench/pgo_train_scale.sh
+          bash -n bench/target_cpu_flags.sh
           bash -n bench/build_pgo.sh
           bash -n bench/pgo_train.sh
           bash -n bench/pgo_train_h3.sh
@@ -195,6 +196,7 @@ jobs:
             ghcr.io/tae-ok-11/pingola
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=cascadelake,enable={{is_default_branch}}
             type=sha,prefix=sha-
             type=semver,pattern={{version}}
           labels: |
@@ -206,7 +208,7 @@ jobs:
             org.opencontainers.image.http3.provider=quiche
             org.opencontainers.image.http3.internal-protocol=direct-gateway
 
-      - name: Build and publish x86-64-v2 Rust PGO release image
+      - name: Build and publish cascadelake Rust PGO release image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -220,9 +222,9 @@ jobs:
             TLS_PROVIDER=boringssl
             PGO_MODE=train
             PGO_NATIVE_BORING=off
-            PGO_TRAIN_TARGET_CPU=x86-64-v2
-            PGO_TRAIN_ROUNDS=1
-            PGO_TRAIN_FAST=on
+            PGO_TRAIN_TARGET_CPU=cascadelake
+            PGO_TRAIN_ROUNDS=2
+            PGO_TRAIN_FAST=off
             PGO_WEIGHT_H1=60
             PGO_WEIGHT_H2=120
             PGO_WEIGHT_H3=900
@@ -237,13 +239,13 @@ jobs:
             PGO_WEIGHT_TLS=300
             PGO_WEIGHT_TAIL=80
             PGO_WEIGHT_GRPC=250
-            RUST_TARGET_CPU=x86-64-v2
+            RUST_TARGET_CPU=cascadelake
             RUST_LTO=fat
             BUILD_VERSION=${{ steps.meta.outputs.version }}
             BUILD_REVISION=${{ github.sha }}
           cache-from: |
-            type=gha,scope=image-x86-64-v2-pgo-rust
+            type=gha,scope=image-cascadelake-pgo-rust
             type=gha,scope=image-test-x86-64-v2-off
-          cache-to: type=gha,mode=max,scope=image-x86-64-v2-pgo-rust
+          cache-to: type=gha,mode=max,scope=image-cascadelake-pgo-rust
           provenance: mode=max
           sbom: true

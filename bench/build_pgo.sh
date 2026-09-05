@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# shellcheck source=bench/target_cpu_flags.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/target_cpu_flags.sh"
+
 : "${RUST_TARGET_TRIPLE:?}"
 : "${RUST_TARGET_CPU:?}"
 : "${RUST_LTO:?}"
@@ -44,14 +47,8 @@ case "${RUSTFLAGS_COMMON}" in
     ;;
 esac
 
-case "${RUST_TARGET_CPU}" in
-  x86-64-v2) ;;
-  *) echo "unsupported Rust target CPU: ${RUST_TARGET_CPU}" >&2; exit 2 ;;
-esac
-case "${PGO_TRAIN_TARGET_CPU}" in
-  x86-64-v2) ;;
-  *) echo "unsupported PGO training target: ${PGO_TRAIN_TARGET_CPU}" >&2; exit 2 ;;
-esac
+validate_rust_target_cpu "${RUST_TARGET_CPU}"
+validate_rust_target_cpu "${PGO_TRAIN_TARGET_CPU}"
 if [[ "${RUST_TARGET_CPU}" != "${PGO_TRAIN_TARGET_CPU}" ]]; then
   echo "PGO target mismatch: train=${PGO_TRAIN_TARGET_CPU} final=${RUST_TARGET_CPU}. Per-CPU PGO profiles may not be shared." >&2
   exit 2
@@ -71,8 +68,8 @@ for value in \
   [[ "${value}" =~ ^[1-9][0-9]*$ ]] || { echo "PGO weights/rounds must be positive integers: ${value}" >&2; exit 2; }
 done
 
-TARGET_NATIVE_FLAGS='-O3 -march=x86-64-v2 -mtune=generic'
-TRAIN_NATIVE_FLAGS="${TARGET_NATIVE_FLAGS}"
+TARGET_NATIVE_FLAGS="$(rust_target_cpu_native_cflags "${RUST_TARGET_CPU}")"
+TRAIN_NATIVE_FLAGS="$(rust_target_cpu_native_cflags "${PGO_TRAIN_TARGET_CPU}")"
 
 rustup component add llvm-tools-preview
 RUST_LLVM_PROFDATA="$(rustc --print target-libdir)/../bin/llvm-profdata"
