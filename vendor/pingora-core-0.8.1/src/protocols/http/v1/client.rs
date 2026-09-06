@@ -485,7 +485,7 @@ impl HttpSession {
         };
         let length = self.body_reader.get_body(&body_ref).len();
         self.body_recv = self.body_recv.saturating_add(length);
-        if let Some(body) = self.body_reader.take_completed_body(&body_ref) {
+        if let Some(body) = self.body_reader.take_body_bytes(&body_ref) {
             return Ok(Some(body));
         }
         Ok(Some(Bytes::copy_from_slice(

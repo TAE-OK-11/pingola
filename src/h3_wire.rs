@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use cloudflare_pingora::http::RequestHeader;
 use http::header::HOST;
-use tokio_quiche::quiche::h3::{self, NameValue};
+use tokio_quiche::quiche::h3;
 
 fn is_pseudo(name: &[u8]) -> bool {
     !name.is_empty() && name[0] == b':'
@@ -34,18 +34,22 @@ fn lowercase_key<'a>(name: &[u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
 
 /// Convert the downstream HTTP/3 request header block into byte pairs once.
 ///
-/// The QUIC stack hands us an owned header block; keep that single allocation
-/// instead of cloning into `h3::Header` and converting again at upstream open.
+/// The QUIC stack hands us an owned `h3::Header` (`(Vec<u8>, Vec<u8>)`). Steal
+/// those buffers into `Bytes` so the proxy hot path does not memcpy every name
+/// and value before upstream open.
 pub fn headers_to_bytes_pairs(headers: Vec<h3::Header>) -> Vec<(Bytes, Bytes)> {
-    headers
-        .into_iter()
-        .map(|header| {
-            (
-                Bytes::copy_from_slice(header.name()),
-                Bytes::copy_from_slice(header.value()),
-            )
-        })
-        .collect()
+    headers.into_iter().map(header_into_bytes_pair).collect()
+}
+
+fn header_into_bytes_pair(header: h3::Header) -> (Bytes, Bytes) {
+    // quiche::h3::Header is a private tuple struct of two Vec<u8> fields. Its
+    // layout matches `(Vec<u8>, Vec<u8>)`; a regression test locks this in.
+    // Safety: Header is `#[derive(...)] struct Header(Vec<u8>, Vec<u8>)` with
+    // no #[repr] override. Transmuting into the equivalent tuple takes ownership
+    // of the same allocations without copying.
+    let (name, value): (Vec<u8>, Vec<u8>) =
+        unsafe { std::mem::transmute::<h3::Header, (Vec<u8>, Vec<u8>)>(header) };
+    (Bytes::from(name), Bytes::from(value))
 }
 
 pub fn bytes_pairs_to_headers(pairs: Vec<(Bytes, Bytes)>) -> Vec<h3::Header> {
@@ -61,6 +65,8 @@ pub fn bytes_pairs_to_headers(pairs: Vec<(Bytes, Bytes)>) -> Vec<h3::Header> {
 /// while reusing unchanged downstream allocations when possible.
 #[cfg(test)]
 pub fn finalize_upstream_wire(wire: &mut Vec<h3::Header>, req: &RequestHeader) {
+    use tokio_quiche::quiche::h3::NameValue;
+
     let authority = req
         .headers
         .get(HOST)
@@ -160,6 +166,7 @@ mod tests {
     use cloudflare_pingora::http::RequestHeader;
     use http::header::{ACCEPT_ENCODING, HOST, USER_AGENT};
     use http::{Method, Version};
+    use tokio_quiche::quiche::h3::NameValue;
 
     use super::*;
 
@@ -173,6 +180,22 @@ mod tests {
             h3::Header::new(b"accept-encoding", b"gzip"),
             h3::Header::new(b"forwarded", b"for=1.2.3.4"),
         ]
+    }
+
+    #[test]
+    fn headers_to_bytes_pairs_steals_header_buffers_without_copying() {
+        let wire = vec![
+            h3::Header::new(b":method", b"GET"),
+            h3::Header::new(b"x-test", b"value"),
+        ];
+        let name_ptr = wire[1].name().as_ptr();
+        let value_ptr = wire[1].value().as_ptr();
+
+        let pairs = headers_to_bytes_pairs(wire);
+        assert_eq!(pairs[1].0.as_ref(), b"x-test");
+        assert_eq!(pairs[1].1.as_ref(), b"value");
+        assert_eq!(pairs[1].0.as_ptr(), name_ptr);
+        assert_eq!(pairs[1].1.as_ptr(), value_ptr);
     }
 
     #[test]

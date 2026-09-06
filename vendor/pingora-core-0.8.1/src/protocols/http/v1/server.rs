@@ -444,7 +444,7 @@ impl HttpSession {
         };
         let length = self.get_body(&body_ref).len();
         self.body_bytes_read += length;
-        if let Some(bytes) = self.body_reader.take_filled_body(&body_ref) {
+        if let Some(bytes) = self.body_reader.take_body_bytes(&body_ref) {
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.write_to_buffer(&bytes);
             }

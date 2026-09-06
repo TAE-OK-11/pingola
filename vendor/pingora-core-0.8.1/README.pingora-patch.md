@@ -86,6 +86,13 @@ small set of documented local changes.
   fixed 512-byte guess.
 - Reason: proxy requests carry Host plus several X-Forwarded-* headers; one
   correctly sized allocation avoids BytesMut growth on the upstream write path.
+- Local change: zero-copy streaming H1 body prefixes (≥16 KiB) via buffer freeze
+  and rotation, in addition to completed-body moves.
+- Reason: large Content-Length / until-close chunks previously always
+  `copy_from_slice`'d even when `BufRef` covered a leading contiguous range.
+  Freezing that prefix and rotating the read buffer removes the memcpy on the
+  common streaming path; small chunks keep the copy path because replacing the
+  64 KiB read buffer would cost more than copying them.
 
 Remove dependency patches after a released Pingora version adopts equivalent
 versions. Re-evaluate the reuse-hash cache whenever `HttpPeer` changes.
