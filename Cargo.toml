@@ -2,7 +2,7 @@
 name = "jbs-pingora"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98.0"
+rust-version = "1.98.1"
 license = "Apache-2.0"
 description = "A production-oriented Pingora reverse proxy replacing the JBS Nginx gateway"
 repository = "https://github.com/TAE-OK-11/pingora"
@@ -24,7 +24,7 @@ anyhow = "1.0.104"
 ahash = "0.8.12"
 arrayvec = "0.7.8"
 boring = { version = "=4.22.0", features = ["pq-experimental"] }
-brotli = "8.0.4"
+brotli = "9.0.0"
 bytes = "1.12.1"
 clap = { version = "4.6.6", default-features = false, features = [
     "std",
@@ -41,14 +41,14 @@ futures = { version = "0.3.34", default-features = false, features = ["std", "as
 getrandom = "0.4.3"
 hex = "0.4.3"
 http = "1.5.0"
-libc = "0.2.180"
+libc = "0.2.189"
 http-body-util = "0.1.5"
 httpdate = "1.0.3"
 hyper = { version = "1.11.1", features = ["client", "server", "http2"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http2", "tokio"] }
-ipnet = { version = "2.12.1", features = ["serde"] }
+ipnet = { version = "2.12.2", features = ["serde"] }
 log = { version = "0.4.34", features = ["release_max_level_info"] }
-lru = "0.18.3"
+lru = "0.18.4"
 mime_guess = "2.0.5"
 parking_lot = "0.12.5"
 percent-encoding = "2.3.2"
@@ -69,7 +69,7 @@ tikv-jemallocator = { version = "0.7.0", features = [
 ], optional = true }
 tokio = { version = "1.53.1", features = ["fs", "net", "rt-multi-thread", "sync", "time"] }
 tokio-quiche = { version = "=0.19.1", default-features = false, features = ["gcongestion"] }
-zstd = { version = "0.13.3", default-features = false }
+zstd = { version = "0.14.0", default-features = false }
 
 [dev-dependencies]
 h2 = "0.4.19"

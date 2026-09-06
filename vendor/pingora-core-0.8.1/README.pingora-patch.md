@@ -15,18 +15,18 @@ small set of documented local changes.
 - Local change: `serde_yaml` to `serde-saphyr` 0.0.29.
 - Reason: remove the deprecated libyaml binding while retaining typed config
   serialization and deserialization.
-- Local change: Brotli 3 to Brotli 8 and flate2 zlib-ng to zlib-rs.
+- Local change: Brotli 3 to Brotli 9 and flate2 zlib-ng to zlib-rs.
 - Reason: use one Brotli version across the final binary and select exactly one
   high-performance DEFLATE backend instead of compiling ambiguous backends.
-- Local change: use an 8-KiB upstream H1 response buffer and move an exact
+- Local change: use a 16-KiB upstream H1 response buffer and move an exact
   completed body chunk into `Bytes` without copying.
 - Reason: the upstream 4-KiB header buffer split a 4096-byte response at
-  `4096 - header_len`, causing an extra read/write syscall, while
-  `read_body_bytes` copied even a complete owned body buffer. The 8-KiB
-  allocation is bounded per active upstream response; partial, chunked,
-  overread and downstream body paths retain their original semantics. The
-  header storage lives for that response because parsed HeaderValue instances
-  share it.
+  `4096 - header_len`, causing an extra read/write syscall. 8 KiB covered the
+  common API case; 16 KiB keeps typical JSON and small static responses in one
+  read while the allocation remains bounded per active upstream response.
+  Partial, chunked, overread and downstream body paths retain their original
+  semantics. The header storage lives for that response because parsed
+  HeaderValue instances share it.
 - Local change: parse downstream H1 requests and upstream H1 responses directly
   into the no-case representation used by this proxy.
 - Reason: the proxy cloned only semantic request parts before forwarding and
@@ -76,6 +76,23 @@ small set of documented local changes.
 - Reason: the previous MSS-sized userspace write buffer forced one syscall per
   small TLS record on large fixed responses; 16 KiB batches writes while
   TCP_NODELAY still governs kernel packetization.
+- Local change: skip the redundant flush in `HttpSession::finish_body` when the
+  upstream request is already fully framed.
+- Reason: bodyless GET/HEAD requests use Content-Length 0 and
+  `write_request_header` already flushed the wire bytes; completed Content-Length
+  bodies already flush inside `write_body`. A second empty flush added latency on
+  every keep-alive upstream H1 exchange without changing framing.
+- Local change: size `http_req_header_to_wire` from the request instead of a
+  fixed 512-byte guess.
+- Reason: proxy requests carry Host plus several X-Forwarded-* headers; one
+  correctly sized allocation avoids BytesMut growth on the upstream write path.
+- Local change: zero-copy streaming H1 body prefixes (≥16 KiB) via buffer freeze
+  and rotation, in addition to completed-body moves.
+- Reason: large Content-Length / until-close chunks previously always
+  `copy_from_slice`'d even when `BufRef` covered a leading contiguous range.
+  Freezing that prefix and rotating the read buffer removes the memcpy on the
+  common streaming path; small chunks keep the copy path because replacing the
+  64 KiB read buffer would cost more than copying them.
 
 Remove dependency patches after a released Pingora version adopts equivalent
 versions. Re-evaluate the reuse-hash cache whenever `HttpPeer` changes.

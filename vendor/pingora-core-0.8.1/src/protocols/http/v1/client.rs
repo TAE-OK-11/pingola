@@ -26,13 +26,14 @@ use std::str;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::body::{BodyReader, BodyWriter};
+use super::body::{BodyMode, BodyReader, BodyWriter};
 use super::common::*;
 
-// Most API responses and their headers fit in 8 KiB. Keeping the upstream
-// response read buffer slightly larger than the generic 4-KiB header buffer
-// prevents a 4-KiB body from being split at `capacity - header_len`.
-const INIT_UPSTREAM_RESPONSE_BUF_SIZE: usize = 8 * 1024;
+// Most API responses and their headers fit in 16 KiB. Keeping the upstream
+// response read buffer larger than the generic 4-KiB header buffer prevents a
+// fixed-size body from being split at `capacity - header_len`, and absorbs
+// typical JSON / short static payloads in a single read.
+const INIT_UPSTREAM_RESPONSE_BUF_SIZE: usize = 16 * 1024;
 use crate::protocols::http::HttpTask;
 use crate::protocols::{Digest, SocketAddr, Stream, UniqueID, UniqueIDType};
 use crate::utils::BufRef;
@@ -189,11 +190,25 @@ impl HttpSession {
     /// Flush local buffer and notify the server by sending the last chunk if chunked encoding is
     /// used.
     pub async fn finish_body(&mut self) -> Result<Option<usize>> {
+        // Content-Length requests that are already fully framed do not need another
+        // flush: write_request_header flushed header-only (CL=0) requests, and
+        // write_body flushes when the declared length is satisfied. Chunked and
+        // close-delimited bodies still need the finish path to write trailers /
+        // drain the BufStream.
+        let skip_flush = match self.body_writer.body_mode {
+            BodyMode::ContentLength(0, 0) => true,
+            BodyMode::ContentLength(total, written) if written >= total => true,
+            BodyMode::Complete(_) => true,
+            _ => false,
+        };
+
         let res = self.body_writer.finish(&mut self.underlying_stream).await?;
-        self.underlying_stream
-            .flush()
-            .await
-            .or_err(WriteError, "flushing body")?;
+        if !skip_flush {
+            self.underlying_stream
+                .flush()
+                .await
+                .or_err(WriteError, "flushing body")?;
+        }
 
         self.maybe_force_close_body_reader();
         Ok(res)
@@ -470,7 +485,7 @@ impl HttpSession {
         };
         let length = self.body_reader.get_body(&body_ref).len();
         self.body_recv = self.body_recv.saturating_add(length);
-        if let Some(body) = self.body_reader.take_completed_body(&body_ref) {
+        if let Some(body) = self.body_reader.take_body_bytes(&body_ref) {
             return Ok(Some(body));
         }
         Ok(Some(Bytes::copy_from_slice(
@@ -868,13 +883,25 @@ fn parse_resp_buffer<'headers, 'buf>(
 // TODO: change it to to_buf
 #[inline]
 pub fn http_req_header_to_wire(req: &RequestHeader) -> Option<BytesMut> {
-    let mut buf = BytesMut::with_capacity(512);
+    let method = req.method.as_str().as_bytes();
+    let path = req.raw_path();
+    // Request-line + headers + final CRLF. Prefer one allocation over growing
+    // from a fixed 512-byte guess on typical proxy requests with forwarded
+    // headers.
+    let mut estimated = method.len() + 1 + path.len() + 1 + 8 + 2; // "METHOD PATH HTTP/1.1\r\n"
+    for (name, value) in req.headers.iter() {
+        estimated = estimated
+            .saturating_add(name.as_str().len())
+            .saturating_add(value.len())
+            .saturating_add(4); // ": \r\n"
+    }
+    estimated = estimated.saturating_add(2);
+    let mut buf = BytesMut::with_capacity(estimated);
 
     // Request-Line
-    let method = req.method.as_str().as_bytes();
     buf.put_slice(method);
     buf.put_u8(b' ');
-    buf.put_slice(req.raw_path());
+    buf.put_slice(path);
     buf.put_u8(b' ');
 
     let version = match req.version {

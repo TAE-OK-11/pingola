@@ -16,7 +16,6 @@ use http::header::CONTENT_LENGTH;
 use http::{HeaderMap, Method};
 use hyper::body::Frame;
 use tokio::sync::{mpsc, oneshot};
-use tokio_quiche::quiche::h3;
 
 use crate::h3_wire;
 use crate::upstream_h3::{
@@ -103,7 +102,7 @@ pub struct H3UpstreamSession {
     digest: Digest,
     body_done: bool,
     expects_request_body: bool,
-    pending_request_wire: Option<Vec<h3::Header>>,
+    pending_request_wire: Option<Vec<(Bytes, Bytes)>>,
 }
 
 impl H3UpstreamSession {
@@ -204,8 +203,14 @@ impl BodyWrite for H3RequestBodyWriter {
                 .await
                 .map_err(Self::write_err);
         }
-        self.pending.extend_from_slice(data);
-        data.clear();
+        if self.pending.is_empty() {
+            // Unique proxy body chunks convert into BytesMut without memcpy.
+            let taken = std::mem::take(data);
+            self.pending = BytesMut::from(taken);
+        } else {
+            self.pending.extend_from_slice(data);
+            data.clear();
+        }
         if self.pending.len() >= UPSTREAM_BODY_BATCH_THRESHOLD {
             self.flush_pending(false).await?;
         }
@@ -259,7 +264,7 @@ impl cloudflare_pingora::protocols::http::custom::client::Session for H3Upstream
         let has_body = !end;
         let allow_early_data = end && matches!(req.method, Method::GET | Method::HEAD);
         let headers = if let Some(wire) = self.pending_request_wire.take() {
-            wire
+            h3_wire::bytes_pairs_to_headers(wire)
         } else {
             encode_pingora_request(&req).map_err(|error| Self::write_err(error.to_string()))?
         };
@@ -419,7 +424,9 @@ impl cloudflare_pingora::protocols::http::custom::client::Session for H3Upstream
     }
 
     fn set_upstream_request_wire(&mut self, wire: Vec<(Bytes, Bytes)>) {
-        self.pending_request_wire = Some(h3_wire::bytes_pairs_to_headers(wire));
+        // Keep byte pairs until open so unchanged downstream allocations stay
+        // shared; convert to quiche headers once at send time.
+        self.pending_request_wire = Some(wire);
     }
 
     async fn finish_custom(&mut self) -> Result<()> {

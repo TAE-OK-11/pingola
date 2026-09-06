@@ -181,19 +181,23 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        // The caller and opt-in contract guarantee that this request has no
-        // body and that filters do not synthesize one. Finish the upstream
-        // request directly instead of allocating retry/filter state for an
-        // empty body.
+        // Empty GET/HEAD requests are already fully framed after the header write
+        // (Content-Length 0). finish_body only updates writer state and skips the
+        // redundant flush; call it so upgraded/close-delimited edge cases still
+        // run maybe_force_close_body_reader when needed.
         client_session.finish_body().await.map_err(|e| e.into_up())?;
 
-        if self.inner.h1_bodyless_poll_downstream(session, ctx) {
+        let poll_downstream = self.inner.h1_bodyless_poll_downstream(session, ctx);
+        let compression_enabled = session.upstream_compression.is_enabled();
+        if poll_downstream {
             loop {
                 tokio::select! {
                     biased;
                     task = client_session.read_response_task() => {
                         let mut task = task.map_err(|e| e.into_up())?;
-                        session.upstream_compression.response_filter(&mut task);
+                        if compression_enabled {
+                            session.upstream_compression.response_filter(&mut task);
+                        }
                         let task = self.h1_uncached_response_filter(session, task, ctx).await?;
                         let done = session.write_response_task(task).await?;
                         if done {
@@ -216,7 +220,9 @@ where
         } else {
             loop {
                 let mut task = client_session.read_response_task().await.map_err(|e| e.into_up())?;
-                session.upstream_compression.response_filter(&mut task);
+                if compression_enabled {
+                    session.upstream_compression.response_filter(&mut task);
+                }
                 let task = self.h1_uncached_response_filter(session, task, ctx).await?;
                 let done = session.write_response_task(task).await?;
                 if done {

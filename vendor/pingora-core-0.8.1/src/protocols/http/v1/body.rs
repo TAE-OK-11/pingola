@@ -271,11 +271,60 @@ impl BodyReader {
     /// This is intentionally limited to an exact, final chunk. Partial,
     /// chunk-framed, downstream and overread ranges keep the established copy
     /// path so their parsing and connection-reuse semantics do not change.
+    #[allow(dead_code)] // exercised by crate unit tests; call sites use take_body_bytes
     pub fn take_completed_body(&mut self, buf_ref: &BufRef) -> Option<Bytes> {
         if !self.upstream {
             return None;
         }
         self.take_filled_body(buf_ref)
+    }
+
+    /// Prefer moving body bytes into `Bytes` without copying.
+    ///
+    /// Order of attempts:
+    /// 1. Exact completed buffer (`take_filled_body` / upstream completed path)
+    /// 2. Streaming prefix at offset 0 large enough that freezing beats memcpy
+    ///    (Content-Length / until-close partial reads always use `BufRef(0, n)`)
+    ///
+    /// Chunk-framed payloads that sit mid-buffer still copy — splitting them out
+    /// would require preserving chunk parser state across a buffer rotation.
+    pub fn take_body_bytes(&mut self, buf_ref: &BufRef) -> Option<Bytes> {
+        if let Some(body) = self.take_filled_body(buf_ref) {
+            return Some(body);
+        }
+        self.take_streaming_prefix(buf_ref)
+    }
+
+    /// Freeze a leading streaming body chunk without copying when it is cheaper
+    /// than `copy_from_slice`, then rotate in a fresh read buffer.
+    fn take_streaming_prefix(&mut self, buf_ref: &BufRef) -> Option<Bytes> {
+        // Below this size, allocating+zeroing a replacement 64 KiB read buffer
+        // costs more than copying the chunk. Keep the copy path for small reads.
+        const MIN_ZERO_COPY_PREFIX: usize = 16 * 1024;
+
+        let len = buf_ref.len();
+        if buf_ref.0 != 0 || len < MIN_ZERO_COPY_PREFIX || self.has_bytes_overread() {
+            return None;
+        }
+        // Only Content-Length / until-close streaming use a leading BufRef.
+        // Chunked framing keeps parser state inside the current buffer.
+        if !matches!(
+            self.body_state,
+            PS::Partial(..) | PS::UntilClose(_) | PS::Complete(_) | PS::Done(_)
+        ) {
+            return None;
+        }
+
+        let mut owned = self.body_buf.take()?;
+        // BufRef stores [start, end); with start==0 the end index is the length.
+        if buf_ref.1 > owned.len() {
+            self.body_buf = Some(owned);
+            return None;
+        }
+        owned.truncate(buf_ref.1);
+        let out = owned.freeze();
+        self.prepare_buf(&[]);
+        Some(out)
     }
 
     #[allow(dead_code)]
@@ -1203,6 +1252,39 @@ mod tests {
         assert_eq!(body, &preread[..]);
         assert_eq!(body.as_ptr(), original_ptr);
         assert!(body_reader.body_buf.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_prefix_moves_large_chunk_without_copying() {
+        let chunk = vec![b'x'; 24 * 1024];
+        let mut mock_io = Builder::new().read(&chunk).build();
+        let mut body_reader = BodyReader::new(true);
+        body_reader.init_content_length(chunk.len() * 2, b"");
+
+        let body_ref = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        assert_eq!(body_ref, BufRef::new(0, chunk.len()));
+        let original_ptr = body_reader.get_body(&body_ref).as_ptr();
+        let body = body_reader.take_body_bytes(&body_ref).unwrap();
+
+        assert_eq!(body.len(), chunk.len());
+        assert_eq!(body.as_ptr(), original_ptr);
+        assert!(body_reader.body_buf.is_some());
+        assert!(matches!(
+            body_reader.body_state,
+            ParseState::Partial(_, remaining) if remaining == chunk.len()
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_prefix_keeps_small_chunks_on_copy_path() {
+        let chunk = vec![b'y'; 1024];
+        let mut mock_io = Builder::new().read(&chunk).build();
+        let mut body_reader = BodyReader::new(true);
+        body_reader.init_content_length(chunk.len() * 4, b"");
+
+        let body_ref = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        assert!(body_reader.take_body_bytes(&body_ref).is_none());
+        assert!(body_reader.body_buf.is_some());
     }
 
     #[tokio::test]
