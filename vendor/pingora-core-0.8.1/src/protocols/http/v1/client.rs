@@ -58,6 +58,8 @@ pub struct HttpSession {
     keepalive_timeout: KeepaliveStatus,
     pub(crate) digest: Box<Digest>,
     response_header: Option<Box<ResponseHeader>>,
+    /// Keepalive / framing metadata retained after the response header is moved out.
+    response_reuse: Option<ResponseReuseState>,
     request_written: Option<Box<RequestHeader>>,
     bytes_sent: usize,
     /// Total response body payload bytes received from upstream
@@ -72,6 +74,29 @@ pub struct HttpSession {
     // If allowed, does not fail with error on invalid content-length
     // (treats as close-delimited response).
     allow_h1_response_invalid_content_length: bool,
+}
+
+/// Subset of the upstream response header needed after `take` for keepalive and
+/// `should_read_resp_header` (avoids cloning the full `HeaderMap` on every exchange).
+#[derive(Clone, Debug)]
+struct ResponseReuseState {
+    status: StatusCode,
+    version: Version,
+    connection: Option<HeaderValue>,
+    keep_alive: Option<HeaderValue>,
+    has_transfer_encoding: bool,
+}
+
+impl ResponseReuseState {
+    fn from_header(header: &ResponseHeader) -> Self {
+        Self {
+            status: header.status,
+            version: header.version,
+            connection: header.headers.get(header::CONNECTION).cloned(),
+            keep_alive: header.headers.get("Keep-Alive").cloned(),
+            has_transfer_encoding: header.headers.contains_key(header::TRANSFER_ENCODING),
+        }
+    }
 }
 
 /// HTTP 1.x client session
@@ -94,6 +119,7 @@ impl HttpSession {
             body_writer: BodyWriter::new(),
             keepalive_timeout: KeepaliveStatus::Off,
             response_header: None,
+            response_reuse: None,
             request_written: None,
             read_timeout: None,
             write_timeout: None,
@@ -388,6 +414,7 @@ impl HttpSession {
                     }
 
                     self.buf = buf;
+                    self.response_reuse = Some(ResponseReuseState::from_header(&response_header));
                     self.response_header = Some(response_header);
                     self.validate_response()?;
                     // convert to upgrade body type
@@ -416,9 +443,22 @@ impl HttpSession {
         }
     }
 
-    /// Similar to [`Self::read_response()`], read the response header and then return a copy of it.
+    /// Similar to [`Self::read_response()`], read the response header and then return it.
+    ///
+    /// For final (non-informational) responses the stored header is moved out after the body
+    /// reader is initialized, avoiding a full `HeaderMap` clone on every keep-alive exchange.
+    /// Informational 1xx responses (other than 101) still clone because another header follows.
     pub async fn read_resp_header_parts(&mut self) -> Result<Box<ResponseHeader>> {
         self.read_response().await?;
+        let status = self.get_status().map(|code| code.as_u16());
+        let informational = matches!(status, Some(100..=199) if status != Some(101));
+        if !informational {
+            // Body framing depends on the response header; initialize before moving it out.
+            let _ = self.is_body_done();
+            return self.response_header.take().ok_or_else(|| {
+                Error::explain(InvalidHTTPHeader, "missing response header after read")
+            });
+        }
         // safe to unwrap because it is just read
         Ok(Box::new(self.resp_header().unwrap().clone()))
     }
@@ -445,7 +485,17 @@ impl HttpSession {
 
     /// Return the status code of the response if read
     pub fn get_status(&self) -> Option<StatusCode> {
-        self.response_header.as_ref().map(|h| h.status)
+        self.response_header
+            .as_ref()
+            .map(|h| h.status)
+            .or_else(|| self.response_reuse.as_ref().map(|r| r.status))
+    }
+
+    fn response_version(&self) -> Option<Version> {
+        self.response_header
+            .as_ref()
+            .map(|h| h.version)
+            .or_else(|| self.response_reuse.as_ref().map(|r| r.version))
     }
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
@@ -558,12 +608,13 @@ impl HttpSession {
 
         // Per [RFC 9112 Section 6.1-16](https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-16),
         // if Transfer-Encoding is received in HTTP/1.0 response, connection MUST be closed after processing.
-        if self.resp_header().map(|h| h.version) == Some(Version::HTTP_10)
-            && self
-                .resp_header()
-                .and_then(|h| h.headers.get(header::TRANSFER_ENCODING))
-                .is_some()
-        {
+        let version = self.response_version();
+        let has_te = self
+            .resp_header()
+            .map(|h| h.headers.contains_key(header::TRANSFER_ENCODING))
+            .or_else(|| self.response_reuse.as_ref().map(|r| r.has_transfer_encoding))
+            .unwrap_or(false);
+        if version == Some(Version::HTTP_10) && has_te {
             self.set_keepalive(None);
             return;
         }
@@ -578,7 +629,7 @@ impl HttpSession {
             } else {
                 self.set_keepalive(None);
             }
-        } else if self.resp_header().map(|h| h.version) == Some(Version::HTTP_11) {
+        } else if version == Some(Version::HTTP_11) {
             self.set_keepalive(Some(0)); // on by default for http 1.1
         } else {
             self.set_keepalive(None); // off by default for http 1.0
@@ -599,7 +650,14 @@ impl HttpSession {
         match request_keepalive {
             // ignore what the server sends if request disables keepalive explicitly
             Some(false) => Some(false),
-            _ => is_buf_keepalive(self.get_header(header::CONNECTION)),
+            _ => {
+                let connection = self.get_header(header::CONNECTION).or_else(|| {
+                    self.response_reuse
+                        .as_ref()
+                        .and_then(|r| r.connection.as_ref())
+                });
+                is_buf_keepalive(connection)
+            }
         }
     }
 
@@ -608,8 +666,16 @@ impl HttpSession {
     /// it's behavior is different on different platforms.
     /// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Keep-Alive
     fn get_keepalive_values(&self) -> (Option<u64>, Option<usize>) {
-        let Some(keep_alive_header) = self.get_header("Keep-Alive") else {
-            return (None, None);
+        let keep_alive_header = match self.get_header("Keep-Alive") {
+            Some(value) => value,
+            None => match self
+                .response_reuse
+                .as_ref()
+                .and_then(|r| r.keep_alive.as_ref())
+            {
+                Some(value) => value,
+                None => return (None, None),
+            },
         };
 
         let Ok(header_value) = str::from_utf8(keep_alive_header.as_bytes()) else {
@@ -788,12 +854,18 @@ impl HttpSession {
     pub async fn read_response_task(&mut self) -> Result<HttpTask> {
         if self.should_read_resp_header() {
             let resp_header = self.read_resp_header_parts().await?;
+            // Body reader is already initialized inside read_resp_header_parts for
+            // final responses; informational clones still need the check.
             let end_of_body = self.is_body_done();
-            debug!("Response header: {resp_header:?}");
-            trace!(
-                "Raw Response header: {:?}",
-                str::from_utf8(self.get_headers_raw()).unwrap()
-            );
+            if log::log_enabled!(log::Level::Debug) {
+                debug!("Response header: {resp_header:?}");
+            }
+            if log::log_enabled!(log::Level::Trace) {
+                trace!(
+                    "Raw Response header: {:?}",
+                    str::from_utf8(self.get_headers_raw()).unwrap()
+                );
+            }
             Ok(HttpTask::Header(resp_header, end_of_body))
         } else if self.is_body_done() {
             // no body
@@ -803,11 +875,15 @@ impl HttpSession {
             /* need to read body */
             let body = self.read_body_bytes().await?;
             let end_of_body = self.is_body_done();
-            debug!(
-                "Response body: {} bytes, end: {end_of_body}",
-                body.as_ref().map_or(0, |b| b.len())
-            );
-            trace!("Response body: {body:?}, upgraded: {}", self.upgraded);
+            if log::log_enabled!(log::Level::Debug) {
+                debug!(
+                    "Response body: {} bytes, end: {end_of_body}",
+                    body.as_ref().map_or(0, |b| b.len())
+                );
+            }
+            if log::log_enabled!(log::Level::Trace) {
+                trace!("Response body: {body:?}, upgraded: {}", self.upgraded);
+            }
             if self.upgraded {
                 Ok(HttpTask::UpgradedBody(body, end_of_body))
             } else {
@@ -1182,8 +1258,9 @@ mod tests_stream {
         let mock_io = Builder::new().read(input).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         let resp = http_stream.read_resp_header_parts().await.unwrap();
-        assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
-        assert_eq!(http_stream.get_header("Server👍").unwrap(), "pingora");
+        assert!(http_stream.resp_header().is_none());
+        assert_eq!(Some(StatusCode::OK), http_stream.get_status());
+        assert_eq!(1, resp.headers.len());
         assert_eq!(resp.headers.get("Server👍").unwrap(), "pingora");
     }
 
