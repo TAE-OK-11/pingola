@@ -992,6 +992,38 @@ pub enum BodyMode {
 
 type BM = BodyMode;
 
+/// Encode `chunk_size` as hexadecimal HTTP/1.1 chunk framing into a stack buffer.
+///
+/// Returns the buffer and the length of the valid prefix (`"{size:X}\r\n"`).
+#[inline]
+fn encode_chunk_size_header(chunk_size: usize) -> ([u8; 18], usize) {
+    // usize hex is at most 16 digits on 64-bit; plus CRLF fits in 18 bytes.
+    let mut buf = [0u8; 18];
+    if chunk_size == 0 {
+        buf[0] = b'0';
+        buf[1] = b'\r';
+        buf[2] = b'\n';
+        return (buf, 3);
+    }
+    let mut n = chunk_size;
+    let mut end = 16;
+    while n > 0 {
+        end -= 1;
+        let digit = (n & 0xf) as u8;
+        buf[end] = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'A' + (digit - 10)
+        };
+        n >>= 4;
+    }
+    let len = 16 - end;
+    buf.copy_within(end..16, 0);
+    buf[len] = b'\r';
+    buf[len + 1] = b'\n';
+    (buf, len + 2)
+}
+
 pub struct BodyWriter {
     pub body_mode: BodyMode,
 }
@@ -1102,9 +1134,11 @@ impl BodyWriter {
         match self.body_mode {
             BM::ChunkedEncoding(written) => {
                 let chunk_size = buf.len();
-
-                let chuck_size_buf = format!("{:X}\r\n", chunk_size);
-                let mut output_buf = Bytes::from(chuck_size_buf).chain(buf).chain(&b"\r\n"[..]);
+                // Stack hex framing avoids a heap String/`Bytes` allocation per chunk.
+                let (chunk_header, header_len) = encode_chunk_size_header(chunk_size);
+                // Disambiguate from AsyncReadExt::chain.
+                let mut output_buf =
+                    Buf::chain(Buf::chain(&chunk_header[..header_len], buf), &b"\r\n"[..]);
                 stream
                     .write_vec_all(&mut output_buf)
                     .await

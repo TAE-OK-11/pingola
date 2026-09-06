@@ -53,7 +53,12 @@ impl H3Route {
         if tcp_fallback {
             return false;
         }
-        self.forced || self.preferred
+        if self.forced {
+            return true;
+        }
+        // Preferred H3 routes skip a cold/down pool and go straight to TCP
+        // instead of failing open and paying an H3→TCP retry on every request.
+        self.preferred && self.is_available()
     }
 
     pub fn is_available(&self) -> bool {
@@ -69,6 +74,16 @@ impl H3Route {
         Self {
             origin,
             available: Arc::new(AtomicBool::new(true)),
+            forced: false,
+            preferred: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn preferred_unavailable_for_tests(origin: SocketAddr) -> Self {
+        Self {
+            origin,
+            available: Arc::new(AtomicBool::new(false)),
             forced: false,
             preferred: true,
         }
@@ -1665,6 +1680,18 @@ fn boxed_error(message: impl Into<String>) -> BoxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferred_h3_skips_unavailable_pool_without_tcp_fallback_flag() {
+        let origin = "127.0.0.1:443".parse().unwrap();
+        let available = H3Route::preferred_for_tests(origin);
+        assert!(available.should_use_direct_h3(false));
+        assert!(!available.should_use_direct_h3(true));
+
+        let unavailable = H3Route::preferred_unavailable_for_tests(origin);
+        assert!(!unavailable.should_use_direct_h3(false));
+        assert!(!unavailable.should_use_direct_h3(true));
+    }
 
     #[test]
     fn only_bodyless_get_and_head_are_early_data_safe() {
