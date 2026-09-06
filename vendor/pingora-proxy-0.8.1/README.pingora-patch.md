@@ -37,3 +37,8 @@ small set of documented local changes.
   responses can skip a `select!` branch on every upstream body chunk.
 - Local change: HTTP/2 bodyless fast path reuses the same downstream poll opt-in
   and skips HTTP/1 chunked framing when the client is already HTTP/2.
+- Local change: skip `upstream_compression.response_filter` on the bodyless H1
+  path when compression is disabled (the common case).
+- Reason: `response_filter` already returns immediately when disabled, but the
+  call still pays for an enabled-state check through a trait object on every
+  response task; hoist the check once per request.

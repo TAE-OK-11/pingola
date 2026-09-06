@@ -90,7 +90,7 @@ version = ">=0.8.9"
 version = "0.1.42"
 
 [dependencies.brotli]
-version = "8"
+version = "9"
 
 [dependencies.bstr]
 version = "1.12.0"

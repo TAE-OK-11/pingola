@@ -920,7 +920,7 @@ impl ProxyHttp for Gateway {
         let plan = self.request_plan(ctx)?;
         strip_request_hop_headers(session.req_header(), upstream_request)?;
         grpc::prepare_upstream_request(upstream_request, &mut ctx.grpc_web, ctx.grpc);
-        upstream_request.headers.reserve(10);
+        upstream_request.headers.reserve(8);
         let client_ip = ctx.upstream_forwarded_for.as_ref().ok_or_else(|| {
             Error::explain(HTTPStatus(500), "upstream forwarded client IP is missing")
         })?;
@@ -929,8 +929,9 @@ impl ProxyHttp for Gateway {
             .as_ref()
             .ok_or_else(|| Error::explain(HTTPStatus(500), "upstream forwarded port is missing"))?;
 
+        // Clients may send Forwarded; drop it because we do not reconstruct it.
+        // X-Forwarded-For is overwritten by insert_typed_header below.
         upstream_request.remove_header(&FORWARDED);
-        upstream_request.remove_header(&X_FORWARDED_FOR);
         upstream_request.insert_typed_header(HOST, plan.upstream_host.clone());
         upstream_request.insert_typed_header(X_REAL_IP, client_ip.clone());
         upstream_request.insert_typed_header(X_FORWARDED_FOR, client_ip.clone());

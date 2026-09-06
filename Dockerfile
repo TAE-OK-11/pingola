@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.25@sha256:0adf442eae370b6087e08edc7c50b552d80ddf261576f4ebd6421006b2461f12
 # check=error=true
 
-ARG RUST_VERSION=1.98.0
+ARG RUST_VERSION=1.98.1
 ARG RUST_TARGET_TRIPLE=x86_64-unknown-linux-gnu
 ARG RUST_TARGET_CPU=cascadelake
 ARG RUST_LTO=fat

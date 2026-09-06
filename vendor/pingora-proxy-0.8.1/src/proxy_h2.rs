@@ -478,7 +478,9 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        session.upstream_compression.response_filter(&mut task);
+        if session.upstream_compression.is_enabled() {
+            session.upstream_compression.response_filter(&mut task);
+        }
         let task = self.h2_uncached_response_filter(session, task, ctx).await?;
         session.write_response_task(task).await
     }
