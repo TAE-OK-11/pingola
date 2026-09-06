@@ -708,10 +708,15 @@ where
             .await
             .map_err(|e| e.into_up())?;
 
-        let resp_header = Box::new(client_session.response_header().expect("just read").clone());
         let header_eos = match client_session.check_response_end_or_error(true).await {
             Ok(eos) => eos,
             Err(e) => {
+                let resp_header = Box::new(
+                    client_session
+                        .take_response_header()
+                        .or_else(|| client_session.response_header().cloned())
+                        .expect("just read"),
+                );
                 let _ = self
                     .write_filtered_custom_task(
                         session,
@@ -724,6 +729,13 @@ where
                 return Err(e.into_up());
             }
         };
+
+        let resp_header = Box::new(
+            client_session
+                .take_response_header()
+                .or_else(|| client_session.response_header().cloned())
+                .expect("just read"),
+        );
 
         if self
             .write_filtered_custom_task(
@@ -973,7 +985,12 @@ async fn custom_pipe_up_to_down_response<S: CustomSession>(
             .read_response_header()
             .await
             .map_err(|e| e.into_up())?;
-        let resp_header = Box::new(client.response_header().expect("just read").clone());
+        let resp_header = Box::new(
+            client
+                .take_response_header()
+                .or_else(|| client.response_header().cloned())
+                .expect("just read"),
+        );
         // `101 Switching Protocols` is a response to the http1 Upgrade header and it's final response.
         // The WebSocket Protocol https://datatracker.ietf.org/doc/html/rfc6455
         is_informational = is_informational_except_101(resp_header.status.as_u16() as u32);

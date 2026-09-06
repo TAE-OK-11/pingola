@@ -308,10 +308,10 @@ where
             .await
             .map_err(|e| e.into_up())?;
 
-        let resp_header = Box::new(client_session.response_header().expect("just read").clone());
         let header_eos = match client_session.check_response_end_or_error() {
             Ok(eos) => {
                 let req_header = client_session.request_header().expect("must have sent req");
+                let resp_header = client_session.response_header().expect("just read");
                 if eos
                     && req_header.method != Method::HEAD
                     && resp_header.status != StatusCode::NO_CONTENT
@@ -330,6 +330,11 @@ where
                 eos
             }
             Err(e) => {
+                let resp_header = Box::new(
+                    client_session
+                        .take_response_header()
+                        .expect("just read"),
+                );
                 let _ = self
                     .write_filtered_h2_task(
                         session,
@@ -340,6 +345,12 @@ where
                 return Err(e.into_up());
             }
         };
+
+        let resp_header = Box::new(
+            client_session
+                .take_response_header()
+                .expect("just read"),
+        );
 
         if self
             .write_filtered_h2_task(session, HttpTask::Header(resp_header, header_eos), ctx)
@@ -1046,8 +1057,6 @@ pub(crate) async fn pipe_up_to_down_response(
         .await
         .map_err(|e| e.into_up())?; // should we send the error as an HttpTask?
 
-    let resp_header = Box::new(client.response_header().expect("just read").clone());
-
     match client.check_response_end_or_error() {
         Ok(eos) => {
             // XXX: the h2 crate won't check for content-length underflow
@@ -1056,6 +1065,7 @@ pub(crate) async fn pipe_up_to_down_response(
             // as does the response to a HEAD request"
             // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
             let req_header = client.request_header().expect("must have sent req");
+            let resp_header = client.response_header().expect("just read");
             if eos
                 && req_header.method != Method::HEAD
                 && resp_header.status != StatusCode::NO_CONTENT
@@ -1075,6 +1085,7 @@ pub(crate) async fn pipe_up_to_down_response(
                     .await;
                 return Ok(());
             }
+            let resp_header = Box::new(client.take_response_header().expect("just read"));
             tx.send(HttpTask::Header(resp_header, eos))
                 .await
                 .or_err(InternalError, "sending h2 headers to pipe")?;
@@ -1083,6 +1094,7 @@ pub(crate) async fn pipe_up_to_down_response(
             // If upstream errored, then push error to downstream and then quit
             // Don't care if send fails (which means downstream already gone)
             // we were still able to retrieve the headers, so try sending
+            let resp_header = Box::new(client.take_response_header().expect("just read"));
             let _ = tx.send(HttpTask::Header(resp_header, false)).await;
             let _ = tx.send(HttpTask::Failed(e.into_up())).await;
             return Ok(());

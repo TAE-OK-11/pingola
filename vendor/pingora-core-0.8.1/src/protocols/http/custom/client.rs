@@ -48,6 +48,12 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn response_header(&self) -> Option<&ResponseHeader>;
 
+    /// Take ownership of the response header after it has been read.
+    /// Prefer this over cloning when the header is no longer needed on the session.
+    fn take_response_header(&mut self) -> Option<ResponseHeader> {
+        None
+    }
+
     fn was_upgraded(&self) -> bool;
 
     fn digest(&self) -> Option<&Digest>;
@@ -121,6 +127,10 @@ impl Session for () {
 
     fn response_header(&self) -> Option<&ResponseHeader> {
         unreachable!("client session: response_header")
+    }
+
+    fn take_response_header(&mut self) -> Option<ResponseHeader> {
+        unreachable!("client session: take_response_header")
     }
 
     fn was_upgraded(&self) -> bool {

@@ -647,7 +647,7 @@ impl ProxyHttp for Gateway {
             // Bound slow readers while a cold-asset memory permit is held.
             session.set_read_timeout(Some(Duration::from_secs(30)));
             session.set_write_timeout(Some(Duration::from_secs(30)));
-            session.set_keepalive(Some(30));
+            session.set_keepalive(Some(60));
             let Some(client_ip) = session_client_ip(&self.runtime, session) else {
                 session.set_keepalive(None);
                 return send_empty(&self.runtime, session, 400, None, tls, http3, &[]).await;
@@ -844,17 +844,19 @@ impl ProxyHttp for Gateway {
             session.set_read_timeout(Some(plan.downstream_timeout));
         }
         session.set_write_timeout(Some(plan.downstream_timeout));
-        session.set_keepalive(Some(30));
+        session.set_keepalive(Some(60));
         ctx.plan_index = plan_index;
-        debug!(
-            "integration route host={} path={} route={} handler={:?} upstream_pool_group={} h3_eligible={}",
-            host.name,
-            session.req_header().uri.path(),
-            plan.route.name(),
-            plan.handler,
-            plan.route.upstream_pool_group(),
-            plan.h3.is_some(),
-        );
+        if log::log_enabled!(log::Level::Debug) {
+            debug!(
+                "integration route host={} path={} route={} handler={:?} upstream_pool_group={} h3_eligible={}",
+                host.name,
+                session.req_header().uri.path(),
+                plan.route.name(),
+                plan.handler,
+                plan.route.upstream_pool_group(),
+                plan.h3.is_some(),
+            );
+        }
 
         Ok(false)
     }
@@ -920,7 +922,8 @@ impl ProxyHttp for Gateway {
         let plan = self.request_plan(ctx)?;
         strip_request_hop_headers(session.req_header(), upstream_request)?;
         grpc::prepare_upstream_request(upstream_request, &mut ctx.grpc_web, ctx.grpc);
-        upstream_request.headers.reserve(8);
+        // Host + X-Real-IP + 5 X-Forwarded-* (+ optional Accept-Encoding/Upgrade).
+        upstream_request.headers.reserve(7);
         let client_ip = ctx.upstream_forwarded_for.as_ref().ok_or_else(|| {
             Error::explain(HTTPStatus(500), "upstream forwarded client IP is missing")
         })?;
@@ -932,10 +935,12 @@ impl ProxyHttp for Gateway {
         // Clients may send Forwarded; drop it because we do not reconstruct it.
         // X-Forwarded-For is overwritten by insert_typed_header below.
         upstream_request.remove_header(&FORWARDED);
-        upstream_request.insert_typed_header(HOST, plan.upstream_host.clone());
+        let upstream_host = plan.upstream_host.clone();
+        let client_ip = client_ip.clone();
+        upstream_request.insert_typed_header(HOST, upstream_host.clone());
         upstream_request.insert_typed_header(X_REAL_IP, client_ip.clone());
-        upstream_request.insert_typed_header(X_FORWARDED_FOR, client_ip.clone());
-        upstream_request.insert_typed_header(X_FORWARDED_HOST, plan.upstream_host.clone());
+        upstream_request.insert_typed_header(X_FORWARDED_FOR, client_ip);
+        upstream_request.insert_typed_header(X_FORWARDED_HOST, upstream_host);
         upstream_request.insert_typed_header(X_FORWARDED_PORT, forwarded_port.clone());
         upstream_request.insert_typed_header(X_FORWARDED_PROTO, if ctx.tls { HTTPS } else { HTTP });
         upstream_request.insert_typed_header(X_FORWARDED_SSL, if ctx.tls { ON } else { OFF });

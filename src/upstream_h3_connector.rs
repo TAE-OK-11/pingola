@@ -149,25 +149,15 @@ impl H3UpstreamSession {
             .response()
             .await
             .map_err(|error| Self::read_err(error.to_string()))?;
-        let mut response =
-            ResponseHeader::build_no_case(status, Some(headers.len())).map_err(|error| {
-                Error::because(
-                    ErrorType::InvalidHTTPHeader,
-                    "upstream HTTP/3 response header build failed",
-                    error,
-                )
-            })?;
-        for (name, value) in &headers {
-            response
-                .insert_header(name.clone(), value.clone())
-                .map_err(|error| {
-                    Error::because(
-                        ErrorType::InvalidHTTPHeader,
-                        "upstream HTTP/3 response header insert failed",
-                        error,
-                    )
-                })?;
-        }
+        let mut response = ResponseHeader::build_no_case(status, Some(0)).map_err(|error| {
+            Error::because(
+                ErrorType::InvalidHTTPHeader,
+                "upstream HTTP/3 response header build failed",
+                error,
+            )
+        })?;
+        // Move the already-decoded HeaderMap instead of cloning every name/value.
+        response.headers = headers;
         self.response_header = Some(response);
         self.body_rx = Some(body);
         self.finished = Some(finished);
@@ -251,7 +241,8 @@ impl H3RequestBodyWriter {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let chunk = std::mem::replace(&mut self.pending, BytesMut::new()).freeze();
+        // Keep pending capacity across flushes to avoid reallocating the batch buffer.
+        let chunk = self.pending.split().freeze();
         send_body_command(&self.commands, self.id, chunk, fin)
             .await
             .map_err(Self::write_err)
@@ -322,8 +313,8 @@ impl cloudflare_pingora::protocols::http::custom::client::Session for H3Upstream
                     Ok(data) if !data.is_empty() => return Ok(Some(data)),
                     Ok(_) => {}
                     Err(frame) => {
-                        if let Some(trailers) = frame.trailers_ref() {
-                            self.pending_trailers = Some(trailers.clone());
+                        if let Ok(trailers) = frame.into_trailers() {
+                            self.pending_trailers = Some(trailers);
                             self.body_done = true;
                             return Ok(None);
                         }
@@ -361,6 +352,10 @@ impl cloudflare_pingora::protocols::http::custom::client::Session for H3Upstream
 
     fn response_header(&self) -> Option<&ResponseHeader> {
         self.response_header.as_ref()
+    }
+
+    fn take_response_header(&mut self) -> Option<ResponseHeader> {
+        self.response_header.take()
     }
 
     fn was_upgraded(&self) -> bool {

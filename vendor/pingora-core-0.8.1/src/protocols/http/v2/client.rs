@@ -385,6 +385,14 @@ impl Http2Session {
         self.response_header.as_ref()
     }
 
+    /// Take ownership of the response header after it has been read.
+    ///
+    /// Bodyless H2 proxy paths use this to avoid cloning the full header map once
+    /// status / content-length checks have finished against a shared borrow.
+    pub fn take_response_header(&mut self) -> Option<ResponseHeader> {
+        self.response_header.take()
+    }
+
     /// Give up the http session abruptly.
     pub fn shutdown(&mut self) {
         if !self.ended || !self.response_finished() {
