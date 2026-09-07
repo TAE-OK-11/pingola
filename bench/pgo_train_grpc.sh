@@ -71,7 +71,11 @@ run_h2load() {
   local name=$1
   shift
 
-  h2load "$@" >"${OUTPUT_DIR}/${name}.log" 2>&1
+  if ! h2load "$@" >"${OUTPUT_DIR}/${name}.log" 2>&1; then
+    echo "h2load gRPC command failed: ${name}" >&2
+    sed -n '1,180p' "${OUTPUT_DIR}/${name}.log" >&2
+    exit 1
+  fi
   if ! grep -Eq '0 failed, 0 errored' "${OUTPUT_DIR}/${name}.log"; then
     echo "h2load gRPC workload failed: ${name}" >&2
     sed -n '1,180p' "${OUTPUT_DIR}/${name}.log" >&2
@@ -154,21 +158,21 @@ if ! wait_tcp "${HTTP_PORT}" "${PINGORA_PID}" Pingora; then
   exit 1
 fi
 
-run_h2load grpc-h2-unary --h2 -n "$(pgo_train_scale 8000)" -c 4 -m 16 -d "${RUNTIME_DIR}/empty.grpc" \
+run_h2load grpc-h2-unary --alpn-list=h2 -n "$(pgo_train_scale 8000)" -c 4 -m 16 -d "${RUNTIME_DIR}/empty.grpc" \
   --sni music.test \
   -H 'host: music.test' \
   -H 'content-type: application/grpc' \
   -H 'te: trailers' \
   "https://127.0.0.1:${HTTPS_PORT}/navidrome.Subsonic/Ping"
 
-run_h2load grpc-h2-proto --h2 -n "$(pgo_train_scale 4000)" -c 4 -m 16 -d "${RUNTIME_DIR}/empty.grpc" \
+run_h2load grpc-h2-proto --alpn-list=h2 -n "$(pgo_train_scale 4000)" -c 4 -m 16 -d "${RUNTIME_DIR}/empty.grpc" \
   --sni music.test \
   -H 'host: music.test' \
   -H 'content-type: application/grpc+proto' \
   -H 'te: trailers' \
   "https://127.0.0.1:${HTTPS_PORT}/navidrome.Subsonic/GetAlbum"
 
-run_h2load grpc-h2-cdn --h2 -n "$(pgo_train_scale 2000)" -c 2 -m 8 -d "${RUNTIME_DIR}/empty.grpc" \
+run_h2load grpc-h2-cdn --alpn-list=h2 -n "$(pgo_train_scale 2000)" -c 2 -m 8 -d "${RUNTIME_DIR}/empty.grpc" \
   --sni cdn.test \
   -H 'host: cdn.test' \
   -H 'content-type: application/grpc' \
