@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Shared Rust target-cpu validation and matching Clang C/C++ flags for BoringSSL,
 # quiche, and jemalloc native objects. PGO training runs on GitHub Actions
-# (x86-64-v2); final release images may target cascadelake for the proxy VM.
+# (x86-64-v2); final release images may target znver3 for the Zen 3 proxy VM.
 set -euo pipefail
 
 validate_rust_target_cpu() {
   case "$1" in
-    x86-64-v2 | cascadelake) return 0 ;;
+    x86-64-v2 | cascadelake | znver3) return 0 ;;
     *)
-      echo "unsupported Rust target CPU: $1 (supported: x86-64-v2, cascadelake)" >&2
+      echo "unsupported Rust target CPU: $1 (supported: x86-64-v2, cascadelake, znver3)" >&2
       return 1
       ;;
   esac
@@ -23,6 +23,11 @@ rust_target_cpu_native_cflags() {
       # Intel Cascade Lake / Cooper Lake (8259CL proxy). Enables AVX-512 where LLVM
       # can use it. Requires AVX2 at minimum; do not run on znver1/older baseline.
       printf '%s' '-O3 -march=cascadelake -mtune=cascadelake -ffunction-sections -fdata-sections'
+      ;;
+    znver3)
+      # AMD Zen 3. Keep Rust and native C/C++ code on the same microarchitecture
+      # so fat-LTO/PGO final codegen and BoringSSL/quiche/jemalloc agree on ISA tuning.
+      printf '%s' '-O3 -march=znver3 -mtune=znver3 -ffunction-sections -fdata-sections'
       ;;
     *)
       echo "unsupported Rust target CPU: $1" >&2
