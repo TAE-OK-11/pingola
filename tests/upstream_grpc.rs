@@ -114,57 +114,64 @@ async fn grpc_origin(
             let mut connection = h2::server::handshake(stream).await.unwrap();
             while let Some(result) = connection.accept().await {
                 let (request, mut respond) = result.unwrap();
-                assert_eq!(request.version(), http::Version::HTTP_2);
-                let content_type = request
-                    .headers()
-                    .get(CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default();
-                if expect_web_converted {
-                    assert_eq!(content_type, "application/grpc+proto");
-                } else {
-                    assert_eq!(content_type, "application/grpc");
-                }
-                saw_grpc.store(true, Ordering::Relaxed);
-                let te = request
-                    .headers()
-                    .get(TE)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default();
-                if te.eq_ignore_ascii_case("trailers") {
-                    saw_te.store(true, Ordering::Relaxed);
-                }
-                requests.fetch_add(1, Ordering::Relaxed);
+                let saw_te = Arc::clone(&saw_te);
+                let saw_grpc = Arc::clone(&saw_grpc);
+                let requests = Arc::clone(&requests);
+                // Keep polling accept() to drive H2 DATA while this stream
+                // awaits its request body, just like a real concurrent origin.
+                tokio::spawn(async move {
+                    assert_eq!(request.version(), http::Version::HTTP_2);
+                    let content_type = request
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default();
+                    if expect_web_converted {
+                        assert_eq!(content_type, "application/grpc+proto");
+                    } else {
+                        assert_eq!(content_type, "application/grpc");
+                    }
+                    saw_grpc.store(true, Ordering::Relaxed);
+                    let te = request
+                        .headers()
+                        .get(TE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default();
+                    if te.eq_ignore_ascii_case("trailers") {
+                        saw_te.store(true, Ordering::Relaxed);
+                    }
+                    requests.fetch_add(1, Ordering::Relaxed);
 
-                // Consume the unary request before ending the response. Dropping
-                // an unread RecvStream races the proxy's body write and can reset
-                // the stream before the gRPC-web response is delivered.
-                let mut request_body = request.into_body();
-                while let Some(chunk) = request_body.data().await {
-                    let chunk = chunk.unwrap();
-                    request_body
-                        .flow_control()
-                        .release_capacity(chunk.len())
+                    // Consume the unary request before ending the response. Dropping
+                    // an unread RecvStream races the proxy's body write and can reset
+                    // the stream before the gRPC-web response is delivered.
+                    let mut request_body = request.into_body();
+                    while let Some(chunk) = request_body.data().await {
+                        let chunk = chunk.unwrap();
+                        request_body
+                            .flow_control()
+                            .release_capacity(chunk.len())
+                            .unwrap();
+                    }
+
+                    let response_type = if expect_web_converted {
+                        "application/grpc+proto"
+                    } else {
+                        "application/grpc"
+                    };
+                    let response = http::Response::builder()
+                        .status(200)
+                        .header(CONTENT_TYPE, response_type)
+                        .body(())
                         .unwrap();
-                }
-
-                let response_type = if expect_web_converted {
-                    "application/grpc+proto"
-                } else {
-                    "application/grpc"
-                };
-                let response = http::Response::builder()
-                    .status(200)
-                    .header(CONTENT_TYPE, response_type)
-                    .body(())
-                    .unwrap();
-                let mut body = respond.send_response(response, false).unwrap();
-                body.send_data(Bytes::from_static(EMPTY_GRPC_FRAME), false)
-                    .unwrap();
-                let mut trailers = http::HeaderMap::new();
-                trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
-                trailers.insert("grpc-message", http::HeaderValue::from_static("OK"));
-                body.send_trailers(trailers).unwrap();
+                    let mut body = respond.send_response(response, false).unwrap();
+                    body.send_data(Bytes::from_static(EMPTY_GRPC_FRAME), false)
+                        .unwrap();
+                    let mut trailers = http::HeaderMap::new();
+                    trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                    trailers.insert("grpc-message", http::HeaderValue::from_static("OK"));
+                    body.send_trailers(trailers).unwrap();
+                });
             }
         });
     }
