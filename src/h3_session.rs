@@ -50,7 +50,7 @@ impl H3Session {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         request_header: RequestHeader,
-        request_wire: Vec<(Bytes, Bytes)>,
+        request_wire: Option<Vec<(Bytes, Bytes)>>,
         send: OutboundFrameSender,
         recv: InboundFrameStream,
         request_fin: bool,
@@ -77,7 +77,7 @@ impl H3Session {
             digest: Digest::default(),
             alt_svc,
             wire_headers: Vec::with_capacity(16),
-            request_wire: Some(request_wire),
+            request_wire,
         }
     }
 

@@ -241,6 +241,11 @@ async fn run(
         public_listen,
         alt_svc,
         allow_early_data,
+        preserve_request_wire: runtime
+            .config
+            .upstreams
+            .values()
+            .any(|upstream| upstream.protocol.uses_http3()),
     });
     let max_requests_per_connection = server.http3_max_requests_per_connection;
     let max_streams_per_connection = server.http3_max_concurrent_streams as usize;
@@ -344,6 +349,7 @@ struct Http3Shared {
     public_listen: std::net::SocketAddr,
     alt_svc: Option<Arc<HeaderValue>>,
     allow_early_data: bool,
+    preserve_request_wire: bool,
 }
 
 #[derive(Clone)]
@@ -484,7 +490,13 @@ async fn proxy_request(incoming: IncomingH3Headers, context: Http3ConnectionCont
         return;
     }
 
-    let request_wire = h3_wire::headers_to_bytes_pairs(headers);
+    // Only custom H3 upstreams consume the captured wire block. For H1/H2
+    // origins, drop it now instead of converting and retaining a second set
+    // of headers for the lifetime of a potentially long audio stream.
+    let request_wire = context
+        .shared
+        .preserve_request_wire
+        .then(|| h3_wire::headers_to_bytes_pairs(headers));
     let session = ServerSession::new_custom(Box::new(H3Session::new(
         request,
         request_wire,

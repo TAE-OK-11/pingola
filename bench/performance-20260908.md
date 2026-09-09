@@ -45,7 +45,10 @@
 2. registry와 실제 의존성 컴파일을 소스와 독립적인 Docker layer로 보존한다.
    dummy root의 fingerprint와 binary는 지워 실제 코드를 반드시 다시 컴파일한다.
    PGO 중간 산출물은 최종 build layer에 남기지 않는다.
-3. H3 wire reconciliation에서 lowercase 이름의 Bytes를 공유하고 HeaderMap의
+3. upstream H3가 하나도 없는 구성에서는 downstream H3의 원본 wire header를
+   변환·보관하지 않는다. 운영 Navidrome H1 경로에서 두 번째 header set이
+   음악 stream 수명 동안 남는 것을 막는다. upstream H3가 있으면 기존 capture를 유지한다.
+   H3 wire reconciliation에서 lowercase 이름의 Bytes를 공유하고 HeaderMap의
    정규화된 이름 slice로 조회한다. 기존의 헤더당 삽입/조회용 Vec 할당 및
    lowercase scratch allocation을 제거한다. 실제 이득의 크기는 미측정이다.
    중복 header, 필터로 바뀐 값, 삭제한 forwarded header 보존 규칙은 유지한다.
