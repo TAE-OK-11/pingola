@@ -61,7 +61,7 @@
 
 로컬 실행 없이 GitHub에서 Rust 테스트/Clippy, allocator fallback,
 H1/H2/H3 통합, image runtime 검증, synthetic overhead 측정을 수행한다.
-CI 결과와 실제 소요 시간은 후속 기록으로 추가한다.
+CI 결과와 실제 소요 시간은 아래 최종 기록에 정리했다.
 
 일반 publish job 예산은 25분이고 verify를 포함해 30분 이내가 목표다.
 Timeout을 줄인 것 자체는 성공 증거가 아니다. 첫 콜드 캐시와 다음 캐시 적중
@@ -72,3 +72,59 @@ QUIC 성능을 측정하지 않는다. shared runner의 포화 p99 차이는 대
 포함하며 순수 처리 비용이 아니다. HTTP 프록시는 추가 socket I/O와 스케줄링을
 수행하므로 오버헤드 0 또는 특정 지연 감소율을 보장할 수 없다.
 운영 컨테이너는 기존 digest에 고정돼 있으며 이 작업은 소스/CI 게시만 수행한다.
+
+## GitHub 최종 검증 — 2026-09-09
+
+검증 소스: `793f32344e59b1e1a10f2cc53300f556d9c4ff9a`.
+[Actions 34315663127](https://github.com/TAE-OK-11/pingola/actions/runs/34315663127): 모든 job 성공.
+
+| 단계 | 실제 시간 |
+| --- | ---: |
+| 전체 workflow (05:37:59–05:57:41 UTC) | 19분 42초 |
+| verify | 5분 16초 |
+| production image build + publish 단계 | 6분 35초 |
+| publish job 전체 | 7분 2초 |
+| portable image build | 7분 5초 |
+| 직접 연결/프록시 benchmark 단계 | 6분 49초 |
+
+기존 전체 4시간 53초 대비 일반 workflow가 약 91.8% 단축됐다.
+full PGO 학습을 생략한 서로 다른 빌드 정책의 비교이며, PGO와 동일한
+실행 성능이라는 의미가 아니다. fat LTO/Zen 3는 유지했다.
+새 의존성 layer의 release 컴파일은 2분 26초, 실제 소스 컴파일은 1분 14초였다.
+첫 실행에서 30분 목표를 달성했다. 후속 캐시 적중 빌드 시간은 아직 측정하지 않았다.
+
+Rust 테스트/Clippy, allocator fallback, retry/limit 격리, H1/H2/H3 통합,
+H3 strict/preferred fallback, image runtime 검사 모두 통과했다.
+세 benchmark의 54개 측정 row는 모두 PASS이며 HTTP/transport error는 0이었다.
+
+게시 이미지 (두 저장소의 동일 manifest digest):
+`ghcr.io/tae-ok-11/pingora@sha256:c6ecc42bc66ce56b13a645d99d2b538a916d726e6948b06e8361ae19034c89df`
+및 `ghcr.io/tae-ok-11/pingola`의 같은 digest.
+운영 서버에 이 이미지를 적용하거나 재시작하지 않았다.
+
+### 직접 backend 대비 proxy p99
+
+단위 µs. 같은 runner에서 3회 측정한 각 target p99의 중앙값 차이이며,
+개별 요청별 추가 지연의 p99는 아니다. H1 평문, rate/active limit off,
+proxy security headers on, synthetic backend와 부하 생성기가 CPU를 공유한다.
+
+| 요청 | 동시성 | Direct p99 | Proxy p99 | 차이 |
+| --- | ---: | ---: | ---: | ---: |
+| API 512 B | 1 | 63 | 170 | 107 |
+| API 512 B | 8 | 162 | 394 | 232 |
+| API 512 B | 32 | 580 | 1624 | 1044 |
+| Cover 4 KiB | 1 | 70 | 176 | 106 |
+| Cover 4 KiB | 8 | 170 | 440 | 270 |
+| Cover 4 KiB | 32 | 618 | 1693 | 1075 |
+| Audio 64 KiB | 1 | 103 | 247 | 144 |
+| Audio 64 KiB | 8 | 395 | 820 | 425 |
+| Audio 64 KiB | 32 | 1430 | 2983 | 1553 |
+
+동시성 1의 추가 p99는 약 0.106–0.144 ms, 동시성 32에서는 1.044–1.553 ms였다.
+포화 처리량은 direct 대비 API/cover 약 43–49%, stream 약 24–28% 낮았다
+(동시성 8/32). 즉 추가 비용은 남아 있다. 단순 응답 backend는 극단적으로
+가벼우므로 이를 실제 Navidrome 처리량 감소율로 해석하면 안 된다.
+현재 자료는 변경 전후 성능 비교가 아니며 HTTP/3 수정의 개선율도 증명하지 않는다.
+
+전체 raw/환경/이미지 provenance는 위 run의
+`proxy-overhead-793f32344e59b1e1a10f2cc53300f556d9c4ff9a` artifact에 14일간 보관한다.
