@@ -295,7 +295,10 @@ mod tests {
     fn finalize_pairs_normalizes_lookup_and_discards_replaced_values() {
         let mut wire = vec![
             (Bytes::from_static(b"X-Value"), Bytes::from_static(b"old")),
-            (Bytes::from_static(b"forwarded"), Bytes::from_static(b"spoof")),
+            (
+                Bytes::from_static(b"forwarded"),
+                Bytes::from_static(b"spoof"),
+            ),
         ];
         let mut req = RequestHeader::build(Method::GET, b"/", None).unwrap();
         req.insert_header("x-value", "new").unwrap();
