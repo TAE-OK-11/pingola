@@ -125,11 +125,32 @@ ENV CC=/src/bench/clang_rust_pgo_filter.sh \
     CARGO_PROFILE_PGO_LTO=fat \
     CARGO_PROFILE_PGO_OPT_LEVEL=3
 
-# Keep dependency downloads in a source-independent layer. BuildKit exports
-# these caches to GitHub Actions, so source-only changes avoid registry churn.
-RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    cargo fetch --locked --target "${RUST_TARGET_TRIPLE}"
+# Ordinary layers, unlike cache mounts, are exported by cache-to=type=gha.
+# Preserve both registry sources and compiled dependencies across fresh runners.
+RUN cargo fetch --locked --target "${RUST_TARGET_TRIPLE}"
+
+COPY --link bench/target_cpu_flags.sh bench/clang_rust_pgo_filter.sh \
+    bench/clangxx_rust_pgo_filter.sh ./bench/
+
+# Compile a disposable root binary to cache the complete dependency graph.
+# Source-only edits invalidate the real build below, not this expensive layer.
+RUN set -eux; \
+    if [ "${PGO_MODE}" = off ]; then \
+      mkdir -p src; \
+      printf 'fn main() {}\n' > src/main.rs; \
+      chmod 755 bench/clang_rust_pgo_filter.sh bench/clangxx_rust_pgo_filter.sh; \
+      . bench/target_cpu_flags.sh; \
+      NATIVE_FLAGS="$(rust_target_cpu_native_cflags "${RUST_TARGET_CPU}")"; \
+      CARGO_TARGET_DIR=/src/target/release \
+      CFLAGS="${NATIVE_FLAGS}" CXXFLAGS="${NATIVE_FLAGS}" \
+      RUSTFLAGS="${RUSTFLAGS_COMMON} -C target-cpu=${RUST_TARGET_CPU}" \
+        cargo build --locked --release --target "${RUST_TARGET_TRIPLE}" \
+          --no-default-features --features "${ALLOCATOR},tls-${TLS_PROVIDER}"; \
+      rm src/main.rs; \
+      rm -rf target/release/${RUST_TARGET_TRIPLE}/release/.fingerprint/jbs-pingora-*; \
+      rm -f target/release/${RUST_TARGET_TRIPLE}/release/deps/pingora-* \
+        target/release/${RUST_TARGET_TRIPLE}/release/pingora; \
+    fi
 
 COPY --link src ./src
 COPY --link examples ./examples
@@ -137,10 +158,7 @@ COPY --link bench/backend.rs bench/pgo_client.rs bench/pgo_train.sh bench/pgo_tr
     bench/pgo_train_upstream_h2.sh bench/pgo_train_upstream_h3.sh bench/pgo_train_grpc.sh bench/pgo_train_scale.sh bench/build_pgo.sh bench/target_cpu_flags.sh bench/rust_lto_flags.sh bench/clang_rust_pgo_filter.sh \
     bench/clangxx_rust_pgo_filter.sh ./bench/
 
-RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=pingora-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=pingora-target-rust-${RUST_VERSION}-${RUST_TARGET_CPU}-${RUST_LTO}-${ALLOCATOR}-${TLS_PROVIDER}-${PGO_MODE}-${PGO_TRAIN_TARGET_CPU}-${PGO_NATIVE_BORING},target=/src/target,sharing=locked \
-    set -eux; \
+RUN set -eux; \
     case "${ALLOCATOR}" in jemalloc|tcmalloc|system-allocator) ;; *) echo "unsupported allocator: ${ALLOCATOR}" >&2; exit 2 ;; esac; \
     case "${TLS_PROVIDER}" in boringssl) ;; *) echo "unsupported TLS provider: ${TLS_PROVIDER}" >&2; exit 2 ;; esac; \
     case "${PGO_MODE}" in off|train) ;; *) echo "unsupported PGO mode: ${PGO_MODE}" >&2; exit 2 ;; esac; \
@@ -172,6 +190,7 @@ RUN --mount=type=cache,id=pingora-cargo-registry,target=/usr/local/cargo/registr
       export BORING_PGO_WEIGHT_H2 BORING_PGO_WEIGHT_H3 BORING_PGO_WEIGHT_UPSTREAM_H3_BBR2; \
       export BORING_PGO_WEIGHT_UPSTREAM_H3_CUBIC BORING_PGO_WEIGHT_TLS RUSTFLAGS_COMMON; \
       bench/build_pgo.sh; \
+      rm -rf /src/target /src/pgo-data /src/pgo-native; \
     fi
 
 FROM debian:${DEBIAN_SUITE}-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS runtime
@@ -242,7 +261,7 @@ LABEL org.opencontainers.image.title="Pingora" \
       org.opencontainers.image.rust.target="${RUST_TARGET_TRIPLE}" \
       org.opencontainers.image.rust.target-cpu="${RUST_TARGET_CPU}" \
       org.opencontainers.image.rust.lto="${RUST_LTO}" \
-      org.opencontainers.image.rust.lto-scope="cargo-fat" \
+      org.opencontainers.image.rust.lto-scope="cargo-${RUST_LTO}" \
       org.opencontainers.image.kernel.ktls="host-dependent" \
       org.opencontainers.image.kernel.udp-offload="gso-gro-txtime" \
       org.opencontainers.image.kernel.tcp-tuning="256k-buf,quickack,notsent-lowat,tfo" \

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -uo pipefail
+set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGE=${PINGORA_IMAGE:-ghcr.io/tae-ok-11/pingora:local}
@@ -173,7 +173,7 @@ docker image inspect "${IMAGE}" >"${OUTPUT}/image-inspect.json"
 printf 'target\tconcurrency\tround\tstatus\trps\tp99_us\terrors\traw\n' >"${OUTPUT}/results.tsv"
 
 run_case() {
-  local target=$1 concurrency=$2 round=$3 url raw warm rc rps p99 errors
+  local target=$1 concurrency=$2 round=$3 url raw warm rc rps p99 errors http_errors status
   if [[ "${target}" == direct ]]; then
     url=${DIRECT_URL}
   else
@@ -183,16 +183,18 @@ run_case() {
   warm=${OUTPUT}/raw/${target}-r${round}-c${concurrency}.warmup.txt
   wrk -t1 -c "${concurrency}" -d "${WARMUP}" -s "${ROOT}/bench/wrk-keepalive.lua" \
     -H 'Host: overhead.test' -H 'Accept-Encoding: identity' "${url}" >"${warm}" 2>&1 || true
+  rc=0
   wrk --latency -t1 -c "${concurrency}" -d "${DURATION}" \
     -s "${ROOT}/bench/wrk-keepalive.lua" -H 'Host: overhead.test' \
-    -H 'Accept-Encoding: identity' "${url}" >"${raw}" 2>&1
-  rc=$?
+    -H 'Accept-Encoding: identity' "${url}" >"${raw}" 2>&1 || rc=$?
   rps=$(awk '/Requests\/sec:/ {print $2}' "${raw}" | tail -1)
   p99=$(sed -nE 's/.*LATENCY_US .*p99=([0-9]+).*/\1/p' "${raw}" | tail -1)
   errors=$(awk '/Socket errors:/ {gsub(/[^0-9 ]/, ""); print $1+$2+$3+$4}' "${raw}" | tail -1)
   errors=${errors:-0}
+  http_errors=$(awk '/Non-2xx or 3xx responses:/ {print $NF}' "${raw}" | tail -1)
+  errors=$((errors + ${http_errors:-0}))
   status=PASS
-  if ((rc != 0 || errors != 0)) || [[ -z "${rps}" || "${rps}" == 0 || "${rps}" == 0.00 ]]; then
+  if ((rc != 0 || errors != 0)) || [[ -z "${rps}" || "${rps}" == 0 || "${rps}" == 0.00 || ! "${p99}" =~ ^[0-9]+$ ]]; then
     status=FAIL
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -212,7 +214,9 @@ done
 python3 - "${OUTPUT}/results.tsv" >"${OUTPUT}/summary.tsv" <<'PY'
 import csv, statistics, sys
 rows = list(csv.DictReader(open(sys.argv[1]), delimiter="\t"))
-print("concurrency\tdirect_rps\tproxy_rps\tproxy_overhead_pct\tdirect_p99_us\tproxy_p99_us\tp99_overhead_pct")
+if not rows or any(r["status"] != "PASS" for r in rows):
+    raise SystemExit("Incomplete/error benchmark: inspect results.tsv and raw logs")
+print("concurrency\tdirect_rps\tproxy_rps\tthroughput_delta_pct\tdirect_p99_us\tproxy_p99_us\tadded_p99_us\tp99_overhead_pct")
 for concurrency in ("1", "8", "32"):
     selected = [r for r in rows if r["concurrency"] == concurrency and r["status"] == "PASS"]
     values = {}
@@ -227,7 +231,8 @@ for concurrency in ("1", "8", "32"):
     print(
         concurrency,
         f"{direct_rps:.2f}", f"{proxy_rps:.2f}", f"{(proxy_rps / direct_rps - 1) * 100:.2f}",
-        f"{direct_p99:.0f}", f"{proxy_p99:.0f}", f"{(proxy_p99 / direct_p99 - 1) * 100:.2f}",
+        f"{direct_p99:.0f}", f"{proxy_p99:.0f}", f"{proxy_p99 - direct_p99:.0f}",
+        f"{(proxy_p99 / direct_p99 - 1) * 100:.2f}" if direct_p99 else "NA",
         sep="\t",
     )
 PY

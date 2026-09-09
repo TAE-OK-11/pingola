@@ -400,28 +400,25 @@ capability를 설정할 때만 mount layer 안에 설치했다가 제거하므�
 남지 않습니다. `RUST_LTO`, `RUST_CODEGEN_UNITS`, `RUST_TARGET_CPU`는 label로 기록되어
 실행 image의 build policy를 inspect할 수 있습니다.
 
-배포 image는 GitHub Actions에서 `RUST_TARGET_CPU=cascadelake`로 빌드합니다. Intel
-Cascade Lake / Cooper Lake(예: Xeon 8259CL, AVX-512) 프록시에 맞춘 ISA이며, PGO
-train과 최종 링크가 같은 `target-cpu`를 사용합니다. 구형 x86-64-v2-only 호스트나
-AVX-512가 비활성화된 VM에서는 `--build-arg RUST_TARGET_CPU=x86-64-v2`로 portable
-image를 빌드하십시오. `native`는 hosted runner CPU에 따라 산출물이 달라지므로 배포
-build에서 허용하지 않습니다. fat LTO/PGO 빌드는 수 GB RAM이 필요하므로 442 MiB
-같은 프록시 VM에서 빌드하지 말고 CI 또는 큰 builder에서 image만 pull하십시오.
-학습 workload는 동일한 synthetic backend를 대상으로 64 B/4096 B H1
-keepalive, 작은/큰 JSON API, 정적 파일 cold miss/hot hit, 1/10 MiB chunked stream,
-예상된 404/500, TLS 신규 연결, 검증된 TLS 1.3 session resumption, H2 다중 stream,
-native gRPC와 gRPC-web(H2 trailers / empty DATA EOS / plaintext H2C warmup)을
-실행합니다. status, Content-Length, body pattern, H2 실패 수, session 재사용 여부를
-검사하고, 약 9만 건의 proxy 요청에서 backend 연결 수가 2,048 미만인지 확인해
-upstream keepalive가 실제로 재사용됐음을 검증합니다. curl/h2load/OpenSSL은 PGO
-학습용 builder에만 설치되며 runtime image에는 포함되지 않습니다. 최종 image label의
-`org.opencontainers.image.rust.pgo=train`,
-`org.opencontainers.image.rust.pgo-train-target-cpu=cascadelake`,
-`org.opencontainers.image.rust.target-cpu` label로 적용 여부를 확인할 수 있습니다.
-PGO 훈련과 최종 code generation은 모두 `cascadelake`를 사용합니다(게시 워크플로:
-`PGO_TRAIN_ROUNDS=3`, `PGO_TRAIN_FAST=off`, `PGO_NATIVE_BORING=on`으로 BoringSSL/quiche
-Clang instrumentation PGO 포함). BOLT는 build와
-runtime에서 사용하지 않습니다.
+배포 image는 GitHub Actions에서 `RUST_TARGET_CPU=znver3`로 빌드합니다.
+Zen 3 ISA를 지원하지 않는 호스트에서는 `RUST_TARGET_CPU=x86-64-v2`를 사용하십시오.
+일반 push는 fat LTO, codegen-units=1, opt-level=3을 유지하고 PGO 학습은 생략합니다.
+CI 검증 후 일반 image build/publish job의 시간 예산은 25분입니다. 전체 workflow
+30분 이내가 목표이며, 러너 대기·콜드 캐시·네트워크 지연까지 보장하는 제한은 아닙니다.
+Cargo registry와 컴파일한 의존성은 GHA로 내보낼 수 있는 Docker layer에 보존합니다.
+소스만 변경되면 의존성 layer를 재사용하고 실제 root binary만 다시 빌드합니다.
+
+전체 Rust/BoringSSL PGO는 `workflow_dispatch`에서 `publish_images=true`,
+`build_profile=full-pgo`로 선택합니다. 이 모드는 기존 360분 예산과 3회 Rust/2회
+native 학습을 유지하며 30분 목표에 포함하지 않습니다. 학습 CPU는 x86-64-v2,
+최종 CPU는 znver3입니다. image label의 `rust.pgo`, `native.pgo`, `rust.target-cpu`,
+`rust.lto`로 실제 정책을 확인할 수 있습니다. BOLT는 사용하지 않습니다.
+
+모든 CI image-test는 portable x86-64-v2 image로 runtime 검사 및 Navidrome API,
+cover-art, audio stream의 direct/backend 대 proxy H1 측정을 수행합니다. 3회 교대
+측정의 RPS와 p99 차이(µs)를 job summary와 artifact에 남깁니다. 이는 shared runner의
+synthetic loopback 측정이며 실제 서버 RTT나 Zen 3 PGO 성능을 대신하지 않습니다.
+분석 근거와 한계는 [성능 분석 기록](bench/performance-20260908.md)을 참조하십시오.
 
 ```bash
 # 동일 commit/allocator/TLS/CPU/LTO의 exact digest 두 개만 허용하는 3-round PGO A/B

@@ -23,6 +23,7 @@ fn skip_regular_header(name: &[u8], value: &[u8]) -> bool {
         || (name.eq_ignore_ascii_case(b"te") && !value.eq_ignore_ascii_case(b"trailers"))
 }
 
+#[cfg(test)]
 fn lowercase_key<'a>(name: &[u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
     scratch.clear();
     scratch.extend_from_slice(name);
@@ -119,12 +120,19 @@ pub fn finalize_upstream_wire_pairs(wire: &mut Vec<(Bytes, Bytes)>, req: &Reques
     let path = req.uri.path_and_query().map_or("/", |value| value.as_str());
 
     let mut reusable = HashMap::with_capacity(wire.len());
-    let mut scratch = Vec::with_capacity(32);
     for (name, value) in wire.drain(..) {
         if is_pseudo(&name) || skip_regular_header(&name, &value) {
             continue;
         }
-        reusable.insert(lowercase_key(&name, &mut scratch).to_vec(), (name, value));
+        // HTTP/3 names are already lowercase. Share their Bytes allocation
+        // instead of allocating a lowercase Vec for every insert and lookup.
+        // Keep normalization for callers supplying mixed-case byte pairs.
+        let key = if name.iter().any(u8::is_ascii_uppercase) {
+            Bytes::from(name.to_ascii_lowercase())
+        } else {
+            name.clone()
+        };
+        reusable.insert(key, (name, value));
     }
 
     wire.clear();
@@ -147,8 +155,7 @@ pub fn finalize_upstream_wire_pairs(wire: &mut Vec<(Bytes, Bytes)>, req: &Reques
         if skip_regular_header(name.as_str().as_bytes(), value.as_bytes()) {
             continue;
         }
-        let key = lowercase_key(name.as_str().as_bytes(), &mut scratch).to_vec();
-        if let Some((existing_name, existing_value)) = reusable.remove(&key)
+        if let Some((existing_name, existing_value)) = reusable.remove(name.as_str().as_bytes())
             && existing_value.as_ref() == value.as_bytes()
         {
             wire.push((existing_name, existing_value));
@@ -261,6 +268,41 @@ mod tests {
             assert_eq!(pair_name.as_ref(), header.name());
             assert_eq!(pair_value.as_ref(), header.value());
         }
+    }
+
+    #[test]
+    fn finalize_pairs_preserves_duplicates_and_reuses_lowercase_buffers() {
+        let name = Bytes::from(Vec::from(&b"x-value"[..]));
+        let value = Bytes::from(Vec::from(&b"second"[..]));
+        let name_ptr = name.as_ptr();
+        let value_ptr = value.as_ptr();
+        let mut wire = vec![(name, value)];
+        let mut req = RequestHeader::build(Method::GET, b"/", None).unwrap();
+        req.append_header("x-value", "second").unwrap();
+        req.append_header("x-value", "first").unwrap();
+        finalize_upstream_wire_pairs(&mut wire, &req);
+        let values: Vec<_> = wire
+            .iter()
+            .filter(|(name, _)| name.as_ref() == b"x-value")
+            .collect();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].0.as_ptr(), name_ptr);
+        assert_eq!(values[0].1.as_ptr(), value_ptr);
+        assert_eq!(values[1].1.as_ref(), b"first");
+    }
+
+    #[test]
+    fn finalize_pairs_normalizes_lookup_and_discards_replaced_values() {
+        let mut wire = vec![
+            (Bytes::from_static(b"X-Value"), Bytes::from_static(b"old")),
+            (Bytes::from_static(b"forwarded"), Bytes::from_static(b"spoof")),
+        ];
+        let mut req = RequestHeader::build(Method::GET, b"/", None).unwrap();
+        req.insert_header("x-value", "new").unwrap();
+        finalize_upstream_wire_pairs(&mut wire, &req);
+        assert_eq!(wire.len(), 5);
+        assert_eq!(wire[4].0.as_ref(), b"x-value");
+        assert_eq!(wire[4].1.as_ref(), b"new");
     }
 
     #[test]

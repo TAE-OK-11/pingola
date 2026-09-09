@@ -104,7 +104,7 @@ assert_container_hardening() {
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.quic.tls.provider"}}' "${name}") == boringssl ]]
   test "$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${name}" | sed -n 's/^MALLOC_CONF=//p')" \
     = 'narenas:1,tcache:true,dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true,abort_conf:true,metadata_thp:disabled,thp:never,retain:false,tcache_max:8192'
-  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.lto-scope"}}' "${name}") == cargo-fat ]]
+  [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.lto-scope"}}' "${name}") == "cargo-${EXPECTED_LTO}" ]]
   [[ $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.rust.pgo"}}' "${name}") == "${EXPECTED_PGO}" ]]
   if [[ "${EXPECTED_PGO}" == train ]]; then
     docker exec "${name}" test -s /usr/share/doc/pingora/pgo-profile-summary.txt
