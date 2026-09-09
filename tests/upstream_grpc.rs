@@ -142,7 +142,10 @@ async fn grpc_origin(
                 let mut request_body = request.into_body();
                 while let Some(chunk) = request_body.data().await {
                     let chunk = chunk.unwrap();
-                    request_body.flow_control().release_capacity(chunk.len()).unwrap();
+                    request_body
+                        .flow_control()
+                        .release_capacity(chunk.len())
+                        .unwrap();
                 }
 
                 let response_type = if expect_web_converted {
