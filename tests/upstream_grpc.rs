@@ -136,6 +136,15 @@ async fn grpc_origin(
                 }
                 requests.fetch_add(1, Ordering::Relaxed);
 
+                // Consume the unary request before ending the response. Dropping
+                // an unread RecvStream races the proxy's body write and can reset
+                // the stream before the gRPC-web response is delivered.
+                let mut request_body = request.into_body();
+                while let Some(chunk) = request_body.data().await {
+                    let chunk = chunk.unwrap();
+                    request_body.flow_control().release_capacity(chunk.len()).unwrap();
+                }
+
                 let response_type = if expect_web_converted {
                     "application/grpc+proto"
                 } else {
