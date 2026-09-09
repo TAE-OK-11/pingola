@@ -904,6 +904,13 @@ hosts:
     }
 
     #[test]
+    fn local_origin_configuration_validates() {
+        let config: Config =
+            serde_saphyr::from_str(include_str!("../config/local-origin.yaml")).unwrap();
+        RuntimeConfig::new(config).unwrap();
+    }
+
+    #[test]
     fn trusted_proxy_cache_is_scoped_to_runtime_config() {
         let trusted = RuntimeConfig::new(sample_config()).unwrap();
         assert!(trusted.is_trusted_proxy("127.0.0.1".parse().unwrap()));

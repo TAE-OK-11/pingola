@@ -10,6 +10,7 @@ use anyhow::{Context, anyhow};
 use arrayvec::ArrayString;
 use bytes::Bytes;
 use cloudflare_pingora::Error;
+use cloudflare_pingora::ErrorSource;
 use cloudflare_pingora::ErrorType;
 use cloudflare_pingora::ErrorType::HTTPStatus;
 use cloudflare_pingora::Result;
@@ -444,6 +445,9 @@ impl Gateway {
         ctx: &RequestContext,
         error: &Error,
     ) -> bool {
+        if is_downstream_h2_cancel(error) {
+            return true;
+        }
         if !ctx.http3 && !is_direct_http3(session) {
             return false;
         }
@@ -1225,6 +1229,10 @@ impl ProxyHttp for Gateway {
         error
     }
 
+    fn request_summary(&self, session: &Session, _ctx: &Self::CTX) -> String {
+        redacted_request_summary(session.req_header())
+    }
+
     async fn logging(&self, session: &mut Session, error: Option<&Error>, ctx: &mut Self::CTX) {
         if error.is_none() && !self.runtime.config.server.access_log {
             return;
@@ -1267,6 +1275,22 @@ impl ProxyHttp for Gateway {
             );
         }
     }
+}
+
+// Pingora's pinned H2 session produces this context only for a peer CANCEL
+// from read_body_or_idle. Do not hide upstream resets or other H2 failures.
+fn is_downstream_h2_cancel(error: &Error) -> bool {
+    error.esource() == &ErrorSource::Downstream
+        && error.etype() == &ErrorType::H2Error
+        && error.context.as_ref().is_some_and(|context| {
+            context.as_str() == "Client closed H2, reason: stream no longer needed"
+        })
+}
+
+fn redacted_request_summary(request: &RequestHeader) -> String {
+    // Subsonic authentication travels in query parameters, even with access
+    // logging disabled. Framework retry/failure logs call this hook too.
+    format!("{} {}", request.method, request.uri.path())
 }
 
 fn connection_option_names(
@@ -2021,6 +2045,40 @@ mod tests {
     use http::header::{
         CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
     };
+
+    #[test]
+    fn only_downstream_h2_cancel_is_benign() {
+        let context = "Client closed H2, reason: stream no longer needed";
+        assert!(is_downstream_h2_cancel(
+            &Error::explain(ErrorType::H2Error, context).into_down()
+        ));
+        assert!(!is_downstream_h2_cancel(
+            &Error::explain(ErrorType::H2Error, context).into_up()
+        ));
+        assert!(!is_downstream_h2_cancel(
+            &Error::explain(ErrorType::H2Error, "protocol error").into_down()
+        ));
+        assert!(!is_downstream_h2_cancel(
+            &Error::explain(ErrorType::ReadTimedout, context).into_down()
+        ));
+    }
+
+    #[test]
+    fn error_summary_omits_auth_query_and_headers() {
+        let mut request = RequestHeader::build(
+            Method::GET,
+            b"/rest/getCoverArt.view?u=user&t=secret&s=salt&id=cover",
+            None,
+        )
+        .unwrap();
+        request
+            .insert_header("authorization", "Bearer secret")
+            .unwrap();
+        assert_eq!(
+            redacted_request_summary(&request),
+            "GET /rest/getCoverArt.view"
+        );
+    }
 
     fn runtime() -> RuntimeConfig {
         let config: Config = serde_saphyr::from_str(

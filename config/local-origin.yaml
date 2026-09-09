@@ -1,0 +1,201 @@
+# Co-located Pingora/Navidrome deployment; certificates stay on the host.
+server:
+  http_listen:
+    - "0.0.0.0:80"
+
+  https_listen:
+    - "0.0.0.0:443"
+
+  # Downstream HTTP/3 / QUIC (IPv4 only — Vultr host has dual-bind clash on [::]:443)
+  http3_listen:
+    - "0.0.0.0:443"
+
+  http3_max_idle_timeout_seconds: 300
+  http3_max_requests_per_connection: 128
+  http3_max_concurrent_streams: 64
+  http3_handshake_timeout_seconds: 10
+
+  http3_enable_early_data: false
+  http3_stateless_retry: true
+
+  # QUIC anti-DDoS / admission control
+  http3_connection_rate_per_second: 256.0
+  http3_connection_burst: 512
+  http3_max_connections_per_ip: 64
+
+  certificate: /etc/pingora/cert/live/tae00217.cloud/fullchain.pem
+  private_key: /etc/pingora/cert/live/tae00217.cloud/privkey.pem
+
+  threads: 2
+
+  # Match binary default (128); improves upstream conn reuse under cover-art bursts
+  upstream_keepalive_pool_size: 128
+  downstream_keepalive_requests: 500
+
+  max_retries: 2
+
+  graceful_shutdown_timeout_seconds: 5
+
+  static_cache_bytes: 16777216
+
+  access_log: false
+
+  health_socket: /tmp/pingora/health.sock
+  legacy_pingola_health: true
+  health_details: false
+
+  global_active_requests: 128
+  static_active_requests_per_client: 16
+
+  # Raised from 32/1MiB/4MiB: logs show Downstream H2 "cannot reserve capacity"
+  # on music cover-art multiplex; RSS ~8MiB leaves headroom on 192MiB limit.
+  http2_max_concurrent_streams: 64
+  http2_stream_window_bytes: 1048576
+  http2_connection_window_bytes: 8388608
+
+  quic_initial_max_data: 4194304
+  quic_stream_window: 1048576
+  quic_max_connection_window: 4194304
+  quic_max_stream_window: 2097152
+  quic_send_capacity_factor: 2.0
+
+  downstream_max_connections: 1024
+  downstream_request_header_timeout_seconds: 15
+
+trusted_proxies:
+  - "173.245.48.0/20"
+  - "103.21.244.0/22"
+  - "103.22.200.0/22"
+  - "103.31.4.0/22"
+  - "141.101.64.0/18"
+  - "108.162.192.0/18"
+  - "190.93.240.0/20"
+  - "188.114.96.0/20"
+  - "197.234.240.0/22"
+  - "198.41.128.0/17"
+  - "162.158.0.0/15"
+  - "104.16.0.0/13"
+  - "104.24.0.0/14"
+  - "172.64.0.0/13"
+  - "131.0.72.0/22"
+  - "2400:cb00::/32"
+  - "2606:4700::/32"
+  - "2803:f800::/32"
+  - "2405:b500::/32"
+  - "2405:8100::/32"
+  - "2a06:98c0::/29"
+  - "2c0f:f248::/32"
+
+upstreams:
+  # Navidrome — plaintext HTTP/1 behind Pingora (public TLS/H3 terminated at edge).
+  navidrome:
+    address: "127.0.0.1:4533"
+    tls: false
+    protocol: http1
+    connect_timeout_seconds: 2
+    # Inherit route timeouts: API/cover 60s, audio streams 3600s.
+    idle_timeout_seconds: 300
+
+  # Public gRPC uses Navidrome's existing plaintext H2C listener.
+  navidrome_grpc:
+    address: "10.77.0.1:50051"
+    tls: false
+    protocol: grpc
+    http2_max_concurrent_streams: 64
+    http2_stream_window_bytes: 1048576
+    http2_connection_window_bytes: 4194304
+    http2_ping_interval_seconds: 30
+    connect_timeout_seconds: 2
+    idle_timeout_seconds: 300
+
+  vaultwarden:
+    address: "127.0.0.1:8081"
+    protocol: http1
+    connect_timeout_seconds: 5
+    idle_timeout_seconds: 15
+
+  couchdb:
+    address: "127.0.0.1:5984"
+    protocol: http1
+    connect_timeout_seconds: 5
+    read_timeout_seconds: 3600
+    write_timeout_seconds: 3600
+    idle_timeout_seconds: 15
+
+  # AdGuard Home UI — Oracle Chuncheon (10.77.0.13)
+  adguard_dns:
+    address: "10.77.0.13:3333"
+    protocol: http1
+    connect_timeout_seconds: 2
+    idle_timeout_seconds: 15
+
+  # DoH backend for /dns-query (adguard-dns 핸들러 필수)
+  adguard_dns_doh:
+    address: "10.77.0.13:1852"
+    tls: true
+    protocol: auto
+    http2_max_concurrent_streams: 64
+    http2_stream_window_bytes: 2097152
+    http2_connection_window_bytes: 8388608
+    http2_ping_interval_seconds: 30
+    warmup_on_start: true
+    warmup_path: /
+    sni: dns.tae00217.cloud
+    verify_certificate: true
+    connect_timeout_seconds: 2
+    read_timeout_seconds: 30
+    write_timeout_seconds: 30
+    idle_timeout_seconds: 30
+
+route_limits:
+  navidrome_stream:
+    rate_per_second: 40
+    burst: 15
+    active_requests: 10
+  navidrome_cover:
+    rate_per_second: 20
+    burst: 20
+    active_requests: 24
+  navidrome_api:
+    rate_per_second: 20
+    burst: 30
+    active_requests: 24
+
+hosts:
+  navidrome_cdn:
+    domains:
+      - cdn.music.tae00217.cloud
+    handler: navidrome-cdn
+    upstream: navidrome
+    redirect_http: true
+
+  navidrome_main:
+    domains:
+      - music.tae00217.cloud
+    handler: navidrome-main
+    upstream: navidrome
+    redirect_http: true
+
+  vaultwarden:
+    domains:
+      - password.tae00217.cloud
+    handler: vaultwarden
+    upstream: vaultwarden
+    redirect_http: true
+    max_body_bytes: 536870912
+
+  couchdb:
+    domains:
+      - sync.tae00217.cloud
+    handler: couchdb
+    upstream: couchdb
+    redirect_http: true
+    max_body_bytes: 536870912
+
+  adguard_dns:
+    domains:
+      - dns.tae00217.cloud
+    handler: adguard-dns
+    upstream: adguard_dns
+    redirect_http: true
+    max_body_bytes: 65536
