@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.98.1"
 license = "Apache-2.0"
 description = "A production-oriented Pingora reverse proxy replacing the JBS Nginx gateway"
-repository = "https://github.com/TAE-OK-11/pingora"
+repository = "https://github.com/TAE-OK-11/pingola"
 
 [[bin]]
 name = "pingora"
@@ -23,6 +23,7 @@ async-trait = "0.1.92"
 anyhow = "1.0.104"
 ahash = "0.8.12"
 arrayvec = "0.7.8"
+# Keep one BoringSSL Rust ABI across Pingora and the vendored quiche stack.
 boring = "=5.2.0"
 brotli = "9.0.0"
 bytes = "1.12.1"
