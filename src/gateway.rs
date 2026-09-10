@@ -2374,7 +2374,9 @@ hosts:
             .insert_header(CONTENT_TYPE, "application/grpc+json")
             .unwrap();
         assert!(!response_allows_compression(&response));
-        response.set_status(http::StatusCode::PARTIAL_CONTENT).unwrap();
+        response
+            .set_status(http::StatusCode::PARTIAL_CONTENT)
+            .unwrap();
         assert!(!response_allows_compression(&response));
         response.set_status(http::StatusCode::OK).unwrap();
         response.remove_header(&CONTENT_RANGE);
@@ -2387,7 +2389,9 @@ hosts:
         assert!(!response_allows_compression(&response));
         response.set_status(http::StatusCode::NOT_MODIFIED).unwrap();
         assert!(!response_allows_compression(&response));
-        response.set_status(http::StatusCode::RESET_CONTENT).unwrap();
+        response
+            .set_status(http::StatusCode::RESET_CONTENT)
+            .unwrap();
         assert!(!response_allows_compression(&response));
         assert!(response_status_is_interim(100));
         assert!(response_status_is_interim(103));
