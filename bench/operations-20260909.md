@@ -44,7 +44,7 @@
   기존 Compose/config를 백업하고 Docker health/readback으로 적용을 확인한다.
   Navidrome이나 다른 컨테이너는 재시작하지 않는다.
 
-검증과 배포 결과는 완료 후 추가한다.
+검증과 배포 결과는 아래 최종 기록에 정리했다.
 
 ## 사용자 추가 요청에 따른 제한적 운영 측정
 
@@ -71,3 +71,29 @@ H1이 유리하다. 일반 upstream H1을 유지하고 gRPC만 H2C로 분리한�
 cold-cache 비교가 아니며 이후 중앙값은 warm 응답 위주다. 단일 곡과 작은 표본,
 서버의 자연 트래픽이 섞인 측정이므로 모든 재생·트랜스코딩에서 절대 최적이라고
 주장하지 않는다. upstream H3는 현재 Navidrome에서 꺼져 있어 테스트하지 않았다.
+
+## 최종 적용/검증
+
+[CI 34406415297](https://github.com/TAE-OK-11/pingola/actions/runs/34406415297)은
+전체 성공(14분 15초). publish job은 캐시 재사용으로 2분 18초였다.
+검증/배포 소스는 `f28a3a0691958326227134b782845edf98f75389`이며,
+운영 image digest는 `sha256:9aa10e662b2c4c4ad41d1ae4821ce81a6c72429441026d02fab5b7d79669d6ca`다.
+
+- `/root/pingora/config/pingora.yaml`에 local-origin 설정을 적용했다.
+- Compose에 새 immutable digest 및 `memswap_limit: 192m`를 반영했다.
+  [Docker의 memory/swap 정의](https://docs.docker.com/engine/containers/resource_constraints/)에
+  따라 memory와 합계 제한을 같게 해 proxy swap을 금지한다.
+- YAML 교체 직후 새 파일의 권한 때문에 시작이 잠시 실패했다.
+  공개 설정 파일을 0644로 수정해 복구했고 최종 컨테이너는 healthy다.
+- 새 image는 실제 인증서/config를 이용한 별도 `--check` 16개를 통과한 뒤 적용했다.
+- 실제 public TLS/H2 gRPC health가 **405 → 200, grpc-status 0**으로 바뀌었다.
+- HTTP/1.1, HTTP/2, HTTP/3 모두 인증을 생략한 REST ping에 기대한 Subsonic
+  missing-parameter 응답(code 10)을 전달했다. 이는 인증 성공 테스트와 구분한다.
+- 최종 readback: Pingora memory.current 21.3 MiB, peak 31.1 MiB,
+  swap.current=0, swap.max=0, OOM/CPU throttling=0. 순간값/컨테이너 누적값이다.
+- Navidrome은 시작 시각 `2026-09-09T12:36:33Z`를 유지했다. 이 작업에서 재시작하지 않았다.
+
+백업: `/root/pingora/backups/ops-20260909/`의 기존 Compose/config 및 적용 전
+상태 manifest. 이전 image도 삭제하지 않아 rollback이 가능하다.
+신규 코드의 H2 CANCEL 처리는 CI의 실제 reset 테스트와 분류 테스트로 검증했다.
+자연 트래픽에서 취소 발생률/장기 p99가 얼마나 줄었는지는 별도 장기 관측이 필요하다.
