@@ -22,7 +22,11 @@ use proxy_cache::range_filter::{self};
 use std::any::Any;
 use std::time::Duration;
 
-<<<<<<< vendor/pingora-proxy-0.9.0/src/proxy_trait.rs
+#[cfg(unix)]
+pub type RawSocketHandle = std::os::unix::io::RawFd;
+#[cfg(windows)]
+pub type RawSocketHandle = std::os::windows::io::RawSocket;
+
 /// Context for proxy warning logs that can be suppressed by
 /// [`ProxyHttp::suppress_proxy_warn_log`].
 ///
@@ -38,12 +42,6 @@ pub enum ProxyWarnLogContext {
     /// A downstream error was ignored so cache fill could continue.
     DownstreamCache,
 }
-=======
-#[cfg(unix)]
-pub type RawSocketHandle = std::os::unix::io::RawFd;
-#[cfg(windows)]
-pub type RawSocketHandle = std::os::windows::io::RawSocket;
->>>>>>> vendor/pingora-proxy-0.8.1/src/proxy_trait.rs
 
 /// The interface to control the HTTP proxy
 ///
@@ -128,8 +126,7 @@ pub trait LocalProxyHttp {
     ///
     /// By default this method does nothing.
     ///
-    /// This method requires the `upstream_modules` feature to be enabled.
-    #[cfg(feature = "upstream_modules")]
+    /// This method is used when the `upstream_modules` feature is enabled.
     fn init_upstream_modules(&self, _modules: &mut HttpModules) {}
 
     /// Handle the incoming request.
@@ -141,7 +138,7 @@ pub trait LocalProxyHttp {
     /// the proxy would exit. The proxy continues to the next phases when `Ok(false)` is returned.
     ///
     /// By default this filter does nothing and returns `Ok(false)`.
-    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool>
+    async fn request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool>
     where
         Self::CTX: Send + Sync;
 
@@ -154,7 +151,7 @@ pub trait LocalProxyHttp {
     /// Note that because this function is executed before any module that might provide access
     /// control or rate limiting, logic should stay in request_filter() if it can in order to be
     /// protected by said modules.
-    async fn early_request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()>
+    async fn early_request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()>
     where
         Self::CTX: Send + Sync;
 
@@ -183,10 +180,10 @@ pub trait LocalProxyHttp {
     /// who process the requests themselves.
     async fn request_body_filter(
         &self,
-        session: &mut Session,
-        body: &mut Option<Bytes>,
-        end_of_stream: bool,
-        ctx: &mut Self::CTX,
+        _session: &mut Session,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync;
@@ -240,11 +237,11 @@ pub trait LocalProxyHttp {
     /// and which kind. Returning `None` indicates no forced invalidation
     async fn cache_hit_filter(
         &self,
-        session: &mut Session,
-        meta: &CacheMeta,
-        hit_handler: &mut HitHandler,
-        is_fresh: bool,
-        ctx: &mut Self::CTX,
+        _session: &mut Session,
+        _meta: &CacheMeta,
+        _hit_handler: &mut HitHandler,
+        _is_fresh: bool,
+        _ctx: &mut Self::CTX,
     ) -> Result<Option<ForcedFreshness>>
     where
         Self::CTX: Send + Sync;
@@ -261,8 +258,8 @@ pub trait LocalProxyHttp {
     /// caller's responsibility to disable keepalive or drain the request body if needed.
     async fn proxy_upstream_filter(
         &self,
-        session: &mut Session,
-        ctx: &mut Self::CTX,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
     ) -> Result<bool>
     where
         Self::CTX: Send + Sync;
@@ -348,9 +345,9 @@ pub trait LocalProxyHttp {
     /// `Transfer-Encoding: chunked`.
     async fn upstream_request_filter(
         &self,
-        session: &mut Session,
-        upstream_request: &mut RequestHeader,
-        ctx: &mut Self::CTX,
+        _session: &mut Session,
+        _upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync;
@@ -373,21 +370,6 @@ pub trait LocalProxyHttp {
     /// The response header is provided as an immutable reference. To modify the response header
     /// itself, use [`Self::upstream_response_filter()`] instead.
     ///
-    /// This filter requires the `upstream_modules` feature to be enabled.
-    #[cfg(feature = "upstream_modules")]
-    async fn adjust_upstream_modules(
-        &self,
-        _session: &mut Session,
-        _upstream_response: &ResponseHeader,
-        _end_of_stream: bool,
-        _ctx: &mut Self::CTX,
-    ) -> Result<()>
-    where
-        Self::CTX: Send + Sync,
-    {
-        Ok(())
-    }
-
     /// Modify the response header from the upstream
     ///
     /// The modification is before caching, so any change here will be stored in the cache if enabled.
@@ -397,9 +379,9 @@ pub trait LocalProxyHttp {
     /// cached header, not served directly to downstream).
     async fn upstream_response_filter(
         &self,
-        session: &mut Session,
-        upstream_response: &mut ResponseHeader,
-        ctx: &mut Self::CTX,
+        _session: &mut Session,
+        _upstream_response: &mut ResponseHeader,
+        _ctx: &mut Self::CTX,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync;
@@ -410,9 +392,9 @@ pub trait LocalProxyHttp {
     /// responses served from cache.
     async fn response_filter(
         &self,
-        session: &mut Session,
-        upstream_response: &mut ResponseHeader,
-        ctx: &mut Self::CTX,
+        _session: &mut Session,
+        _upstream_response: &mut ResponseHeader,
+        _ctx: &mut Self::CTX,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync;
@@ -421,10 +403,10 @@ pub trait LocalProxyHttp {
     #[doc(hidden)]
     async fn custom_forwarding(
         &self,
-        session: &mut Session,
-        ctx: &mut Self::CTX,
-        custom_message_to_upstream: Option<mpsc::Sender<Bytes>>,
-        custom_message_to_downstream: mpsc::Sender<Bytes>,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        _custom_message_to_upstream: Option<mpsc::Sender<Bytes>>,
+        _custom_message_to_downstream: mpsc::Sender<Bytes>,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync;
@@ -433,10 +415,10 @@ pub trait LocalProxyHttp {
     #[doc(hidden)]
     async fn downstream_custom_message_proxy_filter(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         custom_message: Bytes,
-        ctx: &mut Self::CTX,
-        final_hop: bool,
+        _ctx: &mut Self::CTX,
+        _final_hop: bool,
     ) -> Result<Option<Bytes>>
     where
         Self::CTX: Send + Sync;
@@ -445,10 +427,10 @@ pub trait LocalProxyHttp {
     #[doc(hidden)]
     async fn upstream_custom_message_proxy_filter(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         custom_message: Bytes,
-        ctx: &mut Self::CTX,
-        final_hop: bool,
+        _ctx: &mut Self::CTX,
+        _final_hop: bool,
     ) -> Result<Option<Bytes>>
     where
         Self::CTX: Send + Sync;
@@ -498,9 +480,9 @@ pub trait LocalProxyHttp {
     /// TODO: make this interface more intuitive
     async fn response_trailer_filter(
         &self,
-        session: &mut Session,
-        upstream_trailers: &mut header::HeaderMap,
-        ctx: &mut Self::CTX,
+        _session: &mut Session,
+        _upstream_trailers: &mut header::HeaderMap,
+        _ctx: &mut Self::CTX,
     ) -> Result<Option<Bytes>>
     where
         Self::CTX: Send + Sync;
@@ -510,7 +492,7 @@ pub trait LocalProxyHttp {
     ///
     /// An error log is already emitted if there is any error. This phase is used for collecting
     /// metrics and sending access logs.
-    async fn logging(&self, session: &mut Session, error: Option<&Error>, ctx: &mut Self::CTX)
+    async fn logging(&self, _session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX)
     where
         Self::CTX: Send + Sync;
 
@@ -636,7 +618,7 @@ pub trait LocalProxyHttp {
         &self,
         session: &mut Session,
         e: &Error,
-        ctx: &mut Self::CTX,
+        _ctx: &mut Self::CTX,
     ) -> FailToProxy
     where
         Self::CTX: Send + Sync;
@@ -667,12 +649,12 @@ pub trait LocalProxyHttp {
     /// This filter allows user to log timing and connection related info.
     async fn connected_to_upstream(
         &self,
-        session: &mut Session,
-        reused: bool,
-        peer: &HttpPeer,
-        socket: RawSocketHandle,
-        digest: Option<&Digest>,
-        ctx: &mut Self::CTX,
+        _session: &mut Session,
+        _reused: bool,
+        _peer: &HttpPeer,
+        _socket: RawSocketHandle,
+        _digest: Option<&Digest>,
+        _ctx: &mut Self::CTX,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync;
@@ -719,6 +701,7 @@ pub trait LocalProxyHttp {
     }
 }
 
+/// Context struct returned by `fail_to_proxy`.
 /// Send the default downstream error response used by [`ProxyHttp`].
 pub async fn default_fail_to_proxy(session: &mut Session, error: &Error) -> FailToProxy {
     let code = match error.etype() {
@@ -744,7 +727,6 @@ pub async fn default_fail_to_proxy(session: &mut Session, error: &Error) -> Fail
     }
 }
 
-/// Context struct returned by `fail_to_proxy`.
 pub struct FailToProxy {
     pub error_code: u16,
     pub can_reuse_downstream: bool,

@@ -283,8 +283,6 @@ pub struct HttpSession {
     body_sent: usize,
     // buffered request body for retry logic
     retry_buffer: Option<FixedBuffer>,
-    /// Per-read progress timeout for request body DATA.
-    read_timeout: Option<Duration>,
     // digest to record underlying connection info
     digest: Arc<Digest>,
     /// The write timeout which will be applied to writing response body.
@@ -436,7 +434,6 @@ impl HttpSession {
             "while accepting new downstream requests",
         )?;
 
-<<<<<<< vendor/pingora-core-0.9.0/src/protocols/http/v2/server.rs
         let Some((req, mut send_response)) = res else {
             return Ok(None);
         };
@@ -484,24 +481,6 @@ impl HttpSession {
             if let Err(e) = send_response.send_response(response, true) {
                 // A client reset before the write is stream-local; siblings survive.
                 debug!("failed to send downstream h2 authority rejection: {e}");
-=======
-        Ok(res.map(|(req, send_response)| {
-            let (request_header, request_body_reader) = req.into_parts();
-            HttpSession {
-                request_header: request_header.into(),
-                request_body_reader,
-                send_response,
-                send_response_body: None,
-                response_written: None,
-                ended: false,
-                body_read: 0,
-                body_sent: 0,
-                retry_buffer: None,
-                read_timeout: None,
-                digest,
-                write_timeout: None,
-                total_drain_timeout: None,
->>>>>>> vendor/pingora-core-0.8.1/src/protocols/http/v2/server.rs
             }
             account_malformed_stream(malformed_streams)?;
             return Ok(Some(H2Accept::Rejected));
@@ -541,25 +520,11 @@ impl HttpSession {
 
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        let read_timeout = self.read_timeout;
-        let read = async {
-            self.request_body_reader.data().await.transpose().or_err(
-                ErrorType::ReadError,
-                "while reading downstream request body",
-            )
-        };
-        let data = match read_timeout {
-            Some(deadline) => match timeout(deadline, read).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Error::e_explain(
-                        ErrorType::ReadTimedout,
-                        format!("reading downstream H2 body, timeout: {deadline:?}"),
-                    )
-                }
-            },
-            None => read.await?,
-        };
+        // TODO: timeout
+        let data = self.request_body_reader.data().await.transpose().or_err(
+            ErrorType::ReadError,
+            "while reading downstream request body",
+        )?;
         if let Some(data) = data.as_ref() {
             self.body_read += data.len();
             if let Some(buffer) = self.retry_buffer.as_mut() {
@@ -571,14 +536,6 @@ impl HttpSession {
                 .release_capacity(data.len());
         }
         Ok(data)
-    }
-
-    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
-        self.read_timeout = timeout;
-    }
-
-    pub fn get_read_timeout(&self) -> Option<Duration> {
-        self.read_timeout
     }
 
     #[doc(hidden)]
@@ -1859,7 +1816,6 @@ mod test {
     }
 
     #[tokio::test]
-<<<<<<< vendor/pingora-core-0.9.0/src/protocols/http/v2/server.rs
     async fn test_req_conflicting_content_length_rejected() {
         let (client, server) = duplex(65536);
 
@@ -1967,39 +1923,6 @@ mod test {
 
         drop(connection);
         client_task.await.unwrap();
-=======
-    async fn downstream_body_read_honors_timeout() {
-        let (client, server) = duplex(65536);
-        let client = tokio::spawn(async move {
-            let (sender, connection) = h2::client::handshake(client).await.unwrap();
-            let connection = tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri("https://www.example.com/upload")
-                .body(())
-                .unwrap();
-            let (_response, _body) = sender
-                .ready()
-                .await
-                .unwrap()
-                .send_request(request, false)
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            connection.abort();
-        });
-
-        let mut connection = handshake(Box::new(server), None).await.unwrap();
-        let mut session = HttpSession::from_h2_conn(&mut connection, Arc::new(Digest::default()))
-            .await
-            .unwrap()
-            .unwrap();
-        session.set_read_timeout(Some(Duration::from_millis(10)));
-        let error = session.read_body_bytes().await.unwrap_err();
-        assert_eq!(error.etype(), &ErrorType::ReadTimedout);
-        client.await.unwrap();
->>>>>>> vendor/pingora-core-0.8.1/src/protocols/http/v2/server.rs
     }
 
     #[tokio::test]

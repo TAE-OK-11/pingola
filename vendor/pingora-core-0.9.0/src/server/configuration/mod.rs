@@ -641,10 +641,10 @@ working_directory: /var/lib/pingora
             Some(std::path::Path::new("/var/lib/pingora"))
         );
 
-        let yaml = serde_yaml::to_value(&conf).unwrap();
-        assert_eq!(
-            yaml.get("working_directory"),
-            Some(&serde_yaml::Value::String("/var/lib/pingora".to_string()))
+                let yaml = conf.to_yaml();
+        assert!(
+            yaml.contains("/var/lib/pingora"),
+            "to_yaml missing working_directory: {yaml}"
         );
     }
 

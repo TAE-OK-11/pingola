@@ -311,7 +311,7 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     http_options.request_header_timeout = Some(Duration::from_secs(
         server_config.downstream_request_header_timeout_seconds,
     ));
-    // Pingora 0.8.1 interprets this value as the number of HTTP/1.1 reuses
+    // Pingora 0.9.0 interprets this value as the number of HTTP/1.1 reuses
     // after the first request, while the public setting follows NGINX and
     // counts the first request. Validation guarantees this subtraction.
     http_options.keepalive_request_limit = Some(

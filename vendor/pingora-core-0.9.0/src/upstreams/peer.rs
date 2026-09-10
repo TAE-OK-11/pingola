@@ -256,16 +256,6 @@ pub trait Peer: Display + Clone {
             .unwrap_or_default()
     }
 
-    /// Return whether a cached socket peer address is sufficient to validate connection reuse.
-    ///
-    /// This is an explicit opt-in for the connector's reuse fast path. The default is `false` so
-    /// custom peers, including peers with custom [`Peer::matches_fd`] implementations, continue to
-    /// validate the live socket. Implementations must return `true` only when `cached_peer_addr`
-    /// identifies the actual next hop used to establish the connection.
-    fn matches_cached_peer_addr(&self, _cached_peer_addr: &SocketAddr) -> bool {
-        false
-    }
-
     #[cfg(unix)]
     fn matches_fd<V: AsRawFd>(&self, fd: V) -> bool {
         self.address().check_fd_match(fd)
@@ -382,10 +372,6 @@ impl Peer for BasicPeer {
 
     fn get_peer_options(&self) -> Option<&PeerOptions> {
         Some(&self.options)
-    }
-
-    fn matches_cached_peer_addr(&self, cached_peer_addr: &SocketAddr) -> bool {
-        self.options.custom_l4.is_none() && self.address() == cached_peer_addr
     }
 }
 
@@ -543,11 +529,7 @@ pub struct PeerOptions {
     /// Initial connection-level H2 receive window size in bytes.
     /// If `None`, the default of 8MB is used.
     pub h2_connection_window_size: Option<u32>,
-<<<<<<< vendor/pingora-core-0.9.0/src/upstreams/peer.rs
     /// Allow a single invalid Content-Length in HTTP/1 responses (non-RFC compliant).
-=======
-    /// Allow invalid Content-Length in HTTP/1 responses (non-RFC compliant).
->>>>>>> vendor/pingora-core-0.8.1/src/upstreams/peer.rs
     ///
     /// When enabled, a response carrying a single, otherwise-unparseable
     /// Content-Length value is treated as a close-delimited response instead of
@@ -874,12 +856,6 @@ impl Peer for HttpPeer {
 
     fn get_proxy(&self) -> Option<&Proxy> {
         self.proxy.as_ref()
-    }
-
-    fn matches_cached_peer_addr(&self, cached_peer_addr: &SocketAddr) -> bool {
-        self.proxy.is_none()
-            && self.options.custom_l4.is_none()
-            && self.address() == cached_peer_addr
     }
 
     #[cfg(unix)]

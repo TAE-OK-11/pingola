@@ -45,7 +45,6 @@ where
 
         // phase 2 send to upstream
 
-<<<<<<< vendor/pingora-proxy-0.9.0/src/proxy_h1.rs
         let mut req = session.req_header().clone();
         let authority_policy = AuthorityPolicy::from(session.downstream_session.is_custom());
         let downstream_had_host = req.headers.contains_key(http::header::HOST);
@@ -60,41 +59,6 @@ where
             };
             if let Err(e) = result {
                 return (false, true, Some(e.into_down()));
-=======
-        // Header field names are case-insensitive and upstreams do not need
-        // the downstream spelling map. Clone only the semantic request parts
-        // so every subsequent header mutation updates one map instead of two.
-        // Keep the raw non-UTF-8 request target when it differs from the URI's
-        // lossy representation.
-        let downstream_raw_path = session.req_header().raw_path();
-        let mut req = RequestHeader::from(session.req_header().as_owned_parts());
-        if req.raw_path() != downstream_raw_path {
-            if let Err(error) = req.set_raw_path(downstream_raw_path) {
-                return (false, true, Some(error));
-            }
-        }
-
-        // Convert HTTP/2-style request headers to HTTP/1 for upstream HTTP/1
-        // connectors. HTTP/3 custom sessions use HTTP/2 version markers too.
-        if req.version == Version::HTTP_2 {
-            req.set_version(Version::HTTP_11);
-            // if client has body but has no content length, add chunked encoding
-            // https://datatracker.ietf.org/doc/html/rfc9112#name-message-body
-            // "The presence of a message body in a request is signaled by a Content-Length or Transfer-Encoding header field."
-            if !session.is_body_empty() && session.get_header(header::CONTENT_LENGTH).is_none() {
-                req.insert_header(header::TRANSFER_ENCODING, "chunked")
-                    .unwrap();
-            }
-            if session.get_header(header::HOST).is_none() {
-                // H2 is required to set :authority, but no necessarily header
-                // most H1 server expect host header, so convert
-                let host = req
-                    .uri
-                    .authority()
-                    .and_then(|authority| http::HeaderValue::try_from(authority.as_str()).ok())
-                    .unwrap_or_else(|| http::HeaderValue::from_static(""));
-                req.insert_header(header::HOST, host).unwrap();
->>>>>>> vendor/pingora-proxy-0.8.1/src/proxy_h1.rs
             }
         }
 
@@ -125,7 +89,6 @@ where
             }
         }
 
-<<<<<<< vendor/pingora-proxy-0.9.0/src/proxy_h1.rs
         // Reconcile and revalidate after request filters, which can mutate Host, URI, or target.
         if authority_policy.is_standard() {
             if let Err(e) = reconcile_upstream_authority(&mut req) {
@@ -152,14 +115,11 @@ where
 
         session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
 
-        session.upstream_compression.request_filter(&req);
-=======
         if session.upstream_compression.is_enabled() {
             session.upstream_compression.request_filter(&req);
         }
->>>>>>> vendor/pingora-proxy-0.8.1/src/proxy_h1.rs
 
-        debug!("sending HTTP/1 request header upstream");
+        debug!("Sending header to upstream {:?}", req);
 
         match client_session.write_request_header(Box::new(req)).await {
             Ok(_) => { /* Continue */ }
@@ -253,6 +213,7 @@ where
         }
     }
 
+
     /// Proxy a non-upgraded, cache-disabled HTTP/1 GET/HEAD without per-request channels.
     async fn proxy_bodyless_h1(
         &self,
@@ -266,8 +227,8 @@ where
     {
         // Empty GET/HEAD requests are already fully framed after the header write
         // (Content-Length 0). finish_body only updates writer state and skips the
-        // redundant flush; call it so upgraded/close-delimited edge cases still
-        // run maybe_force_close_body_reader when needed.
+        // redundant flush when that patch is present; call it so upgraded/close-
+        // delimited edge cases still run maybe_force_close_body_reader when needed.
         client_session.finish_body().await.map_err(|e| e.into_up())?;
 
         let poll_downstream = self.inner.h1_bodyless_poll_downstream(session, ctx);
@@ -594,12 +555,6 @@ where
                 break;
             }
             #[cfg(feature = "upstream_modules")]
-            if let HttpTask::Header(header, end_of_stream) = &t {
-                self.inner
-                    .adjust_upstream_modules(session, header, *end_of_stream, ctx)
-                    .await?;
-            }
-            #[cfg(feature = "upstream_modules")]
             session.upstream_modules_filter_task(&mut t).await?;
             session.upstream_compression.response_filter(&mut t);
             let task = self
@@ -806,7 +761,6 @@ where
                      */
                 },
 
-<<<<<<< vendor/pingora-proxy-0.9.0/src/proxy_h1.rs
                 // Handle buffered upstream task from previous iteration
                 task = async { next_upstream_task.take() }, if next_upstream_task.is_some() => {
                     debug!("buffered upstream event: {:?}", task);
@@ -821,56 +775,6 @@ where
                             &mut response_state,
                         ).await? else {
                             // nothing sent downstream e.g. serve_from_cache
-=======
-                task = rx.recv(), if !response_state.upstream_done() => {
-                    debug!("HTTP/1 upstream event received");
-                    if let Some(t) = task {
-                        if serve_from_cache.should_discard_upstream() {
-                            // just drain, do we need to do anything else?
-                           continue;
-                        }
-                        // pull as many tasks as we can
-                        let mut tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
-                        tasks.push(t);
-                        // tokio::task::unconstrained because now_or_never may yield None when the future is ready
-                        while let Some(maybe_task) = tokio::task::unconstrained(rx.recv()).now_or_never() {
-                            debug!("additional HTTP/1 upstream event received");
-                            if let Some(t) = maybe_task {
-                                tasks.push(t);
-                            } else {
-                                break; // upstream closed
-                            }
-                        }
-
-                        /* run filters before sending to downstream */
-                        let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
-                        for mut t in tasks {
-                            if self.revalidate_or_stale(session, &mut t, ctx).await {
-                                serve_from_cache.enable();
-                                response_state.enable_cached_response();
-                                // skip downstream filtering entirely as the 304 will not be sent
-                                break;
-                            }
-                            session.upstream_compression.response_filter(&mut t);
-                            let task = self.h1_response_filter(session, t, ctx,
-                                &mut serve_from_cache,
-                                &mut range_body_filter, false).await?;
-                            if serve_from_cache.is_miss_header() {
-                                response_state.enable_cached_response();
-                            }
-                            // check error and abort
-                            // otherwise the error is surfaced via write_response_tasks()
-                            if !serve_from_cache.should_send_to_downstream() {
-                                if let HttpTask::Failed(e) = task {
-                                    return Err(e);
-                                }
-                            }
-                            filtered_tasks.push(task);
-                        }
-
-                        if !serve_from_cache.should_send_to_downstream() {
-                            // TODO: need to derive response_done from filtered_tasks in case downstream failed already
->>>>>>> vendor/pingora-proxy-0.8.1/src/proxy_h1.rs
                             continue;
                         };
                         response_state.maybe_set_upstream_done(response_done);
@@ -924,7 +828,7 @@ where
                     let task = self.h1_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
                         &mut range_body_filter, true).await?;
-                    debug!("HTTP/1 cache task received");
+                    debug!("serve_from_cache task {task:?}");
 
                     if session.downstream_session.supports_proxy_task_api() {
                         session.send_downstream_proxy_task(task).await?;
@@ -1406,7 +1310,6 @@ mod tests {
 
     struct ResponseFilter101;
 
-    #[async_trait]
     impl ProxyHttp for ResponseFilter101 {
         type CTX = ();
 
@@ -1428,6 +1331,119 @@ mod tests {
         ) -> Result<()> {
             response.set_status(http::StatusCode::SWITCHING_PROTOCOLS)?;
             response.set_version(Version::HTTP_11);
+            Ok(())
+        }
+    
+        async fn request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn early_request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+            Ok(())
+        }
+
+        async fn request_body_filter(
+            &self,
+            _session: &mut Session,
+            _body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn cache_hit_filter(
+            &self,
+            _session: &mut Session,
+            _meta: &CacheMeta,
+            _hit_handler: &mut HitHandler,
+            _is_fresh: bool,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Option<ForcedFreshness>> {
+            Ok(None)
+        }
+
+        async fn proxy_upstream_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn upstream_request_filter(
+            &self,
+            _session: &mut Session,
+            _upstream_request: &mut RequestHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn upstream_response_filter(
+            &self,
+            _session: &mut Session,
+            _upstream_response: &mut ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn custom_forwarding(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+            _custom_message_to_upstream: Option<mpsc::Sender<Bytes>>,
+            _custom_message_to_downstream: mpsc::Sender<Bytes>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn downstream_custom_message_proxy_filter(
+            &self,
+            _session: &mut Session,
+            custom_message: Bytes,
+            _ctx: &mut Self::CTX,
+            _final_hop: bool,
+        ) -> Result<Option<Bytes>> {
+            Ok(Some(custom_message))
+        }
+
+        async fn upstream_custom_message_proxy_filter(
+            &self,
+            _session: &mut Session,
+            custom_message: Bytes,
+            _ctx: &mut Self::CTX,
+            _final_hop: bool,
+        ) -> Result<Option<Bytes>> {
+            Ok(Some(custom_message))
+        }
+
+        async fn response_trailer_filter(
+            &self,
+            _session: &mut Session,
+            _upstream_trailers: &mut header::HeaderMap,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Option<Bytes>> {
+            Ok(None)
+        }
+
+        async fn logging(&self, _session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX) {}
+
+        async fn fail_to_proxy(
+            &self,
+            session: &mut Session,
+            e: &Error,
+            _ctx: &mut Self::CTX,
+        ) -> FailToProxy {
+            default_fail_to_proxy(session, e).await
+        }
+
+        async fn connected_to_upstream(
+            &self,
+            _session: &mut Session,
+            _reused: bool,
+            _peer: &HttpPeer,
+            _socket: RawSocketHandle,
+            _digest: Option<&Digest>,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
             Ok(())
         }
     }

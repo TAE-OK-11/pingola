@@ -2614,7 +2614,6 @@ mod tests {
 
     struct TestProxy;
 
-    #[async_trait]
     impl ProxyHttp for TestProxy {
         type CTX = ();
 
@@ -2642,6 +2641,128 @@ mod tests {
                 0,
                 resp.clone(),
             )))
+        }
+    
+        async fn request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn early_request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+            Ok(())
+        }
+
+        async fn request_body_filter(
+            &self,
+            _session: &mut Session,
+            _body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn cache_hit_filter(
+            &self,
+            _session: &mut Session,
+            _meta: &CacheMeta,
+            _hit_handler: &mut HitHandler,
+            _is_fresh: bool,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Option<ForcedFreshness>> {
+            Ok(None)
+        }
+
+        async fn proxy_upstream_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn upstream_request_filter(
+            &self,
+            _session: &mut Session,
+            _upstream_request: &mut RequestHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn upstream_response_filter(
+            &self,
+            _session: &mut Session,
+            _upstream_response: &mut ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn response_filter(
+            &self,
+            _session: &mut Session,
+            _upstream_response: &mut ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn custom_forwarding(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+            _custom_message_to_upstream: Option<mpsc::Sender<Bytes>>,
+            _custom_message_to_downstream: mpsc::Sender<Bytes>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn downstream_custom_message_proxy_filter(
+            &self,
+            _session: &mut Session,
+            custom_message: Bytes,
+            _ctx: &mut Self::CTX,
+            _final_hop: bool,
+        ) -> Result<Option<Bytes>> {
+            Ok(Some(custom_message))
+        }
+
+        async fn upstream_custom_message_proxy_filter(
+            &self,
+            _session: &mut Session,
+            custom_message: Bytes,
+            _ctx: &mut Self::CTX,
+            _final_hop: bool,
+        ) -> Result<Option<Bytes>> {
+            Ok(Some(custom_message))
+        }
+
+        async fn response_trailer_filter(
+            &self,
+            _session: &mut Session,
+            _upstream_trailers: &mut header::HeaderMap,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Option<Bytes>> {
+            Ok(None)
+        }
+
+        async fn logging(&self, _session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX) {}
+
+        async fn fail_to_proxy(
+            &self,
+            session: &mut Session,
+            e: &Error,
+            _ctx: &mut Self::CTX,
+        ) -> FailToProxy {
+            default_fail_to_proxy(session, e).await
+        }
+
+        async fn connected_to_upstream(
+            &self,
+            _session: &mut Session,
+            _reused: bool,
+            _peer: &HttpPeer,
+            _socket: RawSocketHandle,
+            _digest: Option<&Digest>,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
         }
     }
 

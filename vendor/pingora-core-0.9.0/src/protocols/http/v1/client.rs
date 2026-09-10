@@ -15,30 +15,26 @@
 //! HTTP/1.x client session
 
 use bytes::{BufMut, Bytes, BytesMut};
-use http::{header, header::AsHeaderName, HeaderName, HeaderValue, StatusCode, Version};
+use http::{header, header::AsHeaderName, HeaderValue, StatusCode, Version};
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result, RetryType};
-use pingora_http::{HMap, RequestHeader, ResponseHeader};
+use pingora_http::{HMap, IntoCaseHeaderName, RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
-use std::io::ErrorKind;
 use std::mem::MaybeUninit;
+use std::io::ErrorKind;
 use std::str;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyMode, BodyReader, BodyWriter};
 use super::common::*;
-
-// Most API responses and their headers fit in 16 KiB. Keeping the upstream
-// response read buffer larger than the generic 4-KiB header buffer prevents a
-// fixed-size body from being split at `capacity - header_len`, and absorbs
-// typical JSON / short static payloads in a single read.
-const INIT_UPSTREAM_RESPONSE_BUF_SIZE: usize = 16 * 1024;
 use crate::protocols::http::HttpTask;
 use crate::protocols::{Digest, SocketAddr, Stream, UniqueID, UniqueIDType};
 use crate::utils::BufRef;
 
 /// The HTTP 1.x client session
+const INIT_UPSTREAM_RESPONSE_BUF_SIZE: usize = 16 * 1024;
+
 pub struct HttpSession {
     buf: Bytes,
     /// In-progress response header bytes, kept on the session so cancelled reads can resume.
@@ -60,8 +56,6 @@ pub struct HttpSession {
     keepalive_timeout: KeepaliveStatus,
     pub(crate) digest: Box<Digest>,
     response_header: Option<Box<ResponseHeader>>,
-    /// Keepalive / framing metadata retained after the response header is moved out.
-    response_reuse: Option<ResponseReuseState>,
     request_written: Option<Box<RequestHeader>>,
     bytes_sent: usize,
     /// Total response body payload bytes received from upstream
@@ -76,29 +70,6 @@ pub struct HttpSession {
     // If allowed, does not fail with error on invalid content-length
     // (treats as close-delimited response).
     allow_h1_response_invalid_content_length: bool,
-}
-
-/// Subset of the upstream response header needed after `take` for keepalive and
-/// `should_read_resp_header` (avoids cloning the full `HeaderMap` on every exchange).
-#[derive(Clone, Debug)]
-struct ResponseReuseState {
-    status: StatusCode,
-    version: Version,
-    connection: Option<HeaderValue>,
-    keep_alive: Option<HeaderValue>,
-    has_transfer_encoding: bool,
-}
-
-impl ResponseReuseState {
-    fn from_header(header: &ResponseHeader) -> Self {
-        Self {
-            status: header.status,
-            version: header.version,
-            connection: header.headers.get(header::CONNECTION).cloned(),
-            keep_alive: header.headers.get("Keep-Alive").cloned(),
-            has_transfer_encoding: header.headers.contains_key(header::TRANSFER_ENCODING),
-        }
-    }
 }
 
 /// HTTP 1.x client session
@@ -122,7 +93,6 @@ impl HttpSession {
             body_writer: BodyWriter::new(),
             keepalive_timeout: KeepaliveStatus::Off,
             response_header: None,
-            response_reuse: None,
             request_written: None,
             read_timeout: None,
             write_timeout: None,
@@ -235,7 +205,6 @@ impl HttpSession {
             BodyMode::Complete(_) => true,
             _ => false,
         };
-
         let res = self.body_writer.finish(&mut self.underlying_stream).await?;
         if !skip_flush {
             self.underlying_stream
@@ -315,28 +284,35 @@ impl HttpSession {
                 parse_existing_buffer = false;
             }
         }
-<<<<<<< vendor/pingora-core-0.9.0/src/protocols/http/v1/client.rs
 
-=======
-        let mut buf = BytesMut::with_capacity(INIT_UPSTREAM_RESPONSE_BUF_SIZE);
-        let mut already_read: usize = 0;
->>>>>>> vendor/pingora-core-0.8.1/src/protocols/http/v1/client.rs
         loop {
             if parse_existing_buffer {
+                #[cfg(feature = "patched_http1")]
                 let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+                #[cfg(not(feature = "patched_http1"))]
+                let mut headers = [MaybeUninit::uninit(); MAX_HEADERS];
+                #[cfg(feature = "patched_http1")]
                 let mut resp = httparse::Response::new(&mut headers);
+                #[cfg(not(feature = "patched_http1"))]
+                let mut resp = httparse::Response::new(&mut []);
+                #[cfg(feature = "patched_http1")]
                 let parsed = parse_resp_buffer(&mut resp, &self.response_header_read_buf);
+                #[cfg(not(feature = "patched_http1"))]
+                let parsed =
+                    parse_resp_buffer(&mut resp, &self.response_header_read_buf, &mut headers);
                 match parsed {
                     HeaderParseState::Complete(s) => {
                         let total_read = self.response_header_read_buf.len();
                         let base = self.response_header_read_buf.as_ptr() as usize;
-                        let mut header_refs = Vec::<KVRef>::with_capacity(resp.headers.len());
+                        let mut header_refs = HeaderRefs::with_capacity(resp.headers.len());
 
                         // Note: resp.headers has the correct number of headers
                         // while header_refs doesn't as it is still empty
                         let _num_headers = populate_headers(base, &mut header_refs, resp.headers);
 
-                        let mut response_header = match ResponseHeader::build(
+                        // Upstream responses are consumed via case-insensitive HeaderName
+                        // lookups; keep the no-case representation.
+                        let mut response_header = match ResponseHeader::build_no_case(
                             resp.code.unwrap(),
                             Some(resp.headers.len()),
                         ) {
@@ -432,9 +408,9 @@ impl HttpSession {
                 .response_header_read_buf
                 .capacity()
                 .saturating_sub(self.response_header_read_buf.len())
-                < INIT_HEADER_BUF_SIZE
+                < INIT_UPSTREAM_RESPONSE_BUF_SIZE
             {
-                self.response_header_read_buf.reserve(INIT_HEADER_BUF_SIZE);
+                self.response_header_read_buf.reserve(INIT_UPSTREAM_RESPONSE_BUF_SIZE);
             }
 
             let read_fut = self
@@ -480,139 +456,15 @@ impl HttpSession {
                     if true_io_error {
                         e.retry = RetryType::ReusedOnly;
                     } // else: not safe to retry TLS error
-<<<<<<< vendor/pingora-core-0.9.0/src/protocols/http/v1/client.rs
                     return self.fail_response_header_read(e);
-=======
-                    return Err(e);
-                }
-            };
-            already_read += n;
-            let mut headers = [MaybeUninit::uninit(); MAX_HEADERS];
-            let mut resp = httparse::Response::new(&mut []);
-            let parsed = parse_resp_buffer(&mut resp, &buf, &mut headers);
-            match parsed {
-                HeaderParseState::Complete(s) => {
-                    self.raw_header = Some(BufRef(0, s));
-                    self.preread_body = Some(BufRef(s, already_read));
-                    let base = buf.as_ptr() as usize;
-                    let mut header_refs = HeaderRefs::with_capacity(resp.headers.len());
-
-                    // Note: resp.headers has the correct number of headers
-                    // while header_refs doesn't as it is still empty
-                    let _num_headers = populate_headers(base, &mut header_refs, resp.headers);
-
-                    // HTTP field names are case-insensitive and the gateway's response
-                    // filters only use semantic HeaderName lookups. Avoid retaining a
-                    // second map of upstream spelling that is discarded by H2 and has no
-                    // observable HTTP meaning for H1 clients.
-                    let mut response_header = Box::new(ResponseHeader::build_no_case(
-                        resp.code.unwrap(),
-                        Some(resp.headers.len()),
-                    )?);
-
-                    // TODO: enforce https://datatracker.ietf.org/doc/html/rfc9110#section-15.2
-                    // "Since HTTP/1.0 did not define any 1xx status codes,
-                    // a server MUST NOT send a 1xx response to an HTTP/1.0 client."
-                    response_header.set_version(match resp.version {
-                        Some(1) => Version::HTTP_11,
-                        Some(0) => Version::HTTP_10,
-                        _ => Version::HTTP_09,
-                    });
-
-                    response_header.set_reason_phrase(resp.reason)?;
-
-                    let buf = buf.freeze();
-
-                    for header in header_refs {
-                        let header_name = header.get_name_bytes(&buf);
-                        let header_name = HeaderName::from_bytes(&header_name)
-                            .or_err(InvalidHTTPHeader, "while parsing response header name")?;
-                        let value_bytes = header.get_value_bytes(&buf);
-                        let header_value = if cfg!(debug_assertions) {
-                            // from_maybe_shared_unchecked() in debug mode still checks whether
-                            // the header value is valid, which breaks the _obsolete_multiline
-                            // support. To work around this, in debug mode, we replace CRLF with
-                            // whitespace
-                            if let Some(p) = value_bytes.windows(CRLF.len()).position(|w| w == CRLF)
-                            {
-                                let mut new_header = Vec::from_iter(value_bytes);
-                                new_header[p] = b' ';
-                                new_header[p + 1] = b' ';
-                                unsafe {
-                                    http::HeaderValue::from_maybe_shared_unchecked(new_header)
-                                }
-                            } else {
-                                unsafe {
-                                    http::HeaderValue::from_maybe_shared_unchecked(value_bytes)
-                                }
-                            }
-                        } else {
-                            // safe because this is from what we parsed
-                            unsafe { http::HeaderValue::from_maybe_shared_unchecked(value_bytes) }
-                        };
-                        response_header.headers.append(header_name, header_value);
-                    }
-
-                    let contains_transfer_encoding = response_header
-                        .headers
-                        .contains_key(header::TRANSFER_ENCODING);
-                    let contains_content_length =
-                        response_header.headers.contains_key(header::CONTENT_LENGTH);
-
-                    // Transfer encoding overrides content length, so when
-                    // both are present, we MUST remove content length. This is
-                    // https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.3
-                    if contains_content_length && contains_transfer_encoding {
-                        response_header.remove_header(&header::CONTENT_LENGTH);
-                    }
-
-                    self.buf = buf;
-                    self.response_reuse = Some(ResponseReuseState::from_header(&response_header));
-                    self.response_header = Some(response_header);
-                    self.validate_response()?;
-                    // convert to upgrade body type
-                    // https://datatracker.ietf.org/doc/html/rfc9110#status.101
-                    // as an "informational" header, this cannot have a body
-                    self.upgraded = self
-                        .is_upgrade(self.response_header.as_deref().expect("init above"))
-                        .unwrap_or(false);
-                    // init body reader if upgrade status has changed body mode
-                    // (read_response_task will immediately try to init body afterwards anyways)
-                    // informational headers will automatically avoid initializing body reader
-                    self.init_body_reader();
-                    // note that the (request) body writer is converted to close delimit
-                    // when the upgraded body tasks are received
-                    return Ok(s);
-                }
-                HeaderParseState::Partial => { /* continue the loop */ }
-                HeaderParseState::Invalid(e) => {
-                    return Error::e_because(
-                        InvalidHTTPHeader,
-                        format!("buf: {}", buf.escape_ascii()),
-                        e,
-                    );
->>>>>>> vendor/pingora-core-0.8.1/src/protocols/http/v1/client.rs
                 }
             }
         }
     }
 
-    /// Similar to [`Self::read_response()`], read the response header and then return it.
-    ///
-    /// For final (non-informational) responses the stored header is moved out after the body
-    /// reader is initialized, avoiding a full `HeaderMap` clone on every keep-alive exchange.
-    /// Informational 1xx responses (other than 101) still clone because another header follows.
+    /// Similar to [`Self::read_response()`], read the response header and then return a copy of it.
     pub async fn read_resp_header_parts(&mut self) -> Result<Box<ResponseHeader>> {
         self.read_response().await?;
-        let status = self.get_status().map(|code| code.as_u16());
-        let informational = matches!(status, Some(100..=199) if status != Some(101));
-        if !informational {
-            // Body framing depends on the response header; initialize before moving it out.
-            let _ = self.is_body_done();
-            return self.response_header.take().ok_or_else(|| {
-                Error::explain(InvalidHTTPHeader, "missing response header after read")
-            });
-        }
         // safe to unwrap because it is just read
         Ok(Box::new(self.resp_header().unwrap().clone()))
     }
@@ -639,17 +491,7 @@ impl HttpSession {
 
     /// Return the status code of the response if read
     pub fn get_status(&self) -> Option<StatusCode> {
-        self.response_header
-            .as_ref()
-            .map(|h| h.status)
-            .or_else(|| self.response_reuse.as_ref().map(|r| r.status))
-    }
-
-    fn response_version(&self) -> Option<Version> {
-        self.response_header
-            .as_ref()
-            .map(|h| h.version)
-            .or_else(|| self.response_reuse.as_ref().map(|r| r.version))
+        self.response_header.as_ref().map(|h| h.status)
     }
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
@@ -662,18 +504,16 @@ impl HttpSession {
     /// Read the response body into the internal buffer.
     /// Return `Ok(Some(ref)) after a successful read.
     /// Return `Ok(None)` if there is no more body to read.
-    async fn read_body_buf_ref(&mut self) -> Result<Option<BufRef>> {
-        match self.read_timeout {
+    pub async fn read_body_ref(&mut self) -> Result<Option<&[u8]>> {
+        let result = match self.read_timeout {
             Some(t) => match timeout(t, self.do_read_body()).await {
                 Ok(res) => res,
                 Err(_) => Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}")),
             },
             None => self.do_read_body().await,
-        }
-    }
+        };
 
-    pub async fn read_body_ref(&mut self) -> Result<Option<&[u8]>> {
-        self.read_body_buf_ref().await.map(|maybe_body| {
+        result.map(|maybe_body| {
             maybe_body.map(|body_ref| {
                 let slice = self.body_reader.get_body(&body_ref);
                 self.body_recv = self.body_recv.saturating_add(slice.len());
@@ -684,7 +524,17 @@ impl HttpSession {
 
     /// Similar to [`Self::read_body_ref`] but return `Bytes` instead of a slice reference.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        let Some(body_ref) = self.read_body_buf_ref().await? else {
+        self.init_body_reader();
+        let body_ref = match self.read_timeout {
+            Some(t) => match timeout(t, self.body_reader.read_body(&mut self.underlying_stream)).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    return Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}"))
+                }
+            },
+            None => self.body_reader.read_body(&mut self.underlying_stream).await?,
+        };
+        let Some(body_ref) = body_ref else {
             return Ok(None);
         };
         let length = self.body_reader.get_body(&body_ref).len();
@@ -770,13 +620,12 @@ impl HttpSession {
 
         // Per [RFC 9112 Section 6.1-16](https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-16),
         // if Transfer-Encoding is received in HTTP/1.0 response, connection MUST be closed after processing.
-        let version = self.response_version();
-        let has_te = self
-            .resp_header()
-            .map(|h| h.headers.contains_key(header::TRANSFER_ENCODING))
-            .or_else(|| self.response_reuse.as_ref().map(|r| r.has_transfer_encoding))
-            .unwrap_or(false);
-        if version == Some(Version::HTTP_10) && has_te {
+        if self.resp_header().map(|h| h.version) == Some(Version::HTTP_10)
+            && self
+                .resp_header()
+                .and_then(|h| h.headers.get(header::TRANSFER_ENCODING))
+                .is_some()
+        {
             self.set_keepalive(None);
             return;
         }
@@ -791,7 +640,7 @@ impl HttpSession {
             } else {
                 self.set_keepalive(None);
             }
-        } else if version == Some(Version::HTTP_11) {
+        } else if self.resp_header().map(|h| h.version) == Some(Version::HTTP_11) {
             self.set_keepalive(Some(0)); // on by default for http 1.1
         } else {
             self.set_keepalive(None); // off by default for http 1.0
@@ -812,14 +661,7 @@ impl HttpSession {
         match request_keepalive {
             // ignore what the server sends if request disables keepalive explicitly
             Some(false) => Some(false),
-            _ => {
-                let connection = self.get_header(header::CONNECTION).or_else(|| {
-                    self.response_reuse
-                        .as_ref()
-                        .and_then(|r| r.connection.as_ref())
-                });
-                is_buf_keepalive(connection)
-            }
+            _ => is_buf_keepalive(self.get_header(header::CONNECTION)),
         }
     }
 
@@ -828,16 +670,8 @@ impl HttpSession {
     /// it's behavior is different on different platforms.
     /// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Keep-Alive
     fn get_keepalive_values(&self) -> (Option<u64>, Option<usize>) {
-        let keep_alive_header = match self.get_header("Keep-Alive") {
-            Some(value) => value,
-            None => match self
-                .response_reuse
-                .as_ref()
-                .and_then(|r| r.keep_alive.as_ref())
-            {
-                Some(value) => value,
-                None => return (None, None),
-            },
+        let Some(keep_alive_header) = self.get_header("Keep-Alive") else {
+            return (None, None);
         };
 
         let Ok(header_value) = str::from_utf8(keep_alive_header.as_bytes()) else {
@@ -1024,18 +858,12 @@ impl HttpSession {
     pub async fn read_response_task(&mut self) -> Result<HttpTask> {
         if self.should_read_resp_header() {
             let resp_header = self.read_resp_header_parts().await?;
-            // Body reader is already initialized inside read_resp_header_parts for
-            // final responses; informational clones still need the check.
             let end_of_body = self.is_body_done();
-            if log::log_enabled!(log::Level::Debug) {
-                debug!("Response header: {resp_header:?}");
-            }
-            if log::log_enabled!(log::Level::Trace) {
-                trace!(
-                    "Raw Response header: {:?}",
-                    str::from_utf8(self.get_headers_raw()).unwrap()
-                );
-            }
+            debug!("Response header: {resp_header:?}");
+            trace!(
+                "Raw Response header: {:?}",
+                str::from_utf8(self.get_headers_raw()).unwrap()
+            );
             Ok(HttpTask::Header(resp_header, end_of_body))
         } else if self.is_body_done() {
             // no body
@@ -1045,15 +873,11 @@ impl HttpSession {
             /* need to read body */
             let body = self.read_body_bytes().await?;
             let end_of_body = self.is_body_done();
-            if log::log_enabled!(log::Level::Debug) {
-                debug!(
-                    "Response body: {} bytes, end: {end_of_body}",
-                    body.as_ref().map_or(0, |b| b.len())
-                );
-            }
-            if log::log_enabled!(log::Level::Trace) {
-                trace!("Response body: {body:?}, upgraded: {}", self.upgraded);
-            }
+            debug!(
+                "Response body: {} bytes, end: {end_of_body}",
+                body.as_ref().map_or(0, |b| b.len())
+            );
+            trace!("Response body: {body:?}, upgraded: {}", self.upgraded);
             if self.upgraded {
                 Ok(HttpTask::UpgradedBody(body, end_of_body))
             } else {
@@ -1105,6 +929,28 @@ impl HttpSession {
     }
 }
 
+#[cfg(feature = "patched_http1")]
+#[inline]
+fn parse_resp_buffer<'buf>(
+    resp: &mut httparse::Response<'_, 'buf>,
+    buf: &'buf [u8],
+) -> HeaderParseState {
+    let mut parser = httparse::ParserConfig::default();
+    parser.allow_spaces_after_header_name_in_responses(true);
+    parser.allow_obsolete_multiline_headers_in_responses(true);
+    let res = match parser.parse_response(resp, buf) {
+        Ok(s) => s,
+        Err(e) => {
+            return HeaderParseState::Invalid(e);
+        }
+    };
+    match res {
+        httparse::Status::Complete(s) => HeaderParseState::Complete(s),
+        _ => HeaderParseState::Partial,
+    }
+}
+
+#[cfg(not(feature = "patched_http1"))]
 #[inline]
 fn parse_resp_buffer<'headers, 'buf>(
     resp: &mut httparse::Response<'headers, 'buf>,
@@ -1141,6 +987,9 @@ pub(crate) fn request_target_has_forbidden_byte(path: &[u8]) -> bool {
 pub fn http_req_header_to_wire(req: &RequestHeader) -> Option<BytesMut> {
     let method = req.method.as_str().as_bytes();
     let path = req.raw_path();
+    if request_target_has_forbidden_byte(path) {
+        return None;
+    }
     // Request-line + headers + final CRLF. Prefer one allocation over growing
     // from a fixed 512-byte guess on typical proxy requests with forwarded
     // headers.
@@ -1157,14 +1006,6 @@ pub fn http_req_header_to_wire(req: &RequestHeader) -> Option<BytesMut> {
     // Request-Line
     buf.put_slice(method);
     buf.put_u8(b' ');
-<<<<<<< vendor/pingora-core-0.9.0/src/protocols/http/v1/client.rs
-
-    let path = req.raw_path();
-    if request_target_has_forbidden_byte(path) {
-        return None;
-    }
-=======
->>>>>>> vendor/pingora-core-0.8.1/src/protocols/http/v1/client.rs
     buf.put_slice(path);
     buf.put_u8(b' ');
 
@@ -1383,7 +1224,6 @@ mod tests_stream {
             HttpTask::Header(h, eob) => {
                 assert_eq!(h.status, 100);
                 assert!(!eob);
-                assert!(!h.has_case());
             }
             _ => panic!("expected informational header"),
         }
@@ -1446,9 +1286,8 @@ mod tests_stream {
         let mock_io = Builder::new().read(input).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         let resp = http_stream.read_resp_header_parts().await.unwrap();
-        assert!(http_stream.resp_header().is_none());
-        assert_eq!(Some(StatusCode::OK), http_stream.get_status());
-        assert_eq!(1, resp.headers.len());
+        assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
+        assert_eq!(http_stream.get_header("Server👍").unwrap(), "pingora");
         assert_eq!(resp.headers.get("Server👍").unwrap(), "pingora");
     }
 
@@ -1943,7 +1782,6 @@ mod tests_stream {
             HttpTask::Header(h, eob) => {
                 assert_eq!(h.status, 204);
                 assert!(eob);
-                assert!(!h.has_case());
             }
             _ => {
                 panic!("task should be header")

@@ -51,11 +51,8 @@ pub struct Service<A> {
     app_logic: Option<A>,
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
-<<<<<<< vendor/pingora-core-0.9.0/src/services/listening.rs
-    runtime_opts_override: Option<RuntimeOptsOverride>,
-=======
     connection_limit: Option<Arc<Semaphore>>,
->>>>>>> vendor/pingora-core-0.8.1/src/services/listening.rs
+    runtime_opts_override: Option<RuntimeOptsOverride>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Arc<dyn ConnectionFilter>,
 }
@@ -68,11 +65,8 @@ impl<A> Service<A> {
             listeners: Listeners::new(),
             app_logic: Some(app_logic),
             threads: None,
-<<<<<<< vendor/pingora-core-0.9.0/src/services/listening.rs
-            runtime_opts_override: None,
-=======
             connection_limit: None,
->>>>>>> vendor/pingora-core-0.8.1/src/services/listening.rs
+            runtime_opts_override: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
         }
@@ -86,11 +80,8 @@ impl<A> Service<A> {
             listeners,
             app_logic: Some(app_logic),
             threads: None,
-<<<<<<< vendor/pingora-core-0.9.0/src/services/listening.rs
-            runtime_opts_override: None,
-=======
             connection_limit: None,
->>>>>>> vendor/pingora-core-0.8.1/src/services/listening.rs
+            runtime_opts_override: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
         }

@@ -36,25 +36,11 @@ impl FixedBuffer {
         if self.truncated {
             return;
         }
-<<<<<<< vendor/pingora-core-0.9.0/src/protocols/http/body_buffer.rs
 
         if self.buffer.len() + data.len() <= self.capacity {
             self.buffer.extend_from_slice(data);
         } else {
             // Buffered data is no longer usable for a retry, so release its allocation.
-=======
-        if self
-            .buffer
-            .len()
-            .checked_add(data.len())
-            .is_some_and(|length| length <= self.capacity)
-        {
-            self.buffer.extend_from_slice(data);
-        } else {
-            // A truncated retry body can never be replayed. Release its
-            // allocation immediately instead of pinning it for the lifetime
-            // of the downstream connection.
->>>>>>> vendor/pingora-core-0.8.1/src/protocols/http/body_buffer.rs
             self.buffer = BytesMut::new();
             self.truncated = true;
         }
@@ -85,7 +71,6 @@ mod tests {
     use super::*;
 
     #[test]
-<<<<<<< vendor/pingora-core-0.9.0/src/protocols/http/body_buffer.rs
     fn releases_storage_when_truncated() {
         let mut buffer = FixedBuffer::new(4);
         buffer.write_to_buffer(&Bytes::from_static(b"1234"));
@@ -96,17 +81,5 @@ mod tests {
         assert!(buffer.is_truncated());
         assert_eq!(buffer.buffer.capacity(), 0);
         assert!(buffer.get_buffer().is_none());
-=======
-    fn truncation_discards_unusable_retry_storage() {
-        let mut buffer = FixedBuffer::new(4);
-        buffer.write_to_buffer(&Bytes::from_static(b"1234"));
-        buffer.write_to_buffer(&Bytes::from_static(b"5"));
-        assert!(buffer.is_truncated());
-        assert!(buffer.get_buffer().is_none());
-
-        buffer.clear();
-        buffer.write_to_buffer(&Bytes::from_static(b"ok"));
-        assert_eq!(buffer.get_buffer().unwrap(), Bytes::from_static(b"ok"));
->>>>>>> vendor/pingora-core-0.8.1/src/protocols/http/body_buffer.rs
     }
 }

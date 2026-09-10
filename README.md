@@ -10,7 +10,7 @@ crate와 충돌하지 않도록 `jbs-pingora`, 실행 binary와 제품명은 `pi
 upstream dependency는 Rust 코드에서 `cloudflare_pingora` alias로 가져옵니다.
 
 TLS provider는 Cloudflare `boring`/BoringSSL 하나만 지원합니다. Pingora와
-HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항목을
+HTTP/3 `quiche`가 같은 `boring 5.2.0` 및 `boring-sys 5.2.0` lockfile 항목을
 공유하며, 다른 TLS provider를 지정한 Docker build는 즉시 실패합니다.
 
 ## 주요 기능과 한계
@@ -29,7 +29,7 @@ HTTP/3 `quiche`가 같은 `boring 4.22.0` 및 `boring-sys 4.22.0` lockfile 항�
 - Cloudflare BoringSSL TLS 파일 사전 검사와 UID/GID/mode/symlink 대상 진단
 - UID/GID `10001:10001`, read-only root filesystem, 최소 capability
 
-Pingora 0.8.1은 다운스트림 HTTP/3/QUIC server를 제공하지 않으므로 HTTP/3와
+Pingora 0.9.0은 다운스트림 HTTP/3/QUIC server를 제공하지 않으므로 HTTP/3와
 `Alt-Svc`는 지원하지 않습니다. gzip/Brotli/Zstd 동적 압축은 명시적으로 설정한 정적
 호스트에만 직접 적용합니다. Navidrome API/cover는 client의 `Accept-Encoding`을 origin에 전달하고 gateway
 압축은 적용하지 않습니다. 그 외 압축 가능한 프록시 응답(Vaultwarden, CouchDB,
@@ -378,11 +378,11 @@ Rust toolchain은 1.98.1이며 Cargo lockfile은 직접 의존성의 최신 호�
 고정합니다. GitHub Actions는 RustSec audit를 image 게시 전 실행하고, Dependabot이
 Cargo, Docker base image, Actions를 매주 확인합니다. Deprecated `serde_yaml`은
 typed YAML parser인 `serde-saphyr`로 교체했으며, 직접 코드와 vendored Pingora core가
-동일한 Brotli 8 및 zlib-rs backend를 사용합니다. 나머지 transitive crate는
-`cargo update --dry-run --verbose`로 추적합니다. Pingora 0.8.1의
-`prometheus 0.13`이 취약한 `protobuf 2.28`을 가져오는 경로는 core API를 바꾸지 않는
-로컬 최소 패치로 `prometheus 0.14`/`protobuf 3.7.2` 이상을 사용합니다. 패치 근거와
-범위는 `vendor/pingora-core-0.8.1/README.pingora-patch.md`에 기록합니다.
+동일한 Brotli 9 및 zlib-rs backend를 사용합니다. 나머지 transitive crate는
+`cargo update --dry-run --verbose`로 추적합니다. Pingora 0.9.0과 HTTP/3
+`quiche`/`tokio-quiche`는 Cloudflare `boring`/`boring-sys` 5.2.0을 공유하며,
+로컬 vendor 패치 근거와 범위는 `vendor/pingora-core-0.9.0/README.pingora-patch.md`,
+`vendor/quiche-0.29.3/README.pingora-patch.md`에 기록합니다.
 
 정적 파일의 Content-Type/Length, ETag, Last-Modified는 asset cache miss 때 한 번
 검증된 HeaderValue로 만들고 hot path에서는 값만 재사용합니다. URI에서 canonical

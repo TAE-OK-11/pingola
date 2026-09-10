@@ -46,7 +46,11 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool>;
 
-<<<<<<< vendor/pingora-core-0.9.0/src/protocols/http/custom/server.rs
+    /// Write one response task without constructing a temporary task vector.
+    async fn response_duplex_one(&mut self, task: HttpTask) -> Result<bool> {
+        self.response_duplex_vec(vec![task]).await
+    }
+
     /// Whether the cancel-safe proxy task API is enabled for this session.
     fn proxy_tasks_enabled(&self) -> bool {
         false
@@ -75,11 +79,6 @@ pub trait Session: Send + Sync + Unpin + 'static {
     /// Panics if the Custom session does not implement the proxy task API.
     async fn write_proxy_tasks(&mut self) -> Result<bool> {
         panic!("Custom proxy task API not implemented")
-=======
-    /// Write one response task without constructing a temporary task vector.
-    async fn response_duplex_one(&mut self, task: HttpTask) -> Result<bool> {
-        self.response_duplex_vec(vec![task]).await
->>>>>>> vendor/pingora-core-0.8.1/src/protocols/http/custom/server.rs
     }
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>);

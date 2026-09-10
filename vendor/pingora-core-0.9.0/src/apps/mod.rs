@@ -19,14 +19,10 @@ pub mod http_app;
 use crate::server::ShutdownWatch;
 use crate::{Error, ErrorType};
 use async_trait::async_trait;
+use pingora_timeout::timeout;
 use bytes::BytesMut;
 use log::{debug, error};
-<<<<<<< vendor/pingora-core-0.9.0/src/apps/mod.rs
 use std::any::Any;
-=======
-use pingora_timeout::timeout;
-use std::future::poll_fn;
->>>>>>> vendor/pingora-core-0.8.1/src/apps/mod.rs
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,16 +86,14 @@ pub struct HttpServerOptions {
     /// Unlike nginx, the default behavior here is _no limit_.
     pub keepalive_request_limit: Option<u32>,
 
-<<<<<<< vendor/pingora-core-0.9.0/src/apps/mod.rs
+    /// Total time allowed to receive the first request header or HTTP/2 preface.
+    pub request_header_timeout: Option<Duration>,
+
     /// If set, close a downstream HTTP/2 connection that has been idle
     /// for this duration.
     ///
     /// Default: `None`
     pub h2_idle_timeout: Option<Duration>,
-=======
-    /// Total time allowed to receive the first request header or HTTP/2 preface.
-    pub request_header_timeout: Option<Duration>,
->>>>>>> vendor/pingora-core-0.8.1/src/apps/mod.rs
 }
 
 /// Settings persisted across HTTP/1.x keepalive requests on the same downstream connection.
@@ -318,9 +312,6 @@ where
             });
 
             let h2_options = self.h2_options();
-<<<<<<< vendor/pingora-core-0.9.0/src/apps/mod.rs
-            let h2_conn = match server::handshake(stream, h2_options).await {
-=======
             let h2_conn = match self
                 .server_options()
                 .and_then(|options| options.request_header_timeout)
@@ -336,8 +327,7 @@ where
                 }
                 None => server::handshake(stream, h2_options).await,
             };
-            let mut h2_conn = match h2_conn {
->>>>>>> vendor/pingora-core-0.8.1/src/apps/mod.rs
+            let h2_conn = match h2_conn {
                 Err(e) => {
                     error!("H2 handshake error {e}");
                     return None;

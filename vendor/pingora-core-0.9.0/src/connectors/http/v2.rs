@@ -20,18 +20,14 @@ use crate::protocols::http::v2::client::{drive_connection, Http2Session};
 use crate::protocols::{Digest, Stream, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
 
-use ahash::AHashMap;
 use bytes::Bytes;
 use h2::client::SendRequest;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
 use pingora_error::{Error, ErrorType::*, OkOrErr, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
-<<<<<<< vendor/pingora-core-0.9.0/src/connectors/http/v2.rs
 use std::collections::HashMap;
 use std::io::ErrorKind;
-=======
->>>>>>> vendor/pingora-core-0.8.1/src/connectors/http/v2.rs
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -129,8 +125,7 @@ impl ConnectionRef {
     }
 
     pub fn release_stream(&self) {
-        let previous = self.0.current_streams.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(previous > 0, "released more HTTP/2 streams than acquired");
+        self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub fn id(&self) -> UniqueIDType {
@@ -169,18 +164,12 @@ impl ConnectionRef {
 
     // spawn a stream if more stream is allowed, otherwise return Ok(None)
     pub async fn spawn_stream(&self) -> Result<Option<Http2Session>> {
-        // Reserve capacity with one relaxed CAS instead of a sequentially
-        // consistent increment plus compensating decrement on the saturated
-        // hot path. The counter protects only the numeric stream limit; it
-        // does not publish any other state.
-        if self
-            .0
-            .current_streams
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current < self.0.max_streams).then_some(current + 1)
-            })
-            .is_err()
-        {
+        // Atomically check if the current_stream is over the limit
+        // load(), compare and then fetch_add() cannot guarantee the same
+        let current_streams = self.0.current_streams.fetch_add(1, Ordering::SeqCst);
+        if current_streams >= self.0.max_streams {
+            // already over the limit, reset the counter to the previous value
+            self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
             return Ok(None);
         }
 
@@ -188,18 +177,11 @@ impl ConnectionRef {
             Ok(send_req) => Ok(Some(Http2Session::new(send_req, self.clone()))),
             Err(e) => {
                 // fail to create the stream, reset the counter
-<<<<<<< vendor/pingora-core-0.9.0/src/connectors/http/v2.rs
                 self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
 
                 // Check for graceful shutdown conditions where we can retry with a new connection
                 let is_graceful_shutdown = e
                     .root_cause()
-=======
-                self.0.current_streams.fetch_sub(1, Ordering::Relaxed);
-                // Remote sends GOAWAY(NO_ERROR): graceful shutdown: this connection no longer
-                // accepts new streams. We can still try to create new connection.
-                if e.root_cause()
->>>>>>> vendor/pingora-core-0.8.1/src/connectors/http/v2.rs
                     .downcast_ref::<h2::Error>()
                     .map(|e| {
                         // Remote sends GOAWAY(NO_ERROR): graceful shutdown
@@ -224,16 +206,14 @@ impl ConnectionRef {
 }
 
 pub struct InUsePool {
-    // Reuse hashes are trusted u64 values. AHashMap avoids SipHash overhead on
-    // every multiplexed request while the outer lock keeps pool topology
-    // changes infrequent.
-    pools: RwLock<AHashMap<u64, PoolNode<ConnectionRef>>>,
+    // TODO: use pingora hashmap to shard the lock contention
+    pools: RwLock<HashMap<u64, PoolNode<ConnectionRef>>>,
 }
 
 impl InUsePool {
     fn new() -> Self {
         InUsePool {
-            pools: RwLock::new(AHashMap::new()),
+            pools: RwLock::new(HashMap::new()),
         }
     }
 
@@ -261,7 +241,6 @@ impl InUsePool {
             }
         } // drop read lock
 
-<<<<<<< vendor/pingora-core-0.9.0/src/connectors/http/v2.rs
         let mut pools = self.pools.write();
         // Double-check: another thread may have inserted a node between
         // dropping the read lock and acquiring this write lock.
@@ -272,17 +251,6 @@ impl InUsePool {
         let pool = PoolNode::new();
         pool.insert(conn.id(), conn);
         pools.insert(reuse_hash, pool);
-=======
-        // Another connection can create this reuse bucket between the read
-        // miss above and taking the write lock. Entry preserves both
-        // connections instead of replacing the first PoolNode and temporarily
-        // losing all of its reusable capacity.
-        let mut pools = self.pools.write();
-        pools
-            .entry(reuse_hash)
-            .or_insert_with(PoolNode::new)
-            .insert(conn.id(), conn);
->>>>>>> vendor/pingora-core-0.8.1/src/connectors/http/v2.rs
     }
 
     // retrieve a h2 conn ref to create a new stream
@@ -410,22 +378,12 @@ impl Connector {
         settings.max_streams = peer_options.map_or(1, |o| o.max_h2_streams);
         settings.ping_interval = peer.h2_ping_interval();
         settings.stream_window_size = peer_options.and_then(|o| o.h2_stream_window_size);
-<<<<<<< vendor/pingora-core-0.9.0/src/connectors/http/v2.rs
         settings.connection_window_size = peer_options.and_then(|o| o.h2_connection_window_size);
         let conn = handshake(stream, settings).await?;
         let h2_stream = conn.spawn_stream().await?.or_err(
             H2Error,
             "newly created connection has no free streams (server may have sent GOAWAY)",
         )?;
-=======
-        settings.connection_window_size =
-            peer_options.and_then(|o| o.h2_connection_window_size);
-        let conn = handshake(stream, settings).await?;
-        let h2_stream = conn
-            .spawn_stream()
-            .await?
-            .expect("newly created connections should have at least one free stream");
->>>>>>> vendor/pingora-core-0.8.1/src/connectors/http/v2.rs
         if conn.more_streams_allowed() {
             self.in_use_pool.insert(peer.reuse_hash(), conn);
         }
@@ -463,16 +421,8 @@ impl Connector {
             .or_else(|| self.idle_pool.get(&reuse_hash));
         if let Some(conn) = maybe_conn {
             #[cfg(unix)]
-            {
-                let cached_peer_matches = conn
-                    .digest()
-                    .socket_digest
-                    .as_ref()
-                    .and_then(|digest| digest.peer_addr())
-                    .is_some_and(|addr| peer.matches_cached_peer_addr(addr));
-                if !cached_peer_matches && !peer.matches_fd(conn.id()) {
-                    return Ok(None);
-                }
+            if !peer.matches_fd(conn.id()) {
+                return Ok(None);
             }
             #[cfg(windows)]
             {
@@ -582,18 +532,7 @@ impl Connector {
 // Long term, we should advertising large window but shrink it when a small buffer is full.
 // 8 Mbytes = 80 Mbytes X 100ms, which should be enough for most links.
 const H2_WINDOW_SIZE: u32 = 1 << 23;
-const H2_MAX_WINDOW_SIZE: u32 = (1_u32 << 31) - 1;
 
-#[derive(Debug, Clone, Default)]
-#[non_exhaustive]
-pub struct H2HandshakeSettings {
-    pub max_streams: usize,
-    pub ping_interval: Option<Duration>,
-    pub stream_window_size: Option<u32>,
-    pub connection_window_size: Option<u32>,
-}
-
-<<<<<<< vendor/pingora-core-0.9.0/src/connectors/http/v2.rs
 /// Maximum allowed H2 window size per [RFC 9113 §6.9.1](https://datatracker.ietf.org/doc/html/rfc9113#section-6.9.1-7).
 const H2_MAX_WINDOW_SIZE: u32 = (1u32 << 31) - 1;
 
@@ -628,38 +567,17 @@ pub struct H2HandshakeSettings {
 
 impl H2HandshakeSettings {
     /// Create a new `H2HandshakeSettings` with all defaults.
-=======
-impl H2HandshakeSettings {
->>>>>>> vendor/pingora-core-0.8.1/src/connectors/http/v2.rs
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-<<<<<<< vendor/pingora-core-0.9.0/src/connectors/http/v2.rs
 /// Perform an HTTP/2 handshake on the given stream with the given settings.
-=======
->>>>>>> vendor/pingora-core-0.8.1/src/connectors/http/v2.rs
 pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<ConnectionRef> {
     use h2::client::Builder;
     use pingora_runtime::current_handle;
 
     let max_streams = settings.max_streams;
-<<<<<<< vendor/pingora-core-0.9.0/src/connectors/http/v2.rs
-=======
-    if settings
-        .stream_window_size
-        .is_some_and(|window| window == 0 || window > H2_MAX_WINDOW_SIZE)
-    {
-        return Error::e_explain(H2Error, format!("stream_window_size must be between 1 and {H2_MAX_WINDOW_SIZE}"));
-    }
-    if settings
-        .connection_window_size
-        .is_some_and(|window| window == 0 || window > H2_MAX_WINDOW_SIZE)
-    {
-        return Error::e_explain(H2Error, format!("connection_window_size must be between 1 and {H2_MAX_WINDOW_SIZE}"));
-    }
->>>>>>> vendor/pingora-core-0.8.1/src/connectors/http/v2.rs
 
     // Safe guard: new_http_session() assumes there should be at least one free stream
     if max_streams == 0 {
@@ -704,11 +622,7 @@ pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<
         socket_digest: stream.get_socket_digest(),
     };
     let stream_window = settings.stream_window_size.unwrap_or(H2_WINDOW_SIZE);
-<<<<<<< vendor/pingora-core-0.9.0/src/connectors/http/v2.rs
     let conn_window = settings.connection_window_size.unwrap_or(H2_WINDOW_SIZE);
-=======
-    let connection_window = settings.connection_window_size.unwrap_or(H2_WINDOW_SIZE);
->>>>>>> vendor/pingora-core-0.8.1/src/connectors/http/v2.rs
     let (send_req, connection) = Builder::new()
         .enable_push(false)
         .initial_max_send_streams(max_streams)
@@ -716,11 +630,7 @@ pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<
         .max_concurrent_streams(1)
         .max_frame_size(64 * 1024) // advise server to send larger frames
         .initial_window_size(stream_window)
-<<<<<<< vendor/pingora-core-0.9.0/src/connectors/http/v2.rs
         .initial_connection_window_size(conn_window)
-=======
-        .initial_connection_window_size(connection_window)
->>>>>>> vendor/pingora-core-0.8.1/src/connectors/http/v2.rs
         .handshake(stream)
         .await
         .or_err(HandshakeError, "during H2 handshake")?;

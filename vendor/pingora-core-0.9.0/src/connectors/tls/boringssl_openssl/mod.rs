@@ -26,10 +26,6 @@ use crate::tls::ext::{
     ssl_set_renegotiate_mode_freely, ssl_set_verify_cert_store, ssl_use_certificate,
     ssl_use_private_key, ssl_use_second_key_share,
 };
-<<<<<<< vendor/pingora-core-0.9.0/src/connectors/tls/boringssl_openssl/mod.rs
-=======
-#[cfg(feature = "boringssl")]
->>>>>>> vendor/pingora-core-0.8.1/src/connectors/tls/boringssl_openssl/mod.rs
 use crate::tls::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use crate::tls::x509::store::X509StoreBuilder;
 use crate::upstreams::peer::{Peer, ALPN};
@@ -78,11 +74,7 @@ const SIGALG_LIST: &str = "ecdsa_secp256r1_sha256\
  * that are both computationally cheaper and more supported.
  */
 #[cfg(feature = "boringssl")]
-<<<<<<< vendor/pingora-core-0.9.0/src/connectors/tls/boringssl_openssl/mod.rs
 const BORINGSSL_CURVES_LIST: &str = "X25519:P-256:P-384:P-521";
-=======
-const BORINGSSL_CURVE_LIST: &str = "X25519MLKEM768:X25519:P-256:P-384:P-521";
->>>>>>> vendor/pingora-core-0.8.1/src/connectors/tls/boringssl_openssl/mod.rs
 
 static INIT_CA_ENV: Once = Once::new();
 fn init_ssl_cert_env_vars() {
@@ -107,16 +99,12 @@ impl Connector {
         // Set supported signature algorithms and ECDH (key exchange) curves.
         builder.set_sigalgs_list(SIGALG_LIST).unwrap();
         #[cfg(feature = "boringssl")]
-<<<<<<< vendor/pingora-core-0.9.0/src/connectors/tls/boringssl_openssl/mod.rs
         builder.set_curves_list(BORINGSSL_CURVES_LIST).unwrap();
-=======
-        builder.set_curves_list(BORINGSSL_CURVE_LIST).unwrap();
->>>>>>> vendor/pingora-core-0.8.1/src/connectors/tls/boringssl_openssl/mod.rs
         builder
             .set_max_proto_version(Some(SslVersion::TLS1_3))
             .unwrap();
         builder
-            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .set_min_proto_version(Some(SslVersion::TLS1))
             .unwrap();
         if let Some(conf) = options.as_ref() {
             if let Some(ca_file_path) = conf.ca_file.as_ref() {
