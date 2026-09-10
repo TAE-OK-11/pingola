@@ -17,6 +17,8 @@ jobs:
           ref: cursor/pingora-0.9-boring-5-f186
       - name: Apply source patch
         run: python3 scripts/port_pingora09_h2_timeout.py
+      - name: Install rustfmt
+        run: rustup component add --toolchain 1.98.1-x86_64-unknown-linux-gnu rustfmt
       - name: Format
         run: cargo fmt --all
       - name: Commit source patch
