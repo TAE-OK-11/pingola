@@ -283,6 +283,8 @@ pub struct HttpSession {
     body_sent: usize,
     // buffered request body for retry logic
     retry_buffer: Option<FixedBuffer>,
+    /// The read timeout applied to each downstream request-body read.
+    read_timeout: Option<Duration>,
     // digest to record underlying connection info
     digest: Arc<Digest>,
     /// The write timeout which will be applied to writing response body.
@@ -496,6 +498,7 @@ impl HttpSession {
             body_read: 0,
             body_sent: 0,
             retry_buffer: None,
+            read_timeout: None,
             digest,
             write_timeout: None,
             total_drain_timeout: None,
@@ -520,11 +523,25 @@ impl HttpSession {
 
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        // TODO: timeout
-        let data = self.request_body_reader.data().await.transpose().or_err(
-            ErrorType::ReadError,
-            "while reading downstream request body",
-        )?;
+        let read_timeout = self.read_timeout;
+        let read = async {
+            self.request_body_reader.data().await.transpose().or_err(
+                ErrorType::ReadError,
+                "while reading downstream request body",
+            )
+        };
+        let data = match read_timeout {
+            Some(deadline) => match timeout(deadline, read).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Error::e_explain(
+                        ErrorType::ReadTimedout,
+                        format!("reading downstream H2 body, timeout: {deadline:?}"),
+                    )
+                }
+            },
+            None => read.await?,
+        };
         if let Some(data) = data.as_ref() {
             self.body_read += data.len();
             if let Some(buffer) = self.retry_buffer.as_mut() {
@@ -536,6 +553,16 @@ impl HttpSession {
                 .release_capacity(data.len());
         }
         Ok(data)
+    }
+
+    /// Sets the downstream request-body read timeout. The timeout is reset for each read.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+    }
+
+    /// Get the downstream request-body read timeout.
+    pub fn get_read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
     }
 
     #[doc(hidden)]
