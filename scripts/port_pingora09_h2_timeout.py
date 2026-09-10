@@ -80,26 +80,3 @@ replacement = """        Ok(data)
 assert marker in s, "read timeout methods insertion point not found"
 s = s.replace(marker, replacement, 1)
 server.write_text(s)
-
-test = Path("tests/h2_downstream_timeout.rs")
-t = test.read_text()
-old = "use cloudflare_pingora::protocols::http::v2::server::{HttpSession, handshake};"
-new = "use cloudflare_pingora::protocols::http::v2::server::{H2Accept, HttpSession, handshake};"
-assert old in t, "test import not found"
-t = t.replace(old, new, 1)
-
-old = """    let mut session = HttpSession::from_h2_conn(&mut connection, Arc::new(Digest::default()))
-        .await
-        .unwrap()
-        .unwrap();"""
-new = """    let H2Accept::Session(mut session) =
-        HttpSession::from_h2_conn(&mut connection, Arc::new(Digest::default()))
-            .await
-            .unwrap()
-            .unwrap()
-    else {
-        panic!("valid test request was rejected during H2 acceptance");
-    };"""
-assert t.count(old) == 2, f"expected two test session initializers, found {t.count(old)}"
-t = t.replace(old, new)
-test.write_text(t)
