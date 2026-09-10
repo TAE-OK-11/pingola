@@ -157,7 +157,7 @@ impl H3UpstreamSession {
             )
         })?;
         // Move the already-decoded HeaderMap instead of cloning every name/value.
-        response.headers = headers;
+        response.set_headers(headers);
         self.response_header = Some(response);
         self.body_rx = Some(body);
         self.finished = Some(finished);

@@ -708,6 +708,17 @@ impl ResponseHeader {
         clone_resp_parts(&self.base)
     }
 
+    /// Replace all headers with an owned map and clear the case map.
+    ///
+    /// Use this when headers were already built into an [`HMap`] (for example
+    /// HTTP/3 decoding) so they can be moved once without `DerefMut`.
+    pub fn set_headers(&mut self, headers: HMap) {
+        self.base.headers = headers;
+        if let Some(name_map) = self.header_name_map.as_mut() {
+            name_map.clear();
+        }
+    }
+
     /// Helper function to set the HTTP content length on the response header.
     pub fn set_content_length(&mut self, len: usize) -> Result<()> {
         self.insert_header(http::header::CONTENT_LENGTH, len)

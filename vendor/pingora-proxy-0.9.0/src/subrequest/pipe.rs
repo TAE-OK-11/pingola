@@ -241,13 +241,8 @@ where
             .or_err(InternalError, "try_reserve() body pipe for subrequest");
 
         tokio::select! {
-<<<<<<< vendor/pingora-proxy-0.9.0/src/subrequest/pipe.rs
             task = state.pipe_rx.as_mut().expect("pipe_rx always set after spawn").recv(), if !response_state.upstream_done() => {
                 debug!("upstream event: {:?}", task);
-=======
-            task = rx.recv(), if !response_state.upstream_done() => {
-                debug!("subrequest upstream event received");
->>>>>>> vendor/pingora-proxy-0.8.1/src/subrequest/pipe.rs
                 if let Some(t) = task {
                     // Did the subrequest get headers?
                     if matches!(&t, HttpTask::Header(..)) {

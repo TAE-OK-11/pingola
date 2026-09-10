@@ -927,7 +927,6 @@ impl ProxyHttp for Gateway {
         strip_request_hop_headers(session.req_header(), upstream_request)?;
         grpc::prepare_upstream_request(upstream_request, &mut ctx.grpc_web, ctx.grpc);
         // Host + X-Real-IP + 5 X-Forwarded-* (+ optional Accept-Encoding/Upgrade).
-        upstream_request.headers.reserve(7);
         let client_ip = ctx.upstream_forwarded_for.as_ref().ok_or_else(|| {
             Error::explain(HTTPStatus(500), "upstream forwarded client IP is missing")
         })?;
@@ -1393,7 +1392,7 @@ fn strip_request_hop_headers(
     if keep_te_trailers {
         upstream.insert_typed_header(TE, TE_TRAILERS);
     }
-    normalize_content_length_headers(&mut upstream.headers, 400)?;
+    normalize_request_content_length(upstream, 400)?;
     Ok(())
 }
 
@@ -1426,7 +1425,7 @@ fn strip_response_hop_headers(response: &mut ResponseHeader, forwards_upgrade: b
     for name in fixed {
         response.remove_header(&name);
     }
-    normalize_content_length_headers(&mut response.headers, 502)?;
+    normalize_response_content_length(response, 502)?;
     if forwards_upgrade {
         let upgrade = upgrade.ok_or_else(|| {
             Error::explain(
@@ -1526,17 +1525,17 @@ fn validated_request_content_length(
     Ok(length)
 }
 
-fn normalize_content_length_headers(
-    headers: &mut http::HeaderMap,
+fn normalize_request_content_length(
+    request: &mut RequestHeader,
     invalid_status: u16,
 ) -> Result<()> {
-    let length = validated_content_length(headers).map_err(|()| {
+    let length = validated_content_length(&request.headers).map_err(|()| {
         Error::explain(
             HTTPStatus(invalid_status),
             "invalid or conflicting Content-Length fields",
         )
     })?;
-    if headers.contains_key(TRANSFER_ENCODING) && length.is_some() {
+    if request.headers.contains_key(TRANSFER_ENCODING) && length.is_some() {
         return Err(Error::explain(
             HTTPStatus(invalid_status),
             "message contains both Transfer-Encoding and Content-Length",
@@ -1544,7 +1543,7 @@ fn normalize_content_length_headers(
     }
     if let Some(length) = length {
         let already_canonical = {
-            let mut values = headers.get_all(CONTENT_LENGTH).iter();
+            let mut values = request.headers.get_all(CONTENT_LENGTH).iter();
             values.next().is_some_and(|value| {
                 !value.as_bytes().is_empty()
                     && value.as_bytes().iter().all(u8::is_ascii_digit)
@@ -1554,7 +1553,7 @@ fn normalize_content_length_headers(
         if already_canonical {
             return Ok(());
         }
-        headers.remove(CONTENT_LENGTH);
+        request.remove_header(&CONTENT_LENGTH);
         let mut encoded = ArrayString::<39>::new();
         write!(&mut encoded, "{length}").map_err(|error| {
             Error::because(
@@ -1563,14 +1562,49 @@ fn normalize_content_length_headers(
                 error,
             )
         })?;
-        let value = HeaderValue::from_str(&encoded).map_err(|error| {
+        request.insert_header(CONTENT_LENGTH, encoded.as_str())?;
+    }
+    Ok(())
+}
+
+fn normalize_response_content_length(
+    response: &mut ResponseHeader,
+    invalid_status: u16,
+) -> Result<()> {
+    let length = validated_content_length(&response.headers).map_err(|()| {
+        Error::explain(
+            HTTPStatus(invalid_status),
+            "invalid or conflicting Content-Length fields",
+        )
+    })?;
+    if response.headers.contains_key(TRANSFER_ENCODING) && length.is_some() {
+        return Err(Error::explain(
+            HTTPStatus(invalid_status),
+            "message contains both Transfer-Encoding and Content-Length",
+        ));
+    }
+    if let Some(length) = length {
+        let already_canonical = {
+            let mut values = response.headers.get_all(CONTENT_LENGTH).iter();
+            values.next().is_some_and(|value| {
+                !value.as_bytes().is_empty()
+                    && value.as_bytes().iter().all(u8::is_ascii_digit)
+                    && values.next().is_none()
+            })
+        };
+        if already_canonical {
+            return Ok(());
+        }
+        response.remove_header(&CONTENT_LENGTH);
+        let mut encoded = ArrayString::<39>::new();
+        write!(&mut encoded, "{length}").map_err(|error| {
             Error::because(
                 HTTPStatus(invalid_status),
-                "validated Content-Length could not be encoded",
+                "validated Content-Length could not be formatted",
                 error,
             )
         })?;
-        headers.insert(CONTENT_LENGTH, value);
+        response.insert_header(CONTENT_LENGTH, encoded.as_str())?;
     }
     Ok(())
 }
@@ -1912,7 +1946,6 @@ fn insert_security_headers(
     handler: HandlerKind,
     tls: bool,
 ) -> Result<()> {
-    response.headers.reserve(4);
     response.insert_typed_header(X_CONTENT_TYPE_OPTIONS, NOSNIFF);
     if tls {
         response.insert_typed_header(STRICT_TRANSPORT_SECURITY, HSTS_VALUE);
@@ -2341,20 +2374,24 @@ hosts:
             .insert_header(CONTENT_TYPE, "application/grpc+json")
             .unwrap();
         assert!(!response_allows_compression(&response));
-        response.status = http::StatusCode::PARTIAL_CONTENT;
+        response
+            .set_status(http::StatusCode::PARTIAL_CONTENT)
+            .unwrap();
         assert!(!response_allows_compression(&response));
-        response.status = http::StatusCode::OK;
+        response.set_status(http::StatusCode::OK).unwrap();
         response.remove_header(&CONTENT_RANGE);
         response
             .insert_header(CONTENT_ENCODING, "already-encoded")
             .unwrap();
         assert!(!response_allows_compression(&response));
         response.remove_header(&CONTENT_ENCODING);
-        response.status = http::StatusCode::NO_CONTENT;
+        response.set_status(http::StatusCode::NO_CONTENT).unwrap();
         assert!(!response_allows_compression(&response));
-        response.status = http::StatusCode::NOT_MODIFIED;
+        response.set_status(http::StatusCode::NOT_MODIFIED).unwrap();
         assert!(!response_allows_compression(&response));
-        response.status = http::StatusCode::RESET_CONTENT;
+        response
+            .set_status(http::StatusCode::RESET_CONTENT)
+            .unwrap();
         assert!(!response_allows_compression(&response));
         assert!(response_status_is_interim(100));
         assert!(response_status_is_interim(103));
@@ -2435,16 +2472,22 @@ hosts:
 
     #[test]
     fn content_length_is_reconciled_and_conflicts_are_rejected() {
-        let mut headers = http::HeaderMap::new();
-        headers.append(CONTENT_LENGTH, HeaderValue::from_static("5"));
-        headers.append(CONTENT_LENGTH, HeaderValue::from_static("5, 5"));
-        assert_eq!(validated_content_length(&headers), Ok(Some(5)));
-        normalize_content_length_headers(&mut headers, 400).unwrap();
-        assert_eq!(headers.get_all(CONTENT_LENGTH).iter().count(), 1);
-        assert_eq!(headers[CONTENT_LENGTH], "5");
+        let mut request = RequestHeader::build(Method::POST, b"/", None).unwrap();
+        request
+            .append_header(CONTENT_LENGTH, HeaderValue::from_static("5"))
+            .unwrap();
+        request
+            .append_header(CONTENT_LENGTH, HeaderValue::from_static("5, 5"))
+            .unwrap();
+        assert_eq!(validated_content_length(&request.headers), Ok(Some(5)));
+        normalize_request_content_length(&mut request, 400).unwrap();
+        assert_eq!(request.headers.get_all(CONTENT_LENGTH).iter().count(), 1);
+        assert_eq!(request.headers[CONTENT_LENGTH], "5");
 
-        headers.append(CONTENT_LENGTH, HeaderValue::from_static("6"));
-        assert!(validated_content_length(&headers).is_err());
+        request
+            .append_header(CONTENT_LENGTH, HeaderValue::from_static("6"))
+            .unwrap();
+        assert!(validated_content_length(&request.headers).is_err());
         for invalid in ["", "+5", "5x", "5,,5"] {
             let mut headers = http::HeaderMap::new();
             headers.insert(CONTENT_LENGTH, HeaderValue::from_str(invalid).unwrap());
@@ -2460,7 +2503,7 @@ hosts:
         assert!(validated_request_content_length(&request).is_err());
 
         request.remove_header(&CONTENT_LENGTH);
-        request.version = Version::HTTP_2;
+        request.set_version(Version::HTTP_2);
         assert!(validated_request_content_length(&request).is_err());
     }
 

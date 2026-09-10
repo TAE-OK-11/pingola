@@ -112,18 +112,14 @@ where
             }
         }
 
-<<<<<<< vendor/pingora-proxy-0.9.0/src/proxy_custom.rs
         session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
 
-        session.upstream_compression.request_filter(&req);
-=======
         if session.upstream_compression.is_enabled() {
             session.upstream_compression.request_filter(&req);
         }
         if let Some(wire) = upstream_wire.as_mut() {
             self.inner.sync_upstream_request_wire(wire, &req);
         }
->>>>>>> vendor/pingora-proxy-0.8.1/src/proxy_custom.rs
         let body_empty = session.as_mut().is_body_empty();
 
         debug!("Request to custom: {req:?}");
@@ -135,11 +131,6 @@ where
         if let Err(e) = client_session.write_request_header(req, body_empty).await {
             return (false, Some(e.into_up()));
         }
-
-<<<<<<< vendor/pingora-proxy-0.9.0/src/proxy_custom.rs
-=======
-        client_session.set_read_timeout(peer.options.read_timeout);
-        client_session.set_write_timeout(peer.options.write_timeout);
 
         let use_bodyless_fast_path = matches!(session.req_header().method, Method::GET | Method::HEAD)
             && body_empty
@@ -155,7 +146,6 @@ where
             };
         }
 
->>>>>>> vendor/pingora-proxy-0.8.1/src/proxy_custom.rs
         // take the body writer out of the client for easy duplex
         let mut client_body = client_session
             .take_request_body_writer()
@@ -354,12 +344,6 @@ where
                 response_state.enable_cached_response();
                 // skip downstream filtering entirely as the 304 will not be sent
                 break;
-            }
-            #[cfg(feature = "upstream_modules")]
-            if let HttpTask::Header(header, end_of_stream) = &t {
-                self.inner
-                    .adjust_upstream_modules(session, header, *end_of_stream, ctx)
-                    .await?;
             }
             #[cfg(feature = "upstream_modules")]
             session.upstream_modules_filter_task(&mut t).await?;
@@ -841,8 +825,7 @@ where
 
                 /* Add chunked header to tell downstream to use chunked encoding
                  * during the absent of content-length */
-                if !session.downstream_session.is_custom()
-                    && !no_body
+                if !no_body
                     && !header.status.is_informational()
                     && header.headers.get(http::header::CONTENT_LENGTH).is_none()
                 {
@@ -929,6 +912,7 @@ where
         }
         res
     }
+
 
     /// Proxy a non-upgraded, cache-disabled GET/HEAD without per-request mpsc pipes.
     async fn proxy_bodyless_custom(
@@ -1146,7 +1130,9 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        session.upstream_compression.response_filter(&mut task);
+        if session.upstream_compression.is_enabled() {
+            session.upstream_compression.response_filter(&mut task);
+        }
         let task = self
             .custom_response_filter(
                 session,
@@ -1157,7 +1143,7 @@ where
                 false,
             )
             .await?;
-        session.write_response_tasks(vec![task]).await
+        session.write_response_task(task).await
     }
 
     async fn send_body_to_custom(
@@ -1467,7 +1453,6 @@ mod tests {
 
     struct TestProxy;
 
-    #[async_trait]
     impl ProxyHttp for TestProxy {
         type CTX = ();
 
@@ -1479,6 +1464,128 @@ mod tests {
             _ctx: &mut Self::CTX,
         ) -> Result<Box<HttpPeer>> {
             unreachable!("test calls custom_response_filter directly")
+        }
+    
+        async fn request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn early_request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+            Ok(())
+        }
+
+        async fn request_body_filter(
+            &self,
+            _session: &mut Session,
+            _body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn cache_hit_filter(
+            &self,
+            _session: &mut Session,
+            _meta: &CacheMeta,
+            _hit_handler: &mut HitHandler,
+            _is_fresh: bool,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Option<ForcedFreshness>> {
+            Ok(None)
+        }
+
+        async fn proxy_upstream_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn upstream_request_filter(
+            &self,
+            _session: &mut Session,
+            _upstream_request: &mut RequestHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn upstream_response_filter(
+            &self,
+            _session: &mut Session,
+            _upstream_response: &mut ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn response_filter(
+            &self,
+            _session: &mut Session,
+            _upstream_response: &mut ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn custom_forwarding(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+            _custom_message_to_upstream: Option<mpsc::Sender<Bytes>>,
+            _custom_message_to_downstream: mpsc::Sender<Bytes>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn downstream_custom_message_proxy_filter(
+            &self,
+            _session: &mut Session,
+            custom_message: Bytes,
+            _ctx: &mut Self::CTX,
+            _final_hop: bool,
+        ) -> Result<Option<Bytes>> {
+            Ok(Some(custom_message))
+        }
+
+        async fn upstream_custom_message_proxy_filter(
+            &self,
+            _session: &mut Session,
+            custom_message: Bytes,
+            _ctx: &mut Self::CTX,
+            _final_hop: bool,
+        ) -> Result<Option<Bytes>> {
+            Ok(Some(custom_message))
+        }
+
+        async fn response_trailer_filter(
+            &self,
+            _session: &mut Session,
+            _upstream_trailers: &mut header::HeaderMap,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Option<Bytes>> {
+            Ok(None)
+        }
+
+        async fn logging(&self, _session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX) {}
+
+        async fn fail_to_proxy(
+            &self,
+            session: &mut Session,
+            e: &Error,
+            _ctx: &mut Self::CTX,
+        ) -> FailToProxy {
+            default_fail_to_proxy(session, e).await
+        }
+
+        async fn connected_to_upstream(
+            &self,
+            _session: &mut Session,
+            _reused: bool,
+            _peer: &HttpPeer,
+            _socket: RawSocketHandle,
+            _digest: Option<&Digest>,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            Ok(())
         }
     }
 

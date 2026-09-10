@@ -173,19 +173,13 @@ impl BodyReader {
         self.body_state = PS::ToStart;
     }
 
-<<<<<<< vendor/pingora-core-0.9.0/src/protocols/http/v1/body.rs
     fn prepare_buf(&mut self, buf_to_rewind: &[u8]) {
         let mut body_buf = BytesMut::with_capacity(self.body_buf_size.max(buf_to_rewind.len()));
-=======
-    fn prepare_buf_with_size(&mut self, buf_to_rewind: &[u8], buf_size: usize) {
-        let mut body_buf = BytesMut::with_capacity(buf_size);
->>>>>>> vendor/pingora-core-0.8.1/src/protocols/http/v1/body.rs
         if !buf_to_rewind.is_empty() {
             self.rewind_buf_len = buf_to_rewind.len();
             // TODO: this is still 1 copy. Make it zero
             body_buf.put_slice(buf_to_rewind);
         }
-<<<<<<< vendor/pingora-core-0.9.0/src/protocols/http/v1/body.rs
         self.body_buf = Some(body_buf);
     }
 
@@ -223,19 +217,6 @@ impl BodyReader {
         if body_buf.len() < self.body_buf_size {
             body_buf.reserve(self.body_buf_size - body_buf.len());
         }
-=======
-        if buf_size > buf_to_rewind.len() {
-            // AsyncReadExt::read receives an initialized `&mut [u8]`. Exposing
-            // spare capacity with set_len() first violates that contract and
-            // can make a network body read observe uninitialized storage.
-            body_buf.resize(buf_size, 0);
-        }
-        self.body_buf = Some(body_buf);
-    }
-
-    fn prepare_buf(&mut self, buf_to_rewind: &[u8]) {
-        self.prepare_buf_with_size(buf_to_rewind, self.body_buf_size);
->>>>>>> vendor/pingora-core-0.8.1/src/protocols/http/v1/body.rs
     }
 
     pub fn init_chunked(&mut self, buf_to_rewind: &[u8]) {
@@ -265,15 +246,7 @@ impl BodyReader {
                 }
             }
             _ => {
-                // A fixed-length upstream response often arrives entirely with its headers.
-                // Such a response will never read into the unused tail of the normal 64-KiB
-                // body buffer. Keep every preread byte so `do_read_body()` can still split out
-                // overread for connection-reuse rejection, but avoid allocating that unused tail.
-                if self.upstream && buf_to_rewind.len() >= cl {
-                    self.prepare_buf_with_size(buf_to_rewind, buf_to_rewind.len());
-                } else {
-                    self.prepare_buf(buf_to_rewind);
-                }
+                self.prepare_buf(buf_to_rewind);
                 self.body_state = PS::Partial(0, cl);
             }
         }
@@ -348,28 +321,11 @@ impl BodyReader {
         Some(body_buf.freeze())
     }
 
-    /// Move a complete upstream body chunk out without copying it.
-    ///
-    /// This is intentionally limited to an exact, final chunk. Partial,
-    /// chunk-framed, downstream and overread ranges keep the established copy
-    /// path so their parsing and connection-reuse semantics do not change.
-    #[allow(dead_code)] // exercised by crate unit tests; call sites use take_body_bytes
-    pub fn take_completed_body(&mut self, buf_ref: &BufRef) -> Option<Bytes> {
-        if !self.upstream {
-            return None;
-        }
-        self.take_filled_body(buf_ref)
-    }
-
     /// Prefer moving body bytes into `Bytes` without copying.
     ///
     /// Order of attempts:
-    /// 1. Exact completed buffer (`take_filled_body` / upstream completed path)
+    /// 1. Exact completed buffer (`take_filled_body`)
     /// 2. Streaming prefix at offset 0 large enough that freezing beats memcpy
-    ///    (Content-Length / until-close partial reads always use `BufRef(0, n)`)
-    ///
-    /// Chunk-framed payloads that sit mid-buffer still copy — splitting them out
-    /// would require preserving chunk parser state across a buffer rotation.
     pub fn take_body_bytes(&mut self, buf_ref: &BufRef) -> Option<Bytes> {
         if let Some(body) = self.take_filled_body(buf_ref) {
             return Some(body);
@@ -380,16 +336,12 @@ impl BodyReader {
     /// Freeze a leading streaming body chunk without copying when it is cheaper
     /// than `copy_from_slice`, then rotate in a fresh read buffer.
     fn take_streaming_prefix(&mut self, buf_ref: &BufRef) -> Option<Bytes> {
-        // Below this size, allocating+zeroing a replacement 64 KiB read buffer
-        // costs more than copying the chunk. Keep the copy path for small reads.
         const MIN_ZERO_COPY_PREFIX: usize = 16 * 1024;
 
         let len = buf_ref.len();
         if buf_ref.0 != 0 || len < MIN_ZERO_COPY_PREFIX || self.has_bytes_overread() {
             return None;
         }
-        // Only Content-Length / until-close streaming use a leading BufRef.
-        // Chunked framing keeps parser state inside the current buffer.
         if !matches!(
             self.body_state,
             PS::Partial(..) | PS::UntilClose(_) | PS::Complete(_) | PS::Done(_)
@@ -398,7 +350,6 @@ impl BodyReader {
         }
 
         let mut owned = self.body_buf.take()?;
-        // BufRef stores [start, end); with start==0 the end index is the length.
         if buf_ref.1 > owned.len() {
             self.body_buf = Some(owned);
             return None;
@@ -1192,7 +1143,6 @@ pub enum BodyMode {
 
 type BM = BodyMode;
 
-<<<<<<< vendor/pingora-core-0.9.0/src/protocols/http/v1/body.rs
 // ============================================================================
 // Cancel-safe body writing types
 // ============================================================================
@@ -1369,40 +1319,6 @@ impl SendBodyState {
 /// Supports both a legacy async API (`write_body` / `finish`) and a cancel-safe
 /// task API that can be driven inside a `tokio::select!` loop without losing
 /// write progress.
-=======
-/// Encode `chunk_size` as hexadecimal HTTP/1.1 chunk framing into a stack buffer.
-///
-/// Returns the buffer and the length of the valid prefix (`"{size:X}\r\n"`).
-#[inline]
-fn encode_chunk_size_header(chunk_size: usize) -> ([u8; 18], usize) {
-    // usize hex is at most 16 digits on 64-bit; plus CRLF fits in 18 bytes.
-    let mut buf = [0u8; 18];
-    if chunk_size == 0 {
-        buf[0] = b'0';
-        buf[1] = b'\r';
-        buf[2] = b'\n';
-        return (buf, 3);
-    }
-    let mut n = chunk_size;
-    let mut end = 16;
-    while n > 0 {
-        end -= 1;
-        let digit = (n & 0xf) as u8;
-        buf[end] = if digit < 10 {
-            b'0' + digit
-        } else {
-            b'A' + (digit - 10)
-        };
-        n >>= 4;
-    }
-    let len = 16 - end;
-    buf.copy_within(end..16, 0);
-    buf[len] = b'\r';
-    buf[len + 1] = b'\n';
-    (buf, len + 2)
-}
-
->>>>>>> vendor/pingora-core-0.8.1/src/protocols/http/v1/body.rs
 pub struct BodyWriter {
     pub body_mode: BodyMode,
     // Boxed to reduce inline size. Only used by the cancel-safe proxy task API.
@@ -1524,11 +1440,9 @@ impl BodyWriter {
         match self.body_mode {
             BM::ChunkedEncoding(written) => {
                 let chunk_size = buf.len();
-                // Stack hex framing avoids a heap String/`Bytes` allocation per chunk.
-                let (chunk_header, header_len) = encode_chunk_size_header(chunk_size);
-                // Disambiguate from AsyncReadExt::chain.
-                let mut output_buf =
-                    Buf::chain(Buf::chain(&chunk_header[..header_len], buf), &b"\r\n"[..]);
+
+                let chuck_size_buf = format!("{:X}\r\n", chunk_size);
+                let mut output_buf = Bytes::from(chuck_size_buf).chain(buf).chain(&b"\r\n"[..]);
                 stream
                     .write_all_buf(&mut output_buf)
                     .await
@@ -1669,7 +1583,6 @@ impl BodyWriter {
         std::future::poll_fn(|cx| self.poll_write_current_body_task(cx, Pin::new(stream))).await
     }
 
-<<<<<<< vendor/pingora-core-0.9.0/src/protocols/http/v1/body.rs
     /// Poll-based implementation for writing body tasks.
     /// This is the core implementation that maintains state across cancellations.
     fn poll_write_current_body_task<S>(
@@ -1731,147 +1644,6 @@ impl BodyWriter {
 
         // Both write and timeout are pending
         Poll::Pending
-=======
-    #[tokio::test]
-    async fn upstream_content_length_fully_preread_uses_right_sized_buffer() {
-        init_log();
-        let preread = b"abc";
-        let mut mock_io = Builder::new().build();
-        let mut body_reader = BodyReader::new(true);
-
-        body_reader.init_content_length(preread.len(), preread);
-
-        assert_eq!(body_reader.body_buf.as_ref().unwrap().len(), preread.len());
-        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, preread.len()));
-        assert_eq!(body_reader.body_state, ParseState::Complete(preread.len()));
-        assert_eq!(body_reader.get_body(&res), preread);
-        assert_eq!(body_reader.get_body_overread(), None);
-    }
-
-    #[tokio::test]
-    async fn completed_upstream_body_moves_into_bytes_without_copying() {
-        let preread = b"complete-body";
-        let mut mock_io = Builder::new().build();
-        let mut body_reader = BodyReader::new(true);
-        body_reader.init_content_length(preread.len(), preread);
-
-        let body_ref = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
-        let original_ptr = body_reader.get_body(&body_ref).as_ptr();
-        let body = body_reader.take_completed_body(&body_ref).unwrap();
-
-        assert_eq!(body, &preread[..]);
-        assert_eq!(body.as_ptr(), original_ptr);
-        assert!(body_reader.body_buf.is_none());
-    }
-
-    #[tokio::test]
-    async fn streaming_prefix_moves_large_chunk_without_copying() {
-        let chunk = vec![b'x'; 24 * 1024];
-        let mut mock_io = Builder::new().read(&chunk).build();
-        let mut body_reader = BodyReader::new(true);
-        body_reader.init_content_length(chunk.len() * 2, b"");
-
-        let body_ref = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
-        assert_eq!(body_ref, BufRef::new(0, chunk.len()));
-        let original_ptr = body_reader.get_body(&body_ref).as_ptr();
-        let body = body_reader.take_body_bytes(&body_ref).unwrap();
-
-        assert_eq!(body.len(), chunk.len());
-        assert_eq!(body.as_ptr(), original_ptr);
-        assert!(body_reader.body_buf.is_some());
-        assert!(matches!(
-            body_reader.body_state,
-            ParseState::Partial(_, remaining) if remaining == chunk.len()
-        ));
-    }
-
-    #[tokio::test]
-    async fn streaming_prefix_keeps_small_chunks_on_copy_path() {
-        let chunk = vec![b'y'; 1024];
-        let mut mock_io = Builder::new().read(&chunk).build();
-        let mut body_reader = BodyReader::new(true);
-        body_reader.init_content_length(chunk.len() * 4, b"");
-
-        let body_ref = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
-        assert!(body_reader.take_body_bytes(&body_ref).is_none());
-        assert!(body_reader.body_buf.is_some());
-    }
-
-    #[tokio::test]
-    async fn upstream_content_length_fully_preread_preserves_overread() {
-        init_log();
-        let preread = b"abcd";
-        let mut mock_io = Builder::new().build();
-        let mut body_reader = BodyReader::new(true);
-
-        body_reader.init_content_length(3, preread);
-
-        assert_eq!(body_reader.body_buf.as_ref().unwrap().len(), preread.len());
-        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, 3));
-        assert_eq!(body_reader.body_state, ParseState::Complete(3));
-        assert_eq!(body_reader.get_body(&res), b"abc");
-        assert_eq!(body_reader.get_body_overread(), Some(&b"d"[..]));
-        assert!(body_reader.has_bytes_overread());
-        assert!(body_reader.take_completed_body(&res).is_none());
-    }
-
-    #[tokio::test]
-    async fn upstream_zero_content_length_preserves_preread_as_overread() {
-        init_log();
-        let preread = b"next-response";
-        let mut mock_io = Builder::new().build();
-        let mut body_reader = BodyReader::new(true);
-
-        body_reader.init_content_length(0, preread);
-
-        assert_eq!(body_reader.body_state, ParseState::Complete(0));
-        assert!(body_reader.body_buf.is_none());
-        assert_eq!(body_reader.get_body_overread(), Some(&preread[..]));
-        assert!(body_reader.has_bytes_overread());
-        assert_eq!(body_reader.read_body(&mut mock_io).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn upstream_partial_preread_retains_buffer_and_reports_early_eof() {
-        init_log();
-        let preread = b"ab";
-        let mut mock_io = Builder::new().read(b"").build();
-        let mut body_reader = BodyReader::new(true);
-
-        body_reader.init_content_length(3, preread);
-
-        assert_eq!(body_reader.body_buf.as_ref().unwrap().len(), BODY_BUFFER_SIZE);
-        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, preread.len()));
-        assert_eq!(body_reader.body_state, ParseState::Partial(2, 1));
-        assert_eq!(body_reader.get_body(&res), preread);
-
-        let err = body_reader.read_body(&mut mock_io).await.unwrap_err();
-        assert_eq!(&ConnectionClosed, err.etype());
-        assert_eq!(body_reader.body_state, ParseState::Done(2));
-        assert_eq!(body_reader.get_body_overread(), None);
-    }
-
-    #[tokio::test]
-    async fn read_with_body_content_length_2() {
-        init_log();
-        let input1 = b"a";
-        let input2 = b"bc";
-        let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut body_reader = BodyReader::new(false);
-        body_reader.init_content_length(3, b"");
-        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, 1));
-        assert_eq!(body_reader.body_state, ParseState::Partial(1, 2));
-        assert_eq!(input1, body_reader.get_body(&res));
-        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, 2));
-        assert_eq!(body_reader.body_state, ParseState::Complete(3));
-        assert_eq!(input2, body_reader.get_body(&res));
-        assert_eq!(body_reader.get_body_overread(), None);
->>>>>>> vendor/pingora-core-0.8.1/src/protocols/http/v1/body.rs
     }
 
     // ========================================================================

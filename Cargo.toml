@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.98.1"
 license = "Apache-2.0"
 description = "A production-oriented Pingora reverse proxy replacing the JBS Nginx gateway"
-repository = "https://github.com/TAE-OK-11/pingora"
+repository = "https://github.com/TAE-OK-11/pingola"
 
 [[bin]]
 name = "pingora"
@@ -23,7 +23,8 @@ async-trait = "0.1.92"
 anyhow = "1.0.104"
 ahash = "0.8.12"
 arrayvec = "0.7.8"
-boring = { version = "=4.22.0", features = ["pq-experimental"] }
+# Keep one BoringSSL Rust ABI across Pingora and the vendored quiche stack.
+boring = "=5.2.0"
 brotli = "9.0.0"
 bytes = "1.12.1"
 clap = { version = "4.6.6", default-features = false, features = [
@@ -52,7 +53,7 @@ lru = "0.18.4"
 mime_guess = "2.0.5"
 parking_lot = "0.12.5"
 percent-encoding = "2.3.2"
-cloudflare-pingora = { package = "pingora", version = "=0.8.1", default-features = false, features = ["proxy"] }
+cloudflare-pingora = { package = "pingora", version = "=0.9.0", default-features = false, features = ["proxy"] }
 rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -76,11 +77,13 @@ h2 = "0.4.19"
 tempfile = "3.27.0"
 
 # Keep the vendored Pingora HTTP patches while using Pingora's official
-# BoringSSL adapter. Pingora and quiche share boring 4.22.0.
+# BoringSSL adapter. Pingora and quiche share boring 5.2.0.
 [patch.crates-io]
-pingora-core = { path = "vendor/pingora-core-0.8.1" }
-pingora-http = { path = "vendor/pingora-http-0.8.1" }
-pingora-proxy = { path = "vendor/pingora-proxy-0.8.1" }
+pingora-core = { path = "vendor/pingora-core-0.9.0" }
+pingora-http = { path = "vendor/pingora-http-0.9.0" }
+pingora-proxy = { path = "vendor/pingora-proxy-0.9.0" }
+quiche = { path = "vendor/quiche-0.29.3" }
+tokio-quiche = { path = "vendor/tokio-quiche-0.19.1" }
 
 [profile.release]
 codegen-units = 1

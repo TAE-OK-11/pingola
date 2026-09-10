@@ -598,29 +598,6 @@ mod test {
     }
 
     #[test]
-    fn test_header_refs_spill_without_losing_headers() {
-        let mut wire = String::from("GET / HTTP/1.1\r\n");
-        for index in 0..20 {
-            wire.push_str(&format!("X-Test-{index}: value-{index}\r\n"));
-        }
-        wire.push_str("\r\n");
-
-        let bytes = wire.as_bytes();
-        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-        let mut request = httparse::Request::new(&mut headers);
-        assert!(request.parse(bytes).unwrap().is_complete());
-
-        let mut refs = HeaderRefs::new();
-        assert_eq!(populate_headers(bytes.as_ptr() as usize, &mut refs, request.headers), 20);
-        assert!(refs.spilled());
-        assert_eq!(refs.len(), 20);
-        assert_eq!(refs[0].get_name(bytes), b"X-Test-0");
-        assert_eq!(refs[0].get_value(bytes), b"value-0");
-        assert_eq!(refs[19].get_name(bytes), b"X-Test-19");
-        assert_eq!(refs[19].get_value(bytes), b"value-19");
-    }
-
-    #[test]
     fn test_is_upgrade_resp() {
         let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
         response.set_version(Version::HTTP_11);

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use cloudflare_pingora::ErrorType;
 use cloudflare_pingora::protocols::Digest;
-use cloudflare_pingora::protocols::http::v2::server::{HttpSession, handshake};
+use cloudflare_pingora::protocols::http::v2::server::{H2Accept, HttpSession, handshake};
 use http::{Method, Request};
 use tokio::io::duplex;
 
@@ -31,10 +31,14 @@ async fn downstream_h2_body_read_honors_timeout() {
     });
 
     let mut connection = handshake(Box::new(server), None).await.unwrap();
-    let mut session = HttpSession::from_h2_conn(&mut connection, Arc::new(Digest::default()))
-        .await
-        .unwrap()
-        .unwrap();
+    let H2Accept::Session(mut session) =
+        HttpSession::from_h2_conn(&mut connection, Arc::new(Digest::default()))
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("valid test request was rejected during H2 acceptance");
+    };
     session.set_read_timeout(Some(Duration::from_millis(10)));
     let error = session.read_body_bytes().await.unwrap_err();
     assert_eq!(error.etype(), &ErrorType::ReadTimedout);
@@ -68,10 +72,14 @@ async fn downstream_cancel_has_distinct_context_from_protocol_errors() {
             connection.abort();
         });
         let mut connection = handshake(Box::new(server), None).await.unwrap();
-        let mut session = HttpSession::from_h2_conn(&mut connection, Arc::new(Digest::default()))
-            .await
-            .unwrap()
-            .unwrap();
+        let H2Accept::Session(mut session) =
+            HttpSession::from_h2_conn(&mut connection, Arc::new(Digest::default()))
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("valid test request was rejected during H2 acceptance");
+        };
         let driver = tokio::spawn(async move { while connection.accept().await.is_some() {} });
         ready_tx.send(()).unwrap();
         let error = tokio::time::timeout(Duration::from_secs(2), session.read_body_or_idle(true))

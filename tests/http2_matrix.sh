@@ -200,7 +200,7 @@ for concurrency in 1 8 32; do
   # behavior is a separate benchmark dimension and must not multiply this
   # value by h2load's connection count.
   h2load -n $((concurrency * 20)) -c 1 -m "${concurrency}" \
-    -H 'host: matrix.test' "https://127.0.0.1:443/fixed/64" \
+    -H ':authority: matrix.test' "https://127.0.0.1:443/fixed/64" \
     >"${RUNTIME}/h2load-c${concurrency}.stdout" \
     2>"${RUNTIME}/h2load-c${concurrency}.stderr"
   rc=$?

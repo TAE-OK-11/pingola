@@ -58,20 +58,8 @@ impl TlsSettings {
         // rustls 0.23+ requires an explicit CryptoProvider.
         pingora_rustls::install_default_crypto_provider();
 
-<<<<<<< vendor/pingora-core-0.9.0/src/listeners/tls/rustls/mod.rs
         let builder =
             ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
-=======
-        let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
-        else {
-            panic!(
-                "Failed to load provided certificates \"{}\" or key \"{}\".",
-                self.cert_path, self.key_path
-            )
-        };
-
-        let builder = ServerConfig::builder_with_protocol_versions(&[&version::TLS13]);
->>>>>>> vendor/pingora-core-0.8.1/src/listeners/tls/rustls/mod.rs
         let builder = if let Some(verifier) = self.client_cert_verifier {
             builder.with_client_cert_verifier(verifier)
         } else {

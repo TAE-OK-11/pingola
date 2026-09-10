@@ -136,6 +136,9 @@ harness = false
 [dependencies.async-trait]
 version = "0.1.42"
 
+[dependencies.trait-variant]
+version = "0.1.2"
+
 [dependencies.bytes]
 version = "1.0"
 

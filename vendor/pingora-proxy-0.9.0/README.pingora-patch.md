@@ -1,9 +1,9 @@
 # Local Pingora proxy patch
 
-This directory is the source of `pingora-proxy` 0.8.1 from crates.io with a
+This directory is the source of `pingora-proxy` 0.9.0 from crates.io with a
 small set of documented local changes.
 
-- Upstream package: `pingora-proxy` 0.8.1
+- Upstream package: `pingora-proxy` 0.9.0
 - License: Apache-2.0 (`LICENSE` in this directory)
 - Local change: `precomputed_upstream_peer()` on `ProxyHttp`.
 - Reason: immutable prepared peers can be returned by reference instead of
