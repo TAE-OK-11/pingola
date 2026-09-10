@@ -1,0 +1,38 @@
+name: dependency-refresh-once
+
+on:
+  push:
+    branches:
+      - cursor/pingora-0.9-boring-5-f186
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: cursor/pingora-0.9-boring-5-f186
+      - name: Refresh compatible Cargo dependencies
+        run: cargo update
+      - name: Verify pinned TLS stack and show duplicates
+        run: |
+          cargo tree --locked -p pingora-boringssl@0.9.0 | grep -E 'boring(-sys)? v5\.2\.0'
+          cargo tree --locked -p tokio-quiche@0.19.1 | grep -E 'boring(-sys)? v5\.2\.0'
+          ! cargo tree --locked -d | grep -E '^(boring|boring-sys) v'
+          echo '--- duplicate dependency versions ---'
+          cargo tree --locked -d
+      - name: Commit refreshed lockfile and remove one-shot workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/dependency-refresh-once.yml
+          git add Cargo.lock
+          if git diff --cached --quiet; then
+            echo "No compatible dependency updates were available."
+            exit 0
+          fi
+          git commit -m "deps: refresh compatible Cargo dependencies"
+          git push origin HEAD:cursor/pingora-0.9-boring-5-f186
