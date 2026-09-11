@@ -272,12 +272,18 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
     let server_config = &runtime.config.server;
     let pingora_config = ServerConf {
         threads: server_config.threads,
+        // Pingora 0.9.0 turns this per-worker value into a process-wide sharded
+        // keepalive pool with a true global LRU
+        // (`upstream_keepalive_pool_size * threads`). Keep the operator-facing
+        // YAML meaning unchanged.
         upstream_keepalive_pool_size: server_config.upstream_keepalive_pool_size,
         // Pingora's value is total attempts, while the public config is retry count.
         max_retries: server_config
             .max_retries
             .checked_add(1)
             .ok_or_else(|| anyhow!("server.max_retries overflow"))?,
+        // Close listeners immediately on shutdown, then drain in-flight work for
+        // the configured graceful window (improved in Pingora 0.9.0).
         grace_period_seconds: Some(0),
         graceful_shutdown_timeout_seconds: Some(server_config.graceful_shutdown_timeout_seconds),
         pid_file: "/tmp/pingora/pingora.pid".to_string(),
@@ -321,6 +327,9 @@ fn run(runtime: Arc<RuntimeConfig>) -> Result<()> {
             .checked_sub(1)
             .ok_or_else(|| anyhow!("server.downstream_keepalive_requests must be positive"))?,
     );
+    // Bound idle H2 connections so graceful shutdown does not wait on quiet
+    // keepalives beyond the downstream TCP keepalive idle window.
+    http_options.h2_idle_timeout = Some(Duration::from_secs(60));
     let mut service = ProxyServiceBuilder::new(&server.configuration, gateway.clone())
         .name("pingora-gateway")
         .server_options(http_options)
@@ -414,6 +423,8 @@ fn configure_h2_options(
     stream_window: u32,
     connection_window: u32,
 ) -> H2Options {
+    // Start from Pingora 0.9.0's bounded defaults (header-list + concurrent
+    // stream caps) then apply our configured windows/limits.
     let mut options = default_h2_options();
     options.max_concurrent_streams(max_concurrent_streams);
     options.max_header_list_size(max_header_list_size);

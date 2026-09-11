@@ -27,6 +27,7 @@ use cloudflare_pingora::proxy::{
     CacheMeta, FailToProxy, ForcedFreshness, HitHandler, ProxyHttp, RawSocketHandle, Session,
     default_fail_to_proxy,
 };
+use cloudflare_pingora::upstreams::peer::HttpUpstreamRequestPolicy;
 use http::header::{
     ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, FORWARDED, HOST, HeaderName,
     HeaderValue, STRICT_TRANSPORT_SECURITY, TE, TRANSFER_ENCODING, UPGRADE,
@@ -187,6 +188,7 @@ pub struct RequestContext {
     cache_hit: Option<CachedHttpResponse>,
     cache_coalesce: Option<CoalescePermit>,
     cache_pending_insert: Option<PendingCacheInsert>,
+    dns_query_id: Option<u16>,
     dns_request_body: Option<BytesMut>,
     _active_request_permit: Option<ActiveRequestPermit>,
     _global_request_permit: Option<GlobalConcurrentPermit>,
@@ -215,6 +217,7 @@ impl Default for RequestContext {
             cache_hit: None,
             cache_coalesce: None,
             cache_pending_insert: None,
+            dns_query_id: None,
             dns_request_body: None,
             _active_request_permit: None,
             _global_request_permit: None,
@@ -472,6 +475,9 @@ impl Gateway {
         dns_body: Option<&[u8]>,
     ) -> Result<Option<bool>> {
         let now = Instant::now();
+        if plan.route == RouteClass::Doh {
+            ctx.dns_query_id = dns_transaction_id(session.req_header(), dns_body);
+        }
         let lookup = prepare_lookup(
             &self.shared.cache,
             plan.route,
@@ -491,7 +497,8 @@ impl Gateway {
                 if !permit.is_writer()
                     && permit.wait_for_writer().await
                     && let CacheLookup::Hit(value) = self.shared.cache.store.lookup(&key, now)
-                    && let Some(response) = self.materialize_cached_lookup(plan, value, now)
+                    && let Some(response) =
+                        self.materialize_cached_lookup(plan, value, now, ctx.dns_query_id)
                 {
                     return Ok(Some(
                         self.send_cached_http_response(session, ctx, plan, host, response)
@@ -510,10 +517,19 @@ impl Gateway {
         plan: &PreparedPlan,
         value: crate::cache::CachedValue,
         now: Instant,
+        dns_query_id: Option<u16>,
     ) -> Option<CachedHttpResponse> {
         match plan.route {
             RouteClass::Doh => {
-                let body = crate::cache::age_dns_response(&value.body, value.stored_at, now)?;
+                // Coalesced waiters must rewrite the cached answer to the current
+                // query's DNS transaction ID. DoH recommends zero, but clients that
+                // send a non-zero ID still expect an echo.
+                let body = crate::cache::age_dns_response_for_query(
+                    &value.body,
+                    value.stored_at,
+                    now,
+                    dns_query_id.unwrap_or(0),
+                )?;
                 Some(CachedHttpResponse {
                     status: 200,
                     content_type: HeaderValue::from_static("application/dns-message"),
@@ -638,9 +654,17 @@ impl ProxyHttp for Gateway {
 
     async fn early_request_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // Pingora 0.9.0 default is abort-on-close=true. Set it explicitly so a
+        // client FIN after the request body cancels proxy work instead of
+        // leaving the upstream write path waiting.
+        session.set_abort_on_close(true);
+        // HTTP/1.1 pipelining stays off: this gateway proxies request bodies,
+        // WebSocket upgrades, and gRPC streams where pipelined prefixes are
+        // unsafe. Cancel-safe proxy task writers remain opt-in at the Pingora
+        // session layer and are not enabled here without a dedicated soak.
         Ok(())
     }
 
@@ -678,7 +702,8 @@ impl ProxyHttp for Gateway {
                 && let CacheLookup::Hit(value) = self.shared.cache.store.lookup(&key, now)
                 && let Some(plan) = self.routing.plans.get(ctx.plan_index)
                 && let Some(host) = self.host(request_authority(session.req_header()).unwrap_or(""))
-                && let Some(response) = self.materialize_cached_lookup(plan, value, now)
+                && let Some(response) =
+                    self.materialize_cached_lookup(plan, value, now, ctx.dns_query_id)
             {
                 return self
                     .send_cached_http_response(session, ctx, plan, host, response)
@@ -1264,6 +1289,7 @@ impl ProxyHttp for Gateway {
             && dns_request_needs_body(&session.req_header().method)
         {
             let dns_body = ctx.dns_request_body.as_deref();
+            ctx.dns_query_id = dns_transaction_id(session.req_header(), dns_body);
             let lookup = prepare_lookup(
                 &self.shared.cache,
                 plan.route,
@@ -1502,6 +1528,9 @@ impl ProxyHttp for Gateway {
     }
 
     async fn logging(&self, session: &mut Session, error: Option<&Error>, ctx: &mut Self::CTX) {
+        // Release any in-flight cache coalesce permit that survived an early
+        // abort, failed upstream, or hit path that never reached the body filter.
+        self.finish_cache_fill(ctx, false);
         if error.is_none() && !self.runtime.config.server.access_log {
             return;
         }
@@ -1547,6 +1576,17 @@ impl ProxyHttp for Gateway {
 
 // Pingora's pinned H2 session produces this context only for a peer CANCEL
 // from read_body_or_idle. Do not hide upstream resets or other H2 failures.
+fn dns_transaction_id(request: &RequestHeader, dns_body: Option<&[u8]>) -> Option<u16> {
+    let path = request
+        .uri
+        .path_and_query()
+        .map_or("/", |value| value.as_str());
+    let wire = dns_body
+        .map(|body| body.to_vec())
+        .or_else(|| crate::cache::parse_doh_query(request.method.as_str(), path, &[]))?;
+    (wire.len() >= 2).then(|| u16::from_be_bytes([wire[0], wire[1]]))
+}
+
 fn is_downstream_h2_cancel(error: &Error) -> bool {
     error.esource() == &ErrorSource::Downstream
         && error.etype() == &ErrorType::H2Error
@@ -2147,6 +2187,10 @@ fn prepare_upstream(
     peer.options.max_h2_streams = upstream.http2_max_concurrent_streams;
     peer.options.h2_stream_window_size = Some(upstream.http2_stream_window_bytes);
     peer.options.h2_connection_window_size = Some(upstream.http2_connection_window_bytes);
+    // Pingora 0.9.0 defaults already strip hop-by-hop / Connection-nominated
+    // headers. Pin the standards-oriented policy so a future PeerOptions change
+    // cannot silently restore legacy passthrough.
+    peer.options.http_upstream_request_policy = HttpUpstreamRequestPolicy::standard();
     peer.options.h2_ping_interval = (upstream.http2_ping_interval_seconds > 0)
         .then_some(Duration::from_secs(upstream.http2_ping_interval_seconds));
     peer.options.tcp_keepalive = Some(TcpKeepalive {
