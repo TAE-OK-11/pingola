@@ -488,20 +488,15 @@ impl Gateway {
             )),
             PreparedCacheLookup::Miss(key) => {
                 let permit = self.shared.cache.store.begin_fill(key);
-                if !permit.is_writer() {
-                    if permit.wait_for_writer().await {
-                        if let CacheLookup::Hit(value) = self.shared.cache.store.lookup(&key, now) {
-                            if let Some(response) = self.materialize_cached_lookup(plan, value, now)
-                            {
-                                return Ok(Some(
-                                    self.send_cached_http_response(
-                                        session, ctx, plan, host, response,
-                                    )
-                                    .await?,
-                                ));
-                            }
-                        }
-                    }
+                if !permit.is_writer()
+                    && permit.wait_for_writer().await
+                    && let CacheLookup::Hit(value) = self.shared.cache.store.lookup(&key, now)
+                    && let Some(response) = self.materialize_cached_lookup(plan, value, now)
+                {
+                    return Ok(Some(
+                        self.send_cached_http_response(session, ctx, plan, host, response)
+                            .await?,
+                    ));
                 }
                 ctx.cache_key = Some(key);
                 ctx.cache_coalesce = Some(permit);
@@ -675,29 +670,20 @@ impl ProxyHttp for Gateway {
                 .await
                 .map(|_| false);
         }
-        if let (Some(key), Some(permit)) = (ctx.cache_key, ctx.cache_coalesce.as_ref()) {
-            if !permit.is_writer() {
-                let now = Instant::now();
-                if permit.wait_for_writer().await {
-                    if let CacheLookup::Hit(value) = self.shared.cache.store.lookup(&key, now) {
-                        if let Some(plan) = self.routing.plans.get(ctx.plan_index) {
-                            if let Some(host) =
-                                self.host(request_authority(session.req_header()).unwrap_or(""))
-                            {
-                                if let Some(response) =
-                                    self.materialize_cached_lookup(plan, value, now)
-                                {
-                                    return self
-                                        .send_cached_http_response(
-                                            session, ctx, plan, host, response,
-                                        )
-                                        .await
-                                        .map(|_| false);
-                                }
-                            }
-                        }
-                    }
-                }
+        if let (Some(key), Some(permit)) = (ctx.cache_key, ctx.cache_coalesce.as_ref())
+            && !permit.is_writer()
+        {
+            let now = Instant::now();
+            if permit.wait_for_writer().await
+                && let CacheLookup::Hit(value) = self.shared.cache.store.lookup(&key, now)
+                && let Some(plan) = self.routing.plans.get(ctx.plan_index)
+                && let Some(host) = self.host(request_authority(session.req_header()).unwrap_or(""))
+                && let Some(response) = self.materialize_cached_lookup(plan, value, now)
+            {
+                return self
+                    .send_cached_http_response(session, ctx, plan, host, response)
+                    .await
+                    .map(|_| false);
             }
         }
         if ctx.cache_pending_insert.is_none()
@@ -1058,13 +1044,11 @@ impl ProxyHttp for Gateway {
             ctx.dns_request_body = Some(BytesMut::new());
         } else if matches!(plan.route, RouteClass::Doh | RouteClass::NavidromeApi)
             && session.req_header().method == Method::GET
-        {
-            if let Some(handled) = self
+            && let Some(handled) = self
                 .try_serve_cached_request(session, ctx, plan, host, None)
                 .await?
-            {
-                return Ok(handled);
-            }
+        {
+            return Ok(handled);
         }
         if log::log_enabled!(log::Level::Debug) {
             debug!(
@@ -1263,10 +1247,10 @@ impl ProxyHttp for Gateway {
         {
             return Err(Error::explain(HTTPStatus(413), "request body is too large"));
         }
-        if let Some(buffer) = ctx.dns_request_body.as_mut() {
-            if let Some(chunk) = body.as_ref() {
-                buffer.extend_from_slice(chunk);
-            }
+        if let Some(buffer) = ctx.dns_request_body.as_mut()
+            && let Some(chunk) = body.as_ref()
+        {
+            buffer.extend_from_slice(chunk);
         }
         if end_of_stream {
             ctx.body_deadline = None;
@@ -2344,6 +2328,7 @@ async fn send_health_details(
             json!({
                 "enabled": runtime.config.server.cache.enabled,
                 "memory_bytes": runtime.config.server.cache.memory_bytes,
+                "memory_limit": cache.store.memory_limit(),
                 "entries": cache.store.entries(),
                 "bytes": cache.store.bytes(),
                 "dns": cache.store.dns_metrics().to_json(),

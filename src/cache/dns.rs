@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use ahash::AHasher;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::hash::Hasher;
 
 use crate::cache::core::{CacheKey, CacheNamespace, CachedValue};
@@ -436,8 +436,8 @@ mod tests {
 
     fn build_response(name: &str, qtype: u16, ttl: u32, rdata: &[u8], rcode: u16) -> Vec<u8> {
         let mut msg = build_query(name, qtype, 1, true, false);
-        msg[2] = 0x80 | msg[2];
-        msg[3] = (msg[3] & 0xF0) as u8 | (rcode as u8 & 0x0F);
+        msg[2] |= 0x80;
+        msg[3] = (msg[3] & 0xF0) | (rcode as u8 & 0x0F);
         msg[6..8].copy_from_slice(&1u16.to_be_bytes());
         msg.extend(encode_name(name));
         msg.extend_from_slice(&qtype.to_be_bytes());

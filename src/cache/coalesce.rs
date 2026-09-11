@@ -21,6 +21,7 @@ struct InflightEntry {
 pub struct CoalescePermit {
     key: u64,
     writer: bool,
+    wait_timeout: Duration,
     inflight: Arc<InflightEntry>,
 }
 
@@ -34,15 +35,16 @@ impl CoalesceGuard {
 
     pub fn begin(&self, key: u64, metrics: &NamespaceMetrics) -> CoalescePermit {
         loop {
-            if let Some(existing) = self.inflight.get(&key) {
-                if !existing.done.load(Ordering::Acquire) {
-                    metrics.record_coalesced();
-                    return CoalescePermit {
-                        key,
-                        writer: false,
-                        inflight: existing.clone(),
-                    };
-                }
+            if let Some(existing) = self.inflight.get(&key)
+                && !existing.done.load(Ordering::Acquire)
+            {
+                metrics.record_coalesced();
+                return CoalescePermit {
+                    key,
+                    writer: false,
+                    wait_timeout: self.wait_timeout,
+                    inflight: existing.clone(),
+                };
             }
 
             let inflight = Arc::new(InflightEntry {
@@ -56,6 +58,7 @@ impl CoalesceGuard {
                     return CoalescePermit {
                         key,
                         writer: true,
+                        wait_timeout: self.wait_timeout,
                         inflight,
                     };
                 }
@@ -68,6 +71,7 @@ impl CoalesceGuard {
                     return CoalescePermit {
                         key,
                         writer: false,
+                        wait_timeout: self.wait_timeout,
                         inflight: occupied.get().clone(),
                     };
                 }
@@ -94,7 +98,7 @@ impl CoalescePermit {
         if self.writer {
             return true;
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + self.wait_timeout;
         loop {
             if self.inflight.done.load(Ordering::Acquire) {
                 return self.inflight.success.load(Ordering::Acquire);

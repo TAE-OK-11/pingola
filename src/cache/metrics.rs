@@ -85,7 +85,7 @@ pub struct CacheMetricsSnapshot {
 }
 
 impl CacheMetricsSnapshot {
-    pub fn to_json(&self) -> serde_json::Value {
+    pub fn to_json(self) -> serde_json::Value {
         json!({
             "hits": self.hits,
             "misses": self.misses,

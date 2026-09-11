@@ -1,12 +1,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use ahash::AHasher;
 use bytes::Bytes;
 use dashmap::DashMap;
 use pingora_lru::Lru;
-use std::hash::Hasher;
 
 use crate::cache::coalesce::{CoalesceGuard, CoalescePermit};
 use crate::cache::metrics::NamespaceMetrics;
@@ -21,14 +19,7 @@ pub enum CacheNamespace {
 }
 
 impl CacheNamespace {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Dns => "dns",
-            Self::Navidrome => "navidrome",
-        }
-    }
-
-    fn metrics<'a>(self, cache: &'a PingolaCache) -> &'a NamespaceMetrics {
+    fn metrics(self, cache: &PingolaCache) -> &NamespaceMetrics {
         match self {
             Self::Dns => &cache.dns_metrics,
             Self::Navidrome => &cache.navidrome_metrics,
@@ -48,13 +39,6 @@ impl CacheKey {
             namespace,
             hash: digest,
         }
-    }
-
-    pub fn hash_bytes(namespace: CacheNamespace, bytes: &[u8]) -> u64 {
-        let mut hasher = AHasher::default();
-        hasher.write_u8(namespace as u8);
-        hasher.write(bytes);
-        hasher.finish()
     }
 }
 
@@ -82,7 +66,6 @@ pub enum CacheLookup {
 }
 
 struct StoredEntry {
-    namespace: CacheNamespace,
     value: CachedValue,
 }
 
@@ -153,13 +136,7 @@ impl PingolaCache {
             key.namespace.metrics(self).record_rejection();
             return false;
         }
-        if let Some(old) = self.data.insert(
-            key.hash,
-            StoredEntry {
-                namespace: key.namespace,
-                value,
-            },
-        ) {
+        if let Some(old) = self.data.insert(key.hash, StoredEntry { value }) {
             self.bytes_used
                 .fetch_sub(old.value.weight(), Ordering::Relaxed);
         }
@@ -226,6 +203,7 @@ pub type CacheHandle = Arc<PingolaCache>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn insert_lookup_and_expire() {

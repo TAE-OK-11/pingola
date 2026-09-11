@@ -42,7 +42,6 @@ const DNS_CONTENT_TYPE: http::header::HeaderValue =
 
 pub struct PendingCacheInsert {
     pub key: CacheKey,
-    pub ttl: std::time::Duration,
     pub body: BytesMut,
     pub status: u16,
     pub content_type: Option<http::header::HeaderValue>,
@@ -167,7 +166,6 @@ pub fn begin_pending_insert(
             let query = dns_query_key(&wire)?;
             Some(PendingCacheInsert {
                 key: cache_key_for_query(&query),
-                ttl: cache.dns.max_ttl,
                 body: BytesMut::new(),
                 status: 200,
                 content_type: Some(DNS_CONTENT_TYPE.clone()),
@@ -190,7 +188,6 @@ pub fn begin_pending_insert(
             )?;
             Some(PendingCacheInsert {
                 key: navidrome_cache_key(&cacheable),
-                ttl: cache.navidrome.default_ttl,
                 body: BytesMut::new(),
                 status: 200,
                 content_type: None,
