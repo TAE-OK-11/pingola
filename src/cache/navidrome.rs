@@ -42,19 +42,11 @@ const BLOCKED_SUFFIXES: &[&str] = &[
     "stream",
 ];
 
-// These operations can change fields present in cached getSong/getAlbum/getArtist
-// payloads. Purging the small Navidrome metadata namespace after a confirmed
-// successful response is intentionally conservative and avoids stale star/rating/
-// play-count state without trying to maintain a fragile dependency graph.
-const INVALIDATING_SUFFIXES: &[&str] = &[
-    "scrobble",
-    "star",
-    "unstar",
-    "setRating",
-    "createPlaylist",
-    "updatePlaylist",
-    "deletePlaylist",
-];
+// These operations directly change user-specific fields present in cached
+// getSong/getAlbum/getArtist payloads. Purge the small metadata namespace only
+// after a confirmed successful response. Scrobbles intentionally do not purge:
+// they are frequent and play-count freshness can safely follow the short TTL.
+const INVALIDATING_SUFFIXES: &[&str] = &["star", "unstar", "setRating"];
 
 #[derive(Clone, Copy, Debug)]
 pub struct NavidromeCachePolicy {
@@ -167,7 +159,8 @@ pub fn navidrome_response_ttl(
     cache_control_max_age: Option<u64>,
     policy: &NavidromeCachePolicy,
 ) -> Option<Duration> {
-    if response_body.len() > policy.max_response_bytes || navidrome_response_is_error(response_body) {
+    if response_body.len() > policy.max_response_bytes || navidrome_response_is_error(response_body)
+    {
         return None;
     }
     let ttl = cache_control_max_age
@@ -402,10 +395,12 @@ mod tests {
     }
 
     #[test]
-    fn mutations_are_classified_for_invalidation() {
+    fn only_user_state_mutations_force_coarse_invalidation() {
         assert!(navidrome_invalidates_cache("/rest/star.view"));
-        assert!(navidrome_invalidates_cache("/rest/scrobble"));
+        assert!(navidrome_invalidates_cache("/rest/unstar"));
         assert!(navidrome_invalidates_cache("/rest/setRating.view"));
+        assert!(!navidrome_invalidates_cache("/rest/scrobble"));
+        assert!(!navidrome_invalidates_cache("/rest/updatePlaylist.view"));
         assert!(!navidrome_invalidates_cache("/rest/getAlbum.view"));
     }
 }
