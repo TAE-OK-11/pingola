@@ -1,4 +1,5 @@
 mod allocator;
+mod cache;
 mod config;
 mod content_encoding;
 mod gateway;
