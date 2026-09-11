@@ -82,10 +82,7 @@ pub struct CachedValue {
 
 impl CachedValue {
     fn estimated_weight(&self) -> usize {
-        self.body
-            .len()
-            .saturating_add(ENTRY_OVERHEAD_BYTES)
-            .max(1)
+        self.body.len().saturating_add(ENTRY_OVERHEAD_BYTES).max(1)
     }
 
     pub fn is_fresh(&self, now: Instant) -> bool {
@@ -129,11 +126,7 @@ impl PingolaCache {
             enabled,
             memory_limit,
             data: DashMap::with_capacity(max_entries),
-            order: Lru::with_capacity_and_watermark(
-                memory_limit,
-                per_shard,
-                Some(max_entries),
-            ),
+            order: Lru::with_capacity_and_watermark(memory_limit, per_shard, Some(max_entries)),
             bytes_used: AtomicUsize::new(0),
             dns_entries: AtomicUsize::new(0),
             dns_bytes: AtomicUsize::new(0),
@@ -347,10 +340,7 @@ mod tests {
             },
         );
         assert!(matches!(cache.lookup(&dns, now), CacheLookup::Hit(_)));
-        assert!(matches!(
-            cache.lookup(&navidrome, now),
-            CacheLookup::Miss
-        ));
+        assert!(matches!(cache.lookup(&navidrome, now), CacheLookup::Miss));
     }
 
     #[test]
