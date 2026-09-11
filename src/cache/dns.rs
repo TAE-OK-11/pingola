@@ -158,6 +158,7 @@ pub fn build_cached_dns(response: &[u8], ttl: Duration, now: Instant) -> CachedV
 /// the current query wire available. DoH recommends a zero DNS transaction ID,
 /// so use zero rather than leaking the transaction ID from the request that
 /// originally populated the cache.
+#[allow(dead_code)]
 pub fn age_dns_response(response: &Bytes, stored_at: Instant, now: Instant) -> Option<Bytes> {
     age_dns_response_for_query(response, stored_at, now, 0)
 }

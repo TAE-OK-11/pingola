@@ -23,6 +23,7 @@ pub struct CoalescePermit {
     writer: bool,
     wait_timeout: Duration,
     inflight: Arc<InflightEntry>,
+    finished: bool,
 }
 
 impl CoalesceGuard {
@@ -44,6 +45,7 @@ impl CoalesceGuard {
                     writer: false,
                     wait_timeout: self.wait_timeout,
                     inflight: existing.clone(),
+                    finished: false,
                 };
             }
 
@@ -60,6 +62,7 @@ impl CoalesceGuard {
                         writer: true,
                         wait_timeout: self.wait_timeout,
                         inflight,
+                        finished: false,
                     };
                 }
                 dashmap::mapref::entry::Entry::Occupied(occupied) => {
@@ -73,18 +76,37 @@ impl CoalesceGuard {
                         writer: false,
                         wait_timeout: self.wait_timeout,
                         inflight: occupied.get().clone(),
+                        finished: false,
                     };
                 }
             }
         }
     }
 
-    pub fn finish(&self, permit: CoalescePermit, inserted: bool) {
+    pub fn finish(&self, mut permit: CoalescePermit, inserted: bool) {
+        if permit.finished {
+            return;
+        }
+        permit.finished = true;
+        // Only the writer owns completion. Waiters may hold a permit in request
+        // context and later drop/finish it from logging; they must not overwrite
+        // the writer's success bit or remove the inflight entry early.
+        if !permit.writer {
+            return;
+        }
         permit.inflight.success.store(inserted, Ordering::Release);
         permit.inflight.done.store(true, Ordering::Release);
         permit.inflight.notify.notify_waiters();
-        if permit.writer {
-            self.inflight.remove(&permit.key);
+        self.inflight.remove(&permit.key);
+    }
+}
+
+impl Drop for CoalescePermit {
+    fn drop(&mut self) {
+        // Writers that abort before finish_fill must unblock coalesced waiters.
+        if self.writer && !self.finished && !self.inflight.done.swap(true, Ordering::AcqRel) {
+            self.inflight.success.store(false, Ordering::Release);
+            self.inflight.notify.notify_waiters();
         }
     }
 }
@@ -138,5 +160,26 @@ mod tests {
         }
         guard.finish(writer, true);
         assert!(waiter.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dropped_writer_unblocks_waiters_as_failure() {
+        let guard = Arc::new(CoalesceGuard::new());
+        let metrics = NamespaceMetrics::default();
+        let writer = guard.begin(11, &metrics);
+        assert!(writer.is_writer());
+        let waiter = {
+            let guard = guard.clone();
+            tokio::spawn(async move {
+                let waiter = guard.begin(11, &NamespaceMetrics::default());
+                assert!(!waiter.is_writer());
+                waiter.wait_for_writer().await
+            })
+        };
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        drop(writer);
+        assert!(!waiter.await.unwrap());
     }
 }

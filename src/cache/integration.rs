@@ -301,6 +301,59 @@ mod tests {
     }
 
     #[test]
+    fn dns_hit_materializer_echoes_caller_transaction_id() {
+        let store = PingolaCache::new(true, 4096);
+        let now = Instant::now();
+        let mut response = vec![
+            0x00, 0x00, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
+            b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
+        ];
+        response.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01]);
+        response.extend_from_slice(&120u32.to_be_bytes());
+        response.extend_from_slice(&4u16.to_be_bytes());
+        response.extend_from_slice(&[192, 0, 2, 1]);
+
+        let mut query = response[..31].to_vec();
+        query[0..2].copy_from_slice(&0x1234u16.to_be_bytes());
+        query[2] = 0x01;
+        query[3] = 0x00;
+        query[6] = 0;
+        query[7] = 0;
+
+        let key = cache_key_for_query(&dns_query_key(&query).unwrap());
+        assert!(store.insert(
+            key,
+            build_cached_dns(&response, std::time::Duration::from_secs(120), now),
+        ));
+        let cache = CacheRuntime {
+            store: store.clone(),
+            dns: DnsCachePolicy::default(),
+            navidrome: NavidromeCachePolicy::default(),
+        };
+        let request = RequestHeader::build(Method::POST, b"/dns-query", None).unwrap();
+        match prepare_lookup(
+            &cache,
+            RouteClass::Doh,
+            HandlerKind::AdguardDns,
+            &request,
+            Some(&query),
+            now,
+        ) {
+            PreparedCacheLookup::Hit(hit) => assert_eq!(&hit.body[0..2], &[0x12, 0x34]),
+            PreparedCacheLookup::Miss(_) => panic!("expected dns cache hit"),
+            PreparedCacheLookup::Bypass => panic!("expected dns cache hit, got bypass"),
+        }
+
+        let value = match store.lookup(&key, now) {
+            CacheLookup::Hit(value) => value,
+            _ => panic!("missing cached dns value"),
+        };
+        let coalesced =
+            age_dns_response_for_query(&value.body, value.stored_at, now, 0x99AA).unwrap();
+        assert_eq!(&coalesced[0..2], &[0x99, 0xAA]);
+    }
+
+    #[test]
     fn successful_mutation_purges_only_navidrome_namespace() {
         let store = PingolaCache::new(true, 4096);
         let now = Instant::now();
