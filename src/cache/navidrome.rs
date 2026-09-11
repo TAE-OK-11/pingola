@@ -42,6 +42,20 @@ const BLOCKED_SUFFIXES: &[&str] = &[
     "stream",
 ];
 
+// These operations can change fields present in cached getSong/getAlbum/getArtist
+// payloads. Purging the small Navidrome metadata namespace after a confirmed
+// successful response is intentionally conservative and avoids stale star/rating/
+// play-count state without trying to maintain a fragile dependency graph.
+const INVALIDATING_SUFFIXES: &[&str] = &[
+    "scrobble",
+    "star",
+    "unstar",
+    "setRating",
+    "createPlaylist",
+    "updatePlaylist",
+    "deletePlaylist",
+];
+
 #[derive(Clone, Copy, Debug)]
 pub struct NavidromeCachePolicy {
     pub enabled: bool,
@@ -119,6 +133,14 @@ pub fn navidrome_cacheable(
     })
 }
 
+pub fn navidrome_invalidates_cache(path: &str) -> bool {
+    normalize_endpoint(path).is_some_and(|endpoint| {
+        INVALIDATING_SUFFIXES
+            .iter()
+            .any(|candidate| endpoint.eq_ignore_ascii_case(candidate))
+    })
+}
+
 pub fn navidrome_cache_key(entry: &NavidromeCacheable) -> CacheKey {
     let mut hasher = AHasher::default();
     hasher.write(entry.endpoint.as_bytes());
@@ -145,16 +167,21 @@ pub fn navidrome_response_ttl(
     cache_control_max_age: Option<u64>,
     policy: &NavidromeCachePolicy,
 ) -> Option<Duration> {
-    if response_body.len() > policy.max_response_bytes {
-        return None;
-    }
-    if looks_like_error(response_body) {
+    if response_body.len() > policy.max_response_bytes || navidrome_response_is_error(response_body) {
         return None;
     }
     let ttl = cache_control_max_age
         .map(Duration::from_secs)
         .unwrap_or(policy.default_ttl);
     Some(ttl.min(policy.max_ttl))
+}
+
+pub fn navidrome_response_is_error(body: &[u8]) -> bool {
+    let prefix = &body[..body.len().min(512)];
+    let text = String::from_utf8_lossy(prefix);
+    text.contains("<error ")
+        || text.contains("\"status\":\"failed\"")
+        || text.contains("\"status\": \"failed\"")
 }
 
 fn normalize_endpoint(path: &str) -> Option<String> {
@@ -248,14 +275,6 @@ fn stable_query_params(params: &[(String, String)]) -> Vec<(String, String)> {
         // future endpoint parameters from aliasing distinct responses.
         .cloned()
         .collect()
-}
-
-fn looks_like_error(body: &[u8]) -> bool {
-    let prefix = &body[..body.len().min(512)];
-    let text = String::from_utf8_lossy(prefix);
-    text.contains("<error ")
-        || text.contains("\"status\":\"failed\"")
-        || text.contains("\"status\": \"failed\"")
 }
 
 #[cfg(test)]
@@ -380,5 +399,13 @@ mod tests {
         )
         .unwrap();
         assert_ne!(navidrome_cache_key(&first), navidrome_cache_key(&second));
+    }
+
+    #[test]
+    fn mutations_are_classified_for_invalidation() {
+        assert!(navidrome_invalidates_cache("/rest/star.view"));
+        assert!(navidrome_invalidates_cache("/rest/scrobble"));
+        assert!(navidrome_invalidates_cache("/rest/setRating.view"));
+        assert!(!navidrome_invalidates_cache("/rest/getAlbum.view"));
     }
 }
