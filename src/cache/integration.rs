@@ -8,8 +8,8 @@ use http::Method;
 
 use crate::cache::core::{CacheHandle, CacheKey, CacheLookup};
 use crate::cache::dns::{
-    DnsCacheDecision, DnsCachePolicy, build_cached_dns, cache_key_for_query, dns_cacheable,
-    dns_query_key, parse_doh_query,
+    DnsCacheDecision, DnsCachePolicy, age_dns_response_for_query, build_cached_dns,
+    cache_key_for_query, dns_cacheable, dns_query_key, parse_doh_query,
 };
 use crate::cache::navidrome::{
     NavidromeCachePolicy, build_cached_navidrome, navidrome_cache_key, navidrome_cacheable,
@@ -102,12 +102,7 @@ fn prepare_dns_lookup(
     let key = cache_key_for_query(&query);
     match cache.store.lookup(&key, now) {
         CacheLookup::Hit(value) => {
-            let body = crate::cache::dns::age_dns_response(
-                &value.body,
-                value.stored_at,
-                now,
-                query_id,
-            );
+            let body = age_dns_response_for_query(&value.body, value.stored_at, now, query_id);
             body.map(|body| {
                 PreparedCacheLookup::Hit(CachedHttpResponse {
                     status: 200,
@@ -223,8 +218,6 @@ pub fn store_pending_insert(
                 .insert(pending.key, build_cached_dns(&body, ttl, now))
         }
         crate::cache::core::CacheNamespace::Navidrome => {
-            // The Navidrome policy currently only admits f=json requests. Do not
-            // cache a backend response unless it confirms a JSON content type.
             let is_json = pending
                 .content_type
                 .as_ref()
