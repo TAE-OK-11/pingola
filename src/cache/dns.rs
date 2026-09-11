@@ -565,7 +565,8 @@ mod tests {
     fn ages_ttl_and_rewrites_transaction_id() {
         let response = Bytes::from(build_response("example.com", 1, 120, &[192, 0, 2, 1], 0));
         let stored_at = Instant::now() - Duration::from_secs(30);
-        let aged = age_dns_response_for_query(&response, stored_at, Instant::now(), 0x1234).unwrap();
+        let aged =
+            age_dns_response_for_query(&response, stored_at, Instant::now(), 0x1234).unwrap();
         assert_eq!(&aged[0..2], &[0x12, 0x34]);
         let mut offset = skip_questions(&aged, 12).unwrap();
         skip_name(&aged, &mut offset).unwrap();
@@ -588,12 +589,16 @@ mod tests {
         ));
         let response = Bytes::from(response);
         let stored_at = Instant::now() - Duration::from_secs(30);
-        let aged = age_dns_response_for_query(&response, stored_at, Instant::now(), 0x2222).unwrap();
+        let aged =
+            age_dns_response_for_query(&response, stored_at, Instant::now(), 0x2222).unwrap();
 
         let mut offset = skip_questions(&aged, 12).unwrap();
         offset = skip_rrs(&aged, offset, 1).unwrap();
         skip_name(&aged, &mut offset).unwrap();
-        assert_eq!(u16::from_be_bytes([aged[offset], aged[offset + 1]]), EDNS0_TYPE);
+        assert_eq!(
+            u16::from_be_bytes([aged[offset], aged[offset + 1]]),
+            EDNS0_TYPE
+        );
         assert_eq!(
             u32::from_be_bytes([
                 aged[offset + 4],
