@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use ahash::AHashMap;
 use bytes::Bytes;
 use cloudflare_pingora::http::RequestHeader;
 use http::header::HOST;
@@ -76,7 +75,7 @@ pub fn finalize_upstream_wire(wire: &mut Vec<h3::Header>, req: &RequestHeader) {
         .unwrap_or("");
     let path = req.uri.path_and_query().map_or("/", |value| value.as_str());
 
-    let mut reusable = HashMap::with_capacity(wire.len());
+    let mut reusable = AHashMap::with_capacity(wire.len());
     let mut scratch = Vec::with_capacity(32);
     for header in wire.drain(..) {
         let name = header.name();
@@ -119,7 +118,7 @@ pub fn finalize_upstream_wire_pairs(wire: &mut Vec<(Bytes, Bytes)>, req: &Reques
         .unwrap_or("");
     let path = req.uri.path_and_query().map_or("/", |value| value.as_str());
 
-    let mut reusable = HashMap::with_capacity(wire.len());
+    let mut reusable = AHashMap::with_capacity(wire.len());
     for (name, value) in wire.drain(..) {
         if is_pseudo(&name) || skip_regular_header(&name, &value) {
             continue;

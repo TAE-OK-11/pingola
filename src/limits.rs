@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use ahash::RandomState;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use parking_lot::Mutex;
@@ -40,7 +41,7 @@ pub enum LimitZone {
     AdguardUi = 11,
 }
 
-#[derive(Clone, Eq)]
+#[derive(Clone, Copy, Eq)]
 struct ClientKey {
     zone: LimitZone,
     ip: IpAddr,
@@ -67,7 +68,7 @@ struct Bucket {
 /// Per-client token buckets. The map is sharded so unrelated clients do not
 /// contend on a global lock.
 pub struct RateLimiter {
-    buckets: DashMap<ClientKey, Bucket>,
+    buckets: DashMap<ClientKey, Bucket, RandomState>,
     bucket_count: AtomicUsize,
     max_buckets: usize,
     last_cleanup: Mutex<Instant>,
@@ -81,7 +82,7 @@ impl RateLimiter {
     fn with_max_buckets(max_buckets: usize) -> Self {
         let now = Instant::now();
         Self {
-            buckets: DashMap::new(),
+            buckets: DashMap::with_hasher(RandomState::new()),
             bucket_count: AtomicUsize::new(0),
             max_buckets,
             last_cleanup: Mutex::new(now.checked_sub(RATE_CLEANUP_INTERVAL).unwrap_or(now)),
@@ -166,7 +167,7 @@ impl RateLimiter {
 /// Counts active resources per IP. It is used for HTTP requests/streams and
 /// for QUIC connections, with the `zone` separating independent limits.
 pub struct ActiveRequestLimiter {
-    counters: DashMap<ClientKey, Arc<AtomicUsize>>,
+    counters: DashMap<ClientKey, Arc<AtomicUsize>, RandomState>,
     counter_count: AtomicUsize,
     max_counters: usize,
     cleanup: Mutex<()>,
@@ -179,7 +180,7 @@ impl ActiveRequestLimiter {
 
     fn with_max_counters(max_counters: usize) -> Self {
         Self {
-            counters: DashMap::new(),
+            counters: DashMap::with_hasher(RandomState::new()),
             counter_count: AtomicUsize::new(0),
             max_counters,
             cleanup: Mutex::new(()),
@@ -225,7 +226,7 @@ impl ActiveRequestLimiter {
 
         let mut retried_after_cleanup = false;
         let counter = loop {
-            let entry = self.counters.entry(key.clone());
+            let entry = self.counters.entry(key);
             match entry {
                 Entry::Occupied(entry) => {
                     let counter = entry.get().clone();
