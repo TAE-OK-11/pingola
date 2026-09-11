@@ -235,9 +235,7 @@ pub fn store_pending_insert(
                     cache.store.reject(key.namespace);
                     return false;
                 };
-                cache
-                    .store
-                    .insert(key, build_cached_dns(&body, ttl, now))
+                cache.store.insert(key, build_cached_dns(&body, ttl, now))
             }
             CacheNamespace::Navidrome => {
                 let is_json = pending
