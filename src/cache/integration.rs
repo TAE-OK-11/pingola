@@ -39,6 +39,8 @@ pub struct CachedHttpResponse {
 
 const DNS_CONTENT_TYPE: http::header::HeaderValue =
     http::header::HeaderValue::from_static("application/dns-message");
+const JSON_CONTENT_TYPE: http::header::HeaderValue =
+    http::header::HeaderValue::from_static("application/json");
 
 pub struct PendingCacheInsert {
     pub key: CacheKey,
@@ -96,10 +98,16 @@ fn prepare_dns_lookup(
         Some(query) => query,
         None => return PreparedCacheLookup::Bypass,
     };
+    let query_id = u16::from_be_bytes([wire[0], wire[1]]);
     let key = cache_key_for_query(&query);
     match cache.store.lookup(&key, now) {
         CacheLookup::Hit(value) => {
-            let body = crate::cache::dns::age_dns_response(&value.body, value.stored_at, now);
+            let body = crate::cache::dns::age_dns_response(
+                &value.body,
+                value.stored_at,
+                now,
+                query_id,
+            );
             body.map(|body| {
                 PreparedCacheLookup::Hit(CachedHttpResponse {
                     status: 200,
@@ -134,7 +142,7 @@ fn prepare_navidrome_lookup(
     match cache.store.lookup(&key, now) {
         CacheLookup::Hit(value) => PreparedCacheLookup::Hit(CachedHttpResponse {
             status: 200,
-            content_type: http::header::HeaderValue::from_static("application/json"),
+            content_type: JSON_CONTENT_TYPE.clone(),
             body: value.body,
         }),
         CacheLookup::Miss | CacheLookup::Expired => PreparedCacheLookup::Miss(key),
@@ -215,6 +223,22 @@ pub fn store_pending_insert(
                 .insert(pending.key, build_cached_dns(&body, ttl, now))
         }
         crate::cache::core::CacheNamespace::Navidrome => {
+            // The Navidrome policy currently only admits f=json requests. Do not
+            // cache a backend response unless it confirms a JSON content type.
+            let is_json = pending
+                .content_type
+                .as_ref()
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value
+                        .split(';')
+                        .next()
+                        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+                });
+            if !is_json {
+                cache.store.reject(pending.key.namespace);
+                return false;
+            }
             let ttl = navidrome_response_ttl(&body, None, &cache.navidrome);
             let Some(ttl) = ttl else {
                 cache.store.reject(pending.key.namespace);
@@ -246,7 +270,7 @@ mod tests {
         };
         let request = RequestHeader::build(Method::GET, b"/dns-query", None).unwrap();
         let wire = vec![
-            0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
             b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
         ];
         let now = Instant::now();
