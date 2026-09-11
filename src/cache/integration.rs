@@ -6,14 +6,14 @@ use bytes::{Bytes, BytesMut};
 use cloudflare_pingora::http::RequestHeader;
 use http::Method;
 
-use crate::cache::core::{CacheHandle, CacheKey, CacheLookup};
+use crate::cache::core::{CacheHandle, CacheKey, CacheLookup, CacheNamespace};
 use crate::cache::dns::{
-    DnsCacheDecision, DnsCachePolicy, build_cached_dns, cache_key_for_query, dns_cacheable,
-    dns_query_key, parse_doh_query,
+    DnsCacheDecision, DnsCachePolicy, age_dns_response_for_query, build_cached_dns,
+    cache_key_for_query, dns_cacheable, dns_query_key, parse_doh_query,
 };
 use crate::cache::navidrome::{
     NavidromeCachePolicy, build_cached_navidrome, navidrome_cache_key, navidrome_cacheable,
-    navidrome_response_ttl,
+    navidrome_invalidates_cache, navidrome_response_is_error, navidrome_response_ttl,
 };
 use crate::config::HandlerKind;
 use crate::routing::RouteClass;
@@ -39,9 +39,16 @@ pub struct CachedHttpResponse {
 
 const DNS_CONTENT_TYPE: http::header::HeaderValue =
     http::header::HeaderValue::from_static("application/dns-message");
+const JSON_CONTENT_TYPE: http::header::HeaderValue =
+    http::header::HeaderValue::from_static("application/json");
+
+enum PendingCacheAction {
+    Store(CacheKey),
+    Invalidate(CacheNamespace),
+}
 
 pub struct PendingCacheInsert {
-    pub key: CacheKey,
+    action: PendingCacheAction,
     pub body: BytesMut,
     pub status: u16,
     pub content_type: Option<http::header::HeaderValue>,
@@ -96,10 +103,11 @@ fn prepare_dns_lookup(
         Some(query) => query,
         None => return PreparedCacheLookup::Bypass,
     };
+    let query_id = u16::from_be_bytes([wire[0], wire[1]]);
     let key = cache_key_for_query(&query);
     match cache.store.lookup(&key, now) {
         CacheLookup::Hit(value) => {
-            let body = crate::cache::dns::age_dns_response(&value.body, value.stored_at, now);
+            let body = age_dns_response_for_query(&value.body, value.stored_at, now, query_id);
             body.map(|body| {
                 PreparedCacheLookup::Hit(CachedHttpResponse {
                     status: 200,
@@ -134,7 +142,7 @@ fn prepare_navidrome_lookup(
     match cache.store.lookup(&key, now) {
         CacheLookup::Hit(value) => PreparedCacheLookup::Hit(CachedHttpResponse {
             status: 200,
-            content_type: http::header::HeaderValue::from_static("application/json"),
+            content_type: JSON_CONTENT_TYPE.clone(),
             body: value.body,
         }),
         CacheLookup::Miss | CacheLookup::Expired => PreparedCacheLookup::Miss(key),
@@ -165,7 +173,7 @@ pub fn begin_pending_insert(
                 .or_else(|| parse_doh_query(request.method.as_str(), path, &[]))?;
             let query = dns_query_key(&wire)?;
             Some(PendingCacheInsert {
-                key: cache_key_for_query(&query),
+                action: PendingCacheAction::Store(cache_key_for_query(&query)),
                 body: BytesMut::new(),
                 status: 200,
                 content_type: Some(DNS_CONTENT_TYPE.clone()),
@@ -180,14 +188,20 @@ pub fn begin_pending_insert(
             if !cache.navidrome.enabled {
                 return None;
             }
-            let cacheable = navidrome_cacheable(
+            let action = if let Some(cacheable) = navidrome_cacheable(
                 &request.method,
                 request.uri.path(),
                 request.uri.query(),
                 &cache.navidrome,
-            )?;
+            ) {
+                PendingCacheAction::Store(navidrome_cache_key(&cacheable))
+            } else if navidrome_invalidates_cache(request.uri.path()) {
+                PendingCacheAction::Invalidate(CacheNamespace::Navidrome)
+            } else {
+                return None;
+            };
             Some(PendingCacheInsert {
-                key: navidrome_cache_key(&cacheable),
+                action,
                 body: BytesMut::new(),
                 status: 200,
                 content_type: None,
@@ -203,27 +217,50 @@ pub fn store_pending_insert(
     now: Instant,
 ) -> bool {
     let body = pending.body.freeze();
-    match pending.key.namespace {
-        crate::cache::core::CacheNamespace::Dns => {
-            let decision = dns_cacheable(&body, &cache.dns);
-            let DnsCacheDecision::Cacheable { ttl } = decision else {
-                cache.store.reject(pending.key.namespace);
+    match pending.action {
+        PendingCacheAction::Invalidate(CacheNamespace::Navidrome) => {
+            // OpenSubsonic often reports application errors with HTTP 200. Only
+            // invalidate after a response that is not an API-level error.
+            if navidrome_response_is_error(&body) {
                 return false;
-            };
-            cache
-                .store
-                .insert(pending.key, build_cached_dns(&body, ttl, now))
+            }
+            cache.store.purge_namespace(CacheNamespace::Navidrome);
+            true
         }
-        crate::cache::core::CacheNamespace::Navidrome => {
-            let ttl = navidrome_response_ttl(&body, None, &cache.navidrome);
-            let Some(ttl) = ttl else {
-                cache.store.reject(pending.key.namespace);
-                return false;
-            };
-            cache
-                .store
-                .insert(pending.key, build_cached_navidrome(body, ttl, now))
-        }
+        PendingCacheAction::Invalidate(CacheNamespace::Dns) => false,
+        PendingCacheAction::Store(key) => match key.namespace {
+            CacheNamespace::Dns => {
+                let decision = dns_cacheable(&body, &cache.dns);
+                let DnsCacheDecision::Cacheable { ttl } = decision else {
+                    cache.store.reject(key.namespace);
+                    return false;
+                };
+                cache.store.insert(key, build_cached_dns(&body, ttl, now))
+            }
+            CacheNamespace::Navidrome => {
+                let is_json = pending
+                    .content_type
+                    .as_ref()
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value.split(';').next().is_some_and(|mime| {
+                            mime.trim().eq_ignore_ascii_case("application/json")
+                        })
+                    });
+                if !is_json {
+                    cache.store.reject(key.namespace);
+                    return false;
+                }
+                let ttl = navidrome_response_ttl(&body, None, &cache.navidrome);
+                let Some(ttl) = ttl else {
+                    cache.store.reject(key.namespace);
+                    return false;
+                };
+                cache
+                    .store
+                    .insert(key, build_cached_navidrome(body, ttl, now))
+            }
+        },
     }
 }
 
@@ -246,7 +283,7 @@ mod tests {
         };
         let request = RequestHeader::build(Method::GET, b"/dns-query", None).unwrap();
         let wire = vec![
-            0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
             b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
         ];
         let now = Instant::now();
@@ -261,5 +298,45 @@ mod tests {
             ),
             PreparedCacheLookup::Miss(_)
         ));
+    }
+
+    #[test]
+    fn successful_mutation_purges_only_navidrome_namespace() {
+        let store = PingolaCache::new(true, 4096);
+        let now = Instant::now();
+        let dns_key = CacheKey::new(CacheNamespace::Dns, 1);
+        let nav_key = CacheKey::new(CacheNamespace::Navidrome, 1);
+        for key in [dns_key, nav_key] {
+            store.insert(
+                key,
+                crate::cache::core::CachedValue {
+                    body: Bytes::from_static(b"ok"),
+                    stored_at: now,
+                    fresh_until: now + std::time::Duration::from_secs(60),
+                },
+            );
+        }
+        let cache = CacheRuntime {
+            store: store.clone(),
+            dns: DnsCachePolicy::default(),
+            navidrome: NavidromeCachePolicy::default(),
+        };
+        let request = RequestHeader::build(
+            Method::GET,
+            b"/rest/star.view?u=alice&p=secret&id=1&f=json",
+            None,
+        )
+        .unwrap();
+        let pending = begin_pending_insert(
+            &cache,
+            RouteClass::NavidromeApi,
+            HandlerKind::NavidromeMain,
+            &request,
+            None,
+        )
+        .unwrap();
+        assert!(store_pending_insert(&cache, pending, now));
+        assert!(matches!(store.lookup(&dns_key, now), CacheLookup::Hit(_)));
+        assert!(matches!(store.lookup(&nav_key, now), CacheLookup::Miss));
     }
 }
