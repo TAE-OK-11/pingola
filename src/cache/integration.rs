@@ -1,0 +1,268 @@
+//! Gateway integration helpers for Pingola cache hit/miss paths.
+
+use std::time::Instant;
+
+use bytes::{Bytes, BytesMut};
+use cloudflare_pingora::http::RequestHeader;
+use http::Method;
+
+use crate::cache::core::{CacheHandle, CacheKey, CacheLookup};
+use crate::cache::dns::{
+    DnsCacheDecision, DnsCachePolicy, build_cached_dns, cache_key_for_query, dns_cacheable,
+    dns_query_key, parse_doh_query,
+};
+use crate::cache::navidrome::{
+    NavidromeCachePolicy, build_cached_navidrome, navidrome_cache_key, navidrome_cacheable,
+    navidrome_response_ttl,
+};
+use crate::config::HandlerKind;
+use crate::routing::RouteClass;
+
+pub struct CacheRuntime {
+    pub store: CacheHandle,
+    pub dns: DnsCachePolicy,
+    pub navidrome: NavidromeCachePolicy,
+}
+
+pub enum PreparedCacheLookup {
+    Miss(CacheKey),
+    Hit(CachedHttpResponse),
+    Bypass,
+}
+
+#[derive(Clone)]
+pub struct CachedHttpResponse {
+    pub status: u16,
+    pub content_type: http::header::HeaderValue,
+    pub body: Bytes,
+}
+
+const DNS_CONTENT_TYPE: http::header::HeaderValue =
+    http::header::HeaderValue::from_static("application/dns-message");
+
+pub struct PendingCacheInsert {
+    pub key: CacheKey,
+    pub ttl: std::time::Duration,
+    pub body: BytesMut,
+    pub status: u16,
+    pub content_type: Option<http::header::HeaderValue>,
+}
+
+pub fn prepare_lookup(
+    cache: &CacheRuntime,
+    route: RouteClass,
+    handler: HandlerKind,
+    request: &RequestHeader,
+    dns_body: Option<&[u8]>,
+    now: Instant,
+) -> PreparedCacheLookup {
+    if !cache.store.enabled() {
+        return PreparedCacheLookup::Bypass;
+    }
+    match route {
+        RouteClass::Doh => prepare_dns_lookup(cache, request, dns_body, now),
+        RouteClass::NavidromeApi
+            if matches!(
+                handler,
+                HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn
+            ) =>
+        {
+            prepare_navidrome_lookup(cache, request, now)
+        }
+        _ => PreparedCacheLookup::Bypass,
+    }
+}
+
+fn prepare_dns_lookup(
+    cache: &CacheRuntime,
+    request: &RequestHeader,
+    dns_body: Option<&[u8]>,
+    now: Instant,
+) -> PreparedCacheLookup {
+    if !cache.dns.enabled {
+        return PreparedCacheLookup::Bypass;
+    }
+    let path = request
+        .uri
+        .path_and_query()
+        .map_or("/", |value| value.as_str());
+    let wire = match dns_body
+        .map(|body| body.to_vec())
+        .or_else(|| parse_doh_query(request.method.as_str(), path, &[]))
+    {
+        Some(wire) => wire,
+        None => return PreparedCacheLookup::Bypass,
+    };
+    let query = match dns_query_key(&wire) {
+        Some(query) => query,
+        None => return PreparedCacheLookup::Bypass,
+    };
+    let key = cache_key_for_query(&query);
+    match cache.store.lookup(&key, now) {
+        CacheLookup::Hit(value) => {
+            let body = crate::cache::dns::age_dns_response(&value.body, value.stored_at, now);
+            body.map(|body| {
+                PreparedCacheLookup::Hit(CachedHttpResponse {
+                    status: 200,
+                    content_type: DNS_CONTENT_TYPE.clone(),
+                    body,
+                })
+            })
+            .unwrap_or(PreparedCacheLookup::Miss(key))
+        }
+        CacheLookup::Miss | CacheLookup::Expired => PreparedCacheLookup::Miss(key),
+    }
+}
+
+fn prepare_navidrome_lookup(
+    cache: &CacheRuntime,
+    request: &RequestHeader,
+    now: Instant,
+) -> PreparedCacheLookup {
+    if !cache.navidrome.enabled {
+        return PreparedCacheLookup::Bypass;
+    }
+    let cacheable = match navidrome_cacheable(
+        &request.method,
+        request.uri.path(),
+        request.uri.query(),
+        &cache.navidrome,
+    ) {
+        Some(cacheable) => cacheable,
+        None => return PreparedCacheLookup::Bypass,
+    };
+    let key = navidrome_cache_key(&cacheable);
+    match cache.store.lookup(&key, now) {
+        CacheLookup::Hit(value) => PreparedCacheLookup::Hit(CachedHttpResponse {
+            status: 200,
+            content_type: http::header::HeaderValue::from_static("application/json"),
+            body: value.body,
+        }),
+        CacheLookup::Miss | CacheLookup::Expired => PreparedCacheLookup::Miss(key),
+    }
+}
+
+pub fn begin_pending_insert(
+    cache: &CacheRuntime,
+    route: RouteClass,
+    handler: HandlerKind,
+    request: &RequestHeader,
+    dns_body: Option<&[u8]>,
+) -> Option<PendingCacheInsert> {
+    if !cache.store.enabled() {
+        return None;
+    }
+    match route {
+        RouteClass::Doh => {
+            if !cache.dns.enabled {
+                return None;
+            }
+            let path = request
+                .uri
+                .path_and_query()
+                .map_or("/", |value| value.as_str());
+            let wire = dns_body
+                .map(|body| body.to_vec())
+                .or_else(|| parse_doh_query(request.method.as_str(), path, &[]))?;
+            let query = dns_query_key(&wire)?;
+            Some(PendingCacheInsert {
+                key: cache_key_for_query(&query),
+                ttl: cache.dns.max_ttl,
+                body: BytesMut::new(),
+                status: 200,
+                content_type: Some(DNS_CONTENT_TYPE.clone()),
+            })
+        }
+        RouteClass::NavidromeApi
+            if matches!(
+                handler,
+                HandlerKind::NavidromeMain | HandlerKind::NavidromeCdn
+            ) =>
+        {
+            if !cache.navidrome.enabled {
+                return None;
+            }
+            let cacheable = navidrome_cacheable(
+                &request.method,
+                request.uri.path(),
+                request.uri.query(),
+                &cache.navidrome,
+            )?;
+            Some(PendingCacheInsert {
+                key: navidrome_cache_key(&cacheable),
+                ttl: cache.navidrome.default_ttl,
+                body: BytesMut::new(),
+                status: 200,
+                content_type: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn store_pending_insert(
+    cache: &CacheRuntime,
+    pending: PendingCacheInsert,
+    now: Instant,
+) -> bool {
+    let body = pending.body.freeze();
+    match pending.key.namespace {
+        crate::cache::core::CacheNamespace::Dns => {
+            let decision = dns_cacheable(&body, &cache.dns);
+            let DnsCacheDecision::Cacheable { ttl } = decision else {
+                cache.store.reject(pending.key.namespace);
+                return false;
+            };
+            cache
+                .store
+                .insert(pending.key, build_cached_dns(&body, ttl, now))
+        }
+        crate::cache::core::CacheNamespace::Navidrome => {
+            let ttl = navidrome_response_ttl(&body, None, &cache.navidrome);
+            let Some(ttl) = ttl else {
+                cache.store.reject(pending.key.namespace);
+                return false;
+            };
+            cache
+                .store
+                .insert(pending.key, build_cached_navidrome(body, ttl, now))
+        }
+    }
+}
+
+pub fn dns_request_needs_body(method: &Method) -> bool {
+    *method == Method::POST
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::core::PingolaCache;
+
+    #[test]
+    fn dns_lookup_miss_then_hit() {
+        let store = PingolaCache::new(true, 4096);
+        let cache = CacheRuntime {
+            store: store.clone(),
+            dns: DnsCachePolicy::default(),
+            navidrome: NavidromeCachePolicy::default(),
+        };
+        let request = RequestHeader::build(Method::GET, b"/dns-query", None).unwrap();
+        let wire = vec![
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
+            b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
+        ];
+        let now = Instant::now();
+        assert!(matches!(
+            prepare_lookup(
+                &cache,
+                RouteClass::Doh,
+                HandlerKind::AdguardDns,
+                &request,
+                Some(&wire),
+                now
+            ),
+            PreparedCacheLookup::Miss(_)
+        ));
+    }
+}

@@ -150,6 +150,43 @@ fn default_static_cache() -> usize {
     16 * 1024 * 1024
 }
 
+fn default_proxy_cache_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+fn default_dns_cache_ttl() -> u64 {
+    300
+}
+
+fn default_dns_negative_ttl() -> u64 {
+    60
+}
+
+fn default_navidrome_cache_ttl() -> u64 {
+    60
+}
+
+fn default_navidrome_cache_max_ttl() -> u64 {
+    300
+}
+
+fn default_cache_config() -> CacheConfig {
+    CacheConfig {
+        enabled: true,
+        memory_bytes: default_proxy_cache_bytes(),
+        dns: DnsCacheConfig {
+            enabled: true,
+            max_ttl_seconds: default_dns_cache_ttl(),
+            negative_ttl_seconds: default_dns_negative_ttl(),
+        },
+        navidrome: NavidromeCacheConfig {
+            enabled: true,
+            default_ttl_seconds: default_navidrome_cache_ttl(),
+            max_ttl_seconds: default_navidrome_cache_max_ttl(),
+        },
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -238,6 +275,8 @@ pub struct ServerConfig {
     pub graceful_shutdown_timeout_seconds: u64,
     #[serde(default = "default_static_cache")]
     pub static_cache_bytes: usize,
+    #[serde(default = "default_cache_config")]
+    pub cache: CacheConfig,
     #[serde(default)]
     pub access_log: bool,
     #[serde(default = "default_health_socket")]
@@ -274,6 +313,61 @@ pub struct ServerConfig {
     /// controlled benchmark fixtures where the comparison proxy omits them.
     #[serde(default = "default_true")]
     pub security_headers: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_proxy_cache_bytes")]
+    pub memory_bytes: usize,
+    #[serde(default)]
+    pub dns: DnsCacheConfig,
+    #[serde(default)]
+    pub navidrome: NavidromeCacheConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsCacheConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_dns_cache_ttl")]
+    pub max_ttl_seconds: u64,
+    #[serde(default = "default_dns_negative_ttl")]
+    pub negative_ttl_seconds: u64,
+}
+
+impl Default for DnsCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_ttl_seconds: default_dns_cache_ttl(),
+            negative_ttl_seconds: default_dns_negative_ttl(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NavidromeCacheConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_navidrome_cache_ttl")]
+    pub default_ttl_seconds: u64,
+    #[serde(default = "default_navidrome_cache_max_ttl")]
+    pub max_ttl_seconds: u64,
+}
+
+impl Default for NavidromeCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_ttl_seconds: default_navidrome_cache_ttl(),
+            max_ttl_seconds: default_navidrome_cache_max_ttl(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -595,6 +689,21 @@ fn validate(config: &Config) -> Result<()> {
     }
     if config.server.static_cache_bytes == 0 {
         bail!("server.static_cache_bytes must be greater than zero");
+    }
+    if config.server.cache.memory_bytes == 0 {
+        bail!("server.cache.memory_bytes must be greater than zero");
+    }
+    if config.server.cache.dns.max_ttl_seconds == 0 {
+        bail!("server.cache.dns.max_ttl_seconds must be greater than zero");
+    }
+    if config.server.cache.dns.negative_ttl_seconds == 0 {
+        bail!("server.cache.dns.negative_ttl_seconds must be greater than zero");
+    }
+    if config.server.cache.navidrome.default_ttl_seconds == 0 {
+        bail!("server.cache.navidrome.default_ttl_seconds must be greater than zero");
+    }
+    if config.server.cache.navidrome.max_ttl_seconds == 0 {
+        bail!("server.cache.navidrome.max_ttl_seconds must be greater than zero");
     }
     if config.server.health_socket.as_os_str().is_empty()
         || !config.server.health_socket.is_absolute()

@@ -53,6 +53,7 @@ lru = "0.18.4"
 mime_guess = "2.0.5"
 parking_lot = "0.12.5"
 percent-encoding = "2.3.2"
+pingora-lru = { version = "=0.9.0" }
 cloudflare-pingora = { package = "pingora", version = "=0.9.0", default-features = false, features = ["proxy"] }
 rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1.0.229", features = ["derive"] }

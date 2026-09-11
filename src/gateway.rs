@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use ahash::AHashMap;
 use anyhow::{Context, anyhow};
 use arrayvec::ArrayString;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use cloudflare_pingora::Error;
 use cloudflare_pingora::ErrorSource;
 use cloudflare_pingora::ErrorType;
@@ -28,14 +28,19 @@ use cloudflare_pingora::proxy::{
     default_fail_to_proxy,
 };
 use http::header::{
-    ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, FORWARDED, HOST, HeaderName, HeaderValue,
-    STRICT_TRANSPORT_SECURITY, TE, TRANSFER_ENCODING, UPGRADE,
+    ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, FORWARDED, HOST, HeaderName,
+    HeaderValue, STRICT_TRANSPORT_SECURITY, TE, TRANSFER_ENCODING, UPGRADE,
 };
 use http::{Method, Version};
 use log::{debug, info, warn};
 use serde_json::json;
 use tokio::sync::mpsc;
 
+use crate::cache::{
+    CacheKey, CacheLookup, CacheRuntime, CachedHttpResponse, CoalescePermit, PendingCacheInsert,
+    PreparedCacheLookup, begin_pending_insert, dns_request_needs_body, prepare_lookup,
+    store_pending_insert,
+};
 use crate::config::{HandlerKind, RuntimeConfig, UpstreamProtocol, normalized_host};
 use crate::content_encoding::{ContentCoding, EncodingNegotiation};
 use crate::h3_wire;
@@ -178,6 +183,11 @@ pub struct RequestContext {
     grpc_web: GrpcWebCtx,
     started_at: Option<Instant>,
     upstream_h3_tcp_fallback: bool,
+    cache_key: Option<CacheKey>,
+    cache_hit: Option<CachedHttpResponse>,
+    cache_coalesce: Option<CoalescePermit>,
+    cache_pending_insert: Option<PendingCacheInsert>,
+    dns_request_body: Option<BytesMut>,
     _active_request_permit: Option<ActiveRequestPermit>,
     _global_request_permit: Option<GlobalConcurrentPermit>,
 }
@@ -201,6 +211,11 @@ impl Default for RequestContext {
             grpc_web: GrpcWebCtx::Disabled,
             started_at: None,
             upstream_h3_tcp_fallback: false,
+            cache_key: None,
+            cache_hit: None,
+            cache_coalesce: None,
+            cache_pending_insert: None,
+            dns_request_body: None,
             _active_request_permit: None,
             _global_request_permit: None,
         }
@@ -219,6 +234,7 @@ pub enum Http3AdmissionRejection {
 /// would hold duplicate static asset caches.
 pub struct GatewayShared {
     static_files: StaticFiles,
+    cache: CacheRuntime,
     rates: RateLimiter,
     active_requests: ActiveRequestLimiter,
     global_concurrent: GlobalConcurrentLimiter,
@@ -258,10 +274,34 @@ impl GatewayShared {
             .collect::<HashMap<_, _>>();
         Ok(Self {
             static_files: StaticFiles::new(roots, runtime.config.server.static_cache_bytes)?,
+            cache: build_cache_runtime(runtime),
             rates: RateLimiter::new(),
             active_requests: ActiveRequestLimiter::new(),
             global_concurrent: GlobalConcurrentLimiter::new(),
         })
+    }
+}
+
+fn build_cache_runtime(runtime: &RuntimeConfig) -> CacheRuntime {
+    use std::time::Duration;
+
+    use crate::cache::{DnsCachePolicy, NavidromeCachePolicy, PingolaCache};
+
+    let cache_cfg = &runtime.config.server.cache;
+    CacheRuntime {
+        store: PingolaCache::new(cache_cfg.enabled, cache_cfg.memory_bytes),
+        dns: DnsCachePolicy {
+            enabled: cache_cfg.enabled && cache_cfg.dns.enabled,
+            max_ttl: Duration::from_secs(cache_cfg.dns.max_ttl_seconds),
+            negative_ttl: Duration::from_secs(cache_cfg.dns.negative_ttl_seconds),
+            max_response_bytes: 65_535,
+        },
+        navidrome: NavidromeCachePolicy {
+            enabled: cache_cfg.enabled && cache_cfg.navidrome.enabled,
+            default_ttl: Duration::from_secs(cache_cfg.navidrome.default_ttl_seconds),
+            max_ttl: Duration::from_secs(cache_cfg.navidrome.max_ttl_seconds),
+            max_response_bytes: 512 * 1024,
+        },
     }
 }
 
@@ -423,6 +463,117 @@ impl Gateway {
             .ok_or_else(|| Error::explain(HTTPStatus(500), "request plan is missing"))
     }
 
+    async fn try_serve_cached_request(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        plan: &PreparedPlan,
+        host: &PreparedHost,
+        dns_body: Option<&[u8]>,
+    ) -> Result<Option<bool>> {
+        let now = Instant::now();
+        let lookup = prepare_lookup(
+            &self.shared.cache,
+            plan.route,
+            plan.handler,
+            session.req_header(),
+            dns_body,
+            now,
+        );
+        match lookup {
+            PreparedCacheLookup::Bypass => Ok(None),
+            PreparedCacheLookup::Hit(response) => Ok(Some(
+                self.send_cached_http_response(session, ctx, plan, host, response)
+                    .await?,
+            )),
+            PreparedCacheLookup::Miss(key) => {
+                let permit = self.shared.cache.store.begin_fill(key);
+                if !permit.is_writer() {
+                    if permit.wait_for_writer().await {
+                        if let CacheLookup::Hit(value) = self.shared.cache.store.lookup(&key, now) {
+                            if let Some(response) = self.materialize_cached_lookup(plan, value, now)
+                            {
+                                return Ok(Some(
+                                    self.send_cached_http_response(
+                                        session, ctx, plan, host, response,
+                                    )
+                                    .await?,
+                                ));
+                            }
+                        }
+                    }
+                }
+                ctx.cache_key = Some(key);
+                ctx.cache_coalesce = Some(permit);
+                Ok(None)
+            }
+        }
+    }
+
+    fn materialize_cached_lookup(
+        &self,
+        plan: &PreparedPlan,
+        value: crate::cache::CachedValue,
+        now: Instant,
+    ) -> Option<CachedHttpResponse> {
+        match plan.route {
+            RouteClass::Doh => {
+                let body = crate::cache::age_dns_response(&value.body, value.stored_at, now)?;
+                Some(CachedHttpResponse {
+                    status: 200,
+                    content_type: HeaderValue::from_static("application/dns-message"),
+                    body,
+                })
+            }
+            RouteClass::NavidromeApi => Some(CachedHttpResponse {
+                status: 200,
+                content_type: HeaderValue::from_static("application/json"),
+                body: value.body,
+            }),
+            _ => None,
+        }
+    }
+
+    async fn send_cached_http_response(
+        &self,
+        session: &mut Session,
+        ctx: &RequestContext,
+        plan: &PreparedPlan,
+        _host: &PreparedHost,
+        response: CachedHttpResponse,
+    ) -> Result<bool> {
+        let mut header = ResponseHeader::build(response.status, Some(8)).unwrap();
+        header.insert_typed_header(CONTENT_TYPE, response.content_type);
+        header.insert_header("content-length", response.body.len())?;
+        if plan.route == RouteClass::Doh {
+            strip_doh_caching_headers(&mut header);
+        }
+        if self.runtime.config.server.security_headers {
+            insert_security_headers(&mut header, plan.handler, ctx.tls)?;
+        }
+        if ctx.tls
+            && !ctx.http3
+            && let Some(alt_svc) = self.runtime.http3_alt_svc_header()
+        {
+            header.insert_typed_header(ALT_SVC, alt_svc.clone());
+        }
+        session
+            .write_response_header(Box::new(header), response.body.is_empty())
+            .await?;
+        if !response.body.is_empty() {
+            session
+                .write_response_body(Some(response.body), true)
+                .await?;
+        }
+        Ok(true)
+    }
+
+    fn finish_cache_fill(&self, ctx: &mut RequestContext, inserted: bool) {
+        if let Some(permit) = ctx.cache_coalesce.take() {
+            self.shared.cache.store.finish_fill(permit, inserted);
+        }
+    }
+
     fn prepare_upstream_forwarded_headers(
         &self,
         session: &Session,
@@ -511,9 +662,56 @@ impl ProxyHttp for Gateway {
 
     async fn proxy_upstream_filter(
         &self,
-        _session: &mut Session,
-        _ctx: &mut Self::CTX,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
     ) -> Result<bool> {
+        if let Some(response) = ctx.cache_hit.take() {
+            let plan = self.request_plan(ctx)?;
+            let host = self
+                .host(request_authority(session.req_header()).unwrap_or(""))
+                .ok_or_else(|| Error::explain(HTTPStatus(500), "request host is missing"))?;
+            return self
+                .send_cached_http_response(session, ctx, plan, host, response)
+                .await
+                .map(|_| false);
+        }
+        if let (Some(key), Some(permit)) = (ctx.cache_key, ctx.cache_coalesce.as_ref()) {
+            if !permit.is_writer() {
+                let now = Instant::now();
+                if permit.wait_for_writer().await {
+                    if let CacheLookup::Hit(value) = self.shared.cache.store.lookup(&key, now) {
+                        if let Some(plan) = self.routing.plans.get(ctx.plan_index) {
+                            if let Some(host) =
+                                self.host(request_authority(session.req_header()).unwrap_or(""))
+                            {
+                                if let Some(response) =
+                                    self.materialize_cached_lookup(plan, value, now)
+                                {
+                                    return self
+                                        .send_cached_http_response(
+                                            session, ctx, plan, host, response,
+                                        )
+                                        .await
+                                        .map(|_| false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if ctx.cache_pending_insert.is_none()
+            && let Some(plan) = self.routing.plans.get(ctx.plan_index)
+        {
+            let dns_body = ctx.dns_request_body.as_deref();
+            ctx.cache_pending_insert = begin_pending_insert(
+                &self.shared.cache,
+                plan.route,
+                plan.handler,
+                session.req_header(),
+                dns_body,
+            );
+        }
         Ok(true)
     }
 
@@ -615,7 +813,13 @@ impl ProxyHttp for Gateway {
                     )
                     .await;
                 }
-                return send_health_details(session, &self.runtime, &self.upstream_h3).await;
+                return send_health_details(
+                    session,
+                    &self.runtime,
+                    &self.upstream_h3,
+                    &self.shared.cache,
+                )
+                .await;
             }
             _ => {}
         }
@@ -850,6 +1054,18 @@ impl ProxyHttp for Gateway {
         session.set_write_timeout(Some(plan.downstream_timeout));
         session.set_keepalive(Some(60));
         ctx.plan_index = plan_index;
+        if plan.route == RouteClass::Doh && dns_request_needs_body(&session.req_header().method) {
+            ctx.dns_request_body = Some(BytesMut::new());
+        } else if matches!(plan.route, RouteClass::Doh | RouteClass::NavidromeApi)
+            && session.req_header().method == Method::GET
+        {
+            if let Some(handled) = self
+                .try_serve_cached_request(session, ctx, plan, host, None)
+                .await?
+            {
+                return Ok(handled);
+            }
+        }
         if log::log_enabled!(log::Level::Debug) {
             debug!(
                 "integration route host={} path={} route={} handler={:?} upstream_pool_group={} h3_eligible={}",
@@ -977,9 +1193,15 @@ impl ProxyHttp for Gateway {
     async fn upstream_response_filter(
         &self,
         _session: &mut Session,
-        _upstream_response: &mut ResponseHeader,
-        _ctx: &mut Self::CTX,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
     ) -> Result<()> {
+        if let Some(pending) = ctx.cache_pending_insert.as_mut() {
+            pending.status = upstream_response.status.as_u16();
+            if pending.content_type.is_none() {
+                pending.content_type = upstream_response.headers.get(CONTENT_TYPE).cloned();
+            }
+        }
         Ok(())
     }
 
@@ -1041,13 +1263,76 @@ impl ProxyHttp for Gateway {
         {
             return Err(Error::explain(HTTPStatus(413), "request body is too large"));
         }
+        if let Some(buffer) = ctx.dns_request_body.as_mut() {
+            if let Some(chunk) = body.as_ref() {
+                buffer.extend_from_slice(chunk);
+            }
+        }
         if end_of_stream {
             ctx.body_deadline = None;
             if let Some(plan) = self.routing.plans.get(ctx.plan_index) {
                 session.set_read_timeout(Some(plan.downstream_timeout));
             }
         }
+        if end_of_stream
+            && let Some(plan) = self.routing.plans.get(ctx.plan_index)
+            && plan.route == RouteClass::Doh
+            && dns_request_needs_body(&session.req_header().method)
+        {
+            let dns_body = ctx.dns_request_body.as_deref();
+            let lookup = prepare_lookup(
+                &self.shared.cache,
+                plan.route,
+                plan.handler,
+                session.req_header(),
+                dns_body,
+                Instant::now(),
+            );
+            match lookup {
+                PreparedCacheLookup::Hit(response) => {
+                    ctx.cache_hit = Some(response);
+                }
+                PreparedCacheLookup::Miss(key) => {
+                    let permit = self.shared.cache.store.begin_fill(key);
+                    ctx.cache_key = Some(key);
+                    ctx.cache_coalesce = Some(permit);
+                }
+                PreparedCacheLookup::Bypass => {}
+            }
+        }
         Ok(())
+    }
+
+    fn upstream_response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        if let Some(pending) = ctx.cache_pending_insert.as_mut() {
+            if let Some(chunk) = body.as_ref() {
+                pending.body.extend_from_slice(chunk);
+            }
+            if end_of_stream {
+                let should_store = ctx
+                    .cache_pending_insert
+                    .as_ref()
+                    .is_some_and(|pending| pending.status == 200);
+                if should_store {
+                    let inserted = ctx.cache_pending_insert.take().is_some_and(|pending| {
+                        store_pending_insert(&self.shared.cache, pending, Instant::now())
+                    });
+                    self.finish_cache_fill(ctx, inserted);
+                } else {
+                    ctx.cache_pending_insert = None;
+                    self.finish_cache_fill(ctx, false);
+                }
+            }
+        } else if end_of_stream {
+            self.finish_cache_fill(ctx, false);
+        }
+        Ok(None)
     }
 
     async fn response_filter(
@@ -2004,9 +2289,11 @@ async fn send_health_details(
     session: &mut Session,
     runtime: &RuntimeConfig,
     upstream_h3: &UpstreamH3Registry,
+    cache: &CacheRuntime,
 ) -> Result<bool> {
     let query = session.req_header().uri.query().unwrap_or_default();
     let check_upstreams = query.split('&').any(|value| value == "upstreams=1");
+    let check_cache = query.split('&').any(|value| value == "cache=1");
     let allocator = if query.split('&').any(|value| value == "allocator=1")
         && crate::allocator::environment_requests_stats()
     {
@@ -2052,6 +2339,19 @@ async fn send_health_details(
         "certificate_loaded": !runtime.config.server.https_listen.is_empty(),
         "upstreams_checked": check_upstreams,
         "upstreams": upstreams,
+        "cache_checked": check_cache,
+        "cache": if check_cache {
+            json!({
+                "enabled": runtime.config.server.cache.enabled,
+                "memory_bytes": runtime.config.server.cache.memory_bytes,
+                "entries": cache.store.entries(),
+                "bytes": cache.store.bytes(),
+                "dns": cache.store.dns_metrics().to_json(),
+                "navidrome": cache.store.navidrome_metrics().to_json(),
+            })
+        } else {
+            json!(null)
+        },
         "allocator": allocator,
     }))
     .map_err(|error| Error::because(HTTPStatus(500), "health JSON serialization failed", error))?;

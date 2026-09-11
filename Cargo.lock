@@ -1856,6 +1856,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "pingora",
+ "pingora-lru",
  "rustix 1.1.4",
  "serde",
  "serde-saphyr 1.2.0",
