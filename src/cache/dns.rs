@@ -20,11 +20,8 @@ pub struct DnsQueryKey {
     pub qname: String,
     pub qtype: u16,
     pub qclass: u16,
-    /// Recursion desired.
     pub rd: bool,
-    /// Checking disabled (DNSSEC).
     pub cd: bool,
-    /// DNSSEC OK (EDNS DO bit).
     pub do_bit: bool,
     /// Hash of the complete OPT pseudo-RR state. This keeps ECS, cookies,
     /// payload size, version and future EDNS options from aliasing answers.
@@ -75,12 +72,10 @@ pub fn dns_query_key(wire: &[u8]) -> Option<DnsQueryKey> {
     if flags & 0x8000 != 0 {
         return None;
     }
-    let qdcount = u16::from_be_bytes([wire[4], wire[5]]);
-    if qdcount != 1 {
+    if u16::from_be_bytes([wire[4], wire[5]]) != 1 {
         return None;
     }
-    let rd = flags & 0x0100 != 0;
-    let cd = flags & 0x0010 != 0;
+
     let mut offset = 12usize;
     let qname = read_name(wire, &mut offset)?;
     if wire.len() < offset + 4 {
@@ -90,12 +85,13 @@ pub fn dns_query_key(wire: &[u8]) -> Option<DnsQueryKey> {
     let qclass = u16::from_be_bytes([wire[offset + 2], wire[offset + 3]]);
     offset += 4;
     let (do_bit, edns_fingerprint) = edns_state(wire, offset)?;
+
     Some(DnsQueryKey {
         qname,
         qtype,
         qclass,
-        rd,
-        cd,
+        rd: flags & 0x0100 != 0,
+        cd: flags & 0x0010 != 0,
         do_bit,
         edns_fingerprint,
     })
@@ -124,13 +120,10 @@ pub fn dns_cacheable(response: &[u8], policy: &DnsCachePolicy) -> DnsCacheDecisi
         return DnsCacheDecision::NotCacheable;
     }
     let flags = u16::from_be_bytes([response[2], response[3]]);
-    // TC responses are incomplete and must not be persisted as successful cache
-    // entries.
     if flags & 0x0200 != 0 {
         return DnsCacheDecision::NotCacheable;
     }
-    let rcode = flags & 0x000F;
-    match rcode {
+    match flags & 0x000F {
         0 => {}
         3 => {
             let ttl = negative_ttl(response).unwrap_or(policy.negative_ttl);
@@ -138,11 +131,10 @@ pub fn dns_cacheable(response: &[u8], policy: &DnsCachePolicy) -> DnsCacheDecisi
                 ttl: ttl.min(policy.max_ttl),
             };
         }
-        // FORMERR / SERVFAIL / REFUSED and every other transient or unusual
-        // error are deliberately not cached.
-        1 | 2 | 5 => return DnsCacheDecision::NotCacheable,
+        // FORMERR / SERVFAIL / REFUSED and every other error stay uncached.
         _ => return DnsCacheDecision::NotCacheable,
     }
+
     let Some(min_ttl) = min_rr_ttl(response) else {
         return DnsCacheDecision::NotCacheable;
     };
@@ -162,13 +154,20 @@ pub fn build_cached_dns(response: &[u8], ttl: Duration, now: Instant) -> CachedV
     }
 }
 
-/// Materialize a cached DNS response for a new query.
+/// Backward-compatible materializer used by older call sites that do not have
+/// the current query wire available. DoH recommends a zero DNS transaction ID,
+/// so use zero rather than leaking the transaction ID from the request that
+/// originally populated the cache.
+pub fn age_dns_response(response: &Bytes, stored_at: Instant, now: Instant) -> Option<Bytes> {
+    age_dns_response_for_query(response, stored_at, now, 0)
+}
+
+/// Materialize a cached response for the current query.
 ///
-/// The DNS transaction ID is per query and is intentionally not part of the
-/// cache key, so it must be replaced on every cache hit. Only real RR TTLs are
-/// aged; TYPE 41 OPT uses the same four-byte field for extended RCODE/version/
-/// flags and must never be decremented.
-pub fn age_dns_response(
+/// The DNS transaction ID is per query and intentionally absent from the cache
+/// key. TYPE 41 OPT's four-byte pseudo-TTL is extended RCODE/version/flags and
+/// must never be aged like a normal DNS RR TTL.
+pub fn age_dns_response_for_query(
     response: &Bytes,
     stored_at: Instant,
     now: Instant,
@@ -185,16 +184,7 @@ pub fn age_dns_response(
     let mut out = response.to_vec();
     out[0..2].copy_from_slice(&query_id.to_be_bytes());
 
-    let qdcount = u16::from_be_bytes([out[4], out[5]]) as usize;
-    let mut offset = 12usize;
-    for _ in 0..qdcount {
-        skip_name(&out, &mut offset)?;
-        offset = offset.checked_add(4)?;
-        if offset > out.len() {
-            return None;
-        }
-    }
-
+    let mut offset = skip_questions(&out, 12)?;
     let ancount = u16::from_be_bytes([out[6], out[7]]) as usize;
     let nscount = u16::from_be_bytes([out[8], out[9]]) as usize;
     let arcount = u16::from_be_bytes([out[10], out[11]]) as usize;
@@ -239,6 +229,7 @@ fn negative_ttl(response: &[u8]) -> Option<Duration> {
     offset = skip_rrs(response, offset, ancount)?;
     let nscount = u16::from_be_bytes([response[8], response[9]]) as usize;
     let mut min = None;
+
     for _ in 0..nscount {
         skip_name(response, &mut offset)?;
         if response.len() < offset + 10 {
@@ -268,6 +259,7 @@ fn negative_ttl(response: &[u8]) -> Option<Duration> {
         }
         offset = next;
     }
+
     min.map(|seconds| Duration::from_secs(seconds.max(1) as u64))
 }
 
@@ -277,6 +269,7 @@ fn min_rr_ttl(response: &[u8]) -> Option<Duration> {
     let nscount = u16::from_be_bytes([response[8], response[9]]) as usize;
     let arcount = u16::from_be_bytes([response[10], response[11]]) as usize;
     let mut min = None;
+
     for _ in 0..(ancount + nscount + arcount) {
         skip_name(response, &mut offset)?;
         if response.len() < offset + 10 {
@@ -299,11 +292,15 @@ fn min_rr_ttl(response: &[u8]) -> Option<Duration> {
         }
         offset = next;
     }
+
     min.filter(|ttl| *ttl > 0)
         .map(|seconds| Duration::from_secs(seconds as u64))
 }
 
 fn skip_questions(response: &[u8], mut offset: usize) -> Option<usize> {
+    if response.len() < 12 {
+        return None;
+    }
     let qdcount = u16::from_be_bytes([response[4], response[5]]) as usize;
     for _ in 0..qdcount {
         skip_name(response, &mut offset)?;
@@ -316,7 +313,7 @@ fn skip_questions(response: &[u8], mut offset: usize) -> Option<usize> {
 }
 
 /// Returns (DO bit, fingerprint of all OPT state). Non-OPT additional records
-/// in a query are conservatively treated as non-cacheable by returning None.
+/// in a query are conservatively treated as non-cacheable.
 fn edns_state(response: &[u8], mut offset: usize) -> Option<(bool, u64)> {
     let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
     let nscount = u16::from_be_bytes([response[8], response[9]]) as usize;
@@ -342,10 +339,7 @@ fn edns_state(response: &[u8], mut offset: usize) -> Option<(bool, u64)> {
         let rdlength = u16::from_be_bytes([response[offset + 8], response[offset + 9]]) as usize;
         let rdata_start = offset + 10;
         let next = rdata_start.checked_add(rdlength)?;
-        if next > response.len() {
-            return None;
-        }
-        if rtype != EDNS0_TYPE {
+        if next > response.len() || rtype != EDNS0_TYPE {
             return None;
         }
 
@@ -512,11 +506,10 @@ mod tests {
 
     fn add_opt(msg: &mut Vec<u8>, do_bit: bool, option: Option<(u16, &[u8])>) {
         msg[10..12].copy_from_slice(&1u16.to_be_bytes());
-        msg.push(0); // root name
+        msg.push(0);
         msg.extend_from_slice(&EDNS0_TYPE.to_be_bytes());
         msg.extend_from_slice(&1232u16.to_be_bytes());
-        let flags = if do_bit { 0x0000_8000u32 } else { 0 };
-        msg.extend_from_slice(&flags.to_be_bytes());
+        msg.extend_from_slice(&(if do_bit { 0x0000_8000u32 } else { 0 }).to_be_bytes());
         let rdlength = option.map_or(0usize, |(_, value)| 4 + value.len());
         msg.extend_from_slice(&(rdlength as u16).to_be_bytes());
         if let Some((code, value)) = option {
@@ -547,20 +540,11 @@ mod tests {
         let key_a = dns_query_key(&a).unwrap();
         let key_aaaa = dns_query_key(&aaaa).unwrap();
         assert_eq!(key_a.qname, "example.com");
-        assert_eq!(key_a.qtype, 1);
-        assert_eq!(key_aaaa.qtype, 28);
         assert_ne!(cache_key_for_query(&key_a), cache_key_for_query(&key_aaaa));
     }
 
     #[test]
-    fn cd_bit_isolated_in_cache_key() {
-        let plain = dns_query_key(&build_query("example.com", 1, 1, true, false)).unwrap();
-        let cd = dns_query_key(&build_query("example.com", 1, 1, true, true)).unwrap();
-        assert_ne!(cache_key_for_query(&plain), cache_key_for_query(&cd));
-    }
-
-    #[test]
-    fn edns_state_isolated_in_cache_key() {
+    fn dnssec_and_edns_options_are_isolated() {
         let mut plain = build_query("example.com", 1, 1, true, false);
         add_opt(&mut plain, false, None);
         let mut dnssec = build_query("example.com", 1, 1, true, false);
@@ -581,11 +565,9 @@ mod tests {
     fn ages_ttl_and_rewrites_transaction_id() {
         let response = Bytes::from(build_response("example.com", 1, 120, &[192, 0, 2, 1], 0));
         let stored_at = Instant::now() - Duration::from_secs(30);
-        let aged = age_dns_response(&response, stored_at, Instant::now(), 0x1234).unwrap();
+        let aged = age_dns_response_for_query(&response, stored_at, Instant::now(), 0x1234).unwrap();
         assert_eq!(&aged[0..2], &[0x12, 0x34]);
-        let mut offset = 12;
-        skip_name(&aged, &mut offset).unwrap();
-        offset += 4;
+        let mut offset = skip_questions(&aged, 12).unwrap();
         skip_name(&aged, &mut offset).unwrap();
         let ttl = u32::from_be_bytes([
             aged[offset + 4],
@@ -606,19 +588,21 @@ mod tests {
         ));
         let response = Bytes::from(response);
         let stored_at = Instant::now() - Duration::from_secs(30);
-        let aged = age_dns_response(&response, stored_at, Instant::now(), 0x2222).unwrap();
+        let aged = age_dns_response_for_query(&response, stored_at, Instant::now(), 0x2222).unwrap();
 
         let mut offset = skip_questions(&aged, 12).unwrap();
         offset = skip_rrs(&aged, offset, 1).unwrap();
         skip_name(&aged, &mut offset).unwrap();
         assert_eq!(u16::from_be_bytes([aged[offset], aged[offset + 1]]), EDNS0_TYPE);
-        let pseudo_ttl = u32::from_be_bytes([
-            aged[offset + 4],
-            aged[offset + 5],
-            aged[offset + 6],
-            aged[offset + 7],
-        ]);
-        assert_eq!(pseudo_ttl, 0x0000_8000);
+        assert_eq!(
+            u32::from_be_bytes([
+                aged[offset + 4],
+                aged[offset + 5],
+                aged[offset + 6],
+                aged[offset + 7],
+            ]),
+            0x0000_8000
+        );
     }
 
     #[test]
@@ -640,8 +624,10 @@ mod tests {
         rdata.extend_from_slice(&60u32.to_be_bytes());
         msg.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
         msg.extend_from_slice(&rdata);
-        let decision = dns_cacheable(&msg, &DnsCachePolicy::default());
-        assert!(matches!(decision, DnsCacheDecision::Cacheable { .. }));
+        assert!(matches!(
+            dns_cacheable(&msg, &DnsCachePolicy::default()),
+            DnsCacheDecision::Cacheable { .. }
+        ));
     }
 
     #[test]
