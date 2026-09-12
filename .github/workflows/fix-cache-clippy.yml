@@ -1,0 +1,41 @@
+name: fix-cache-clippy
+
+on:
+  push:
+    branches:
+      - fix/cache-content-encoding-bounds
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/cache-content-encoding-bounds
+          fetch-depth: 0
+      - name: Apply clippy fix
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('src/cache/integration.rs')
+          text = path.read_text()
+          old = '''        let mut navidrome = NavidromeCachePolicy::default();\n        navidrome.max_response_bytes = 8;'''
+          new = '''        let navidrome = NavidromeCachePolicy {\n            max_response_bytes: 8,\n            ..Default::default()\n        };'''
+          if old not in text:
+              raise SystemExit('target block not found')
+          path.write_text(text.replace(old, new, 1))
+      - name: Install pinned rustfmt
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt
+      - name: Format
+        run: cargo +1.98.1 fmt --all
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/cache/integration.rs
+          git commit -m "fix: satisfy cache clippy checks"
+          git push origin HEAD:fix/cache-content-encoding-bounds
