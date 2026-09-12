@@ -557,8 +557,10 @@ mod tests {
     #[test]
     fn oversized_pending_body_stops_buffering() {
         let store = PingolaCache::new(true, 4096);
-        let mut navidrome = NavidromeCachePolicy::default();
-        navidrome.max_response_bytes = 8;
+        let navidrome = NavidromeCachePolicy {
+            max_response_bytes: 8,
+            ..Default::default()
+        };
         let cache = CacheRuntime {
             store,
             dns: DnsCachePolicy::default(),
