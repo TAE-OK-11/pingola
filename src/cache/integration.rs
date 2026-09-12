@@ -13,8 +13,9 @@ use crate::cache::dns::{
     cache_key_for_query, dns_cacheable, dns_query_key, parse_doh_query,
 };
 use crate::cache::navidrome::{
-    NavidromeCachePolicy, build_cached_navidrome, navidrome_cache_key, navidrome_cacheable,
-    navidrome_invalidates_cache, navidrome_response_is_error, navidrome_response_ttl,
+    NAVIDROME_CACHE_SCOPE_HEADER, NavidromeCachePolicy, build_cached_navidrome,
+    navidrome_cache_key, navidrome_cacheable, navidrome_invalidates_cache,
+    navidrome_response_is_error, navidrome_response_ttl,
 };
 use crate::config::HandlerKind;
 use crate::content_encoding::negotiate;
@@ -167,6 +168,13 @@ fn request_accepts_identity(request: &RequestHeader) -> bool {
     negotiate(request.headers.get_all(ACCEPT_ENCODING).iter()).identity_acceptable
 }
 
+fn request_cache_scope(request: &RequestHeader) -> Option<&str> {
+    request
+        .headers
+        .get(NAVIDROME_CACHE_SCOPE_HEADER)
+        .and_then(|value| value.to_str().ok())
+}
+
 fn prepare_navidrome_lookup(
     cache: &CacheRuntime,
     request: &RequestHeader,
@@ -179,6 +187,7 @@ fn prepare_navidrome_lookup(
         &request.method,
         request.uri.path(),
         request.uri.query(),
+        request_cache_scope(request),
         &cache.navidrome,
     ) {
         Some(cacheable) => cacheable,
@@ -240,6 +249,7 @@ pub fn begin_pending_insert(
                         &request.method,
                         request.uri.path(),
                         request.uri.query(),
+                        request_cache_scope(request),
                         &cache.navidrome,
                     )
                 })
@@ -334,6 +344,11 @@ pub fn dns_request_needs_body(method: &Method) -> bool {
 mod tests {
     use super::*;
     use crate::cache::core::PingolaCache;
+
+    const CACHE_SCOPE_A: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const CACHE_SCOPE_B: &str =
+        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
     #[test]
     fn dns_lookup_miss_then_hit() {
@@ -442,6 +457,75 @@ mod tests {
                 Instant::now(),
             ),
             PreparedCacheLookup::Bypass
+        ));
+    }
+
+    #[test]
+    fn stable_scope_hits_across_rotating_token_salt() {
+        let store = PingolaCache::new(true, 4096);
+        let cache = CacheRuntime {
+            store,
+            dns: DnsCachePolicy::default(),
+            navidrome: NavidromeCachePolicy::default(),
+        };
+        let now = Instant::now();
+        let mut first = RequestHeader::build(
+            Method::GET,
+            b"/rest/getAlbum.view?u=alice&t=one&s=salt1&id=1&f=json",
+            None,
+        )
+        .unwrap();
+        first
+            .insert_header(NAVIDROME_CACHE_SCOPE_HEADER, CACHE_SCOPE_A)
+            .unwrap();
+        let mut pending = begin_pending_insert(
+            &cache,
+            RouteClass::NavidromeApi,
+            HandlerKind::NavidromeMain,
+            &first,
+            None,
+        )
+        .unwrap();
+        pending.content_type = Some(JSON_CONTENT_TYPE.clone());
+        pending
+            .body
+            .extend_from_slice(br#"{"subsonic-response":{"status":"ok"}}"#);
+        assert!(store_pending_insert(&cache, pending, now));
+
+        let mut rotated = RequestHeader::build(
+            Method::GET,
+            b"/rest/getAlbum.view?u=alice&t=two&s=salt2&id=1&f=json",
+            None,
+        )
+        .unwrap();
+        rotated
+            .insert_header(NAVIDROME_CACHE_SCOPE_HEADER, CACHE_SCOPE_A)
+            .unwrap();
+        assert!(matches!(
+            prepare_lookup(
+                &cache,
+                RouteClass::NavidromeApi,
+                HandlerKind::NavidromeMain,
+                &rotated,
+                None,
+                now,
+            ),
+            PreparedCacheLookup::Hit(_)
+        ));
+
+        rotated
+            .insert_header(NAVIDROME_CACHE_SCOPE_HEADER, CACHE_SCOPE_B)
+            .unwrap();
+        assert!(matches!(
+            prepare_lookup(
+                &cache,
+                RouteClass::NavidromeApi,
+                HandlerKind::NavidromeMain,
+                &rotated,
+                None,
+                now,
+            ),
+            PreparedCacheLookup::Miss(_)
         ));
     }
 
