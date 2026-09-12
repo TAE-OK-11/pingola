@@ -9,6 +9,8 @@ use http::Method;
 
 use crate::cache::core::{CacheKey, CacheNamespace, CachedValue};
 
+pub const NAVIDROME_CACHE_SCOPE_HEADER: &str = "x-bufi-cache-scope";
+
 const CACHEABLE_SUFFIXES: &[&str] = &[
     "getAlbum",
     "getArtist",
@@ -18,6 +20,8 @@ const CACHEABLE_SUFFIXES: &[&str] = &[
     "getAlbumInfo",
     "getArtistInfo",
     "getSongInfo",
+    "getLyricsBySongId",
+    "getLyrics",
 ];
 
 const BLOCKED_SUFFIXES: &[&str] = &[
@@ -78,6 +82,7 @@ pub fn navidrome_cacheable(
     method: &Method,
     path: &str,
     query: Option<&str>,
+    client_cache_scope: Option<&str>,
     policy: &NavidromeCachePolicy,
 ) -> Option<NavidromeCacheable> {
     if !policy.enabled || *method != Method::GET {
@@ -112,10 +117,12 @@ pub fn navidrome_cacheable(
         return None;
     }
 
-    // A username alone is not authentication. The cache scope must contain an
-    // authentication secret/proof so an invalid request cannot reuse a cache
-    // entry populated by a previously authenticated request for the same user.
-    let user_scope = authenticated_user_scope(&params)?;
+    // A username alone is not authentication. Normal clients remain scoped by
+    // their authentication secret/proof. BuFi password auth intentionally uses
+    // a fresh t/s pair per request; a high-entropy per-process cache capability
+    // lets those requests share a cache key without weakening the auth check for
+    // clients that do not opt in. The capability is never a password derivative.
+    let user_scope = authenticated_user_scope(&params, client_cache_scope)?;
     let stable_params = stable_query_params(&params);
 
     Some(NavidromeCacheable {
@@ -208,7 +215,14 @@ fn parse_query_pairs(query: Option<&str>) -> Vec<(String, String)> {
     pairs
 }
 
-fn authenticated_user_scope(params: &[(String, String)]) -> Option<String> {
+fn valid_client_cache_scope(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn authenticated_user_scope(
+    params: &[(String, String)],
+    client_cache_scope: Option<&str>,
+) -> Option<String> {
     let username = params
         .iter()
         .find(|(key, _)| key == "u")
@@ -243,10 +257,19 @@ fn authenticated_user_scope(params: &[(String, String)]) -> Option<String> {
         if username.is_empty() || token.is_empty() || salt.is_empty() {
             return None;
         }
-        hasher.write(b"token-salt\0");
-        hasher.write(token.as_bytes());
-        hasher.write_u8(0);
-        hasher.write(salt.as_bytes());
+        if let Some(scope) = client_cache_scope.filter(|scope| valid_client_cache_scope(scope)) {
+            hasher.write(b"client-cache-scope\0");
+            for byte in scope.bytes() {
+                hasher.write_u8(byte.to_ascii_lowercase());
+            }
+        } else {
+            // Safe fallback for every existing client: rotating t/s values still
+            // isolate cache entries exactly as before when no capability exists.
+            hasher.write(b"token-salt\0");
+            hasher.write(token.as_bytes());
+            hasher.write_u8(0);
+            hasher.write(salt.as_bytes());
+        }
     }
 
     Some(format!("auth:{:016x}", hasher.finish()))
@@ -274,6 +297,11 @@ fn stable_query_params(params: &[(String, String)]) -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
+    const CACHE_SCOPE_A: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const CACHE_SCOPE_B: &str =
+        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
     #[test]
     fn only_allows_conservative_authenticated_json_endpoints() {
         let policy = NavidromeCachePolicy::default();
@@ -282,6 +310,7 @@ mod tests {
                 &Method::GET,
                 "/rest/getAlbum.view",
                 Some("u=alice&t=token&s=salt&id=1&f=json"),
+                None,
                 &policy
             )
             .is_some()
@@ -291,10 +320,29 @@ mod tests {
                 &Method::GET,
                 "/rest/scrobble.view",
                 Some("u=alice&t=token&s=salt&id=1&f=json"),
+                None,
                 &policy
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn lyrics_are_cacheable_authenticated_json_reads() {
+        let policy = NavidromeCachePolicy::default();
+        for endpoint in ["getLyricsBySongId", "getLyrics"] {
+            assert!(
+                navidrome_cacheable(
+                    &Method::GET,
+                    &format!("/rest/{endpoint}.view"),
+                    Some("u=alice&t=token&s=salt&id=1&f=json"),
+                    None,
+                    &policy,
+                )
+                .is_some(),
+                "endpoint={endpoint}"
+            );
+        }
     }
 
     #[test]
@@ -305,6 +353,7 @@ mod tests {
                 &Method::GET,
                 "/rest/getAlbum.view",
                 Some("u=alice&id=1&f=json"),
+                Some(CACHE_SCOPE_A),
                 &policy,
             )
             .is_none()
@@ -312,12 +361,13 @@ mod tests {
     }
 
     #[test]
-    fn auth_proof_is_part_of_user_scope() {
+    fn auth_proof_is_part_of_user_scope_without_client_capability() {
         let policy = NavidromeCachePolicy::default();
         let first = navidrome_cacheable(
             &Method::GET,
             "/rest/getSong.view",
             Some("u=alice&id=9&t=one&s=salt1&f=json"),
+            None,
             &policy,
         )
         .unwrap();
@@ -325,10 +375,67 @@ mod tests {
             &Method::GET,
             "/rest/getSong.view",
             Some("u=alice&id=9&t=two&s=salt2&f=json"),
+            None,
             &policy,
         )
         .unwrap();
         assert_ne!(navidrome_cache_key(&first), navidrome_cache_key(&second));
+    }
+
+    #[test]
+    fn stable_client_scope_reuses_key_across_rotating_token_salt() {
+        let policy = NavidromeCachePolicy::default();
+        let first = navidrome_cacheable(
+            &Method::GET,
+            "/rest/getAlbum.view",
+            Some("u=alice&t=one&s=salt1&id=1&f=json"),
+            Some(CACHE_SCOPE_A),
+            &policy,
+        )
+        .unwrap();
+        let second = navidrome_cacheable(
+            &Method::GET,
+            "/rest/getAlbum.view",
+            Some("u=alice&t=two&s=salt2&id=1&f=json"),
+            Some(CACHE_SCOPE_A),
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(navidrome_cache_key(&first), navidrome_cache_key(&second));
+    }
+
+    #[test]
+    fn client_scope_is_a_real_capability_not_a_username_alias() {
+        let policy = NavidromeCachePolicy::default();
+        let first = navidrome_cacheable(
+            &Method::GET,
+            "/rest/getAlbum.view",
+            Some("u=alice&t=one&s=salt1&id=1&f=json"),
+            Some(CACHE_SCOPE_A),
+            &policy,
+        )
+        .unwrap();
+        let different_scope = navidrome_cacheable(
+            &Method::GET,
+            "/rest/getAlbum.view",
+            Some("u=alice&t=two&s=salt2&id=1&f=json"),
+            Some(CACHE_SCOPE_B),
+            &policy,
+        )
+        .unwrap();
+        let invalid_scope = navidrome_cacheable(
+            &Method::GET,
+            "/rest/getAlbum.view",
+            Some("u=alice&t=two&s=salt2&id=1&f=json"),
+            Some("not-a-valid-cache-scope"),
+            &policy,
+        )
+        .unwrap();
+        assert_ne!(
+            navidrome_cache_key(&first),
+            navidrome_cache_key(&different_scope)
+        );
+        assert_ne!(navidrome_cache_key(&first), navidrome_cache_key(&invalid_scope));
     }
 
     #[test]
@@ -338,6 +445,7 @@ mod tests {
             &Method::GET,
             "/rest/getAlbum.view",
             Some("u=alice&p=secret&id=1&f=json"),
+            None,
             &policy,
         )
         .unwrap();
@@ -345,6 +453,7 @@ mod tests {
             &Method::GET,
             "/rest/getAlbum.view",
             Some("u=bob&p=secret&id=1&f=json"),
+            None,
             &policy,
         )
         .unwrap();
@@ -359,6 +468,7 @@ mod tests {
                 &Method::GET,
                 "/rest/getSong.view",
                 Some("u=alice&p=secret&id=1&f=xml"),
+                None,
                 &policy,
             )
             .is_none()
@@ -368,6 +478,7 @@ mod tests {
                 &Method::GET,
                 "/rest/getSong.view",
                 Some("u=alice&p=secret&id=1&f=json&callback=cb"),
+                None,
                 &policy,
             )
             .is_none()
@@ -381,6 +492,7 @@ mod tests {
             &Method::GET,
             "/rest/getAlbum.view",
             Some("u=alice&p=secret&id=1&f=json&v=1.16.1"),
+            None,
             &policy,
         )
         .unwrap();
@@ -388,6 +500,7 @@ mod tests {
             &Method::GET,
             "/rest/getAlbum.view",
             Some("u=alice&p=secret&id=1&f=json&v=1.16.2"),
+            None,
             &policy,
         )
         .unwrap();
