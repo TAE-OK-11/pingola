@@ -345,10 +345,8 @@ mod tests {
     use super::*;
     use crate::cache::core::PingolaCache;
 
-    const CACHE_SCOPE_A: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const CACHE_SCOPE_B: &str =
-        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const CACHE_SCOPE_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const CACHE_SCOPE_B: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
     #[test]
     fn dns_lookup_miss_then_hit() {

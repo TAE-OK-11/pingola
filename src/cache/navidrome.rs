@@ -297,10 +297,8 @@ fn stable_query_params(params: &[(String, String)]) -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
-    const CACHE_SCOPE_A: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const CACHE_SCOPE_B: &str =
-        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const CACHE_SCOPE_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const CACHE_SCOPE_B: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
     #[test]
     fn only_allows_conservative_authenticated_json_endpoints() {
@@ -435,7 +433,10 @@ mod tests {
             navidrome_cache_key(&first),
             navidrome_cache_key(&different_scope)
         );
-        assert_ne!(navidrome_cache_key(&first), navidrome_cache_key(&invalid_scope));
+        assert_ne!(
+            navidrome_cache_key(&first),
+            navidrome_cache_key(&invalid_scope)
+        );
     }
 
     #[test]
