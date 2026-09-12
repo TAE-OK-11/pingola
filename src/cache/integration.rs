@@ -5,6 +5,7 @@ use std::time::Instant;
 use bytes::{Bytes, BytesMut};
 use cloudflare_pingora::http::RequestHeader;
 use http::Method;
+use http::header::ACCEPT_ENCODING;
 
 use crate::cache::core::{CacheHandle, CacheKey, CacheLookup, CacheNamespace};
 use crate::cache::dns::{
@@ -16,6 +17,7 @@ use crate::cache::navidrome::{
     navidrome_invalidates_cache, navidrome_response_is_error, navidrome_response_ttl,
 };
 use crate::config::HandlerKind;
+use crate::content_encoding::negotiate;
 use crate::routing::RouteClass;
 
 pub struct CacheRuntime {
@@ -47,9 +49,49 @@ enum PendingCacheAction {
     Invalidate(CacheNamespace),
 }
 
+/// Bounded response accumulator used while deciding whether a miss is safe to
+/// cache. Once the configured limit is crossed we drop the buffered bytes and
+/// stop allocating for the remainder of the response.
+pub struct BoundedBody {
+    bytes: BytesMut,
+    limit: usize,
+    overflowed: bool,
+}
+
+impl BoundedBody {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: BytesMut::new(),
+            limit,
+            overflowed: false,
+        }
+    }
+
+    pub fn extend_from_slice(&mut self, chunk: &[u8]) {
+        if self.overflowed {
+            return;
+        }
+        let Some(next_len) = self.bytes.len().checked_add(chunk.len()) else {
+            self.bytes.clear();
+            self.overflowed = true;
+            return;
+        };
+        if next_len > self.limit {
+            self.bytes.clear();
+            self.overflowed = true;
+            return;
+        }
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    fn freeze(self) -> Option<Bytes> {
+        (!self.overflowed).then(|| self.bytes.freeze())
+    }
+}
+
 pub struct PendingCacheInsert {
     action: PendingCacheAction,
-    pub body: BytesMut,
+    pub body: BoundedBody,
     pub status: u16,
     pub content_type: Option<http::header::HeaderValue>,
 }
@@ -121,12 +163,16 @@ fn prepare_dns_lookup(
     }
 }
 
+fn request_accepts_identity(request: &RequestHeader) -> bool {
+    negotiate(request.headers.get_all(ACCEPT_ENCODING).iter()).identity_acceptable
+}
+
 fn prepare_navidrome_lookup(
     cache: &CacheRuntime,
     request: &RequestHeader,
     now: Instant,
 ) -> PreparedCacheLookup {
-    if !cache.navidrome.enabled {
+    if !cache.navidrome.enabled || !request_accepts_identity(request) {
         return PreparedCacheLookup::Bypass;
     }
     let cacheable = match navidrome_cacheable(
@@ -174,7 +220,7 @@ pub fn begin_pending_insert(
             let query = dns_query_key(&wire)?;
             Some(PendingCacheInsert {
                 action: PendingCacheAction::Store(cache_key_for_query(&query)),
-                body: BytesMut::new(),
+                body: BoundedBody::new(cache.dns.max_response_bytes),
                 status: 200,
                 content_type: Some(DNS_CONTENT_TYPE.clone()),
             })
@@ -188,12 +234,17 @@ pub fn begin_pending_insert(
             if !cache.navidrome.enabled {
                 return None;
             }
-            let action = if let Some(cacheable) = navidrome_cacheable(
-                &request.method,
-                request.uri.path(),
-                request.uri.query(),
-                &cache.navidrome,
-            ) {
+            let cacheable = request_accepts_identity(request)
+                .then(|| {
+                    navidrome_cacheable(
+                        &request.method,
+                        request.uri.path(),
+                        request.uri.query(),
+                        &cache.navidrome,
+                    )
+                })
+                .flatten();
+            let action = if let Some(cacheable) = cacheable {
                 PendingCacheAction::Store(navidrome_cache_key(&cacheable))
             } else if navidrome_invalidates_cache(request.uri.path()) {
                 PendingCacheAction::Invalidate(CacheNamespace::Navidrome)
@@ -202,7 +253,7 @@ pub fn begin_pending_insert(
             };
             Some(PendingCacheInsert {
                 action,
-                body: BytesMut::new(),
+                body: BoundedBody::new(cache.navidrome.max_response_bytes),
                 status: 200,
                 content_type: None,
             })
@@ -216,7 +267,15 @@ pub fn store_pending_insert(
     pending: PendingCacheInsert,
     now: Instant,
 ) -> bool {
-    let body = pending.body.freeze();
+    if pending.body.overflowed {
+        if let PendingCacheAction::Store(key) = &pending.action {
+            cache.store.reject(key.namespace);
+        }
+        return false;
+    }
+    let Some(body) = pending.body.freeze() else {
+        return false;
+    };
     match pending.action {
         PendingCacheAction::Invalidate(CacheNamespace::Navidrome) => {
             // OpenSubsonic often reports application errors with HTTP 200. Only
@@ -247,7 +306,10 @@ pub fn store_pending_insert(
                             mime.trim().eq_ignore_ascii_case("application/json")
                         })
                     });
-                if !is_json {
+                if !is_json || serde_json::from_slice::<serde_json::Value>(&body).is_err() {
+                    // A compressed response body cannot be replayed safely because
+                    // cached responses intentionally do not preserve Content-Encoding.
+                    // Strict JSON validation also rejects malformed/JSONP payloads.
                     cache.store.reject(key.namespace);
                     return false;
                 }
@@ -351,6 +413,97 @@ mod tests {
         let coalesced =
             age_dns_response_for_query(&value.body, value.stored_at, now, 0x99AA).unwrap();
         assert_eq!(&coalesced[0..2], &[0x99, 0xAA]);
+    }
+
+    #[test]
+    fn navidrome_cache_bypasses_when_identity_is_forbidden() {
+        let store = PingolaCache::new(true, 4096);
+        let cache = CacheRuntime {
+            store,
+            dns: DnsCachePolicy::default(),
+            navidrome: NavidromeCachePolicy::default(),
+        };
+        let mut request = RequestHeader::build(
+            Method::GET,
+            b"/rest/getAlbum.view?u=alice&p=secret&id=1&f=json",
+            None,
+        )
+        .unwrap();
+        request
+            .insert_header(ACCEPT_ENCODING, "gzip, identity;q=0")
+            .unwrap();
+        assert!(matches!(
+            prepare_lookup(
+                &cache,
+                RouteClass::NavidromeApi,
+                HandlerKind::NavidromeMain,
+                &request,
+                None,
+                Instant::now(),
+            ),
+            PreparedCacheLookup::Bypass
+        ));
+    }
+
+    #[test]
+    fn navidrome_encoded_or_malformed_body_is_not_cached() {
+        let store = PingolaCache::new(true, 4096);
+        let cache = CacheRuntime {
+            store,
+            dns: DnsCachePolicy::default(),
+            navidrome: NavidromeCachePolicy::default(),
+        };
+        let request = RequestHeader::build(
+            Method::GET,
+            b"/rest/getAlbum.view?u=alice&p=secret&id=1&f=json",
+            None,
+        )
+        .unwrap();
+        let mut pending = begin_pending_insert(
+            &cache,
+            RouteClass::NavidromeApi,
+            HandlerKind::NavidromeMain,
+            &request,
+            None,
+        )
+        .unwrap();
+        pending.content_type = Some(JSON_CONTENT_TYPE.clone());
+        pending.body.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00]);
+        assert!(!store_pending_insert(&cache, pending, Instant::now()));
+    }
+
+    #[test]
+    fn oversized_pending_body_stops_buffering() {
+        let store = PingolaCache::new(true, 4096);
+        let mut navidrome = NavidromeCachePolicy::default();
+        navidrome.max_response_bytes = 8;
+        let cache = CacheRuntime {
+            store,
+            dns: DnsCachePolicy::default(),
+            navidrome,
+        };
+        let request = RequestHeader::build(
+            Method::GET,
+            b"/rest/getAlbum.view?u=alice&p=secret&id=1&f=json",
+            None,
+        )
+        .unwrap();
+        let mut pending = begin_pending_insert(
+            &cache,
+            RouteClass::NavidromeApi,
+            HandlerKind::NavidromeMain,
+            &request,
+            None,
+        )
+        .unwrap();
+        pending.body.extend_from_slice(b"12345678");
+        assert_eq!(pending.body.bytes.len(), 8);
+        pending.body.extend_from_slice(b"9");
+        assert!(pending.body.overflowed);
+        assert!(pending.body.bytes.is_empty());
+        pending.body.extend_from_slice(b"more ignored bytes");
+        assert!(pending.body.bytes.is_empty());
+        assert!(!store_pending_insert(&cache, pending, Instant::now()));
     }
 
     #[test]
