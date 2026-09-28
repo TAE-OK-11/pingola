@@ -10,7 +10,7 @@ ARG LTO_MODE=fat
 ARG DEBIAN_SUITE=13
 ARG DEBIAN_DIGEST=sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 
-FROM debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132 AS toolchain
+FROM debian:13-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS toolchain
 
 ARG DEBIAN_SUITE
 
@@ -152,7 +152,7 @@ RUN --mount=from=tls-builder,source=/opt/tls,target=/opt/tls,ro \
       printf 'ktls=on\n'; \
     } > /out/build-info.txt
 
-FROM debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132 AS runtime
+FROM debian:13-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS runtime
 
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=unknown
