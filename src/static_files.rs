@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ahash::AHasher;
+use ahash::{AHashMap, AHasher};
 use bytes::{Bytes, BytesMut};
 use cloudflare_pingora::Result;
 use cloudflare_pingora::http::ResponseHeader;
@@ -100,7 +100,7 @@ struct PathCache {
     // unrelated sites never contend on one mutex, and use String keys only for
     // insertion. LruCache's borrowed-key lookup lets cache hits use &str without
     // allocating a temporary URI String on every request.
-    entries: HashMap<String, Mutex<LruCache<String, CachedPath>>>,
+    entries: AHashMap<String, Mutex<LruCache<String, CachedPath>>>,
 }
 
 impl PathCache {
@@ -201,7 +201,7 @@ impl AssetCache {
 }
 
 pub struct StaticFiles {
-    roots: HashMap<String, PathBuf>,
+    roots: AHashMap<String, PathBuf>,
     cache: AssetCache,
     paths: PathCache,
     cold_read_slot: Semaphore,
@@ -211,7 +211,7 @@ pub struct StaticFiles {
 
 impl StaticFiles {
     pub fn new(roots: HashMap<String, PathBuf>, cache_bytes: usize) -> anyhow::Result<Self> {
-        let mut canonical_roots = HashMap::with_capacity(roots.len());
+        let mut canonical_roots = AHashMap::with_capacity(roots.len());
         for (name, root) in roots {
             let canonical = std::fs::canonicalize(&root).map_err(|error| {
                 anyhow::anyhow!(

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::error::Error as StdError;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -92,8 +92,8 @@ impl H3Route {
 
 #[derive(Default)]
 pub struct UpstreamH3Registry {
-    routes: HashMap<String, H3Route>,
-    pools: HashMap<String, Arc<H3Pool>>,
+    routes: AHashMap<String, H3Route>,
+    pools: AHashMap<String, Arc<H3Pool>>,
 }
 
 impl UpstreamH3Registry {
@@ -135,8 +135,8 @@ pub fn start(
     runtime: Arc<RuntimeConfig>,
     h3_runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<Arc<UpstreamH3Registry>> {
-    let mut routes = HashMap::new();
-    let mut pools = HashMap::new();
+    let mut routes = AHashMap::new();
+    let mut pools = AHashMap::new();
     let mut pool_workers = Vec::new();
 
     for (name, upstream) in &runtime.config.upstreams {
@@ -291,6 +291,12 @@ impl H3Pool {
     }
 
     fn select_shard(&self) -> &PoolShard {
+        // One connection is the default and common deployment. Avoid both the
+        // shared atomic RMW and integer modulo when round-robin cannot change
+        // the selected shard.
+        if self.shards.len() == 1 {
+            return &self.shards[0];
+        }
         let index = self.round_robin.fetch_add(1, Ordering::Relaxed);
         &self.shards[index % self.shards.len()]
     }
